@@ -88,7 +88,7 @@ DatamigrationAgent/                         (git repo)
 ### 2.3 Dependencies
 
 - **Runtime prerequisite:** ASP.NET Core Runtime 8+ (single installer; includes .NET runtime).
-- **NuGet:** `Microsoft.Data.SqlClient`, `Microsoft.Data.Sqlite`. Nothing else at runtime.
+- **NuGet:** `Microsoft.Data.SqlClient` 7.x, `Microsoft.Data.SqlClient.Extensions.Azure` 7.x (SqlClient 7 moved the Entra ID auth modes into this package), `Microsoft.Data.Sqlite`. Nothing else at runtime.
 - **Test-only:** xUnit; optional Playwright smoke test.
 - **No npm, no CDN, no MCP server.** A CLI on PATH is cheaper than MCP (tool schemas would occupy context every turn).
 
@@ -129,9 +129,13 @@ SETUP → DISCOVERY → ANALYSIS ⟲ → MAPPING ⟲ → SQL ⟲ → READY → T
 | TRANSFER | Engine | Running / paused / failed / cancelled transfer run. |
 | COMPLETE | Engine | Final report artifact. |
 
+Script steps (discovery, rule findings, auto-mapping, SQL templating and validation) run as **server jobs** triggered by state transitions: they run even when Claude is offline and cost no tokens. Claude is needed only for agent (judgement) steps.
+
+Phase statuses: `pending → running` (server job) `→ drafting` (agent must produce the first reviewable version) `→ awaiting_review ⇄ reworking → approved`; an approved or in-progress phase becomes `stale` when an upstream phase is reopened.
+
 ### 3.2 Review loop (ANALYSIS, MAPPING, SQL)
 
-1. Draft **vN** is created (status `awaiting_review`).
+1. The server job writes a script draft as **v0** (internal); the agent turns it into **v1**, the first version shown for review (status `awaiting_review`).
 2. Human reviews in the UI and either **Approves** or adds **feedback items**: general, or **anchored** to an element (table, column, finding, mapping row, SQL task/line).
 3. On "Request changes", phase goes `reworking`; Claude receives only the feedback items plus the affected slice.
 4. Claude returns a patch plus a **response per feedback item** (`addressed` with note, or `declined` with reason). Engine creates **vN+1**; UI shows the per-item responses and a diff vN→vN+1.
@@ -147,7 +151,7 @@ Rules:
 ### 3.3 Pause / resume
 
 - A **Pause** control is available in every phase (UI top bar).
-- Agent side: `dbm await` returns `{"event":"paused"}`; `dbm next` returns `{"action":"stop"}` while paused; `dbm apply` still accepts an in-flight patch so no work is lost. Claude then ends its turn.
+- Agent side: while paused, `dbm next` returns `{"action":"await","reason":"paused"}`; `dbm apply` still accepts an in-flight patch so no work is lost. Claude reports "Paused" in one line and keeps a background `dbm await` open (zero tokens), so clicking **Resume** continues automatically while the session is alive.
 - Transfer side: workers finish the current chunk, commit, checkpoint, then stop.
 - **Resume:** UI button (if agent online) or `/db-migrate resume` in any new Claude session; the engine state determines exactly where to continue.
 - If Claude is not running, the UI still works: browse, queue feedback, approve, pause, run the transfer. A banner shows "Agent offline — run `/db-migrate resume` in Claude Code" whenever an agent action is pending.
@@ -156,7 +160,8 @@ Rules:
 
 - `dbm await` long-polls `GET /api/agent/await` on the local server (starting the server if needed). While connected the server marks the agent **online**.
 - The orchestrator runs `dbm await` as a **background** Bash command so waiting costs no tokens; the user's action completes the command and wakes the session.
-- **Spike (first implementation task):** confirm that a completed background Bash command re-invokes the session in both CLI and Desktop. **Fallback:** foreground `dbm await --timeout 540` in a loop (a few tokens per ~9 minutes idle).
+- **Verified (2026-09-11, CLI on Windows):** a completed background command re-invokes the session. Desktop is re-checked in M6. **Fallback** for any surface that doesn't: foreground `dbm await --timeout 540` in a loop (a few tokens per ~9 minutes idle).
+- **Verified (2026-09-11, Windows):** processes started from a tool command survive the command ending, so `dbm` can spawn the detached server directly (`setsid`/`nohup` equivalent used on macOS/Linux).
 
 ## 4. Agents & token strategy
 
@@ -166,10 +171,9 @@ Rules:
 
 ```
 dbm next  →  {"action": "...", ...}
-  run    → execute the given dbm command, then loop
-  agent  → dispatch the named subagent with the given packet path; pass its patch to `dbm apply`; loop
-  await  → run `dbm await` in background; on wake, loop
-  stop   → paused or complete; report status in one line and end turn
+  agent  → dispatch the named subagent with the packet path; `dbm apply` its patch; loop
+  await  → run `dbm await` in background (returns the next action once state changes); loop
+  stop   → complete or failed; report the one-line summary and end turn
 ```
 
 Sub-commands: `/db-migrate` (start or continue in current workspace), `/db-migrate resume`, `/db-migrate status`, `/db-migrate ui` (re-open browser). Phase playbooks in `reference/` are read only when that phase's agent step needs them.
@@ -279,9 +283,10 @@ All commands print compact JSON unless `--human`.
 |---|---|
 | `project` | id, name, created_at, paused |
 | `connection` | side (src/tgt), encrypted_conn, server_meta_json, fingerprint |
-| `phase` | name, status (`pending\|running\|awaiting_review\|reworking\|approved\|stale`), current_version, approved_version, approved_fingerprint |
+| `phase` | name, status (`pending\|running\|drafting\|awaiting_review\|reworking\|approved\|stale`), current_version, approved_version, approved_fingerprint |
 | `artifact` | id, phase, version, payload_json, author (`script\|agent\|human`), created_at |
-| `feedback` | id, artifact_id, anchor, text, status (`open\|addressed\|declined`), response, created_at |
+| `feedback` | id, artifact_id, anchor, text, status (`draft\|open\|addressed\|declined`), response, created_at |
+| `job` | id, kind, phase, status (`queued\|running\|done\|failed`), error, started_at, ended_at |
 | `event` | id, ts, type, payload_json (audit log + SSE feed) |
 | `catalog_object` | id, side, kind, schema, name, parent_id, meta_json |
 | `profile` | object_id, stats_json |
@@ -302,7 +307,7 @@ Single page, vanilla JS modules, SSE for live updates, no framework, no CDN. Cle
 - **Mapping:** table grid (source → target, confidence bar, method badge), expandable column mappings with transform editor, unmapped-source and unresolved-target panels (blocking), direct editing.
 - **SQL:** tasks in execution order, syntax-highlighted code (tiny built-in highlighter), pre/post/validation scripts, line-anchored comments, version diff, script-pack download.
 - **Execute:** pre-flight checklist (connectivity, fingerprint unchanged, target row counts, permissions, estimated volume), options (batch/chunk size, parallelism, stop-on-error vs skip-and-log, truncate target first), **Execute** button with typed confirmation of the target DB name. Live view: overall and per-task progress bars, rows/sec, ETA, throughput sparkline, error count, log tail; Pause / Resume / Cancel.
-- **Final report:** per task source vs target vs rejected counts, duration, throughput, validation results (counts; checksums over sampled rows), errors with sample rows; export HTML/JSON.
+- **Final report:** per task source vs target vs rejected counts, duration, throughput, validation results (counts; column checksums), errors with sample rows; export HTML/JSON.
 
 ### 8.1 HTTP API (127.0.0.1 only; token required on every request)
 
@@ -312,12 +317,12 @@ Single page, vanilla JS modules, SSE for live updates, no framework, no CDN. Cle
 
 - Runs inside the `dbm` server process; independent of Claude.
 - **Ordering:** topological sort of target FK graph; tasks run in dependency levels with N parallel workers (default 4). FK cycles → load with constraints `NOCHECK`, re-enable `WITH CHECK` in post-script.
-- **Copy path:** `SqlDataReader` (source, `CommandBehavior.SequentialAccess`) → `SqlBulkCopy` (target, `EnableStreaming`, `BulkCopyTimeout = 0`, `KeepIdentity` when `identityInsert`, `NotifyAfter` for progress events).
+- **Copy path:** `SqlDataReader` (source, `CommandBehavior.SequentialAccess`) → `SqlBulkCopy` (target, `EnableStreaming`, `BulkCopyTimeout = 0`, `CheckConstraints`, `KeepNulls`, `KeepIdentity` when `identityInsert`, `NotifyAfter` for progress events).
 - **Modes:** `direct` (bulk copy into target table) or `staging_merge` (bulk copy into a staging table, then `MERGE`/`INSERT…SELECT` with target-side lookups).
-- **Chunking & checkpoints:** keyset chunks on the source key (`WHERE key > @last ORDER BY key`, default 100k rows); each chunk commits in its own target transaction, then the checkpoint (`last_key`, counts) is written to SQLite.
-- **Idempotent resume:** before resuming a task, target rows beyond the last checkpoint are removed (direct mode, key-derived targets) or the staging table is truncated (staging mode). Tables with no usable key fall back to truncate-and-reload on resume (flagged as a risk in analysis).
+- **Chunking & checkpoints:** keyset chunks on the source key (`WHERE key > @last ORDER BY key`, default 100k rows); each chunk commits in its own target transaction together with its checkpoint.
+- **Exactly-once chunks:** the checkpoint (`last_key`, counts) is written to a control table in the target (`dbo.__dbm_checkpoint`) **inside the same transaction** as the chunk's rows, so a chunk is either committed with its checkpoint or not at all; resume reads the target checkpoint (SQLite keeps a mirror for the UI). Staging mode bulk-copies each chunk into a session `#stg` table and runs the task's merge SQL inside that same transaction. Tables with no usable key load in a single transaction (restart from scratch on failure; flagged as a risk in analysis). The control table is dropped when the run completes.
 - **Crash recovery:** tasks in `running` with a stale heartbeat are treated as `paused` on server start.
-- **Validation:** per task row counts source (after filters) vs target; optional checksum comparison over sampled rows of mapped columns.
+- **Validation:** per task, source row count (after filters) vs target rows added by the run; optional per-column aggregate checksums (source expression cast to the target type vs the target column) when the target table was empty before the run; LOB/unsupported types are excluded from checksums.
 
 ## 10. Error handling & security
 
@@ -339,7 +344,7 @@ Single page, vanilla JS modules, SSE for live updates, no framework, no CDN. Cle
 
 | # | Milestone | Done when |
 |---|---|---|
-| M0 | Spike + skeleton | Background-await wake-up verified (or fallback chosen); solution builds; `dbm doctor` works; plugin installs locally |
+| M0 | Skeleton | Solution builds; `dbm doctor` works; plugin installs locally (wake-up and detach spikes already verified) |
 | M1 | Core platform | State store, crypto, connections, server + SSE + UI shell, pause/resume plumbing, `dbm next/await/apply` |
 | M2 | Discovery + Analysis loop | Catalog + profile + rules + vector index; analysis screen; full review loop with schema-analyst |
 | M3 | Mapping loop | Auto-mapper; mapping screen with direct edit; mapping-architect loop; blocking validation |
@@ -351,7 +356,7 @@ Single page, vanilla JS modules, SSE for live updates, no framework, no CDN. Cle
 
 | Risk | Mitigation |
 |---|---|
-| Background Bash may not wake the session on all surfaces | M0 spike; foreground timeout-loop fallback |
+| Background Bash may not wake the session on some surfaces (verified in CLI) | Re-check Desktop in M6; foreground timeout-loop fallback |
 | ASP.NET Core runtime missing on teammate machines | `dbm doctor` detects it and prints the one-line install command per OS |
 | Name-based matching weak for semantically different names | Synonym dictionary + profile signals + agent resolves low-confidence band; `IVectorizer` seam for embeddings later |
 | Very large LOB columns | `SequentialAccess` + `EnableStreaming`; per-task chunk size override |
