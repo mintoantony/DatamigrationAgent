@@ -1,0 +1,19 @@
+# Tooling state
+.omc/
+.vs/
+.vscode/
+.idea/
+
+# Migration project state (created by `dbm init` in user workspaces)
+.dbmigrate/
+
+# .NET build output (engine only — plugins/db-migrate/bin/ holds the launchers and must stay tracked)
+plugins/db-migrate/engine/**/bin/
+plugins/db-migrate/engine/**/obj/
+TestResults/
+*.user
+*.suo
+
+# OS
+.DS_Store
+Thumbs.db
