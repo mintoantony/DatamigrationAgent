@@ -2848,8 +2848,8 @@ public class DbmServicesTests
 
         using var s = DbmServices.Open(tw.Ws);
 
-        Assert.Empty(s.Modules);        // M1: registries are empty until later milestones append
-        Assert.Empty(s.JobHandlers);
+        Assert.Equal(ModuleRegistry.Create(s).Select(m => m.Phase).Order(), s.Modules.Keys.Order());
+        Assert.Equal(JobRegistry.Create(s).Select(h => h.Kind).Order(), s.JobHandlers.Keys.Order());
         Assert.IsType<DbEventSink>(s.Sink);
         Assert.NotNull(s.Workflow);
         Assert.True(File.Exists(tw.Ws.StateDbPath));
@@ -2877,7 +2877,7 @@ public class DbmServicesTests
 
         Assert.Equal("test", faked.Project.Get().Name);
         Assert.True(faked.Project.Get().Paused);
-        Assert.Empty(plain.Modules);
+        Assert.Equal(ModuleRegistry.Create(plain).Count(), plain.Modules.Count);
         Assert.Equal(3, faked.Modules.Count);
         Assert.Equal(4, faked.JobHandlers.Count);
     }
