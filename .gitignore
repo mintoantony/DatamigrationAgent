@@ -1,5 +1,7 @@
 # Tooling state
 .omc/
+.worktrees/
+.superpowers/
 .vs/
 .vscode/
 .idea/
