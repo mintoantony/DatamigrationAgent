@@ -614,7 +614,7 @@ public static class ApprovalGuards
 | `POST /api/edit/{phase}` | T1.7 | `Patch` → `ApplyResult` (human edit) |
 | `POST /api/shutdown` | T1.7 | → `{ok}` then process exits |
 | `GET /api/catalog/{side}` , `GET /api/catalog/{side}/table/{key}` , `POST /api/rediscover` , `GET /api/search?q=&side=&k=` | T2.8 | |
-| `GET /api/export/{what}` (`analysis`, `mapping`, `sql`, `report` → standalone HTML; `sqlpack` → zip) | T2.8 / T4.4 / T5.6 | |
+| `GET`/`POST /api/export/{what}` (`analysis`, `sql`, `report` → standalone HTML; `sqlpack` → zip; kinds are registered with `ExportEndpoints.Register`) | T2.8 / T4.4 / T5.6 | |
 | `POST /api/transfer/preflight`, `POST /api/transfer/start`, `POST /api/transfer/{pause|resume|cancel}`, `GET /api/transfer`, `GET /api/transfer/errors?task=` | T5.5 | |
 
 `StateView`:
