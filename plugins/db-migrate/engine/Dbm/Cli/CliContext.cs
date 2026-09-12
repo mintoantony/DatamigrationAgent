@@ -7,4 +7,6 @@ public sealed class CliContext
 
     /// <summary>From the global --workspace option.</summary>
     public string? WorkspaceOverride { get; init; }
+
+    public Dbm.Core.Workspace Workspace() => Dbm.Core.Workspace.Resolve(WorkspaceOverride);
 }
