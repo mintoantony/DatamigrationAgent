@@ -9,6 +9,7 @@ public static class CommandRegistry
         // M0
         new HelpCommand(),
         new VersionCommand(),
+        new DoctorCommand(),
         // Later tasks append their commands below this line.
     ];
 }

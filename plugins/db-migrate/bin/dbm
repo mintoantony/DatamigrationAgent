@@ -1,0 +1,56 @@
+#!/bin/sh
+# db-migrate launcher (macOS, Linux, Git Bash on Windows).
+# Runs engine/dist/Dbm.dll with the installed .NET runtime; builds it once when missing (needs the .NET SDK).
+# Exit codes: 3 = runtime missing, 4 = engine not built / build failed; otherwise the engine's own exit code.
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+root=$(dirname -- "$here")
+engine="$root/engine"
+dll="$engine/dist/Dbm.dll"
+
+install_help() {
+  echo "Install the ASP.NET Core Runtime 8 (or later), then open a new terminal:" >&2
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    Darwin) echo "  macOS:   brew install --cask dotnet" >&2 ;;
+    Linux) echo "  Linux:   install package aspnetcore-runtime-8.0 (apt/dnf) - see https://learn.microsoft.com/dotnet/core/install/linux" >&2 ;;
+    MINGW* | MSYS* | CYGWIN*) echo "  Windows: winget install Microsoft.DotNet.AspNetCore.8" >&2 ;;
+    *) echo "  See https://dotnet.microsoft.com/download/dotnet/8.0" >&2 ;;
+  esac
+}
+
+if ! command -v dotnet >/dev/null 2>&1; then
+  echo "dbm: 'dotnet' was not found on PATH." >&2
+  install_help
+  exit 3
+fi
+
+aspnet_major=$(dotnet --list-runtimes 2>/dev/null |
+  awk '$1 == "Microsoft.AspNetCore.App" { split($2, v, "."); if (v[1] + 0 > m) m = v[1] + 0 } END { print m + 0 }')
+if [ "$aspnet_major" -lt 8 ]; then
+  echo "dbm: the ASP.NET Core Runtime 8 or later is required (found: ${aspnet_major:-none})." >&2
+  install_help
+  exit 3
+fi
+
+if [ "${1:-}" = "doctor" ]; then
+  for arg in "$@"; do
+    if [ "$arg" = "--rebuild" ]; then DBM_REBUILD=1; fi
+  done
+fi
+
+if [ ! -f "$dll" ] || [ "${DBM_REBUILD:-}" = "1" ]; then
+  if dotnet --list-sdks 2>/dev/null | grep -q .; then
+    echo "dbm: building the engine (first run, about a minute)..." >&2
+    if ! dotnet publish "$engine/Dbm/Dbm.csproj" -c Release -o "$engine/dist" --nologo -v q >&2; then
+      echo "dbm: engine build failed (see the messages above)." >&2
+      exit 4
+    fi
+  else
+    echo "dbm: engine not built ($dll is missing) and no .NET SDK is installed to build it." >&2
+    echo "     Install the .NET 8 SDK or use a release of the plugin that ships engine/dist." >&2
+    exit 4
+  fi
+fi
+
+exec dotnet "$dll" "$@"

@@ -1,0 +1,9 @@
+{
+  "name": "db-migrate",
+  "version": "0.1.0",
+  "description": "SQL Server to SQL Server migration agent: schema analysis, source-to-target mapping and migration SQL, each reviewed and approved in a local web UI, then a chunked, checkpointed transfer with a final report.",
+  "author": {
+    "name": "Xanalys"
+  },
+  "keywords": ["sql-server", "database", "migration", "etl", "schema-mapping"]
+}

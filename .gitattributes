@@ -1,0 +1,4 @@
+# Launchers must keep their native line endings on every platform.
+plugins/db-migrate/bin/dbm text eol=lf
+*.sh text eol=lf
+*.cmd text eol=crlf

@@ -1,0 +1,15 @@
+{
+  "name": "db-migrate",
+  "description": "Xanalys plugins for SQL Server data migration.",
+  "owner": {
+    "name": "Xanalys"
+  },
+  "plugins": [
+    {
+      "name": "db-migrate",
+      "source": "./plugins/db-migrate",
+      "description": "Migrate data between two SQL Server databases with different schemas: analysis, mapping and SQL reviewed in a local web UI, then a chunked, resumable transfer.",
+      "version": "0.1.0"
+    }
+  ]
+}
