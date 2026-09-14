@@ -6653,3 +6653,52 @@ The invariant is about **type-conversion hazards**. Nullability — a left join 
 The two carry-over tests — the approved mapping carrying no attention, and the automap summary reading zero attention — **do not change**. Risks are not attention, so carry-over's bare recompute adds risk text to `CreatedAt`, `OrderDate` and `Comment` without adding attention. Assert that those three columns carry `typeRisk`.
 
 Any test asserting that a risky column is attention must be reverted, deliberately and with a comment recording that the rule reversed.
+
+## 13. Removal scope — what the branch already built that must come out
+
+The sections above state the target. They do not say what to delete, and commit `27204be` implements the superseded design across seventeen files. A rule being void does not remove the code that implements it.
+
+Remove:
+
+- `riskAck` and `riskClass` from the payload model, and every field, node and helper that carries them;
+- the hazard-class helper in `TypeCompat` and its tests;
+- the carry-over copying of those two fields;
+- the acknowledgement, class and token-refresh cases from the risk tests, **keeping** the recompute, ordering and sentinel cases;
+- the playbook's acknowledgement rules, its "then acknowledge the column's risk" step, the acknowledgement entries in the mapping-model block, and the `acknowledged` packet list;
+- the `acknowledged` field from the packet.
+
+**The two carry-over tests are restored**, not kept as `27204be` left them. §12 means "unchanged relative to before the fix round", and `27204be` changed both to expect attention lines. Restore their original assertions and add assertions that `CreatedAt`, `OrderDate` and `Comment` carry `typeRisk`.
+
+**`Validate` strips an incoming `riskAck` or `riskClass` from the stored node**, warning and naming the column. The fields no longer exist on the deserialised model, but the engine stores the node — so an agent working from an older playbook would write a junk acknowledgement straight into the artifact and nothing would remove it. Same reasoning as the ownership rule in §1.
+
+## 14. The invariant this model exists to hold
+
+**A type-conversion hazard reaches both the human and the agent, on every path, whenever one is present.**
+
+This is the rule §6 serves and the one §11 scopes. It was stated in text this section voided, and voiding it left the rest of the model with nothing to be a means to.
+
+## 15. Rules the blanket void removed and this restores
+
+**The three coverage tests.** These are the tests that fail if `typeRisk` stops reaching the packet — the original finding of this review, voided by accident:
+
+- a draft packet with a risk on a high-confidence column: the table is absent from `confident`, and the detail column carries the exact risk text;
+- the rework `colmap:` context carries it;
+- the round trip through `BuildPacket` with a serialised payload, which is what catches a rename or a serialisation attribute.
+
+**The playbook scope.** The mapping-model block presents `typeRisk` as engine-computed, not author-written; the required-column-fields rule and the packet legend say the same; and the complete example patch passes its own procedure, applied through the dry-run patch path, asserting no blocker or attention warnings and exactly the expected risk lines.
+
+**The non-blank predicate.** "Carrying a type risk" means present and not whitespace, and the same predicate is used everywhere: attention, `IsConfident`, the warning lines, the packet list and the approval count.
+
+**The packet risk list shape.** `typeRisks`, keyed by qualified column name to risk text, in both draft and rework modes. Rework contexts carry the risks of the columns they concern; a context anchored on general feedback carries all of them.
+
+## 16. Two clarifications
+
+**§2's "structural errors"** are the malformed-payload errors specified outside this section — the null collections and null elements that the packet builder and `Summarize` cannot process. Those rules stand and are unaffected by anything here.
+
+**§7's "assigned in this run rather than kept"** is a test on the draft alone: the column's method is not `carried`. `NeedsAgent` receives only the draft, and only the third condition needs the previous version.
+
+## 17. The browser's attention rule
+
+The view's attention status and count **exclude type risks**, exactly as the server's do. The risk count and filter are separate and always visible.
+
+This is the one rule where the two languages could silently diverge, because the earlier design made a risk an attention item and the reversal is invisible unless stated on both sides.
