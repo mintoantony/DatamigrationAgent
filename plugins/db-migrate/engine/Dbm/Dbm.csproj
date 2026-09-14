@@ -28,4 +28,8 @@
     <EmbeddedResource Include="..\..\samples\legacyshop-to-shopv2\*.sql" LogicalName="samples/legacyshop-to-shopv2/%(Filename)%(Extension)" />
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="Core\Matching\synonyms.json" LogicalName="Dbm.Core.Matching.synonyms.json" />
+  </ItemGroup>
+
 </Project>
