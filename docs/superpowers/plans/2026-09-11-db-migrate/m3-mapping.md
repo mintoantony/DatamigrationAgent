@@ -5812,3 +5812,39 @@ The Task 3.4 third-pass corrections change what the Task 3.5 round must implemen
 **The sentinel is an ordinary risk.** A changed column whose expression is not a bare single-source reference carries the risk string `"not evaluated: custom expression"`. It is a `typeRisk` like any other: it flows through the same predicate, renders in the same place, and needs no special-casing. If the UI branches on that text anywhere, something is wrong with the design rather than with the UI.
 
 **`riskAck` must render.** Show it next to the risk it acknowledges, so a reviewer can see both that a hazard exists and why it was accepted. A risk shown without its acknowledgement reads as an unresolved problem; an acknowledgement shown without its risk hides the hazard.
+
+### AMENDMENT CORRECTION (Task 3.4, fourth pass) — C1's rule 3 reintroduced the loop
+
+C1 withdrew rule 4 because it forced the agent to revert its own fixes. C1's replacement then did the same thing by a shorter route, and this corrects it. Everything else in C1 through C7 stands.
+
+#### The defect
+
+C1 made rule 3 write a sentinel risk on **every** changed non-bare expression. Trace the agent through that:
+
+1. The agent writes a `CAST` to handle a truncation hazard and removes the risk, exactly as B8 instructs.
+2. Validate runs rule 3, sees a changed custom expression, and overwrites that deliberate removal with the sentinel.
+3. The column is now attention.
+4. The playbook requires the agent to resolve every attention item — which it already did, in step 1.
+
+That is the rule-3-versus-rule-4 loop, reintroduced inside the fix for it. The same trap catches a human who writes a `CAST` and explains it.
+
+#### The correction
+
+Rule 3, for a changed column whose expression is **not** a bare single-source reference:
+
+- If the incoming payload supplies a **non-blank `riskAck`** for that column, write no sentinel and leave the risk text exactly as supplied. The author has taken responsibility and stated why.
+- Otherwise, replace whatever risk text is present with the sentinel `"not evaluated: custom expression"`.
+
+**`method` is never consulted.** An acknowledgement written by a human and by the agent must behave identically, and C2 already forbids method gating for the attention predicate — a method gate here would reintroduce one there by the back door.
+
+This stays payload-only, so the JavaScript mirror remains trivial, and there is still exactly **one** attention predicate: a non-blank `typeRisk` with a blank `riskAck`.
+
+#### Consequence for B8 — one channel, not two
+
+B8 previously offered two ways to record that a new expression handles a hazard: remove the risk and explain in `rationale`, or keep the risk and set `riskAck`. **The `rationale` route is closed.** `rationale` is free text that nothing can check, and it leaves rule 3 unable to distinguish a considered removal from an accidental one — which is exactly how the loop above arises.
+
+The single way to record that an expression handles a hazard is to **set `riskAck`** saying so. The worked example patch must demonstrate that, and the playbook must say it plainly.
+
+#### Why the fixture stays green
+
+None of the seven custom expressions in the shared approved fixture — the `LEFT`, the `SUBSTRING`, the two `CAST`s, the subquery, the `CASE`, the two-source column — has **changed**. Rule 3 only touches columns whose `expr` or `sourceColumns` differ from `ctx.Current`, so none of them is sentinelled, and the pinned zero-attention summary string, the assertion that the approved mapping does not need the agent, and the empty-warnings assertion all continue to pass with the fixture untouched.
