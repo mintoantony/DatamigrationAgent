@@ -66,7 +66,7 @@ public static class MappingPacket
             ["options"] = new JsonObject { ["autoAccept"] = options.AutoAccept, ["candidate"] = options.Candidate },
             ["blockers"] = Strings(blockers),
             ["attention"] = Strings(attention),
-            ["typeRisks"] = Strings(MappingValidator.RiskWarnings(m)),
+            ["typeRisks"] = RiskMap(m),
             ["confident"] = confident,
             ["detail"] = detail,
             ["uncovered"] = Uncovered(m, src),
@@ -95,7 +95,7 @@ public static class MappingPacket
             ["summary"] = Summary(m, src, tgt, options),
             ["blockers"] = Strings(MappingValidator.Blockers(m, src, tgt)),
             ["attention"] = Strings(MappingValidator.Attention(m, options)),
-            ["typeRisks"] = Strings(MappingValidator.RiskWarnings(m)),
+            ["typeRisks"] = RiskMap(m),
             ["contexts"] = contexts,
             ["hint"] = Hint
         };
@@ -282,6 +282,21 @@ public static class MappingPacket
     /// <summary>Adds <c>typeRisks: {"schema.table.Column": risk}</c> for every column selected by <paramref name="include"/> that
     /// carries a type risk; omitted when there are none. Rework contexts that name target columns only by key use this so the
     /// risk is not lost on the rework path.</summary>
+    /// <summary>The packet risk list, in both modes: <c>typeRisks: {"schema.table.Column": risk}</c> for every column carrying a
+    /// type risk in a non-skip table (a skipped table loads no data). Always present, possibly empty.</summary>
+    public static JsonObject RiskMap(MappingPayload m)
+    {
+        ArgumentNullException.ThrowIfNull(m);
+        var risks = new JsonObject();
+        foreach (var (tableKey, map) in m.Tables.OrderBy(kv => kv.Key, StringComparer.Ordinal))
+        {
+            if (map.Kind == "skip") continue;
+            foreach (var (name, cm) in map.Columns.OrderBy(kv => kv.Key, StringComparer.Ordinal))
+                if (MappingValidator.HasTypeRisk(cm)) risks[$"{tableKey}.{name}"] = cm.TypeRisk;
+        }
+        return risks;
+    }
+
     private static void AddTypeRisks(JsonObject obj, MappingPayload m, Func<string, TableMap, ColumnMap, bool> include)
     {
         var risks = new JsonObject();

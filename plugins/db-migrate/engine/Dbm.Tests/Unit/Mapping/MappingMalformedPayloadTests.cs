@@ -141,6 +141,35 @@ public class MappingMalformedPayloadTests
         });
     }
 
+    [Theory]
+    [InlineData("riskAck", "\"accepted\"")]
+    [InlineData("riskAck", "[\"accepted\"]")]
+    [InlineData("riskAck", "{\"risk\":5,\"reason\":null}")]
+    [InlineData("riskAck", "{\"risk\":\"may truncate (source max 300)\",\"reason\":\"fine\"}")]
+    [InlineData("RiskClass", "\"may truncate|varchar(500)->nvarchar(200)\"")]
+    [InlineData("riskClass", "7")]
+    public void Withdrawn_acknowledgement_fields_are_stripped_with_a_warning_not_rejected(string field, string json)
+    {
+        // The deserialised model has no such field, but the engine stores the node: an agent following an older playbook must not
+        // write one into the artifact. Any shape is harmless because the strip runs before anything reads the risk fields.
+        using var project = TempProject.Create();
+        var services = project.Services.WithSampleCatalogs();
+        var module = new MappingModule(services);
+        var approvedRow = new ArtifactRow(1, PhaseName.Mapping, 0, Json.Serialize(SampleMappings.Approved()), "human", null, DateTimeOffset.UtcNow);
+        var payload = Json.ToNode(SampleMappings.Approved()).AsObject();
+        payload["tables"]!["app.Orders"]!["columns"]!["Comment"]![field] = JsonNode.Parse(json);
+
+        var check = module.Validate(new ModuleContext { Services = services, Current = approvedRow, OpenFeedback = [] }, payload);
+
+        Assert.True(check.Ok, string.Join(Environment.NewLine, check.Errors));
+        Assert.Equal([$"app.Orders.Comment: {char.ToLowerInvariant(field[0])}{field[1..]} is not a mapping field; dbm removed it"], check.Warnings);   // named by its canonical spelling
+        Assert.DoesNotContain(field, payload.ToJsonString(Json.Options), StringComparison.OrdinalIgnoreCase);
+        var stored = new ArtifactRow(2, PhaseName.Mapping, 1, payload.ToJsonString(Json.Options), "human", null, DateTimeOffset.UtcNow);
+        Assert.NotNull(module.BuildPacket(new ModuleContext { Services = services, Current = stored, OpenFeedback = [] }, PacketMode.Draft));
+        Assert.NotNull(module.BuildPacket(new ModuleContext { Services = services, Current = stored, OpenFeedback = EveryAnchorKind(SampleCatalogs.Source(), SampleCatalogs.Target()) }, PacketMode.Rework));
+        Assert.NotEmpty(module.Summarize(JsonNode.Parse(stored.PayloadJson)!));
+    }
+
     [Fact]
     public void A_rejected_human_edit_is_not_stored_and_the_phase_stays_workable()
     {

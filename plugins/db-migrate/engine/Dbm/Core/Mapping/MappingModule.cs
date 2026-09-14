@@ -20,8 +20,8 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
 
     /// <summary>Evaluated once when the automap job completes. True when any holds:
     /// (1) attention (the confidence band) or a blocker;
-    /// (2) a type risk on a column the auto-mapper assigned in this run (exact, fuzzy or vector) rather than kept;
-    /// (3) a kept bare column whose recomputed risk text differs from the text in the version BEFORE this draft. The job stores
+    /// (2) a type risk on a column the auto-mapper assigned in this run rather than kept: method is not carried;
+    /// (3) a kept (carried) bare column whose recomputed risk text differs from the text in the version BEFORE this draft. The job stores
     ///     the draft before calling this, so the latest artifact is normally the draft itself and is skipped.
     /// Risks never count as attention. Skip tables load no data and are exempt from (2) and (3).</summary>
     public bool NeedsAgent(JsonNode draft)
@@ -37,7 +37,7 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
             foreach (var (name, cm) in map.Columns ?? new())
             {
                 if (cm is null) continue;
-                if (!MappingCarryOver.IsKept(cm.Method))
+                if (cm.Method != MapMethod.Carried)   // assigned in this run: a test on the draft alone
                 {
                     if (MappingValidator.HasTypeRisk(cm)) return true;
                     continue;
@@ -124,7 +124,8 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
     /// First match wins: (1) not changed: the stored typeRisk verbatim; (2) expr null and default null: no risk;
     /// (3) expr non-null and a bare single-source reference: TypeCompat with the source profile, as the auto-mapper computes it;
     /// (4) everything else: <see cref="TypeCompat.UnevaluatedRisk"/>.
-    /// An incoming typeRisk is never stored; it earns a warning when present and different from the stored version's.</summary>
+    /// An incoming typeRisk is never stored; it earns a warning when present and different from the stored version's.
+    /// An incoming riskAck or riskClass (fields of a withdrawn design) is stripped from the node with a warning.</summary>
     private static void NormaliseRisks(JsonNode payload, MappingPayload m, MappingPayload? baseline, CatalogSnapshot src, CatalogSnapshot tgt,
         List<string> warnings)
     {
@@ -140,6 +141,9 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
                 if (columnNode is not JsonObject columnObj || !map.Columns.TryGetValue(name, out var cm)) continue;
                 if (target.FindColumn(name) is not { } targetColumn) continue;
                 var old = before is null ? null : MappingValidator.FindColumnMap(before, name);
+                foreach (var removed in new[] { "riskAck", "riskClass" })
+                    if (RemoveProperty(columnObj, removed))
+                        warnings.Add($"{tableKey}.{name}: {removed} is not a mapping field; dbm removed it");
                 if (Blank(cm.TypeRisk) is { } supplied && supplied != Blank(old?.TypeRisk))
                     warnings.Add($"{tableKey}.{name}: typeRisk is computed by dbm; the supplied value was ignored");
 
@@ -178,6 +182,15 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
         foreach (var k in obj.Select(kv => kv.Key).Where(k => string.Equals(k, name, StringComparison.OrdinalIgnoreCase)).ToList())
             obj.Remove(k);
         if (value is not null) obj[name] = value;
+    }
+
+    /// <summary>Removes every case spelling of <paramref name="name"/>; true when one was present. The deserialised model has no
+    /// such field, but the engine stores the node, so a field an older playbook taught would otherwise persist.</summary>
+    private static bool RemoveProperty(JsonObject obj, string name)
+    {
+        var keys = obj.Select(kv => kv.Key).Where(k => string.Equals(k, name, StringComparison.OrdinalIgnoreCase)).ToList();
+        foreach (var k in keys) obj.Remove(k);
+        return keys.Count > 0;
     }
 
     private static JsonNode? Property(JsonObject obj, string name) =>

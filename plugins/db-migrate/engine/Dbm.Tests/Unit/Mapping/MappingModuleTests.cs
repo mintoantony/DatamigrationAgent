@@ -50,16 +50,14 @@ public class MappingModuleTests
         var comment = m.Tables["app.Orders"].Columns["Comment"];
         comment.TypeRisk = "may truncate (source max 300)";
 
-        foreach (var assigned in new[] { MapMethod.Exact, MapMethod.Fuzzy })   // at or above the band: no attention
+        // §16: "assigned in this run" is a test on the draft alone — the column's method is not carried.
+        foreach (var assigned in new[] { MapMethod.Exact, MapMethod.Fuzzy, MapMethod.Human, MapMethod.Agent })
         {
-            (comment.Method, comment.Confidence) = (assigned, 0.9);
+            (comment.Method, comment.Confidence) = (assigned, 0.9);   // at or above the band: no attention
             Assert.True(module.NeedsAgent(Json.ToNode(m)), assigned.ToString());
         }
-        foreach (var kept in new[] { MapMethod.Carried, MapMethod.Human, MapMethod.Agent })
-        {
-            comment.Method = kept;   // no previous version stored: nothing to compare the kept text with
-            Assert.False(module.NeedsAgent(Json.ToNode(m)), kept.ToString());
-        }
+        comment.Method = MapMethod.Carried;   // kept; no previous version stored, so nothing to compare its text with
+        Assert.False(module.NeedsAgent(Json.ToNode(m)));
     }
 
     [Fact]

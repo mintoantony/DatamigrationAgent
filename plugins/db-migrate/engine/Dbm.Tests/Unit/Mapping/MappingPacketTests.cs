@@ -155,7 +155,7 @@ public class MappingPacketTests
         Assert.Equal(Truncates, (string?)detail["columns"]!["Comment"]!["typeRisk"]);
         // RULE REVERSED (final risk model §5): a risk is not attention; both packet modes carry it in their own typeRisks list.
         Assert.Empty(data["attention"]!.AsArray());
-        Assert.Equal([$"app.Orders.Comment: type risk: {Truncates}"], Texts(data["typeRisks"]));
+        Assert.Equal(Truncates, (string?)Assert.Single(data["typeRisks"]!.AsObject()).Value);
     }
 
     [Fact]
@@ -175,10 +175,11 @@ public class MappingPacketTests
 
         var rework = MappingPacket.Rework(m, SampleCatalogs.Source(), SampleCatalogs.Target(), Options, [Feedback(1, "column:src:dbo.ORD_HDR.CMNT")]);
 
-        Assert.Equal([$"app.Orders.Comment: type risk: {Truncates}"], Texts(Draft(m)["typeRisks"]));
-        Assert.Equal([$"app.Orders.Comment: type risk: {Truncates}"], Texts(rework["typeRisks"]));
+        Assert.Equal(Truncates, (string?)Draft(m)["typeRisks"]!["app.Orders.Comment"]);
+        Assert.Equal(Truncates, (string?)rework["typeRisks"]!["app.Orders.Comment"]);
+        Assert.Single(rework["typeRisks"]!.AsObject());
         Assert.Equal("6 tables, 35 columns mapped, 4 drops, 0 attention, 0 blockers", (string?)rework["summary"]);
-        Assert.Empty(Texts(Draft(SampleMappings.Approved())["typeRisks"]));
+        Assert.Empty(Draft(SampleMappings.Approved())["typeRisks"]!.AsObject());
         Assert.DoesNotContain("riskAck", Draft(m).ToJsonString());
     }
 
