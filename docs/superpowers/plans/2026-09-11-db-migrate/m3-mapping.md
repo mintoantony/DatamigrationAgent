@@ -6520,3 +6520,17 @@ It is also small. `WorkflowEngine.Approve` is unchanged. The approval guards can
 #### Still to pin
 
 The carry-over sequence, minus its acknowledgement halves: a bare single-source reference recomputes; everything else keeps its stored `typeRisk` verbatim; `expr` and `default` both null means no risk.
+
+### Task 3.5 JavaScript — approve confirmation, settled
+
+The final JavaScript section above says the confirmation may move to Milestone 6 if it reaches too far into closed code. **That fallback is struck.** It lands here, in this round.
+
+Deferring it would create a breaking change across two milestones: Milestones 4 and 5 approve mappings and build SQL generation and transfers on them, so every mapping their flows and tests approve would be signed off on visibility alone, and a later milestone turning a no-flag approve into an error would break every one of those flows.
+
+**The flag names a version.** A human edit in one review tab creates version N+1 while another tab still displays version N, so a bare boolean from the stale tab would sign off a version it never showed.
+
+- the approve call carries `confirmRisksVersion`, naming the version being signed off;
+- the review screen lists the type risks in that version before the approve control is usable;
+- the server rejects approval when the phase carries type risks and the flag is absent, or names a version other than the current one, with `409` and `{"error":"risk_confirmation_required","message":"version N has K type risks; confirm them to approve"}`.
+
+The check belongs in the approve handler ahead of the approval guards, since the guards cannot see the request. `WorkflowEngine.Approve` is unchanged. Approval exists only over HTTP, with no CLI equivalent, so the flag is human-only by construction and no agent can set it.
