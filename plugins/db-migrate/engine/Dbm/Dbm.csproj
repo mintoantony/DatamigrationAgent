@@ -24,4 +24,8 @@
     <EmbeddedResource Include="Core\State\schema.sql" LogicalName="Dbm.Core.State.schema.sql" />
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\samples\legacyshop-to-shopv2\*.sql" LogicalName="samples/legacyshop-to-shopv2/%(Filename)%(Extension)" />
+  </ItemGroup>
+
 </Project>
