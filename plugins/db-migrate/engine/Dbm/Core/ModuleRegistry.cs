@@ -13,5 +13,6 @@ public static class ModuleRegistry
         if (s is null) yield break;   // keeps this an iterator while no module is registered
         // milestone registrations below
         yield return new Dbm.Core.Analysis.AnalysisModule();   // T2.7
+        yield return new Dbm.Core.Mapping.MappingModule(s);    // T3.4
     }
 }
