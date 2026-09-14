@@ -6414,3 +6414,9 @@ This also removes a trap: applying that never-equal comparator to every column, 
 #### L4 — One constant each, for a later milestone to reference
 
 The sentinel risk text and the sentinel `riskClass` value each live in a single C# constant, placed where a later milestone can reference them. Milestone 4 must recognise the sentinel so it does not render one as a data-loss warning, and it must reference the constant rather than string-matching a copy of the text.
+
+#### L5 — One more strike: K6 second clause
+
+Amendment 4 K6 stated the sentinel as a dual rule: in the predicate, sentinel text equals sentinel text; in the `riskClass` check, a newly computed sentinel class never equals the stored one. **L3 deleted the second half.** K6 second clause is therefore stale and is struck.
+
+The whole of the sentinel rule is now the first half, and it is not a rule so much as a consequence: under plain string equality, identical sentinel text compares equal and the acknowledgement stands. Nothing anywhere treats the sentinel differently from any other risk.
