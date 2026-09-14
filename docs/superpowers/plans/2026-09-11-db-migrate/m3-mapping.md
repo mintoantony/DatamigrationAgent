@@ -6759,3 +6759,19 @@ The predicate is used by `IsConfident`, the risk warning lines, the packet risk 
 - **The strip happens on the node, after the structural errors and before anything reads the risk fields**, so a malformed acknowledgement — an array, a number — is harmless by the time normalisation runs.
 - **The top-level risk list and the rework context maps share the key name**, `typeRisks`, keyed by qualified column name to risk text.
 - **§16's "structural errors"** are those specified under the heading requiring `Validate` to reject what the packet builder cannot process.
+
+### 13c. Residue, defined rather than enumerated
+
+The completion criterion has now been written too narrowly three times: first that the search must return nothing outside git history, then that only the strip implementation and the approval text may remain, then a two-category list that excludes the best survivors. Each attempt enumerated what may remain instead of saying what residue **is**.
+
+**Residue is a reference that still feeds something** — attention, the packet, the agent trigger, or a stored artifact. A reference that only asserts a field is *absent* feeds nothing and guards everything: it fails if the mechanism ever returns. Such assertions stay, and are not counted against the gate.
+
+For each surviving hit, the question is whether deleting it would change any test outcome or any value the engine produces. If not, it is dead code or an unguarded assertion; if so, it is either residue or a guard, and which one is obvious from whether it reads a value or asserts an absence.
+
+### 15b. Skip tables are excluded everywhere
+
+§15 says a rework context anchored on general feedback carries "all of" the risks, while skip tables are excluded from the top-level list, the risk warnings and the agent trigger. Both cannot hold.
+
+A skipped table loads no data, so a type risk on one of its columns describes a conversion that will never happen. Surfacing it is noise in a channel whose whole value depends on being signal — the failure that made a never-zero attention count useless.
+
+**Skip tables are excluded from every risk surface**: the top-level risk list, the risk warnings, every packet context including the general one, and `NeedsAgent`. "All of them" means every risk that exists in the risk channel, and a skip table never enters it.
