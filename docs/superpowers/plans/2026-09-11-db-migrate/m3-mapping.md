@@ -5594,3 +5594,67 @@ Parity tests must cover **both** an `exact` row carrying a risk and a `human` ro
 - **Approve** and **Request changes** from the review bar while dirty have no defined behaviour today, and the guard would strand the view on the old version after the phase moves on. While dirty, both must first make the user resolve the edits — save or discard — and after the action succeeds the view must re-render even though the guard would otherwise block it, because the phase has moved and the editable view is no longer valid. If `ctx.refresh` has no way to force a render, add one.
 
 The A1 invariant is unchanged and still governs. These two paths are further examples, not a new exhaustive list.
+
+---
+
+## Task 3.4 — AMENDMENT (fix round 1): defects found in review
+
+These are defects in the plan text above, not in the implementation. `MappingPacket.cs`, `MappingModule.cs`, `mapping-architect.md` and all four test files are byte-identical to the brief; the registry line is exactly as specified. The brief was wrong.
+
+### B1 — A table carrying a type risk is NOT confident (highest priority)
+
+**INVARIANT (this is the spec; everything after it is explanation):**
+
+> A column's `TypeRisk` must reach BOTH the human and the AI agent, on every path, whenever it is present. No summarisation, confidence score, compatibility level or match method may cause it to be omitted.
+
+`IsConfident` currently tests blockers, sources and `NeedsReview(method, confidence)` and never looks at `TypeRisk`. A confident table is summarised as `{target, source, confidence, columns}`, and the playbook tells the agent to skip confident tables. Only *detail* tables carry `columns[*].typeRisk`.
+
+The auto-mapper produces the dangerous case routinely: a column matching by name with a Widening or Risky type conversion scores `method: fuzzy` (Exact requires `Level == Exact`) at a total at or above the 0.85 auto-accept threshold, so it is not "needs review". Example: `varchar(300) → nvarchar(200)` at fuzzy 0.9 carrying `"may truncate (source max 300)"`. Its table is confident, the agent skips it, no `LEFT`/`CAST` is added, and rows truncate at transfer.
+
+**Fix, both halves:**
+
+1. `IsConfident` returns false when any column of the table has a non-null, non-empty `TypeRisk`. Such a table is therefore detailed, and the existing detail path already carries the risk — no new packet field, no playbook change.
+2. `NeedsAgent` returns true when any column carries a `TypeRisk` and has not already been decided by the agent or a human. Without this, a project whose *only* problem is type risk never invokes the agent at all.
+
+Chosen deliberately over the cheaper alternative of adding a `typeRisks` map to summarised entries plus a playbook instruction to stop skipping them: that leaves a seam where a risk can be forgotten again, and this milestone's entire failure history is risks disappearing at seams. Detailing a table that carries a genuine data-loss hazard is the correct place to spend packet tokens.
+
+**Rework contexts:** the `column:src:`, `table:src:` and `general` contexts omit the risk today, and `usedBy` lists bare target column names. Carry the risk in these too — the invariant above is not limited to the draft packet.
+
+### B2 — Validate must REJECT what the packet builder cannot process
+
+**INVARIANT (this is the spec; the list beneath is EXAMPLES, not the enumeration):**
+
+> Any payload `Validate` accepts must be one that `BuildPacket` (both modes) and `Summarize` can process without throwing. If you find a malformed shape that Validate accepts and either of those two cannot handle, it is covered by this invariant even though it is not listed below — fix it and say so.
+
+Task 3.2 made `MappingValidator` null-tolerant, meaning it no longer *throws* on malformed input. That was necessary and insufficient: not throwing and not reporting are different things. The validator now silently **accepts** shapes that `MappingPacket` dereferences directly, so `Validate` returns ok, the malformed artifact is stored, and the phase wedges — human edits need `awaiting_review`, `RetryJob` needs `running` or `drafting`, `Reopen` needs `approved`, so the only exit is editing `state.db` by hand.
+
+Known-accepted malformed shapes (examples): `tables` null; `drops` null; a table's `columns` null; a table's `sources` null; `candidates` containing a null element at table or column level; a column's `sourceColumns` null.
+
+`Validate` must report each such shape as an **Error** (`"tables must be an object"` and so on), so the patch is rejected rather than stored. Normalising during parse does not help: the engine stores the original `JsonNode`, not the deserialised object.
+
+**Required test:** run the same malformed-payload matrix Task 3.2 used, but through the full chain — `Validate` → `Summarize` → `BuildPacket(Draft)` → `BuildPacket(Rework)`. A matrix that stops at `Validate` is what let this through.
+
+### B3 — Null guards at public boundaries, and the brief's own test is wrong
+
+`MappingModule`'s constructor and the public `MappingPacket` statics have no null guards, contrary to the global constraint (`RespectNullableAnnotations` is .NET 9+ and unavailable here). `new MappingModule(null!)` fails later with an NRE inside `Options()`/`Catalogs()`.
+
+The brief's `Identity_and_registration` test calls `new MappingModule(null!)`, so adding the guard breaks it. **Change the test** to construct with real services from `TestWorkspace.OpenServices()`. A test asserting that a null-services module constructs successfully is pinning the wrong behaviour.
+
+### B4 — Drop the undocumented `map` key
+
+`TableDetail` emits `"map": null` for a target table with no map. That key appears in neither the normative Draft shape nor the playbook, so the agent receives an undocumented field. Omit the key when there is no map.
+
+### B5 — Tests that would actually catch B1
+
+Deleting the line that writes `typeRisk` into the packet leaves all of this task's tests passing — verified by mutation. The root cause is that `SampleMappings.Approved()` contains **zero** columns with a `TypeRisk`.
+
+**Do NOT add a `TypeRisk` to `SampleMappings.Approved()`.** That fixture is pinned across milestones: Milestone 4's SQL generator tests assert exact generated SQL and the exact summary string `"6 tasks, 0 errors, 9 warnings"` derived from it, and a new risk would add a warning and break them before that milestone starts. New tests must build their own payload carrying a risk and leave the shared fixture untouched.
+
+Required tests:
+- an auto draft's risky *detail* column carries `typeRisk`;
+- the B1 case: a high-confidence risky column in an otherwise clean table still reaches the agent (the table is no longer confident);
+- the `colmap:` rework context carries the risk.
+
+### B6 — Note on `ctx.Services`
+
+The module captures `DbmServices` through its constructor and ignores `ctx.Services` everywhere. This is harmless today because the registry passes the same instance, but a test constructing a `ModuleContext` with different services would not notice. Not a required fix; recorded so it is a deliberate choice rather than an accident.
