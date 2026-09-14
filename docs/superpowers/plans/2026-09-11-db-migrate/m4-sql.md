@@ -3985,3 +3985,23 @@ EOF
 - **Deliberate deviations:** three-batch PARSEONLY instead of the single batch (single batch executes the statement); `NeedsAgent` ignores `staging_merge` tasks already `Custom`; `CountSql` contains newlines; the script pack always exports the current version.
 - **Placeholder scan:** no TBD/TODO; every code block is complete; the only `…` characters are UI strings and prose.
 - **Verification:** this plan was executed task by task on top of the M0–M3 integration repo (byte-exact from their plan text); every code block in this file is byte-identical to the files that then passed: full unit suite 672 (597 upstream + 75 M4), full LocalDB integration suite 45 (35 + 10 M4, incl. `Generated_sample_plan_validates_ok` with the real `TypeCompat`/`SampleCatalogs`/`SampleMappings` and `SqlCommandsIntegrationTests`), full node suite 54 (36 + 18 M4). Not automated: the rendered screen — covered by the manual checklist in T4.5 Step 8.
+
+---
+
+## AMENDMENT — two rules Milestone 3 imposes on this milestone
+
+Recorded here because the Milestone 4 implementer reads this file and will never read Milestone 3 amendment history. Both follow from Milestone 3 making `typeRisk` engine-owned and recomputed.
+
+### The mapping hash must cover only SQL-relevant fields
+
+This plan specifies `MappingHash` as a SHA-256 of the serialised table map, and keeps a human hand-written custom SQL for a table only while that hash matches.
+
+The hash therefore covers `typeRisk`, `candidates`, `rationale` and `confidence`, none of which change the generated SQL. `typeRisk` is recomputed on every rediscovery for bare columns, and a re-sampled observed maximum alone changes its text. So an unchanged conversion silently discards a DBA hand-written SQL for that table.
+
+**The hash covers only fields that affect the generated SQL**: the table kind, sources, from and filter, and per column the expression, source columns and default. Nothing else.
+
+### A sentinel risk is not a data-loss warning
+
+This plan emits one warning per non-empty `typeRisk`. Milestone 3 introduces a sentinel risk text meaning *this conversion could not be evaluated*, which is a different statement from a conversion that was evaluated and found lossy.
+
+A sentinel must not be rendered as a data-loss warning in the SQL plan. Reference the shared sentinel constant from Milestone 3 rather than string-matching a copy of the text — a third codebase growing its own copy of a definition is exactly the drift this project has already paid for once.
