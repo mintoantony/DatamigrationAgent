@@ -9,7 +9,7 @@ public static class EndpointRegistry
         CoreEndpoints.Map(app, state);
         CatalogEndpoints.Map(app, state);   // T2.8
         ExportEndpoints.Map(app, state);    // T2.8
-        // T3.5: MappingEndpoints.Map(app, state);
+        MappingEndpoints.Map(app, state);   // T3.5
         // T4.5: SqlEndpoints.Map(app, state);
         // T5.5: TransferEndpoints.Map(app, state);
     }
