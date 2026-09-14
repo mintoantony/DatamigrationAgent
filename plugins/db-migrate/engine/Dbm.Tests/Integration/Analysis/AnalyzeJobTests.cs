@@ -1,9 +1,11 @@
 using Dbm.Core;
 using Dbm.Core.Analysis;
+using Dbm.Core.Catalog;
 using Dbm.Core.Jobs;
 using Dbm.Core.State;
 using Dbm.Tests.Integration.Catalog;
 using Dbm.Tests.Support;
+using static Dbm.Tests.Support.TestCatalogs;
 
 namespace Dbm.Tests.Integration.Analysis;
 
@@ -35,5 +37,28 @@ public sealed class AnalyzeJobTests(SamplePairFixture fixture) : IClassFixture<S
         Assert.Equal(Analyzer.Summary(payload), result.Summary);
         Assert.Equal(19_711, payload.Estimates.TotalRows);
         Assert.Null(result.DraftPayload!["narrative"]);
+    }
+
+    [Fact]
+    public async Task CountOrphansAsync_leaves_the_key_absent_when_the_query_fails()
+    {
+        using var project = await SampleProject.CreateAsync(fixture.Pair);
+        var connectionString = project.Services.Connections.GetConnectionString(Side.Src);
+        var log = new List<string>();
+
+        // A real, open connection, but an FK pointed at a table that doesn't exist on this database: the query
+        // itself fails ("Invalid object name"), which is the per-candidate catch, not the connection-open one.
+        var brokenFk = Fk("FK_ORD_CUST", "CUST_ID", "dbo.NOPE_TABLE", "CUST_ID", notTrusted: true);
+        var src = LegacyShop() with
+        {
+            Tables = LegacyShop().Tables.Select(t => t.Key == "dbo.ORD_HDR" ? t with { ForeignKeys = new List<ForeignKeyInfo> { brokenFk } } : t).ToList(),
+        };
+
+        var counts = await AnalyzeJob.CountOrphansAsync(connectionString, src, log.Add, CancellationToken.None);
+
+        // Key absent (not 0): the query never returned a count, so R09 must read this as "not counted" (medium).
+        Assert.False(counts.ContainsKey(RuleContext.OrphanKey("dbo.ORD_HDR", "FK_ORD_CUST")));
+        Assert.Empty(counts);
+        Assert.Contains(log, l => l.StartsWith("orphan check skipped for dbo.ORD_HDR FK_ORD_CUST:", StringComparison.Ordinal));
     }
 }

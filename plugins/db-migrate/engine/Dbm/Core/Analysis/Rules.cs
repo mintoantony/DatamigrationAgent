@@ -343,7 +343,13 @@ public sealed class VersionDowngradeRule : IRule
 /// <summary>Cycle detection over a catalog's FK graph (Tarjan SCC). Self-references are not reported here.</summary>
 public static class FkGraph
 {
-    /// <summary>Strongly connected components with two or more tables; members sorted, components sorted by first member.</summary>
+    /// <summary>
+    /// Strongly connected components with two or more tables; members sorted, components sorted by first member.
+    /// Iterative (explicit-stack) Tarjan: a recursive DFS walks to the depth of the longest FK reference *path*
+    /// before any frame pops, which a purely acyclic chain of only a few thousand tables is enough to overflow
+    /// the CLR call stack (uncatchable in .NET, and fatal to the whole process). The explicit stack below keeps
+    /// the same low-link algorithm but on the heap, so depth is bounded only by available memory.
+    /// </summary>
     public static List<List<string>> Cycles(IReadOnlyList<TableInfo> tables)
     {
         var keys = tables.Select(t => t.Key).OrderBy(k => k, StringComparer.OrdinalIgnoreCase).ToList();
@@ -362,38 +368,63 @@ public static class FkGraph
         var onStack = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var result = new List<List<string>>();
 
-        foreach (var key in keys)
-            if (!indices.ContainsKey(key)) Visit(key);
+        // Each call-stack frame is (node, index of the next outgoing edge of that node still to visit); it
+        // stands in for one activation of the recursive Visit(v) below the point where it examines edges[v][i].
+        var frames = new Stack<(string Node, int EdgeIndex)>();
 
-        return result.OrderBy(c => c[0], StringComparer.OrdinalIgnoreCase).ToList();
-
-        void Visit(string v)
+        foreach (var start in keys)
         {
-            indices[v] = low[v] = index++;
-            stack.Push(v);
-            onStack.Add(v);
-            foreach (var w in edges[v])
+            if (indices.ContainsKey(start)) continue;
+            indices[start] = low[start] = index++;
+            stack.Push(start);
+            onStack.Add(start);
+            frames.Push((start, 0));
+
+            while (frames.Count > 0)
             {
-                if (!indices.ContainsKey(w))
+                var (v, i) = frames.Pop();
+                var vEdges = edges[v];
+                if (i < vEdges.Count)
                 {
-                    Visit(w);
-                    low[v] = Math.Min(low[v], low[w]);
+                    var w = vEdges[i];
+                    frames.Push((v, i + 1));   // resume v after w (its outgoing edge) is dealt with
+                    if (!indices.ContainsKey(w))
+                    {
+                        indices[w] = low[w] = index++;
+                        stack.Push(w);
+                        onStack.Add(w);
+                        frames.Push((w, 0));   // "recurse" into w before v resumes
+                    }
+                    else if (onStack.Contains(w))
+                    {
+                        low[v] = Math.Min(low[v], indices[w]);
+                    }
+                    continue;
                 }
-                else if (onStack.Contains(w))
+
+                // v has no more outgoing edges to examine: finish it, same as the end of a recursive Visit(v).
+                if (low[v] == indices[v])
                 {
-                    low[v] = Math.Min(low[v], indices[w]);
+                    var component = new List<string>();
+                    string member;
+                    do
+                    {
+                        member = stack.Pop();
+                        onStack.Remove(member);
+                        component.Add(member);
+                    } while (!string.Equals(member, v, StringComparison.OrdinalIgnoreCase));
+                    if (component.Count > 1) result.Add(component.OrderBy(k => k, StringComparer.OrdinalIgnoreCase).ToList());
+                }
+                // Propagate v's low-link to whichever node "called" it, i.e. the frame now on top (a no-op tree
+                // edge is folded away for a root, since frames is then empty).
+                if (frames.Count > 0)
+                {
+                    var (parent, _) = frames.Peek();
+                    low[parent] = Math.Min(low[parent], low[v]);
                 }
             }
-            if (low[v] != indices[v]) return;
-            var component = new List<string>();
-            string member;
-            do
-            {
-                member = stack.Pop();
-                onStack.Remove(member);
-                component.Add(member);
-            } while (!string.Equals(member, v, StringComparison.OrdinalIgnoreCase));
-            if (component.Count > 1) result.Add(component.OrderBy(k => k, StringComparer.OrdinalIgnoreCase).ToList());
         }
+
+        return result.OrderBy(c => c[0], StringComparer.OrdinalIgnoreCase).ToList();
     }
 }

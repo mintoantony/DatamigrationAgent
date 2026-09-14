@@ -96,6 +96,48 @@ public sealed class RulesTests
         Assert.Contains(Run(new TargetFkCyclesRule(), tgt: selfRef), x => x.Object == "app.Products" && x.Message.Contains("FK_Products_Parent"));
     }
 
+    private static TableInfo ChainTable(string key, ForeignKeyInfo? fk = null) =>
+        Table(key, 0, new[] { Col("Id", "int", nullable: false) }, pk: new[] { "Id" },
+            fks: fk is null ? Array.Empty<ForeignKeyInfo>() : new[] { fk });
+
+    [Fact]
+    public void FkGraph_detects_a_three_node_cycle()
+    {
+        var tables = new[]
+        {
+            ChainTable("dbo.CycA", Fk("FK_A_B", "Id", "dbo.CycB", "Id")),
+            ChainTable("dbo.CycB", Fk("FK_B_C", "Id", "dbo.CycC", "Id")),
+            ChainTable("dbo.CycC", Fk("FK_C_A", "Id", "dbo.CycA", "Id")),
+        };
+        var cycles = FkGraph.Cycles(tables);
+        Assert.Equal(new List<List<string>> { new() { "dbo.CycA", "dbo.CycB", "dbo.CycC" } }, cycles);
+
+        var tgt = Snapshot(Meta("Cyclic"), tables);
+        var f = Run(new TargetFkCyclesRule(), tgt: tgt).Single();
+        Assert.Equal(("dbo.CycA ↔ dbo.CycB ↔ dbo.CycC", Severity.Medium, "table:tgt:dbo.CycA"), (f.Object, f.Severity, f.Anchor));
+    }
+
+    [Fact]
+    public void FkGraph_completes_on_a_deep_acyclic_chain_without_stack_overflow()
+    {
+        // A plain reference chain (T0 -> T1 -> ... -> T[n-1], no back edges) is exactly the shape whose DFS depth
+        // equals its length; a naive recursive Tarjan walks this to full depth before any frame pops. 20,000 is
+        // well past the ~6,000-6,500 recursion depth that overflows a default 1 MB thread stack for this shape
+        // (confirmed by an isolated repro of the original algorithm), so this only passes if Cycles() no longer
+        // recurses per edge.
+        const int depth = 20_000;
+        var tables = new List<TableInfo>(depth);
+        for (var i = 0; i < depth; i++)
+        {
+            var next = i + 1 < depth ? Fk($"FK_Chain{i:D6}", "Id", $"dbo.Chain{i + 1:D6}", "Id") : null;
+            tables.Add(ChainTable($"dbo.Chain{i:D6}", next));
+        }
+
+        var cycles = FkGraph.Cycles(tables);
+
+        Assert.Empty(cycles);
+    }
+
     [Fact]
     public void R15_and_R16_target_state_and_version()
     {
@@ -140,4 +182,21 @@ public sealed class RulesTests
         Assert.Equal(
             "SELECT COUNT_BIG(*) FROM [dbo].[ORD_HDR] AS c WHERE c.[CUST_ID] IS NOT NULL AND NOT EXISTS (SELECT 1 FROM [dbo].[CUST] AS p WHERE p.[CUST_ID] = c.[CUST_ID]);",
             AnalyzeJob.OrphanSql(LegacyShop().FindTable("dbo.ORD_HDR")!, LegacyShop().FindTable("dbo.ORD_HDR")!.ForeignKeys[0]));
+
+    [Fact]
+    public async Task CountOrphansAsync_leaves_the_key_absent_when_the_connection_fails()
+    {
+        var log = new List<string>();
+        // 127.0.0.1 on a port nothing listens on refuses the TCP connect immediately; Connect Timeout=1 is a
+        // backstop, not the mechanism, so this stays fast rather than waiting out a real network timeout.
+        const string unreachable = "Server=127.0.0.1,1;Database=nope;User Id=sa;Password=wrong;" +
+            "Connect Timeout=1;Encrypt=False;TrustServerCertificate=True;Pooling=False;";
+
+        var counts = await AnalyzeJob.CountOrphansAsync(unreachable, LegacyShop(), log.Add, CancellationToken.None);
+
+        // Key absent (not 0): R09 must read this as "not counted" (medium), never as "counted, found none" (low).
+        Assert.False(counts.ContainsKey(RuleContext.OrphanKey("dbo.ORD_HDR", "FK_ORD_CUST")));
+        Assert.Empty(counts);
+        Assert.Contains(log, l => l.StartsWith("orphan checks skipped:", StringComparison.Ordinal));
+    }
 }
