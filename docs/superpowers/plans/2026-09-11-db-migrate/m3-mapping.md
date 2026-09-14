@@ -6256,3 +6256,15 @@ This is the engine touching an author-owned field, deliberately and narrowly: on
 - **Carried artifacts skip `Validate`**, so a malformed `riskAck` can reach the automap job, which catches only deserialisation failures. The predicate must tolerate an odd but well-formed acknowledgement without throwing.
 - **The invariant covers type-conversion hazards.** Nullability — a left join feeding a `NOT NULL` target — and join fan-out are real hazards outside this model, and nothing here should be read as covering them.
 - **Milestone 4 calls this same predicate** rather than re-deriving "acknowledged", or the project grows a third definition of it. Recorded with the other M4 rulings.
+
+### Task 3.5 JavaScript — correction for the token refresh
+
+The FINAL JavaScript risk scope above says the hazard class is mirrored from the committed C#, with the same stripping rules. **That is superseded.** The engine now refreshes the acknowledgement token: when an acknowledgement still matches its hazard by class but the risk text has drifted, the engine rewrites the stored token to the current text before anything else reads it.
+
+So the browser needs **no hazard class at all**, and must not attempt one. The predicate in JavaScript is plain string equality:
+
+> a column needs review when `typeRisk` is present and non-blank, and not (`riskAck.reason` is non-blank and `riskAck.risk` equals `typeRisk` exactly).
+
+Mirroring a stripping algorithm was the thing that would have made the UI disagree with the server precisely when it mattered — after a rediscovery changes an observed length. With the refresh, both sides compare the same two strings and agree by construction.
+
+Attention remains the confidence band **or** this risk predicate. The risk predicate does not replace the band.
