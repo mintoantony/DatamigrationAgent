@@ -6380,3 +6380,37 @@ The cost is a one-time re-acknowledgement for artifacts written before this mode
 The JavaScript risk scope still tells its implementer to mirror `HazardClass`, "with the same treatment of the sentinel as a class matching nothing else". Both halves are now wrong: the browser needs no class function at all, and read literally that sentence makes a sentinel column impossible to acknowledge, because sentinel would never match sentinel in the predicate.
 
 **That sentence is struck.** The dual rule, stated once: in the **predicate**, sentinel text equals sentinel text and the acknowledgement stands; in the **`riskClass` check**, a newly computed sentinel class never equals the stored one, so a changed custom column always loses its acknowledgement.
+
+### RISK MODEL AMENDMENT 5 — deletions only
+
+Three things in this model are now dead: a rule that cannot fire, a function with no caller, and an instruction that tells an implementer to stop at a decision already taken. This amendment removes them and adds nothing.
+
+It is deliberately a deletion-only amendment. A stopping rule recorded earlier says that a fifth amendment means cutting the acknowledgement mechanism rather than amending again. That rule exists because repeated amendment signalled a wrong design — and removing vestigial parts is the opposite signal. **The rule now reads: if anything after this requires a new rule rather than a removal, the mechanism is cut rather than amended.**
+
+#### L1 — `HazardClass` is deleted
+
+It has no caller. The predicate became plain string equality; K3 moved the token refresh into carry-over only, and there the comparison is the stored `riskClass` against the recomputed `riskClass`. Nothing in either language calls a text-derived class.
+
+Remove it from `TypeCompat`, and remove any JavaScript mirror. The normalised-text idea it embodied — stripping observed lengths and sample suffixes — is not needed once `riskClass` carries declared types and the refresh is confined to carry-over.
+
+#### L2 — Section 3's formula and the stop-instruction are struck
+
+Section 3 still writes the predicate in terms of `HazardClass`. **Struck.** The predicate is:
+
+> a column needs review when `typeRisk` is present and non-blank, and not (`riskAck.reason` is non-blank and `riskAck.risk` equals `typeRisk` exactly).
+
+Plain string equality, identical in C# and JavaScript, reading nothing but the column.
+
+The `riskClass` amendment ends with an instruction to stop if the two comparisons are ever collapsed into one, and to say which property was lost. K3 collapsed them deliberately, and the property — tolerance of text drift inside a single validation — turned out not to exist, because a catalogue cannot change mid-validation. **That instruction is struck.** Nobody should halt on it.
+
+#### L3 — The sentinel special case is deleted
+
+J1 gave the sentinel `riskClass` a comparator that never equals anything, including another sentinel. That rule cannot fire. A sentinel class is computed only in Validate's catch-all, which only a **changed** column reaches, and G3 already clears the acknowledgement on any change — so it could only ever apply to a column whose acknowledgement was already gone. Carry-over never computes a sentinel at all, because K1 copies non-bare kept columns verbatim.
+
+**The sentinel `riskClass` is a plain constant, compared by plain equality like any other class.** There is now no sentinel special case anywhere in the model, in either language.
+
+This also removes a trap: applying that never-equal comparator to every column, rather than only to columns whose class was computed in the current pass, would have compared an unchanged sentinel column's stored class with itself, called it changed, and cleared the acknowledgement on every save.
+
+#### L4 — One constant each, for a later milestone to reference
+
+The sentinel risk text and the sentinel `riskClass` value each live in a single C# constant, placed where a later milestone can reference them. Milestone 4 must recognise the sentinel so it does not render one as a data-loss warning, and it must reference the constant rather than string-matching a copy of the text.
