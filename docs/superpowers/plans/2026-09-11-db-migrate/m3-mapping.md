@@ -40,7 +40,7 @@
   }
   ```
 
-**Rule summary (what the tests pin down).** Families: integers (tinyint < smallint < int < bigint); exact decimals (decimal/numeric by precision/scale, money ≈ decimal(19,4), smallmoney ≈ decimal(10,4)); float/real; bit; character strings (char/varchar/text ≈ varchar(max); nchar/nvarchar/ntext ≈ nvarchar(max); xml behaves like an unbounded Unicode string when converted to text); binary/varbinary/image (≈ varbinary(max)), rowversion ≈ binary(8) as a source; date; time(p); smalldatetime/datetime/datetime2(p)/datetimeoffset(p); uniqueidentifier; xml; sql_variant; geography/geometry; hierarchyid. Same type and size → Exact. Same family and fits → Widening (Risk null). Anything that can lose data → Risky with an explicit Risk text; a source profile that proves the data fits (MaxLen, Min/Max, date range) turns a size/range risk back into Widening. **Incompatible only when SQL Server has no conversion at all** (`"<src> cannot be converted to <tgt>"`, e.g. int↔uniqueidentifier, numbers→date/time/datetime2, datetime2→int, xml↔numbers); anything SQL Server converts implicitly or with `CAST` is Widening or Risky — e.g. int→bit Risky "non-zero values become 1" (the result of `CASE … THEN 1 ELSE 0 END` into a bit column), int/decimal/float/bit→datetime Risky "number interpreted as days since 1900-01-01", datetime→int Risky, numbers/dates/xml/spatial/hierarchyid→binary Risky "stored as raw bytes", binary→date Risky, string→geography Risky. M4's SQL validation relies on this (the sample plan must validate with warnings, not errors). Any rowversion **target** is Incompatible (the server generates it). Unknown type names → Risky `"unrecognised type conversion …"`.
+**Rule summary (what the tests pin down).** Families: integers (tinyint < smallint < int < bigint); exact decimals (decimal/numeric by precision/scale, money ≈ decimal(19,4), smallmoney ≈ decimal(10,4)); float/real; bit; character strings (char/varchar/text ≈ varchar(max); nchar/nvarchar/ntext ≈ nvarchar(max); xml behaves like an unbounded Unicode string when converted to text); binary/varbinary/image (≈ varbinary(max)), rowversion ≈ binary(8) as a source; date; time(p); smalldatetime/datetime/datetime2(p)/datetimeoffset(p); uniqueidentifier; xml; sql_variant; geography/geometry; hierarchyid. Same type and size → Exact. Same family and fits → Widening, with Risk null when no profile was involved. Anything that can lose data → Risky with an explicit Risk text; a source profile whose sample fits (MaxLen, Min/Max, date range) lowers a size/range risk to Widening (score 0.9) **but never clears the Risk text** — the softened text keeps the hazard phrase, names the sample size, and contains the token `sampled`. A `TOP n` read is evidence, not proof, and `typeRisk` is the only channel carrying the hazard to the mapping-architect agent (see its Procedure step 3) and the human approver, so erasing it would report a silently truncating conversion as safe. (Amended after the Task 3.1 review; the original text mandated a full flip to Risk null.) **Incompatible only when SQL Server has no conversion at all** (`"<src> cannot be converted to <tgt>"`, e.g. int↔uniqueidentifier, numbers→date/time/datetime2, datetime2→int, xml↔numbers); anything SQL Server converts implicitly or with `CAST` is Widening or Risky — e.g. int→bit Risky "non-zero values become 1" (the result of `CASE … THEN 1 ELSE 0 END` into a bit column), int/decimal/float/bit→datetime Risky "number interpreted as days since 1900-01-01", datetime→int Risky, numbers/dates/xml/spatial/hierarchyid→binary Risky "stored as raw bytes", binary→date Risky, string→geography Risky. M4's SQL validation relies on this (the sample plan must validate with warnings, not errors). Any rowversion **target** is Incompatible (the server generates it). Unknown type names → Risky `"unrecognised type conversion …"`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -70,11 +70,11 @@ public class TypeCompatTests
     [InlineData("smallint", "int", null, null, null, "Widening", null)]
     [InlineData("int", "bigint", null, null, null, "Widening", null)]
     [InlineData("bigint", "int", null, null, null, "Risky", "overflow possible")]
-    [InlineData("bigint", "int", null, "1", "1000", "Widening", null)]
+    [InlineData("bigint", "int", null, "1", "1000", "Widening", "sampled")]
     [InlineData("int", "tinyint", null, "-5", "10", "Risky", "overflow possible")]
     [InlineData("int", "decimal(10,0)", null, null, null, "Widening", null)]
     [InlineData("int", "decimal(9,0)", null, null, null, "Risky", "overflow possible")]
-    [InlineData("int", "decimal(9,0)", null, "1", "5000", "Widening", null)]
+    [InlineData("int", "decimal(9,0)", null, "1", "5000", "Widening", "sampled")]
     [InlineData("int", "money", null, null, null, "Widening", null)]
     [InlineData("int", "smallmoney", null, null, null, "Risky", "overflow possible")]
     [InlineData("int", "float", null, null, null, "Widening", null)]
@@ -100,11 +100,11 @@ public class TypeCompatTests
     [InlineData("decimal(19,4)", "decimal(10,2)", null, null, null, "Risky", "rounded to 2 decimal places")]
     [InlineData("decimal(19,4)", "decimal(10,4)", null, null, null, "Risky", "overflow possible (target decimal(10,4))")]
     [InlineData("decimal(10,2)", "decimal(12,2)", null, null, null, "Widening", null)]
-    [InlineData("decimal(12,2)", "decimal(10,2)", null, "0", "99.5", "Widening", null)]
+    [InlineData("decimal(12,2)", "decimal(10,2)", null, "0", "99.5", "Widening", "sampled")]
     [InlineData("decimal(10,2)", "int", null, null, null, "Risky", "fractional part truncated")]
     [InlineData("decimal(9,0)", "int", null, null, null, "Widening", null)]
     [InlineData("decimal(12,0)", "int", null, null, null, "Risky", "overflow possible")]
-    [InlineData("decimal(12,0)", "int", null, "0", "100", "Widening", null)]
+    [InlineData("decimal(12,0)", "int", null, "0", "100", "Widening", "sampled")]
     [InlineData("numeric(18,0)", "bigint", null, null, null, "Widening", null)]
     [InlineData("decimal(10,2)", "float", null, null, null, "Widening", null)]
     [InlineData("decimal(20,2)", "float", null, null, null, "Risky", "precision loss")]
@@ -133,7 +133,7 @@ public class TypeCompatTests
     [InlineData("varchar(100)", "nvarchar(100)", null, null, null, "Widening", null)]
     [InlineData("varchar(100)", "nvarchar(200)", null, null, null, "Widening", null)]
     [InlineData("varchar(100)", "nvarchar(50)", null, null, null, "Risky", "may truncate (source max 100)")]
-    [InlineData("varchar(100)", "nvarchar(50)", 40, null, null, "Widening", null)]
+    [InlineData("varchar(100)", "nvarchar(50)", 40, null, null, "Widening", "sampled")]
     [InlineData("varchar(500)", "nvarchar(200)", 300, null, null, "Risky", "may truncate (source max 300)")]
     [InlineData("varchar(500)", "nvarchar(200)", null, null, null, "Risky", "may truncate (source max 500)")]
     [InlineData("nvarchar(50)", "varchar(50)", null, null, null, "Risky", "non-ASCII characters may be lost")]
@@ -143,7 +143,7 @@ public class TypeCompatTests
     [InlineData("text", "nvarchar(max)", null, null, null, "Widening", null)]
     [InlineData("text", "varchar(max)", null, null, null, "Widening", null)]
     [InlineData("text", "nvarchar(200)", null, null, null, "Risky", "may truncate (source length unbounded)")]
-    [InlineData("text", "nvarchar(200)", 150, null, null, "Widening", null)]
+    [InlineData("text", "nvarchar(200)", 150, null, null, "Widening", "sampled")]
     [InlineData("ntext", "nvarchar(max)", null, null, null, "Widening", null)]
     [InlineData("ntext", "varchar(max)", null, null, null, "Risky", "non-ASCII characters may be lost")]
     [InlineData("varchar(max)", "text", null, null, null, "Widening", null)]
@@ -162,7 +162,7 @@ public class TypeCompatTests
     // binary
     [InlineData("varbinary(10)", "varbinary(20)", null, null, null, "Widening", null)]
     [InlineData("varbinary(20)", "varbinary(10)", null, null, null, "Risky", "may truncate (source max 20 bytes)")]
-    [InlineData("varbinary(20)", "varbinary(10)", 8, null, null, "Widening", null)]
+    [InlineData("varbinary(20)", "varbinary(10)", 8, null, null, "Widening", "sampled")]
     [InlineData("image", "varbinary(max)", null, null, null, "Widening", null)]
     [InlineData("binary(16)", "uniqueidentifier", null, null, null, "Risky", "conversion may fail")]
     [InlineData("varbinary(10)", "varchar(10)", null, null, null, "Risky", "bytes reinterpreted as characters")]
@@ -172,7 +172,7 @@ public class TypeCompatTests
     // date
     [InlineData("date", "datetime2(0)", null, null, null, "Widening", null)]
     [InlineData("date", "datetime", null, null, null, "Risky", "dates before 1753 fail")]
-    [InlineData("date", "datetime", null, "2000-01-01", "2020-12-31", "Widening", null)]
+    [InlineData("date", "datetime", null, "2000-01-01", "2020-12-31", "Widening", "sampled")]
     [InlineData("date", "smalldatetime", null, null, null, "Risky", "dates outside 1900-2079 fail")]
     [InlineData("date", "datetimeoffset(7)", null, null, null, "Risky", "time zone offset assumed +00:00")]
     [InlineData("date", "varchar(10)", null, null, null, "Widening", null)]
@@ -198,7 +198,7 @@ public class TypeCompatTests
     [InlineData("smalldatetime", "datetime", null, null, null, "Widening", null)]
     [InlineData("datetime", "smalldatetime", null, null, null, "Risky", "seconds dropped")]
     [InlineData("datetime2(7)", "datetime", null, null, null, "Risky", "fractional seconds rounded to 1/300 s")]
-    [InlineData("datetime2(0)", "datetime", null, "2000-01-01", "2001-01-01", "Widening", null)]
+    [InlineData("datetime2(0)", "datetime", null, "2000-01-01", "2001-01-01", "Widening", "sampled")]
     [InlineData("datetimeoffset(7)", "datetime2(7)", null, null, null, "Risky", "time zone offset dropped")]
     [InlineData("datetime", "datetimeoffset(7)", null, null, null, "Risky", "time zone offset assumed +00:00")]
     [InlineData("datetime", "varchar(30)", null, null, null, "Widening", null)]
@@ -235,6 +235,11 @@ public class TypeCompatTests
     [InlineData("binary(8)", "timestamp", null, null, null, "Incompatible", "rowversion")]
     [InlineData("timestamp", "timestamp", null, null, null, "Incompatible", "rowversion")]
     [InlineData("mytype", "int", null, null, null, "Risky", "unrecognised type")]
+    // AMENDED after the Task 3.1 review (see the SDD ledger, "Task 3.1 review"): a source profile may LOWER the level but
+    // must never NULL the risk. Sample-supported conversions are (Widening, 0.9, non-null risk) that retains the hazard
+    // phrase and contains the token "sampled" — a TOP n read is evidence, not proof, and typeRisk is the only channel
+    // that carries the hazard to the mapping-architect agent and the human approver. The nine profile-flip rows below
+    // therefore expect a risk substring, not null. Unsampled widenings still carry Risk == null.
     public void Check_follows_the_rule_table(string src, string tgt, int? maxLen, string? min, string? max, string level, string? risk)
     {
         var profile = maxLen is null && min is null && max is null

@@ -12,6 +12,7 @@
 # .NET build output (engine only — plugins/db-migrate/bin/ holds the launchers and must stay tracked)
 plugins/db-migrate/engine/**/bin/
 plugins/db-migrate/engine/**/obj/
+plugins/db-migrate/engine/dist/
 TestResults/
 *.user
 *.suo
