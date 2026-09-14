@@ -90,13 +90,7 @@ public class ServerControlTests
     {
         using var tw = new TestWorkspace();
         tw.Ws.EnsureCreated();
-        using var exited = Process.Start(new ProcessStartInfo("cmd.exe", "/c exit 0")
-        {
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        })!;
-        exited.WaitForExit();
-        var deadPid = exited.Id;
+        var deadPid = await RunToExitAsync();
 
         File.WriteAllText(tw.Ws.ServerJsonPath, Json.Serialize(new ServerInfo(1, deadPid, "tok", DateTimeOffset.UtcNow)));
 
@@ -111,6 +105,7 @@ public class ServerControlTests
             var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ServerControl.StopAsync(tw.Ws));
 
             Assert.Contains(deadPid.ToString(), ex.Message);
+            Assert.Contains("exited", ex.Message);
             Assert.True(File.Exists(tw.Ws.ServerJsonPath));
         }
         finally
@@ -118,6 +113,20 @@ public class ServerControlTests
             ServerControl.LockReleaseTimeout = savedLock;
             ServerControl.KillGraceTimeout = savedKill;
         }
+    }
+
+    /// <summary>Spawns a trivial, immediately-exiting process (cross-platform: cmd.exe on Windows, /bin/sh
+    /// elsewhere) and returns its PID once it has exited — a PID guaranteed not to belong to any running process.</summary>
+    private static async Task<int> RunToExitAsync()
+    {
+        var psi = OperatingSystem.IsWindows()
+            ? new ProcessStartInfo("cmd.exe", "/c exit 0")
+            : new ProcessStartInfo("/bin/sh", "-c \"exit 0\"");
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        using var process = Process.Start(psi)!;
+        await process.WaitForExitAsync();
+        return process.Id;
     }
 
     [Fact]
@@ -178,6 +187,140 @@ public class ServerControlTests
         finally
         {
             ServerControl.SpawnOverrides.TryRemove(tw.Ws.Root, out _);
+        }
+    }
+
+    /// <summary>
+    /// The ordered drain-wait test T1.7 fix round 4 was supposed to add but didn't: a previous server's lock is
+    /// still held (draining), then released, and EnsureRunningAsync must proceed to spawn — exactly once, not
+    /// zero (stuck) and not more than once (a duplicate spawn racing the first).
+    /// </summary>
+    [Fact]
+    public async Task EnsureRunningAsync_waits_for_a_draining_lock_to_release_then_spawns_exactly_once()
+    {
+        using var tw = new TestWorkspace();
+        tw.Ws.EnsureCreated();
+        var heldLock = new FileStream(tw.Ws.ServerLockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        var release = Task.Run(async () =>
+        {
+            await Task.Delay(300);
+            heldLock.Dispose();
+        });
+
+        WebTestServer? spawned = null;
+        var spawnCount = 0;
+        ServerControl.SpawnOverrides[tw.Ws.Root] = async (ws, _) =>
+        {
+            Interlocked.Increment(ref spawnCount);
+            spawned = await WebTestServer.StartAsync(ws, FakeServices.Factory());
+        };
+        try
+        {
+            var info = await ServerControl.EnsureRunningAsync(tw.Ws);
+
+            await release;
+            Assert.Equal(1, spawnCount);
+            Assert.Equal(spawned!.Info.Pid, info.Pid);
+        }
+        finally
+        {
+            ServerControl.SpawnOverrides.TryRemove(tw.Ws.Root, out _);
+            if (spawned is not null) await spawned.DisposeAsync();
+        }
+    }
+
+    /// <summary>Nothing in the default suite exercised the "becomes healthy partway through the wait" path before
+    /// this — reverting WaitForHealthyOwnerAsync to a single check (no retry loop) kept every prior test green.</summary>
+    [Fact]
+    public async Task WaitForHealthyOwnerAsync_finds_an_owner_that_becomes_healthy_partway_through_the_wait()
+    {
+        using var tw = new TestWorkspace();
+        WebTestServer? server = null;
+        var spawnLater = Task.Run(async () =>
+        {
+            await Task.Delay(300);
+            server = await WebTestServer.StartAsync(tw.Ws);
+        });
+        try
+        {
+            var owner = await ServerControl.WaitForHealthyOwnerAsync(tw.Ws);
+
+            await spawnLater;
+            Assert.NotNull(owner);
+            Assert.Equal(server!.Info.Pid, owner!.Pid);
+        }
+        finally
+        {
+            if (server is not null) await server.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Regression test for T1.7 fix round 5, item 1: a stop that has to kill a hung process frees server.lock and
+    /// deletes server.json from two independently-polling 200 ms loops, not atomically — so a caller must not
+    /// read "lock free, server.json still there" as a crash the instant it observes the lock go free. Shortens
+    /// ReconnectGraceWindow so the test doesn't need to wait out the real default.
+    /// </summary>
+    [Fact]
+    public async Task WaitForCleanStopAsync_treats_a_lock_release_followed_promptly_by_server_json_deletion_as_stopped()
+    {
+        using var tw = new TestWorkspace();
+        tw.Ws.EnsureCreated();
+        File.WriteAllText(tw.Ws.ServerJsonPath, Json.Serialize(new ServerInfo(1, 4321, "tok", DateTimeOffset.UtcNow)));
+        var heldLock = new FileStream(tw.Ws.ServerLockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+
+        var saved = ServerControl.ReconnectGraceWindow;
+        ServerControl.ReconnectGraceWindow = TimeSpan.FromSeconds(2);
+        try
+        {
+            var killThenCleanUp = Task.Run(async () =>
+            {
+                await Task.Delay(300);
+                heldLock.Dispose();   // simulates the kill freeing the lock
+                await Task.Delay(100);
+                File.Delete(tw.Ws.ServerJsonPath);   // simulates StopAsync's own slightly-delayed cleanup
+            });
+
+            var stopped = await ServerControl.WaitForCleanStopAsync(tw.Ws, 4321, TimeSpan.FromSeconds(3));
+
+            await killThenCleanUp;
+            Assert.True(stopped);
+        }
+        finally
+        {
+            ServerControl.ReconnectGraceWindow = saved;
+        }
+    }
+
+    /// <summary>The other half of the same regression: a crash frees the lock too, but nobody ever deletes
+    /// server.json, so this must still resolve to "not stopped" (reconnect) once the grace window passes.</summary>
+    [Fact]
+    public async Task WaitForCleanStopAsync_treats_a_lock_release_with_server_json_never_removed_as_a_crash()
+    {
+        using var tw = new TestWorkspace();
+        tw.Ws.EnsureCreated();
+        File.WriteAllText(tw.Ws.ServerJsonPath, Json.Serialize(new ServerInfo(1, 4321, "tok", DateTimeOffset.UtcNow)));
+        var heldLock = new FileStream(tw.Ws.ServerLockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+
+        var saved = ServerControl.ReconnectGraceWindow;
+        ServerControl.ReconnectGraceWindow = TimeSpan.FromMilliseconds(500);
+        try
+        {
+            var release = Task.Run(async () =>
+            {
+                await Task.Delay(200);
+                heldLock.Dispose();
+            });
+
+            var stopped = await ServerControl.WaitForCleanStopAsync(tw.Ws, 4321, TimeSpan.FromSeconds(3));
+
+            await release;
+            Assert.False(stopped);
+            Assert.True(File.Exists(tw.Ws.ServerJsonPath));
+        }
+        finally
+        {
+            ServerControl.ReconnectGraceWindow = saved;
         }
     }
 }

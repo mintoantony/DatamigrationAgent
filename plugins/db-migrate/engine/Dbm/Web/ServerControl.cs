@@ -8,8 +8,10 @@ namespace Dbm.Web;
 public static class ServerControl
 {
     /// <summary>How long EnsureRunningAsync waits for a spawned server (or a healthy owner it did not spawn itself)
-    /// to answer. Mutable (not readonly) so tests can shorten it — matches LockReleaseTimeout/KillGraceTimeout.</summary>
-    public static TimeSpan StartTimeout = TimeSpan.FromSeconds(20);
+    /// to answer. Mutable (not readonly) so tests can shorten it — matches LockReleaseTimeout/KillGraceTimeout.
+    /// Internal (not public): a test that shortens it and forgets to restore it can otherwise contaminate any
+    /// other test in the same run, including ones in a different test class or the Integration suite.</summary>
+    internal static TimeSpan StartTimeout = TimeSpan.FromSeconds(20);
 
     /// <summary>Test seam, keyed by workspace root: replaces spawning a real process.</summary>
     internal static readonly ConcurrentDictionary<string, Func<Workspace, CancellationToken, Task>> SpawnOverrides =
@@ -151,6 +153,7 @@ public static class ServerControl
                 $"a dbm server for this workspace is still starting or shutting down; see {ws.ServerLogPath}.");
 
         Process? process;
+        var pidExited = false;
         try
         {
             process = Process.GetProcessById(info.Pid);
@@ -158,6 +161,7 @@ public static class ServerControl
         catch (ArgumentException)
         {
             process = null;   // the recorded PID has exited; something else may now hold the lock
+            pidExited = true;
         }
 
         var killed = false;
@@ -203,11 +207,11 @@ public static class ServerControl
         // is still running and this must not report success.
         if (!await WaitForLockReleaseAsync(ws, KillGraceTimeout))
         {
-            throw killed
-                ? new InvalidOperationException($"dbm server PID {info.Pid} is still running and could not be stopped.")
-                : new InvalidOperationException(
-                    $"PID {info.Pid} is not the dbm server for this workspace, and server.lock is still held by an " +
-                    $"unidentified process; see {ws.ServerLogPath}.");
+            if (killed)
+                throw new InvalidOperationException($"dbm server PID {info.Pid} is still running and could not be stopped.");
+            throw new InvalidOperationException(pidExited
+                ? $"dbm server PID {info.Pid} has already exited, but server.lock is still held by an unidentified process; see {ws.ServerLogPath}."
+                : $"PID {info.Pid} is not the dbm server for this workspace, and server.lock is still held by an unidentified process; see {ws.ServerLogPath}.");
         }
 
         DeleteStaleInfo(ws, info);
@@ -259,6 +263,55 @@ public static class ServerControl
             if (DateTime.UtcNow >= deadline) return null;
             await Task.Delay(200, ct);
         }
+    }
+
+    /// <summary>Primary window <see cref="WaitForCleanStopAsync"/> waits for server.json to disappear or the lock
+    /// to free, before deciding a held lock means "still running, reconnect".</summary>
+    internal static TimeSpan ReconnectDecisionWindow = TimeSpan.FromSeconds(3);
+
+    /// <summary>Extra grace window, once the lock looks free, for server.json to also disappear. Closes the race
+    /// between a stop that had to kill a hung process (which frees the lock and deletes server.json from two
+    /// independently-polling 200 ms loops — StopAsync's own, and this one — not atomically) and a caller that
+    /// happens to observe the lock go free a poll tick before StopAsync does.</summary>
+    internal static TimeSpan ReconnectGraceWindow = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// After losing the connection to the server recorded under <paramref name="pid"/>, decides whether it
+    /// stopped cleanly or crashed — using the lock, not a fixed window on server.json alone, as the authority.
+    /// A clean stop (including one that had to kill a hung process) frees server.lock <em>and</em> deletes
+    /// server.json; a crash frees the lock too (the OS always releases it, kill included) but nobody ever
+    /// deletes server.json, since the crashed process never got to run its own cleanup. So: once the lock looks
+    /// free, this waits a further <see cref="ReconnectGraceWindow"/> for server.json to disappear as well, rather
+    /// than reading "lock free, file still there" as a crash on the spot — a stop-initiated kill resolves within
+    /// that window essentially always; a genuine crash never does, and still correctly resolves to a reconnect.
+    /// Also treats server.json changing to name a different PID as "gone" — something else already took over.
+    /// </summary>
+    internal static async Task<bool> WaitForCleanStopAsync(Workspace ws, int pid, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        var lockFreedWithinWindow = false;
+        while (DateTime.UtcNow < deadline)
+        {
+            if (ReadInfo(ws) is not { } still || still.Pid != pid) return true;
+            if (ProbeLockFree(ws))
+            {
+                lockFreedWithinWindow = true;
+                break;
+            }
+            await Task.Delay(200);
+        }
+
+        if (lockFreedWithinWindow)
+        {
+            var graceDeadline = DateTime.UtcNow + ReconnectGraceWindow;
+            while (DateTime.UtcNow < graceDeadline)
+            {
+                if (ReadInfo(ws) is not { } still || still.Pid != pid) return true;
+                await Task.Delay(200);
+            }
+        }
+
+        return ReadInfo(ws) is not { } final || final.Pid != pid;
     }
 
     private static async Task<bool> WaitForLockReleaseAsync(Workspace ws, TimeSpan timeout, CancellationToken ct = default)

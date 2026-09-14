@@ -67,19 +67,11 @@ public sealed class AwaitCommand : ICommand
                 // connection reset: handled below
             }
 
-            // Connection lost. Wait (≤ 3 s) for whichever signal comes first: server.json disappearing (the
-            // server's own cleanup — a clean stop) or server.lock freeing (the OS releases it on any exit,
-            // including a crash that never got to run its own cleanup and so never deleted server.json). Once the
-            // lock is free, re-read once more: file gone means it was a clean stop after all; file still naming
-            // the old PID means a crash — reconnect (EnsureRunningAsync will find the lock free and respawn),
-            // rather than inferring a stop from server.json merely outliving a fixed window.
-            for (var i = 0; i < 15; i++)
-            {
-                if (ServerControl.ReadInfo(ws) is null) return Output.Ok(ctx, ServerStopped);
-                if (ServerControl.ProbeLockFree(ws)) break;
-                await Task.Delay(200);
-            }
-            if (ServerControl.ReadInfo(ws) is null) return Output.Ok(ctx, ServerStopped);
+            // Connection lost. Decide stopped-vs-crashed from the lock, not from server.json alone outliving a
+            // fixed window — see ServerControl.WaitForCleanStopAsync for why a stop that had to kill a hung
+            // process needs its own short grace window here too (never respawn a server the user just stopped).
+            if (await ServerControl.WaitForCleanStopAsync(ws, info.Pid, ServerControl.ReconnectDecisionWindow))
+                return Output.Ok(ctx, ServerStopped);
             if (++reconnects > MaxReconnects)
                 return Output.Fail(ctx, "server_unreachable", $"Lost the connection to the dbm server {MaxReconnects} times; see {ws.ServerLogPath}");
         }

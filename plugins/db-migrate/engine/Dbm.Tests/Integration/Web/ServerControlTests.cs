@@ -7,8 +7,12 @@ using Dbm.Web;
 
 namespace Dbm.Tests.Integration.Web;
 
-/// <summary>Spawns a real detached `dotnet Dbm.dll serve` process from the test output folder.</summary>
+/// <summary>Spawns a real detached `dotnet Dbm.dll serve` process from the test output folder. In
+/// ProcessStateCollection because other test classes in that collection shorten ServerControl's mutable static
+/// timeouts (StartTimeout, LockReleaseTimeout, ...) — without this, a full run including Integration tests could
+/// pick up a shortened value mid-test and contaminate these (much slower, real-process) tests.</summary>
 [Trait("Category", "Integration")]
+[Collection(ProcessStateCollection.Name)]
 public class ServerControlTests
 {
     /// <summary>
