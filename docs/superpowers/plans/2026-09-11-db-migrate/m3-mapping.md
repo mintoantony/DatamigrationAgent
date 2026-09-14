@@ -5980,3 +5980,71 @@ Apply it through the workflow's dry-run patch path instead, and assert there are
 #### E6 — Keep acknowledgement counts out of `Summarize`
 
 D5's acknowledged-risk count belongs to the work packet and the UI context. It must **not** go into `Summarize`, whose output is pinned by assertions such as the zero-attention, zero-blockers summary string. A display concern must not move a load-bearing assertion.
+
+### AMENDMENT CORRECTION (Task 3.4, eighth pass) — invalidation must not become a treadmill, and three paths store a hazard with no text
+
+D4 as written clears a valid acknowledgement on the next unrelated save. Three separate paths let a real conversion reach the artifact with no risk text at all — the same failure class every pass of this amendment has produced in a new disguise. And D1's warning compares the wrong two values, firing on the main human workflow.
+
+#### F1 — D4 applies only to columns that changed in this Validate
+
+D1 restores an unchanged custom column's `typeRisk` verbatim, so a sentinel goes in and the same sentinel comes out. D4 then says a sentinel never counts as unchanged, so that column compares as "differs" on **every** Validate, and a carried-along `riskAck` equals the one in `ctx.Current` so it does not count as a deliberate new acknowledgement — and it is cleared.
+
+An acknowledgement on a sentinel therefore cannot survive one unrelated save. The reviewer called this the treadmill in its purest form, and that is right: it would teach every user that acknowledging is pointless.
+
+**Correction.** D4's comparison — including the rule that a sentinel is never "the same risk" — applies **only** to columns whose `expr` or `sourceColumns` changed in this Validate. An unchanged column keeps both its `typeRisk` and its `riskAck` from `ctx.Current`, with no comparison performed. D4's own premise is that the hazard changed; nothing about an unchanged column changed.
+
+The same exemption holds in carry-over: a custom-expression column keeps its stored risk and acknowledgement verbatim, and the D4 comparison is not applied to it.
+
+#### F2 — "Bare single-source reference" defined precisely
+
+Nothing currently verifies that the expression reads the column its `sourceColumns` names. `expr: "s.[NOTES]"` with `sourceColumns: ["dbo.CUST.CUST_NM"]` makes the engine evaluate `CUST_NM` and store its risk — or no risk — while the load actually reads `NOTES`. A truncation ships silently.
+
+A column is a **bare single-source reference** when all of these hold:
+
+- the expression is exactly an alias, a dot, and a bracketed column name;
+- the alias resolves to `sources[0]`, or to an alias declared in the table's `from`;
+- the resulting table-and-column equals the single `sourceColumns` entry, compared case-insensitively.
+
+Anything else is non-bare and takes the sentinel.
+
+#### F3 — Table-level changes make every column changed
+
+`sources` and `from` decide what the alias points at. A patch touching only `/tables/T/sources` or `/tables/T/from` rebinds every expression in that table while each column still looks unchanged, so every stale risk is restored verbatim — including the absence of one, where the new table's types are lossier.
+
+A column counts as changed when its own `expr` or `sourceColumns` changed, **or** when its table's `sources` or `from` changed.
+
+#### F4 — Defaults and literals are non-bare
+
+C6 says an empty expression with a single source column computes no risk. But a null expression with `default: "'UNKNOWN'"` into `char(3)`, or `default: "GETDATE()"` into `date`, is a real conversion with no text — and so is a literal expression carrying zero source columns.
+
+A non-null `default`, or an expression with zero source columns, is non-bare and takes the sentinel. C6's no-risk case narrows to: expression null **and** default null.
+
+#### F5 — D1's warning compares against ctx.Current, not against the computed risk
+
+`Validate` sees the post-patch node, never the patch. A field-level edit sends only the properties that changed, so the node still carries the **old** risk; a whole-object replace omits the field entirely. Comparing the node against what the engine computes therefore fires on nearly every edit of a risky column — noise on the main human workflow, in one reading, and dead code in the other.
+
+An author **wrote** `typeRisk` only when the node's value is present **and** differs from `ctx.Current`'s value for that column. Absent means not written. Equal to `ctx.Current` means carried through. Compare against `ctx.Current`; never against the computed value.
+
+The same definition governs D5's newly-acknowledged count, or the dry-run output lists every carried acknowledgement as new.
+
+Add a test: an agent patch that sets a `typeRisk` differing from `ctx.Current` on an unchanged column is stored with the engine's value, and the result warns naming that column. Nothing in the current tests, examples or UI writes the field, so without this test the rule is untested.
+
+#### F6 — Invalidation compares a hazard class, not risk text
+
+The profiler samples without an `ORDER BY`, and the truncation text embeds the **observed** maximum length. Two discoveries of unchanged data can therefore produce `"may truncate (source max 300)"` and then `"(source max 297)"`, or flip the sampled-rows suffix. If invalidation compares text, every rediscovery clears every acknowledgement and humans re-acknowledge hazards that did not change.
+
+`TypeCompat` exposes a stable **hazard class** alongside the risk text, and acknowledgement invalidation compares that class rather than the text. This is server-side only, so the JavaScript mirror is unaffected and parity holds.
+
+Compare trimmed expressions when deciding whether one changed, so that reformatting alone does not invalidate an acknowledgement.
+
+Pin it: same declared types with a different sampled maximum leaves the acknowledgement intact; a changed declared target type clears it.
+
+#### F7 — The residual is wider than D3 says
+
+D3 records that a source type change under a custom expression is not re-evaluated. The real residual is larger: **every custom-expression column stored before this amendment carries no risk text and no sentinel**, and D3 keeps it verbatim while it stays unchanged. A hand-written `LEFT(...)` that truncates therefore stays text-less indefinitely. The shared approved fixture's seven custom expressions are exactly this state.
+
+They are not retro-sentinelled: doing so would flag every long-approved expression in every existing project at once, which is the withdrawn rule 4 by a fourth route. They take a sentinel the first time they are edited. State the residual in these terms.
+
+#### F8 — The browser must stop diffing the risk field
+
+The mapping view lists `typeRisk` among the column properties it diffs, so the client will emit an operation for it the moment anything rebuilds a column object — which the acknowledgement UI in the Task 3.5 round will do. Remove `typeRisk` from the diffed column properties. The engine owns it; the browser sends only `riskAck`.
