@@ -6721,3 +6721,41 @@ Identifiers to remove entirely: the acknowledgement field, the class field, the 
 **Do not trust this list either.** It is the second attempt at the same enumeration, and the first was short by nine files. The completion criterion is mechanical: after deletion, a case-insensitive search of the engine and plugin tree for those identifiers returns nothing outside git history. That check does not depend on the list being right, which is the property every enumeration in this document has lacked.
 
 One judgement the search cannot make: `acknowledged` may survive in prose that is still correct — a comment or a playbook sentence about a human having seen a risk, rather than about the deleted field. Read each hit before removing it.
+
+### 13b. The removals the compiler cannot find
+
+The references to the removed mechanism divide in two, and only one half is safe to leave to a sweeping phrase.
+
+**C# identifiers announce themselves.** Deleting the payload fields breaks the build at every use, so "every field, node and helper that carries them" is sufficient for those.
+
+**Strings and JSON compile and survive.** Neither §13 nor §13a named any of them. All of these must go, and three of them change behaviour if they do not:
+
+- **The attention reversal can be undone by a rename.** `ColumnNeedsAttention` is `NeedsReview || HasOpenTypeRisk`, and the risk line is emitted *inside* `Attention()`. Renaming the predicate and dropping its acknowledgement half compiles, reads as correct, and leaves type risks in attention — the whole of §5 undone by a change that looks like tidying. **The risk line moves out of `Attention()` into its own warning class, and the attention predicate stops consulting risks entirely.**
+- **The malformed-payload tests expect the acknowledgement to be rejected.** Once the field is gone those payloads deserialise cleanly and are stripped with a warning, so the tests fail — and the obvious repair is to re-add validation for a field that no longer exists, restoring its door. **Convert them to assert stripped-with-a-warning.**
+- **The packet legend still teaches the old rule to every agent**, describing the acknowledgement as the only way to clear a type risk, with a class line beside it. It compiles, it passes, and the agent reads it every run.
+
+Also surviving, and also to be removed: the playbook's example-patch acknowledgement operations, and its attention, detail-columns, rework and ownership descriptions; the architect tests asserting the acknowledgement sentence, which push toward keeping it; the rework context acknowledgement map and the column node's acknowledgement field; the flow test's acknowledgement patch operations, which pass silently; `TypeCompat`'s five class members rather than the one §13 described, of which three compile unused; and carry-over's class-change clearing and token refresh on the recompute path, which is more than the copying §13 named.
+
+Keep the single sentinel constant of §4.
+
+#### The completion check, corrected
+
+§13a said the search must return nothing outside git history. That is wrong: §13's strip-with-warning implementation and its tests, and §9's approval confirmation text, legitimately contain these terms.
+
+**After removal, a case-insensitive search of the plugin tree for the acknowledgement, class, hazard-class, comparison-helper and acknowledgement-predicate terms returns only (i) the strip-with-warning implementation and its tests, and (ii) §9's confirmation text. The implementer's report lists every remaining hit with a one-line reason. A hit that is neither is residue.**
+
+This is the completion criterion. It does not depend on §13, §13a or this section being complete, which is the property none of the three enumerations had.
+
+### 15a. Correction — the predicate is never used by attention
+
+§15 said the non-blank predicate is used "everywhere: attention, `IsConfident`, the warning lines, the packet list and the approval count."
+
+**`attention` is struck from that list.** §5 says a type risk never creates an attention item, and §17 says the same for the browser. Listing attention among the predicate's users restores the reversed rule inside the section written to prevent contradictions, and the committed code already matches that wrong reading.
+
+The predicate is used by `IsConfident`, the risk warning lines, the packet risk list and the approval count. Never by attention.
+
+### 16a. Three clarifications
+
+- **The strip happens on the node, after the structural errors and before anything reads the risk fields**, so a malformed acknowledgement — an array, a number — is harmless by the time normalisation runs.
+- **The top-level risk list and the rework context maps share the key name**, `typeRisks`, keyed by qualified column name to risk text.
+- **§16's "structural errors"** are those specified under the heading requiring `Validate` to reject what the packet builder cannot process.
