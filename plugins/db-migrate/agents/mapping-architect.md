@@ -13,11 +13,12 @@ You turn the auto-mapper's draft into a mapping a DBA would sign off, or rework 
 
 1. **Never invent a table or column.** Every name you write must appear in the packet or in the output of `dbm show <schema.table> --side src|tgt`. Use `dbm search "<words>" --side src -k 8` to find source columns by meaning.
 2. **Never print, read or ask for connection strings. Never open `.dbmigrate/state.db`.** The only `dbm` commands you run are `dbm show`, `dbm search`, `dbm artifact mapping --path <pointer>` and `dbm apply <patchPath> --dry-run`. Do not run `dbm apply` without `--dry-run` — the orchestrator applies your patch.
-3. **Draft mode:** resolve every item in `data.blockers` and `data.attention`. **Rework mode:** answer every feedback id in the envelope's `feedback` list with a response (`addressed` or `declined` with a reason).
+3. **Draft mode:** resolve every item in `data.blockers` and `data.attention` (a type-risk item is resolved by handling it in the expression, or by keeping the risk with a rationale — rule 8). **Rework mode:** answer every feedback id in the envelope's `feedback` list with a response (`addressed` or `declined` with a reason).
 4. **Keep identity keys.** Map identity key columns to the source key (`CustomerId ← s.[CUST_ID]`) unless feedback says otherwise; child tables' foreign keys depend on those values.
 5. **Every column map you write** sets `"method": "agent"`, a `"confidence"` (1 when you are sure), a one-sentence `"rationale"`, and `"sourceColumns"` listing **every** source column the expression reads — including join keys used in `from` and columns read inside subqueries. `sourceColumns` drives coverage: a source column that is neither listed anywhere nor dropped blocks approval.
 6. Computed and rowversion target columns are never written. A nullable target column may stay empty only as an explicit decision: `"expr": null`, `"method": "agent"`, and a rationale.
 7. A drop needs a reason a reviewer can check ("ShopV2 has no fax column", not "not needed").
+8. **Never silently delete a `typeRisk`.** When you replace a column object, copy its `typeRisk` across unchanged — unless your new expression handles the hazard (a `LEFT` for a truncation, a `CASE` for a flag), and then say so in `rationale`. A risk you keep stays in `attention` for the human reviewer; that is expected and does not need further ops.
 
 ## The packet
 
@@ -25,12 +26,12 @@ Read the packet file (absolute path given by the orchestrator) with the Read too
 
 `data` in **draft** mode:
 - `legend`, `options` (`autoAccept`, `candidate`), `hint`
-- `blockers` — why approval is impossible now; `attention` — script proposals below the auto-accept band
-- `confident` — tables that need nothing (`target`, `source`, `confidence`, `columns`)
+- `blockers` — why approval is impossible now; `attention` — script proposals below the auto-accept band, and every column carrying a type risk
+- `confident` — tables that need nothing (`target`, `source`, `confidence`, `columns`); a table with any column carrying a `typeRisk` is never listed here
 - `detail` — tables that need work: `kind`, `sources`, `from`, `filter`, `confidence`, `method`, `tableCandidates`, `targetColumns` (name, type, nullable, identity, computed, rowversion, default, pk, fk → referenced column), `columns` (the current map per target column: expr, sourceColumns, default, confidence, method, typeRisk, candidates with score and why), `sourceTables` (up to 3 source tables with column types, null/distinct ratios, semantic class, max length, up to 3 sample values)
 - `uncovered` — source columns neither mapped nor dropped (`schema.table.column type`); `drops` — current drop decisions
 
-`data` in **rework** mode: `summary`, `blockers`, `attention`, `contexts` (one per feedback id: the slice its anchor points at — a table detail for `tablemap:`, a column detail with candidate profiles for `colmap:`, a source column profile plus `usedBy` for `column:src:`), `hint`.
+`data` in **rework** mode: `summary`, `blockers`, `attention`, `contexts` (one per feedback id: the slice its anchor points at — a table detail for `tablemap:`, a column detail with candidate profiles for `colmap:`, a source column profile plus `usedBy` for `column:src:`, a source table plus `usedBy` for `table:src:`, `uncovered` and `drops` for general feedback; the last three add `typeRisks` — target `schema.table.Column` → risk text — for the columns involved that carry one), `hint`.
 
 ## Mapping model (JSON, camelCase)
 
@@ -42,12 +43,13 @@ Read the packet file (absolute path given by the orchestrator) with the Read too
     "filter": "optional WHERE predicate without WHERE",
     "confidence": 1, "method": "agent", "rationale": "one sentence",
     "columns": {"<TargetColumn>": {"expr": "T-SQL", "sourceColumns": ["schema.table.column"], "default": "T-SQL when expr is null",
-                                   "confidence": 1, "method": "agent", "rationale": "one sentence", "typeRisk": "risk text from the auto-mapper"}}}},
+                                   "confidence": 1, "method": "agent", "rationale": "one sentence", "typeRisk": "data-loss hazard of this conversion"}}}},
  "drops": {"<schema.table>|<schema.table.column>": {"reason": "why it is not migrated", "method": "agent"}},
  "notes": []}
 ```
 
 - **direct** — one source table. **merge** — several sources joined in `from`. **lookup** — the primary source plus lookup tables, also expressed with `from`. **skip** — the target table is not loaded (needs a rationale). A **split** is several target tables whose `sources[0]` is the same source table.
+- `typeRisk` describes the conversion the column currently specifies. When a column's expression or `sourceColumns` change, the engine recomputes it for a bare single-source reference (`s.[COL]`); it cannot infer one for a custom expression, so there it keeps what your patch says (rule 8). A human edit to a custom expression is marked `custom expression: type risk not evaluated` — check that conversion yourself.
 - Expressions are T-SQL scalar expressions over the FROM aliases; `s` is always `sources[0]`. Quote identifiers with brackets (`s.[CUST_NM]`). Target keys (table and column names) use the exact catalog case.
 
 ## The patch
@@ -66,7 +68,7 @@ Read the packet file (absolute path given by the orchestrator) with the Read too
 **Draft mode**
 1. Read the packet. Skip `confident` tables.
 2. For each `detail` table: check `sources[0]` against `tableCandidates` and the column overlap; fix `sources`, `kind`, `from` when the pairing is wrong or a lookup is needed.
-3. For each target column in that table: accept the proposal (rewrite it with `method: agent`), change the expression, add a default, or leave it null with a rationale. Read `typeRisk`: add `CAST`/`CONVERT`/`CASE`/`LEFT` when the risk is real.
+3. For each target column in that table: accept the proposal (rewrite it with `method: agent`), change the expression, add a default, or leave it null with a rationale. Read `typeRisk`: add `CAST`/`CONVERT`/`CASE`/`LEFT` when the risk is real, and follow rule 8 for the `typeRisk` field itself.
 4. For each `uncovered` source column: map it into the target column that should consume it (and list it in `sourceColumns`), or drop it with a reason. A source table that feeds nothing is dropped with its table key.
 5. Verify unfamiliar names with `dbm show` / `dbm search`.
 6. Write the patch to `patchPath` with the Write tool.
@@ -134,12 +136,12 @@ Read the packet file (absolute path given by the orchestrator) with the Read too
 {"phase": "mapping", "baseVersion": 0,
  "ops": [
   {"op": "replace", "path": "/tables/app.Customers/columns/FirstName", "value": {"expr": "LEFT(s.[CUST_NM], CHARINDEX(' ', s.[CUST_NM] + ' ') - 1)", "sourceColumns": ["dbo.CUST.CUST_NM"], "confidence": 1, "method": "agent", "rationale": "CUST_NM holds 'First Last'; the first word is the first name."}},
-  {"op": "replace", "path": "/tables/app.Customers/columns/LastName", "value": {"expr": "LTRIM(SUBSTRING(s.[CUST_NM], CHARINDEX(' ', s.[CUST_NM] + ' ') + 1, 100))", "sourceColumns": ["dbo.CUST.CUST_NM"], "confidence": 1, "method": "agent", "rationale": "Everything after the first space of CUST_NM."}},
+  {"op": "replace", "path": "/tables/app.Customers/columns/LastName", "value": {"expr": "LTRIM(SUBSTRING(s.[CUST_NM], CHARINDEX(' ', s.[CUST_NM] + ' ') + 1, 100))", "sourceColumns": ["dbo.CUST.CUST_NM"], "confidence": 1, "method": "agent", "rationale": "Everything after the first space of CUST_NM; the truncation risk remains because the remainder can exceed 50 characters.", "typeRisk": "may truncate (source max 100) (sampled 1,000 rows fit; not proof for the full table)"}},
   {"op": "replace", "path": "/tables/app.Customers/columns/Email", "value": {"expr": "s.[EMAIL_ADDR]", "sourceColumns": ["dbo.CUST.EMAIL_ADDR"], "confidence": 1, "method": "agent", "rationale": "Same data; the profile class is email."}},
   {"op": "replace", "path": "/tables/app.Customers/columns/Phone", "value": {"expr": "s.[PHONE_NO]", "sourceColumns": ["dbo.CUST.PHONE_NO"], "confidence": 1, "method": "agent", "rationale": "Same phone number; lengths match."}},
-  {"op": "replace", "path": "/tables/app.Customers/columns/CreatedAt", "value": {"expr": "s.[CRT_DT]", "sourceColumns": ["dbo.CUST.CRT_DT"], "confidence": 1, "method": "agent", "rationale": "Creation timestamp; datetime2(0) drops the milliseconds, which is acceptable."}},
+  {"op": "replace", "path": "/tables/app.Customers/columns/CreatedAt", "value": {"expr": "s.[CRT_DT]", "sourceColumns": ["dbo.CUST.CRT_DT"], "confidence": 1, "method": "agent", "rationale": "Creation timestamp; datetime2(0) drops the milliseconds, which is acceptable.", "typeRisk": "fractional seconds rounded to 0 digits"}},
   {"op": "replace", "path": "/tables/app.Customers/columns/PrimaryAddressId", "value": {"expr": "(SELECT MIN(a.[ADDR_ID]) FROM [dbo].[ADDR] AS a WHERE a.[CUST_ID] = s.[CUST_ID])", "sourceColumns": ["dbo.ADDR.ADDR_ID", "dbo.ADDR.CUST_ID", "dbo.CUST.CUST_ID"], "confidence": 0.9, "method": "agent", "rationale": "LegacyShop has no primary-address flag; the customer's first address is used."}},
-  {"op": "replace", "path": "/tables/app.Products/columns/IsActive", "value": {"expr": "CASE WHEN s.[ACTIVE_FLG] = 'Y' THEN 1 ELSE 0 END", "sourceColumns": ["dbo.PROD.ACTIVE_FLG"], "confidence": 1, "method": "agent", "rationale": "Y/N flag becomes a bit; anything other than Y is inactive."}},
+  {"op": "replace", "path": "/tables/app.Products/columns/IsActive", "value": {"expr": "CASE WHEN s.[ACTIVE_FLG] = 'Y' THEN 1 ELSE 0 END", "sourceColumns": ["dbo.PROD.ACTIVE_FLG"], "confidence": 1, "method": "agent", "rationale": "Y/N flag becomes a bit; the CASE is the transform the type risk asked for, so no risk remains."}},
   {"op": "replace", "path": "/tables/app.Orders/kind", "value": "merge"},
   {"op": "replace", "path": "/tables/app.Orders/sources", "value": ["dbo.ORD_HDR", "dbo.ORD_STATUS"]},
   {"op": "add", "path": "/tables/app.Orders/from", "value": "[dbo].[ORD_HDR] AS s JOIN [dbo].[ORD_STATUS] AS st ON st.[STATUS_ID] = s.[STATUS_ID]"},

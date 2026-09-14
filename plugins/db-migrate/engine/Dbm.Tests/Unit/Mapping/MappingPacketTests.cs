@@ -131,6 +131,136 @@ public class MappingPacketTests
         Assert.Equal(["app.Customers.FirstName", "app.Customers.LastName"], node["usedBy"]!.AsArray().Select(n => (string)n!).ToArray());
     }
 
+    private const string Truncates = "may truncate (source max 300)";
+
+    /// <summary>An Approved() copy (not a fixture change) where Orders.Comment has the auto-mapper's B1 shape: a fuzzy match
+    /// at or above the auto-accept band that carries a truncation risk.</summary>
+    private static MappingPayload WithRiskyConfidentComment()
+    {
+        var m = SampleMappings.Approved();
+        var comment = m.Tables["app.Orders"].Columns["Comment"];
+        (comment.Method, comment.Confidence, comment.TypeRisk) = (MapMethod.Fuzzy, 0.9, Truncates);
+        return m;
+    }
+
+    [Fact]
+    public void A_high_confidence_risky_column_details_its_table_and_carries_the_risk()
+    {
+        var data = Draft(WithRiskyConfidentComment());
+
+        Assert.Equal(5, data["confident"]!.AsArray().Count);
+        Assert.DoesNotContain(data["confident"]!.AsArray(), n => (string?)n!["target"] == "app.Orders");
+        var detail = Assert.Single(data["detail"]!.AsArray())!;
+        Assert.Equal("app.Orders", (string?)detail["target"]);
+        Assert.Equal(Truncates, (string?)detail["columns"]!["Comment"]!["typeRisk"]);
+        Assert.Contains($"app.Orders.Comment: type risk: {Truncates}", Texts(data["attention"]));
+    }
+
+    [Fact]
+    public void A_decided_column_carrying_a_risk_still_details_its_table()
+    {
+        var m = SampleMappings.Approved();
+        m.Tables["app.Orders"].Columns["Comment"].TypeRisk = Truncates;   // method human, confidence 1
+
+        Assert.Equal(5, Draft(m)["confident"]!.AsArray().Count);
+    }
+
+    [Fact]
+    public void A_skipped_table_carrying_a_risk_stays_confident()
+    {
+        var m = SampleMappings.Approved();
+        m.Tables["app.Orders"].Kind = "skip";
+        m.Tables["app.Orders"].Columns["Comment"].TypeRisk = Truncates;
+        m.Drops["dbo.ORD_HDR"] = new DropDecision("test", MapMethod.Human);
+        m.Drops["dbo.ORD_STATUS"] = new DropDecision("test", MapMethod.Human);
+
+        var data = Draft(m);
+
+        Assert.Contains(data["confident"]!.AsArray(), n => (string?)n!["target"] == "app.Orders");
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("  ")]
+    public void A_blank_risk_neither_details_the_table_nor_renders(string blank)
+    {
+        var m = SampleMappings.Approved();
+        m.Tables["app.Orders"].Columns["Comment"].TypeRisk = blank;
+        Assert.Equal(6, Draft(m)["confident"]!.AsArray().Count);
+
+        m.Tables["app.Orders"].Columns["Comment"].Method = MapMethod.Fuzzy;
+        m.Tables["app.Orders"].Columns["Comment"].Confidence = 0.5;
+        var detail = Assert.Single(Draft(m)["detail"]!.AsArray())!;
+        Assert.Null(detail["columns"]!["Comment"]!["typeRisk"]);
+        Assert.False(detail["columns"]!.AsObject()["Comment"]!.AsObject().ContainsKey("typeRisk"));
+    }
+
+    [Fact]
+    public void Rework_contexts_carry_the_risk_on_every_anchor_kind()
+    {
+        var m = WithRiskyConfidentComment();
+        var feedback = new[]
+        {
+            Feedback(1, "colmap:app.Orders.Comment"),
+            Feedback(2, "column:src:dbo.ORD_HDR.CMNT"),
+            Feedback(3, "table:src:dbo.ORD_HDR"),
+            Feedback(4, null),
+            Feedback(5, "tablemap:app.Orders"),
+            Feedback(6, "column:src:dbo.CUST.CUST_NM"),
+        };
+
+        var contexts = MappingPacket.Rework(m, SampleCatalogs.Source(), SampleCatalogs.Target(), Options, feedback)["contexts"]!.AsArray();
+
+        Assert.Equal(Truncates, (string?)contexts[0]!["context"]!["map"]!["typeRisk"]);
+        Assert.Equal(Truncates, (string?)contexts[1]!["context"]!["typeRisks"]!["app.Orders.Comment"]);
+        Assert.Equal(Truncates, (string?)contexts[2]!["context"]!["typeRisks"]!["app.Orders.Comment"]);
+        Assert.Equal(Truncates, (string?)contexts[3]!["context"]!["typeRisks"]!["app.Orders.Comment"]);
+        Assert.Equal(Truncates, (string?)contexts[4]!["context"]!["columns"]!["Comment"]!["typeRisk"]);
+        Assert.Null(contexts[5]!["context"]!["typeRisks"]);   // unrelated source column: key omitted
+    }
+
+    [Fact]
+    public void Auto_draft_risky_detail_columns_carry_their_risk()
+    {
+        var m = AutoMapper.Map(SampleCatalogs.Source(), SampleCatalogs.Target(), Synonyms.Default(), Options);
+
+        var data = Draft(m);
+
+        var risky = m.Tables.SelectMany(t => t.Value.Columns.Where(c => MappingValidator.HasTypeRisk(c.Value))
+            .Select(c => (Table: t.Key, Column: c.Key, c.Value.TypeRisk))).ToList();
+        Assert.NotEmpty(risky);
+        foreach (var (table, column, risk) in risky)
+        {
+            var detail = data["detail"]!.AsArray().Single(d => (string?)d!["target"] == table)!;
+            Assert.Equal(risk, (string?)detail["columns"]![column]!["typeRisk"]);
+        }
+    }
+
+    [Fact]
+    public void Table_detail_without_a_map_omits_the_map_key()
+    {
+        var tgt = SampleCatalogs.Target();
+        var node = MappingPacket.TableDetail(tgt.FindTable("app.Orders")!, null, SampleCatalogs.Source());
+        Assert.False(node.ContainsKey("map"));
+        Assert.Empty(node["columns"]!.AsObject());
+    }
+
+    [Fact]
+    public void Public_packet_statics_reject_null_arguments()
+    {
+        var (m, src, tgt) = (SampleMappings.Approved(), SampleCatalogs.Source(), SampleCatalogs.Target());
+        var table = tgt.FindTable("app.Orders")!;
+        Assert.Throws<ArgumentNullException>(() => MappingPacket.Summary(null!, src, tgt, Options));
+        Assert.Throws<ArgumentNullException>(() => MappingPacket.Draft(m, null!, tgt, Options));
+        Assert.Throws<ArgumentNullException>(() => MappingPacket.Rework(m, src, tgt, Options, null!));
+        Assert.Throws<ArgumentNullException>(() => MappingPacket.Resolve("general", m, src, tgt, null!));
+        Assert.Throws<ArgumentNullException>(() => MappingPacket.TableDetail(null!, null, src));
+        Assert.Throws<ArgumentNullException>(() => MappingPacket.ColumnDetail(table, null!, m, src));
+        Assert.Throws<ArgumentNullException>(() => MappingPacket.TargetColumn(table, null!));
+        Assert.Throws<ArgumentNullException>(() => MappingPacket.SourceTable(null!));
+        Assert.Throws<ArgumentNullException>(() => MappingPacket.SourceColumn(null!, table.Columns[0]));
+    }
+
     [Fact]
     public void Summary_counts_tables_columns_drops_attention_and_blockers()
     {

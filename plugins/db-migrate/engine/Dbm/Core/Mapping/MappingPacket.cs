@@ -29,6 +29,7 @@ public static class MappingPacket
 
     public static string Summary(MappingPayload m, CatalogSnapshot src, CatalogSnapshot tgt, MatchOptions options)
     {
+        Guard(m, src, tgt, options);
         var live = m.Tables.Values.Where(t => t.Kind != "skip").ToList();
         var tables = live.Count(t => t.Sources.Count > 0);
         var columns = live.Sum(t => t.Columns.Values.Count(c => !string.IsNullOrWhiteSpace(c.Expr)));
@@ -39,6 +40,7 @@ public static class MappingPacket
 
     public static JsonObject Draft(MappingPayload m, CatalogSnapshot src, CatalogSnapshot tgt, MatchOptions options)
     {
+        Guard(m, src, tgt, options);
         var blockers = MappingValidator.Blockers(m, src, tgt);
         var attention = MappingValidator.Attention(m, options);
         var confident = new JsonArray();
@@ -74,6 +76,8 @@ public static class MappingPacket
     public static JsonObject Rework(MappingPayload m, CatalogSnapshot src, CatalogSnapshot tgt, MatchOptions options,
         IReadOnlyList<FeedbackRow> feedback)
     {
+        Guard(m, src, tgt, options);
+        ArgumentNullException.ThrowIfNull(feedback);
         var contexts = new JsonArray();
         foreach (var f in feedback)
         {
@@ -98,8 +102,13 @@ public static class MappingPacket
     /// column:src: → source column profile and usage; table:src: → source table and usage; anything else → overall uncovered list.</summary>
     public static JsonNode? Resolve(string? anchor, MappingPayload m, CatalogSnapshot src, CatalogSnapshot tgt, MatchOptions options)
     {
+        Guard(m, src, tgt, options);
         if (anchor is null or "general" or "narrative")
-            return new JsonObject { ["uncovered"] = Uncovered(m, src), ["drops"] = Drops(m) };
+        {
+            var general = new JsonObject { ["uncovered"] = Uncovered(m, src), ["drops"] = Drops(m) };
+            AddTypeRisks(general, m, (_, _, _) => true);
+            return general;
+        }
         if (TryStrip(anchor, "tablemap:", out var tkey) || TryStrip(anchor, "table:tgt:", out tkey))
         {
             var t = tgt.FindTable(tkey);
@@ -117,6 +126,7 @@ public static class MappingPacket
             var (table, column) = hit.Value;
             var key = $"{table.Key}.{column.Name}";
             var obj = new JsonObject { ["table"] = table.Key, ["column"] = SourceColumn(table, column), ["usedBy"] = UsedBy(m, key) };
+            AddTypeRisks(obj, m, (_, _, cm) => cm.SourceColumns.Contains(key, StringComparer.OrdinalIgnoreCase));
             if ((DropOf(m, key) ?? DropOf(m, table.Key)) is { } drop) obj["drop"] = drop.Reason;
             return obj;
         }
@@ -126,6 +136,9 @@ public static class MappingPacket
             if (table is null) return Unknown(anchor);
             var obj = SourceTable(table);
             obj["usedBy"] = Strings(m.Tables.Where(kv => kv.Value.Sources.Contains(table.Key, StringComparer.OrdinalIgnoreCase)).Select(kv => kv.Key));
+            AddTypeRisks(obj, m, (_, map, cm) =>
+                map.Sources.Contains(table.Key, StringComparer.OrdinalIgnoreCase)
+                || cm.SourceColumns.Any(sc => MappingValidator.ResolveSourceColumn(src, sc)?.Table.Key == table.Key));
             if (DropOf(m, table.Key) is { } drop) obj["drop"] = drop.Reason;
             return obj;
         }
@@ -134,9 +147,10 @@ public static class MappingPacket
 
     public static JsonObject TableDetail(TableInfo t, TableMap? map, CatalogSnapshot src)
     {
+        ArgumentNullException.ThrowIfNull(t);
+        ArgumentNullException.ThrowIfNull(src);
         var obj = new JsonObject { ["target"] = t.Key };
-        if (map is null) obj["map"] = null;
-        else
+        if (map is not null)   // no map: the key is omitted (targetColumns and an empty columns object say enough)
         {
             obj["kind"] = map.Kind;
             obj["sources"] = Strings(map.Sources);
@@ -169,6 +183,10 @@ public static class MappingPacket
 
     public static JsonObject ColumnDetail(TableInfo t, ColumnInfo c, MappingPayload m, CatalogSnapshot src)
     {
+        ArgumentNullException.ThrowIfNull(t);
+        ArgumentNullException.ThrowIfNull(c);
+        ArgumentNullException.ThrowIfNull(m);
+        ArgumentNullException.ThrowIfNull(src);
         var map = MappingValidator.FindTableMap(m, t.Key);
         var cm = map is null ? null : MappingValidator.FindColumnMap(map, c.Name);
         var obj = new JsonObject { ["target"] = t.Key, ["column"] = TargetColumn(t, c) };
@@ -193,6 +211,8 @@ public static class MappingPacket
 
     public static JsonObject TargetColumn(TableInfo t, ColumnInfo c)
     {
+        ArgumentNullException.ThrowIfNull(t);
+        ArgumentNullException.ThrowIfNull(c);
         var obj = new JsonObject { ["name"] = c.Name, ["type"] = c.TypeDisplay, ["nullable"] = c.IsNullable };
         if (c.IsIdentity) obj["identity"] = true;
         if (c.IsComputed) obj["computed"] = true;
@@ -203,15 +223,21 @@ public static class MappingPacket
         return obj;
     }
 
-    public static JsonObject SourceTable(TableInfo s) => new()
+    public static JsonObject SourceTable(TableInfo s)
     {
-        ["key"] = s.Key,
-        ["rows"] = s.Rows,
-        ["columns"] = new JsonArray(s.Columns.OrderBy(c => c.Ordinal).Select(c => (JsonNode)SourceColumn(s, c)).ToArray())
-    };
+        ArgumentNullException.ThrowIfNull(s);
+        return new JsonObject
+        {
+            ["key"] = s.Key,
+            ["rows"] = s.Rows,
+            ["columns"] = new JsonArray(s.Columns.OrderBy(c => c.Ordinal).Select(c => (JsonNode)SourceColumn(s, c)).ToArray())
+        };
+    }
 
     public static JsonObject SourceColumn(TableInfo s, ColumnInfo c)
     {
+        ArgumentNullException.ThrowIfNull(s);
+        ArgumentNullException.ThrowIfNull(c);
         var obj = new JsonObject { ["name"] = c.Name, ["type"] = c.TypeDisplay, ["nullable"] = c.IsNullable };
         if (s.PrimaryKey?.Columns.Contains(c.Name, StringComparer.OrdinalIgnoreCase) == true) obj["pk"] = true;
         if (FkRef(s, c) is { } fk) obj["fk"] = fk;
@@ -233,18 +259,42 @@ public static class MappingPacket
         if (cm.Default is not null) obj["default"] = cm.Default;
         obj["confidence"] = R(cm.Confidence);
         obj["method"] = EnumText.ToText(cm.Method);
-        if (cm.TypeRisk is not null) obj["typeRisk"] = cm.TypeRisk;
+        if (MappingValidator.HasTypeRisk(cm)) obj["typeRisk"] = cm.TypeRisk;
         if (cm.Rationale is not null) obj["rationale"] = cm.Rationale;
         if (cm.Candidates is { Count: > 0 }) obj["candidates"] = Candidates(cm.Candidates);
         return obj;
     }
 
+    /// <summary>INVARIANT: a column's type risk reaches the agent whenever present, so a table carrying one is never summarised
+    /// as confident — whatever its method, confidence or who decided it. The single exemption is kind "skip": a skipped table
+    /// loads no data, so there is no conversion to be risky about.</summary>
     private static bool IsConfident(TableInfo t, TableMap map, List<string> blockers, MatchOptions options)
     {
         if (blockers.Any(b => Mentions(b, t.Key))) return false;
         if (map.Kind == "skip") return true;
+        if (map.Columns.Values.Any(MappingValidator.HasTypeRisk)) return false;
         if (map.Sources.Count == 0 || MappingValidator.NeedsReview(map.Method, map.Confidence, options)) return false;
         return !map.Columns.Values.Any(c => MappingValidator.NeedsReview(c.Method, c.Confidence, options));
+    }
+
+    /// <summary>Adds <c>typeRisks: {"schema.table.Column": risk}</c> for every column selected by <paramref name="include"/> that
+    /// carries a type risk; omitted when there are none. Rework contexts that name target columns only by key use this so the
+    /// risk is not lost on the rework path.</summary>
+    private static void AddTypeRisks(JsonObject obj, MappingPayload m, Func<string, TableMap, ColumnMap, bool> include)
+    {
+        var risks = new JsonObject();
+        foreach (var (tableKey, map) in m.Tables)
+            foreach (var (name, cm) in map.Columns)
+                if (MappingValidator.HasTypeRisk(cm) && include(tableKey, map, cm)) risks[$"{tableKey}.{name}"] = cm.TypeRisk;
+        if (risks.Count > 0) obj["typeRisks"] = risks;
+    }
+
+    private static void Guard(MappingPayload m, CatalogSnapshot src, CatalogSnapshot tgt, MatchOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(m);
+        ArgumentNullException.ThrowIfNull(src);
+        ArgumentNullException.ThrowIfNull(tgt);
+        ArgumentNullException.ThrowIfNull(options);
     }
 
     private static bool Mentions(string item, string tableKey) =>

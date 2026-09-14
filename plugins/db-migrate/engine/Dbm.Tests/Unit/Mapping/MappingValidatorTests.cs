@@ -259,13 +259,82 @@ public class MappingValidatorTests
     }
 
     [Fact]
-    public void Null_sources_and_columns_collections_from_json_are_treated_as_empty()
+    public void Null_sources_and_columns_collections_from_json_are_errors_and_do_not_throw()
     {
+        // Task 3.4 fix round 1 (B2): tolerating a null collection is not accepting it — the packet builder dereferences both.
         var json = "{\"tables\":{\"app.Products\":{\"kind\":\"direct\",\"sources\":null,\"columns\":null}},\"drops\":{}}";
         var m = Json.Deserialize<MappingPayload>(json);
 
-        Assert.Empty(MappingValidator.Errors(m, SampleCatalogs.Source(), SampleCatalogs.Target()));
+        Assert.Equal(["app.Products: sources must be an array", "app.Products: columns must be an object"],
+            MappingValidator.Errors(m, SampleCatalogs.Source(), SampleCatalogs.Target()));
         Assert.Contains(Blockers(m), b => b.StartsWith("app.Products: no source table"));
+    }
+
+    [Theory]
+    [InlineData(MapMethod.Exact, 1.0)]
+    [InlineData(MapMethod.Human, 1.0)]
+    [InlineData(MapMethod.Agent, 1.0)]
+    [InlineData(MapMethod.Fuzzy, 0.95)]
+    public void A_column_carrying_a_type_risk_is_attention_whatever_its_method_and_confidence(MapMethod method, double confidence)
+    {
+        var m = SampleMappings.Approved();
+        var comment = m.Tables["app.Orders"].Columns["Comment"];
+        (comment.Method, comment.Confidence, comment.TypeRisk) = (method, confidence, "may truncate (source max 300)");
+
+        Assert.Equal(["app.Orders.Comment: type risk: may truncate (source max 300)"], MappingValidator.Attention(m, Options));
+        Assert.True(MappingValidator.ColumnNeedsAttention(comment, Options));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void A_blank_type_risk_is_no_risk(string? risk)
+    {
+        var m = SampleMappings.Approved();
+        m.Tables["app.Orders"].Columns["Comment"].TypeRisk = risk;
+
+        Assert.False(MappingValidator.HasTypeRisk(m.Tables["app.Orders"].Columns["Comment"]));
+        Assert.Empty(MappingValidator.Attention(m, Options));
+    }
+
+    [Fact]
+    public void A_column_below_the_band_with_a_type_risk_is_listed_once()
+    {
+        var m = SampleMappings.Approved();
+        var comment = m.Tables["app.Orders"].Columns["Comment"];
+        (comment.Method, comment.Confidence, comment.TypeRisk) = (MapMethod.Fuzzy, 0.5, "may truncate (source max 300)");
+
+        Assert.Equal(["app.Orders.Comment: s.[CMNT] needs review (confidence 0.50, fuzzy)"], MappingValidator.Attention(m, Options));
+    }
+
+    [Theory]
+    [InlineData("s.[CMNT]", "CMNT")]
+    [InlineData("  s . [CMNT]  ", "CMNT")]
+    [InlineData("s.CMNT", "CMNT")]
+    [InlineData("[CMNT]", "CMNT")]
+    [InlineData("CMNT", "CMNT")]
+    [InlineData("[odd]]name]", "odd]name")]
+    [InlineData("st.[STATUS_CD]", "STATUS_CD")]
+    [InlineData("CAST(s.[CMNT] AS nvarchar(200))", null)]
+    [InlineData("LEFT(s.[CMNT], 200)", null)]
+    [InlineData("'N/A'", null)]
+    [InlineData("s.[A] + s.[B]", null)]
+    [InlineData("", null)]
+    [InlineData(null, null)]
+    public void BareColumnName_recognises_only_a_single_column_reference(string? expr, string? expected) =>
+        Assert.Equal(expected, MappingValidator.BareColumnName(expr));
+
+    [Fact]
+    public void Public_validator_methods_reject_null_arguments()
+    {
+        var src = SampleCatalogs.Source();
+        var tgt = SampleCatalogs.Target();
+        Assert.Throws<ArgumentNullException>(() => MappingValidator.Errors(null!, src, tgt));
+        Assert.Throws<ArgumentNullException>(() => MappingValidator.Blockers(SampleMappings.Approved(), null!, tgt));
+        Assert.Throws<ArgumentNullException>(() => MappingValidator.Attention(SampleMappings.Approved(), null!));
+        Assert.Throws<ArgumentNullException>(() => MappingValidator.UncoveredSourceColumns(null!, src));
+        Assert.Throws<ArgumentNullException>(() => MappingValidator.FindTableMap(null!, "app.Orders"));
     }
 
     [Fact]
