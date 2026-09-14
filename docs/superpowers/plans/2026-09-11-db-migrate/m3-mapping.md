@@ -6789,3 +6789,11 @@ Test it on the failing path rather than the simple one: rediscovery changes a ke
 §2 case (2) tests `expr` null and `default` **null**. An empty or whitespace default therefore falls to the catch-all and is stored with the sentinel, reading as "not evaluated: custom expression" for a column that has no expression and no usable default. The blocker rules already treat such a column as having no default, so the two disagree.
 
 **Case (2) is `expr` blank and `default` blank**, using the same present-and-not-whitespace predicate as everywhere else in this model.
+
+### 13d. An absence assertion is a guard only if a mutation defeats it
+
+§13c says a reference that only asserts a field is absent feeds nothing and guards everything. That is too generous. **An absence assertion goes stale when the thing it inspects cannot contain the field by construction** — asserting absence in a JSON string serialised from a typed model with no such property passes whatever happens, including if the mechanism returns by a different path.
+
+**An absence assertion counts as a guard only if a mutation that reintroduces the mechanism makes it fail.** If no such mutation exists, the assertion is decoration: it should be deleted or replaced by one that bites.
+
+The same test applies to any assertion of a negative, not only to these. A test that passes by construction reads exactly like a test that passes because the property holds, and only a mutation distinguishes them.
