@@ -9,6 +9,13 @@
     try { fromQuery = new URLSearchParams(window.location.search).get('t'); } catch (e) { fromQuery = null; }
     if (fromQuery) {
       try { sessionStorage.setItem(KEY, fromQuery); } catch (e) { /* storage blocked */ }
+      // The token grants full API access: strip it from the address bar/history once it's saved, keeping the path,
+      // any other query params and the "#/phase" hash so a reload still returns to the same phase.
+      try {
+        var url = new URL(window.location.href);
+        url.searchParams.delete('t');
+        window.history.replaceState(null, '', url.pathname + url.search + url.hash);
+      } catch (e) { /* history/URL blocked: token stays in the bar for this load */ }
       return fromQuery;
     }
     try { return sessionStorage.getItem(KEY) || ''; } catch (e) { return ''; }
