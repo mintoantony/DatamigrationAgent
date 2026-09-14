@@ -7,10 +7,6 @@ namespace Dbm.Core.Mapping;
 public static class MappingValidator
 {
     public static readonly IReadOnlyList<string> Kinds = ["direct", "merge", "lookup", "skip"];
-
-    /// <summary>The typeRisk dbm stores when a changed column's conversion cannot be evaluated. An ordinary risk string: it
-    /// flows through <see cref="HasOpenTypeRisk"/> with no special-casing.</summary>
-    public const string UnevaluatedRisk = TypeCompat.UnevaluatedRisk;
     private static readonly StringComparer Ci = StringComparer.OrdinalIgnoreCase;
 
     /// <summary>Errors reject a payload. INVARIANT: any payload with no errors can be processed by MappingPacket (Summary, Draft,
@@ -104,8 +100,9 @@ public static class MappingValidator
         return blockers;
     }
 
-    /// <summary>One entry per table and per column that needs a reviewer's eye. A column is attention when
-    /// <see cref="ColumnNeedsAttention"/> is true; the JS mapping view mirrors that predicate.</summary>
+    /// <summary>Attention is the confidence band only: one entry per table and per column whose script proposal is below the
+    /// auto-accept band. A type risk never creates an attention item — risks are their own warning class, see
+    /// <see cref="RiskWarnings"/>.</summary>
     public static List<string> Attention(MappingPayload m, MatchOptions options)
     {
         ArgumentNullException.ThrowIfNull(m);
@@ -123,15 +120,10 @@ public static class MappingValidator
             }
             foreach (var (name, cm) in ColumnsOf(map).OrderBy(kv => kv.Key, StringComparer.Ordinal))
             {
-                if (cm is null || !ColumnNeedsAttention(cm, options)) continue;
-                // One entry per column. The risk text always comes LAST and verbatim after "type risk: ", so an author can copy it
-                // into riskAck.risk: "<table>.<column>: type risk: <typeRisk>", or the band message followed by "; type risk: <typeRisk>".
-                var risk = HasOpenTypeRisk(cm) ? $"type risk: {cm.TypeRisk}" : null;
-                if (!NeedsReview(cm.Method, cm.Confidence, options)) { list.Add($"{key}.{name}: {risk}"); continue; }
-                var band = cm.Expr is null
+                if (cm is null || !NeedsReview(cm.Method, cm.Confidence, options)) continue;
+                list.Add(cm.Expr is null
                     ? Inv($"{key}.{name}: unmapped (best candidate {cm.Confidence:0.00})")
-                    : Inv($"{key}.{name}: {cm.Expr} needs review (confidence {cm.Confidence:0.00}, {EnumText.ToText(cm.Method)})");
-                list.Add(risk is null ? band : $"{band}; {risk}");
+                    : Inv($"{key}.{name}: {cm.Expr} needs review (confidence {cm.Confidence:0.00}, {EnumText.ToText(cm.Method)})"));
             }
         }
         return list;
@@ -141,24 +133,27 @@ public static class MappingValidator
     public static bool NeedsReview(MapMethod method, double confidence, MatchOptions options) =>
         method is MapMethod.Fuzzy or MapMethod.Vector && confidence < options.AutoAccept;
 
-    /// <summary>Column-level attention: a script proposal below the auto-accept band, OR an open type risk. The type-risk half
-    /// ignores method and confidence (an exact match or a human edit carrying a hazard is attention).</summary>
-    public static bool ColumnNeedsAttention(ColumnMap cm, MatchOptions options) =>
-        NeedsReview(cm.Method, cm.Confidence, options) || HasOpenTypeRisk(cm);
-
-    /// <summary>THE risk predicate (Risk model §3 with G5; JS mirrors this line): typeRisk is present and non-blank, and not
-    /// (riskAck.reason is non-blank and riskAck.risk equals typeRisk exactly). Payload-only. The engine refreshes riskAck.risk to
-    /// the current wording while the hazard class still matches, which is why plain ordinal equality is enough here. The sentinel
-    /// is an ordinary risk. Tolerates any well-formed acknowledgement, including null members.</summary>
-    public static bool HasOpenTypeRisk(ColumnMap? cm) =>
-        !string.IsNullOrWhiteSpace(cm?.TypeRisk)
-        && !(cm.RiskAck is { } ack && !string.IsNullOrWhiteSpace(ack.Reason) && string.Equals(ack.Risk, cm.TypeRisk, StringComparison.Ordinal));
-
-    /// <summary>typeRisk is present and not whitespace.</summary>
+    /// <summary>typeRisk is present and not whitespace. Decides packet confidence, the risk list and the risk warnings.</summary>
     public static bool HasTypeRisk(ColumnMap? cm) => !string.IsNullOrWhiteSpace(cm?.TypeRisk);
 
-    /// <summary>A risk that is present and acknowledged (so not attention): listed for the approver as a set.</summary>
-    public static bool HasAcknowledgedTypeRisk(ColumnMap? cm) => HasTypeRisk(cm) && !HasOpenTypeRisk(cm);
+    /// <summary>The prefix every type-risk warning carries after "&lt;table&gt;.&lt;column&gt;: ".</summary>
+    public const string RiskWarningMarker = "type risk: ";
+
+    /// <summary>The type-risk warning class: one line per column carrying a type risk, in non-skip tables (a skipped table loads
+    /// no data), exactly "&lt;table&gt;.&lt;column&gt;: type risk: &lt;typeRisk&gt;" with the risk text last and verbatim.
+    /// Never part of <see cref="Attention"/>.</summary>
+    public static List<string> RiskWarnings(MappingPayload m)
+    {
+        ArgumentNullException.ThrowIfNull(m);
+        var list = new List<string>();
+        foreach (var (key, map) in (m.Tables ?? new()).OrderBy(kv => kv.Key, StringComparer.Ordinal))
+        {
+            if (map is null || map.Kind == "skip") continue;
+            foreach (var (name, cm) in ColumnsOf(map).OrderBy(kv => kv.Key, StringComparer.Ordinal))
+                if (HasTypeRisk(cm)) list.Add($"{key}.{name}: {RiskWarningMarker}{cm!.TypeRisk}");
+        }
+        return list;
+    }
 
     /// <summary>A column is a bare single-source reference when ALL hold: the expression (trimmed) is exactly
     /// <c>alias.[Column]</c>; the alias is one declared in the table's <c>from</c>, or <c>s</c> for <c>sources[0]</c> when

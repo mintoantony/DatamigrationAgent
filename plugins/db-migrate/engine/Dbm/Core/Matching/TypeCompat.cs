@@ -81,48 +81,9 @@ public static class TypeCompat
     private static readonly TypeCompatResult WideningResult = new(CompatLevel.Widening, 0.9, null);
     private static readonly TypeCompatResult RawBytes = new(CompatLevel.Risky, 0.5, "stored as raw bytes");
 
-    /// <summary>The risk dbm stores for a changed column whose conversion it cannot evaluate. An ordinary risk text.</summary>
+    /// <summary>THE sentinel risk text: what dbm stores for a changed column whose conversion it cannot evaluate. An ordinary
+    /// risk in every other respect. Reference this constant; never copy the literal (later milestones included).</summary>
     public const string UnevaluatedRisk = "not evaluated: custom expression";
-
-    /// <summary>The class of the sentinel. It matches nothing, not even another sentinel.</summary>
-    public const string UnevaluatedClass = "unevaluated";
-
-    private static readonly System.Text.RegularExpressions.Regex SampledSuffix =
-        new(@"\s*\(sampled [^)]*\)", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
-    private static readonly System.Text.RegularExpressions.Regex ObservedLength =
-        new(@"\((?:source max \d+(?: bytes)?|source length unbounded)\)", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
-
-    /// <summary>A stable class for a risk TEXT, derived from the text alone: every sampled-rows suffix "(sampled …)" is removed and
-    /// every source length "(source max N)", "(source max N bytes)" or "(source length unbounded)" becomes
-    /// "(source max)" — the parts a re-profile of unchanged data can flip. Null or blank → null; the sentinel →
-    /// <see cref="UnevaluatedClass"/>. Compare with <see cref="SameHazard"/>, never with ==.</summary>
-    public static string? HazardClass(string? risk)
-    {
-        if (string.IsNullOrWhiteSpace(risk)) return null;
-        if (risk.Trim() == UnevaluatedRisk) return UnevaluatedClass;
-        // Whole-text replacements, not a split on "; ": the sampled suffix itself contains "; ".
-        return ObservedLength.Replace(SampledSuffix.Replace(risk.Trim(), ""), "(source max)");
-    }
-
-    /// <summary>True when two risk texts name the same hazard. Null and the sentinel match nothing.</summary>
-    public static bool SameHazard(string? a, string? b) =>
-        HazardClass(a) is { } ca && ca != UnevaluatedClass && ca == HazardClass(b);
-
-    /// <summary>The stored riskClass: hazard class plus the DECLARED source and target types, e.g.
-    /// "may truncate (source max)|varchar(300)->nvarchar(200)". Never observed lengths or sample counts. Null when there is no
-    /// risk; <see cref="UnevaluatedClass"/> for the sentinel.</summary>
-    public static string? RiskClass(string? risk, ColumnInfo source, ColumnInfo target)
-    {
-        ArgumentNullException.ThrowIfNull(source);
-        ArgumentNullException.ThrowIfNull(target);
-        var hazard = HazardClass(risk);
-        return hazard is null or UnevaluatedClass ? hazard : $"{hazard}|{source.TypeDisplay}->{target.TypeDisplay}";
-    }
-
-    /// <summary>True when two stored riskClass values name the same hazard over the same declared types. Null and the sentinel
-    /// class match nothing.</summary>
-    public static bool SameRiskClass(string? a, string? b) =>
-        a is not null && a != UnevaluatedClass && string.Equals(a, b, StringComparison.Ordinal);
 
     public static TypeCompatResult Check(ColumnType src, ColumnType tgt, ColumnProfile? srcProfile = null)
     {

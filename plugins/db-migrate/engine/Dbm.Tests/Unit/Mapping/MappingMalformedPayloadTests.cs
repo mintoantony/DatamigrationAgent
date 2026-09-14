@@ -33,9 +33,6 @@ public class MappingMalformedPayloadTests
         { "column candidate without source", true },
         { "drop entry null", true },
         { "skip table columns null", true },
-        { "riskAck is a bare string (the old shape)", true },
-        { "riskAck is an array", true },
-        { "riskAck risk is a number", true },
         // Benign shapes: must be accepted AND survive the chain.
         { "tables empty", false },
         { "table candidates null", false },
@@ -45,10 +42,6 @@ public class MappingMalformedPayloadTests
         { "column typeRisk null", false },
         { "notes absent", false },
         { "sources absent", false },
-        { "riskAck null", false },
-        { "riskAck with null members", false },
-        { "riskAck empty object", false },
-        { "riskAck on a risky column with null members", false },
     };
 
     private static JsonObject Mutate(string name)
@@ -82,16 +75,6 @@ public class MappingMalformedPayloadTests
             case "column typeRisk null": comment["typeRisk"] = null; break;
             case "notes absent": root.Remove("notes"); break;
             case "sources absent": orders.Remove("sources"); break;
-            case "riskAck is a bare string (the old shape)": comment["riskAck"] = "accepted"; break;
-            case "riskAck is an array": comment["riskAck"] = new JsonArray("accepted"); break;
-            case "riskAck risk is a number": comment["riskAck"] = JsonNode.Parse("""{"risk":5,"reason":"x"}"""); break;
-            case "riskAck null": comment["riskAck"] = null; break;
-            case "riskAck with null members": comment["riskAck"] = JsonNode.Parse("""{"risk":null,"reason":null}"""); break;
-            case "riskAck empty object": comment["riskAck"] = new JsonObject(); break;
-            case "riskAck on a risky column with null members":
-                comment["typeRisk"] = "may truncate (source max 300)";
-                comment["riskAck"] = JsonNode.Parse("""{"risk":null,"reason":"x"}""");
-                break;
             default: throw new ArgumentException(name);
         }
         return root;
@@ -144,7 +127,6 @@ public class MappingMalformedPayloadTests
         // Evidence that each rejection is needed: bypassing Validate, the chain (or the automap carry-over) throws.
         if (!rejected || name is "table sources contain null" or "column sourceColumns contain null" or "table candidate without source"
                 or "column candidate without source") return;   // these four are rejected as meaningless, not because they throw
-        if (name.StartsWith("riskAck", StringComparison.Ordinal)) return;   // rejected at deserialisation: Validate reports the parse error
         var src = SampleCatalogs.Source();
         var tgt = SampleCatalogs.Target();
         var m = Json.FromNode<MappingPayload>(Mutate(name));
@@ -157,31 +139,6 @@ public class MappingMalformedPayloadTests
             MappingPacket.Rework(m, src, tgt, options, EveryAnchorKind(src, tgt));
             Dbm.Core.Matching.AutoMapper.Map(src, tgt, Dbm.Core.Matching.Synonyms.Default(), options, m);
         });
-    }
-
-    [Fact]
-    public void Odd_but_well_formed_acknowledgements_in_an_artifact_that_skipped_Validate_do_not_throw()
-    {
-        // Carried job drafts are stored without Validate, so the predicate and every consumer must tolerate these shapes.
-        using var project = TempProject.Create();
-        var services = project.Services.WithSampleCatalogs();
-        var module = new MappingModule(services);
-        var root = Json.ToNode(SampleMappings.Approved()).AsObject();
-        var columns = root["tables"]!["app.Orders"]!["columns"]!;
-        columns["Comment"]!["typeRisk"] = "may truncate (source max 300)";
-        columns["Comment"]!["riskAck"] = JsonNode.Parse("""{"risk":null,"reason":null}""");
-        columns["OrderDate"]!["typeRisk"] = "fractional seconds rounded to 0 digits";
-        columns["OrderDate"]!["riskAck"] = new JsonObject();
-        columns["CustomerId"]!["riskAck"] = JsonNode.Parse("""{"risk":"nothing","reason":"no risk here"}""");
-        var row = new ArtifactRow(2, PhaseName.Mapping, 1, root.ToJsonString(Json.Options), "script", null, DateTimeOffset.UtcNow);
-        var feedback = EveryAnchorKind(SampleCatalogs.Source(), SampleCatalogs.Target());
-
-        Assert.Contains("2 attention", module.Summarize(JsonNode.Parse(row.PayloadJson)!));
-        Assert.True(module.NeedsAgent(JsonNode.Parse(row.PayloadJson)!));
-        Assert.NotNull(module.BuildPacket(new ModuleContext { Services = services, Current = row, OpenFeedback = [] }, PacketMode.Draft));
-        Assert.NotNull(module.BuildPacket(new ModuleContext { Services = services, Current = row, OpenFeedback = feedback }, PacketMode.Rework));
-        Dbm.Core.Matching.AutoMapper.Map(SampleCatalogs.Source(), SampleCatalogs.Target(), Dbm.Core.Matching.Synonyms.Default(),
-            new Dbm.Core.Matching.MatchOptions(), Json.Deserialize<MappingPayload>(row.PayloadJson));
     }
 
     [Fact]

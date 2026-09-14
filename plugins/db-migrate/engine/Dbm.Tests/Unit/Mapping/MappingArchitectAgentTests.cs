@@ -47,8 +47,8 @@ public class MappingArchitectAgentTests
     [Fact]
     public void Example_patch_passes_its_own_procedure_through_the_dry_run_path()
     {
-        // E5: through the workflow's dry-run patch path, so MappingModule.Validate and the Risk model run on the playbook's own
-        // example. Step 7 requires every blocker and attention item cleared; acknowledgement output is informational warnings.
+        // Through the workflow's dry-run patch path, so MappingModule.Validate and the risk model run on the playbook's own example.
+        // Step 7: no blockers and no attention remain; type-risk lines are their own class and are expected to remain.
         var text = AgentText();
         var marker = text.IndexOf("<!-- example-patch -->", StringComparison.Ordinal);
         var start = text.IndexOf("```json", marker, StringComparison.Ordinal) + "```json".Length;
@@ -62,19 +62,31 @@ public class MappingArchitectAgentTests
         var dry = services.Workflow.ApplyPatch(patch, dryRun: true);
 
         Assert.True(dry.Ok, string.Join(Environment.NewLine, dry.Errors));
-        var open = dry.Warnings.Where(w => !w.Contains(": risk acknowledged: ", StringComparison.Ordinal)).ToList();
-        Assert.True(open.Count == 0, "still open after the example patch: " + string.Join(Environment.NewLine, open));
-        Assert.Contains(patch.Ops, o => o.Value?.ToJsonString().Contains("\"riskAck\"") == true);
+        Assert.Equal(
+        [
+            "app.Customers.BirthDate: type risk: time part dropped",
+            "app.Customers.CreatedAt: type risk: fractional seconds rounded to 0 digits",
+            $"app.Customers.FirstName: type risk: {TypeCompat.UnevaluatedRisk}",
+            $"app.Customers.LastName: type risk: {TypeCompat.UnevaluatedRisk}",
+            $"app.Customers.PrimaryAddressId: type risk: {TypeCompat.UnevaluatedRisk}",
+            "app.Orders.Comment: type risk: may truncate (source max 300)",
+            "app.Orders.OrderDate: type risk: fractional seconds rounded to 0 digits",
+            $"app.Orders.StatusCode: type risk: {TypeCompat.UnevaluatedRisk}",
+            $"app.Products.IsActive: type risk: {TypeCompat.UnevaluatedRisk}",
+        ], dry.Warnings);
         Assert.DoesNotContain(patch.Ops, o => o.Value?.ToJsonString().Contains("\"typeRisk\"") == true || o.Path.EndsWith("/typeRisk"));
+        foreach (var column in new[] { "CreatedAt", "OrderDate", "BirthDate", "Comment" })
+            Assert.Contains(column, patch.Summary);   // step 7: each genuine risk is explained in summary
     }
 
     [Fact]
-    public void Playbook_teaches_one_risk_channel()
+    public void Playbook_teaches_the_engine_owned_risk_and_names_the_warning_classes()
     {
         var text = AgentText();
         Assert.Contains("`typeRisk` is computed by dbm. Never write it and never remove it", text);
-        Assert.Contains("A type risk is cleared only by `riskAck`", text);
+        Assert.Contains("or say in `summary` why it is acceptable", text);
+        Assert.Contains("are **expected to remain**", text);
+        Assert.DoesNotContain("riskAck", text);
         Assert.DoesNotContain("copy its `typeRisk`", text);
-        Assert.DoesNotContain("keeping the risk with a rationale", text);
     }
 }

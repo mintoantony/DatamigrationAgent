@@ -153,7 +153,9 @@ public class MappingPacketTests
         var detail = Assert.Single(data["detail"]!.AsArray())!;
         Assert.Equal("app.Orders", (string?)detail["target"]);
         Assert.Equal(Truncates, (string?)detail["columns"]!["Comment"]!["typeRisk"]);
-        Assert.Contains($"app.Orders.Comment: type risk: {Truncates}", Texts(data["attention"]));
+        // RULE REVERSED (final risk model §5): a risk is not attention; both packet modes carry it in their own typeRisks list.
+        Assert.Empty(data["attention"]!.AsArray());
+        Assert.Equal([$"app.Orders.Comment: type risk: {Truncates}"], Texts(data["typeRisks"]));
     }
 
     [Fact]
@@ -166,28 +168,18 @@ public class MappingPacketTests
     }
 
     [Fact]
-    public void An_acknowledged_risk_keeps_its_table_confident_and_is_listed_as_acknowledged()
+    public void Both_packet_modes_carry_the_risk_list_and_the_summary_does_not_count_risks()
     {
         var m = SampleMappings.Approved();
-        var comment = m.Tables["app.Orders"].Columns["Comment"];
-        (comment.TypeRisk, comment.RiskAck) = (Truncates, new RiskAck { Risk = Truncates, Reason = "notes over 200 chars are expendable" });
+        m.Tables["app.Orders"].Columns["Comment"].TypeRisk = Truncates;
 
-        var data = Draft(m);
+        var rework = MappingPacket.Rework(m, SampleCatalogs.Source(), SampleCatalogs.Target(), Options, [Feedback(1, "column:src:dbo.ORD_HDR.CMNT")]);
 
-        Assert.Equal(6, data["confident"]!.AsArray().Count);
-        Assert.Empty(data["attention"]!.AsArray());
-        var ack = Assert.Single(data["acknowledged"]!.AsArray())!;
-        Assert.Equal(("app.Orders.Comment", Truncates, "notes over 200 chars are expendable"),
-            ((string?)ack["column"], (string?)ack["typeRisk"], (string?)ack["reason"]));
-        Assert.Equal("6 tables, 35 columns mapped, 4 drops, 0 attention, 0 blockers",
-            MappingPacket.Summary(m, SampleCatalogs.Source(), SampleCatalogs.Target(), Options));   // E6: no acknowledgement count
-
-        comment.Method = MapMethod.Fuzzy;   // detailed for another reason: the detail column shows the acknowledgement beside the risk
-        comment.Confidence = 0.5;
-        var column = Draft(m)["detail"]!.AsArray().Single()!["columns"]!["Comment"]!;
-        Assert.Equal(Truncates, (string?)column["typeRisk"]);
-        Assert.Equal(Truncates, (string?)column["riskAck"]!["risk"]);
-        Assert.Equal("notes over 200 chars are expendable", (string?)column["riskAck"]!["reason"]);
+        Assert.Equal([$"app.Orders.Comment: type risk: {Truncates}"], Texts(Draft(m)["typeRisks"]));
+        Assert.Equal([$"app.Orders.Comment: type risk: {Truncates}"], Texts(rework["typeRisks"]));
+        Assert.Equal("6 tables, 35 columns mapped, 4 drops, 0 attention, 0 blockers", (string?)rework["summary"]);
+        Assert.Empty(Texts(Draft(SampleMappings.Approved())["typeRisks"]));
+        Assert.DoesNotContain("riskAck", Draft(m).ToJsonString());
     }
 
     [Fact]

@@ -10,12 +10,13 @@ using Dbm.Tests.Support;
 
 namespace Dbm.Tests.Unit.Mapping;
 
-/// <summary>Task 3.4 fix round 1: typeRisk is engine-owned (B7, C5, C6, D1, E3, F2–F5), riskAck is author-owned (C2, D4, D5, E2, F1).
-/// Payloads are Approved() copies built inline; SampleMappings.cs is never edited.</summary>
+/// <summary>Task 3.4 fix round 1, THE RISK MODEL (the only normative risk text): typeRisk is engine-owned; Validate's ordered cases;
+/// carry-over's own sequence; risks are their own warning class, never attention. Payloads are Approved() copies built inline;
+/// SampleMappings.cs is never edited.</summary>
 public class MappingRiskTests
 {
     private const string Truncates = "may truncate (source max 300)";
-    private const string Sentinel = MappingValidator.UnevaluatedRisk;
+    private const string Sentinel = TypeCompat.UnevaluatedRisk;
 
     private static MappingPayload WithComment(string? expr, params string[] sourceColumns)
     {
@@ -234,23 +235,6 @@ public class MappingRiskTests
         Assert.Equal(Truncates, (string?)new MappingModule(services).BuildPacket(ctx, PacketMode.Draft)["detail"]![0]!["columns"]!["Comment"]!["typeRisk"]);
     }
 
-    // ---- riskClass -----------------------------------------------------------------------------------------------------
-
-    [Fact]
-    public void RiskClass_is_written_beside_the_risk_and_omitted_without_one()
-    {
-        var (_, lossy) = Validate(WithComment("s.[ORD_ID]", "dbo.ORD_HDR.ORD_ID"), WithComment("s.[CMNT]", "dbo.ORD_HDR.CMNT"));
-        Assert.Equal("may truncate (source max)|varchar(500)->nvarchar(200)", (string?)CommentNode(lossy)["riskClass"]);
-
-        var (_, custom) = Validate(SampleMappings.Approved(), WithComment("LEFT(s.[CMNT], 200)", "dbo.ORD_HDR.CMNT"));
-        Assert.Equal(TypeCompat.UnevaluatedClass, (string?)CommentNode(custom)["riskClass"]);
-
-        var supplied = WithComment("s.[ORD_ID]", "dbo.ORD_HDR.ORD_ID");
-        Comment(supplied).RiskClass = "forged";
-        var (_, safe) = Validate(WithComment("s.[CMNT]", "dbo.ORD_HDR.CMNT"), supplied);
-        Assert.False(CommentNode(safe).ContainsKey("riskClass"));
-    }
-
     [Fact]
     public void A_bare_reference_carrying_a_default_is_recomputed_not_sentinelled()
     {
@@ -261,7 +245,7 @@ public class MappingRiskTests
     }
 
     [Fact]
-    public void A_column_or_table_absent_from_Current_counts_as_changed()
+    public void A_column_or_table_absent_from_the_stored_version_counts_as_changed()
     {
         var withoutComment = SampleMappings.Approved();
         withoutComment.Tables["app.Orders"].Columns.Remove("Comment");
@@ -274,169 +258,29 @@ public class MappingRiskTests
         Assert.Equal(Sentinel, (string?)node["tables"]!["app.Orders"]!["columns"]!["StatusCode"]!["typeRisk"]);
     }
 
-    // ---- riskAck -------------------------------------------------------------------------------------------------------
-
-    private static RiskAck Ack(string? risk, string? reason = "values over 200 characters are notes we can lose") => new() { Risk = risk, Reason = reason };
-
-    /// <summary>A lossy bare Comment as the engine stores it (risk and class), optionally acknowledged.</summary>
-    private static MappingPayload RiskyComment(RiskAck? ack = null)
-    {
-        var m = WithComment("s.[CMNT]", "dbo.ORD_HDR.CMNT");
-        (Comment(m).TypeRisk, Comment(m).RiskClass, Comment(m).RiskAck) = (Truncates, "may truncate (source max)|varchar(500)->nvarchar(200)", ack);
-        return m;
-    }
-
-    private static JsonObject? AckNode(JsonNode node) => CommentNode(node)["riskAck"] as JsonObject;
-
     [Fact]
-    public void A_new_acknowledgement_naming_the_risk_closes_it_and_is_listed()
+    public void Risks_are_their_own_warning_class_after_attention_and_never_attention()
     {
-        var (check, node) = Validate(RiskyComment(), RiskyComment(Ack(Truncates)));
+        var after = WithComment("s.[CMNT]", "dbo.ORD_HDR.CMNT");
+        (Comment(after).Method, Comment(after).Confidence) = (MapMethod.Fuzzy, 0.5);   // also below the band
 
-        Assert.Equal(Truncates, (string?)AckNode(node)!["risk"]);
-        Assert.Equal("values over 200 characters are notes we can lose", (string?)AckNode(node)!["reason"]);
-        Assert.DoesNotContain(check.Warnings, w => w.Contains("type risk:"));
-        Assert.Contains($"app.Orders.Comment: risk acknowledged: {Truncates} (reason: values over 200 characters are notes we can lose)", check.Warnings);
+        var (check, _) = Validate(WithComment("s.[ORD_ID]", "dbo.ORD_HDR.ORD_ID"), after);
+
+        var attention = check.Warnings.IndexOf("app.Orders.Comment: s.[CMNT] needs review (confidence 0.50, fuzzy)");
+        var risk = check.Warnings.IndexOf($"app.Orders.Comment: type risk: {Truncates}");
+        Assert.True(attention >= 0 && risk > attention, string.Join(Environment.NewLine, check.Warnings));
     }
 
     [Fact]
-    public void A_field_level_acknowledgement_that_names_nothing_stays_open_even_though_the_node_still_carries_the_risk()
+    public void Serialised_mappings_carry_no_acknowledgement_or_class_fields()
     {
-        var after = RiskyComment(Ack(null, "ok"));   // add /…/riskAck {"reason":"ok"}: typeRisk is still in the node, but the ack names nothing
-
-        var (check, node) = Validate(RiskyComment(), after);
-
-        Assert.NotNull(AckNode(node));
-        Assert.Contains($"app.Orders.Comment: type risk: {Truncates}", check.Warnings);
-        Assert.Contains($"app.Orders.Comment: riskAck does not name the current risk; its risk must be: {Truncates}", check.Warnings);
+        var (_, node) = Validate(WithComment("s.[ORD_ID]", "dbo.ORD_HDR.ORD_ID"), WithComment("s.[CMNT]", "dbo.ORD_HDR.CMNT"));
+        var json = node.ToJsonString(Json.Options);
+        Assert.DoesNotContain("riskAck", json);
+        Assert.DoesNotContain("riskClass", json);
     }
 
-    [Fact]
-    public void An_acknowledgement_with_a_drifted_wording_of_the_same_hazard_is_refreshed_but_another_hazard_is_not()
-    {
-        var (_, drifted) = Validate(RiskyComment(), RiskyComment(Ack("may truncate (source max 297)")));
-        Assert.Equal(Truncates, (string?)AckNode(drifted)!["risk"]);
-        Assert.Equal("values over 200 characters are notes we can lose", (string?)AckNode(drifted)!["reason"]);
-
-        var (check, other) = Validate(RiskyComment(), RiskyComment(Ack("time part dropped")));
-        Assert.Equal("time part dropped", (string?)AckNode(other)!["risk"]);
-        Assert.Contains($"app.Orders.Comment: type risk: {Truncates}", check.Warnings);
-    }
-
-    [Fact]
-    public void An_acknowledgement_on_a_column_with_no_risk_is_dropped_with_a_warning_not_rejected()
-    {
-        var after = WithComment("s.[ORD_ID]", "dbo.ORD_HDR.ORD_ID");
-        Comment(after).RiskAck = Ack("anything", "being careful");
-
-        var (check, node) = Validate(SampleMappings.Approved(), after);
-
-        Assert.True(check.Ok);
-        Assert.Null(AckNode(node));
-        Assert.Contains("app.Orders.Comment: riskAck dropped: dbm computes no type risk for this column", check.Warnings);
-    }
-
-    [Theory]
-    [InlineData(null)]
-    [InlineData("")]
-    [InlineData("   ")]
-    public void An_acknowledgement_without_a_reason_is_stored_as_absent(string? reason)
-    {
-        var (check, node) = Validate(RiskyComment(), RiskyComment(Ack(Truncates, reason)));
-
-        Assert.False(CommentNode(node).ContainsKey("riskAck"));
-        Assert.DoesNotContain("riskAck", node.ToJsonString(Json.Options));
-        Assert.Contains($"app.Orders.Comment: type risk: {Truncates}", check.Warnings);
-    }
-
-    [Fact]
-    public void A_carried_acknowledgement_survives_an_unrelated_save_including_on_a_sentinel()
-    {
-        static MappingPayload State()
-        {
-            var m = RiskyComment(Ack(Truncates));
-            var first = m.Tables["app.Customers"].Columns["FirstName"];
-            (first.TypeRisk, first.RiskClass, first.RiskAck) = (Sentinel, TypeCompat.UnevaluatedClass, Ack(Sentinel, "checked by hand"));
-            return m;
-        }
-        var after = State();
-        after.Tables["app.Products"].Columns["Name"].Rationale = "unrelated";
-
-        var (check, node) = Validate(State(), after);
-
-        Assert.Equal(Truncates, (string?)AckNode(node)!["risk"]);
-        Assert.Equal(Sentinel, (string?)node["tables"]!["app.Customers"]!["columns"]!["FirstName"]!["riskAck"]!["risk"]);
-        Assert.Empty(check.Warnings);
-    }
-
-    [Fact]
-    public void A_carried_acknowledgement_is_cleared_by_any_change_to_its_column()
-    {
-        // expr
-        var exprChanged = RiskyComment(Ack(Truncates));
-        Comment(exprChanged).Expr = "LEFT(s.[CMNT], 200)";
-        AssertCleared(RiskyComment(Ack(Truncates)), exprChanged);
-
-        // sourceColumns
-        var sourcesChanged = RiskyComment(Ack(Truncates));
-        Comment(sourcesChanged).SourceColumns.Add("dbo.ORD_HDR.ORD_ID");
-        AssertCleared(RiskyComment(Ack(Truncates)), sourcesChanged);
-
-        // the table's from, under a sentinel: the old acknowledgement would otherwise match the fresh sentinel
-        static MappingPayload Sentinelled()
-        {
-            var m = SampleMappings.Approved();
-            var status = m.Tables["app.Orders"].Columns["StatusCode"];
-            (status.TypeRisk, status.RiskClass, status.RiskAck) = (Sentinel, TypeCompat.UnevaluatedClass, Ack(Sentinel, "the join yields the code verbatim"));
-            return m;
-        }
-        var fromChanged = Sentinelled();
-        fromChanged.Tables["app.Orders"].From = "[dbo].[ORD_HDR] AS s JOIN [dbo].[ORD_STATUS] AS st ON st.[STATUS_ID] = s.[CUST_ID]";
-        var (check, node) = Validate(Sentinelled(), fromChanged);
-        Assert.Equal(Sentinel, (string?)node["tables"]!["app.Orders"]!["columns"]!["StatusCode"]!["typeRisk"]);
-        Assert.Null(node["tables"]!["app.Orders"]!["columns"]!["StatusCode"]!["riskAck"]);
-        Assert.Contains($"app.Orders.StatusCode: type risk: {Sentinel}", check.Warnings);
-
-        // default, under a default-only sentinel
-        static MappingPayload DefaultOnly(string dflt)
-        {
-            var m = WithComment(null);
-            (Comment(m).Default, Comment(m).TypeRisk, Comment(m).RiskClass, Comment(m).RiskAck) =
-                (dflt, Sentinel, TypeCompat.UnevaluatedClass, Ack(Sentinel, "a short literal"));
-            return m;
-        }
-        AssertCleared(DefaultOnly("N'n/a'"), DefaultOnly("REPLICATE(N'x', 400)"));
-
-        static void AssertCleared(MappingPayload before, MappingPayload after)
-        {
-            var (check, node) = Validate(before, after);
-            Assert.Null(AckNode(node));
-            Assert.Contains(check.Warnings, w => w == "app.Orders.Comment: riskAck cleared: the column changed, so it acknowledged a different conversion");
-        }
-    }
-
-    [Fact]
-    public void A_change_that_supplies_its_own_acknowledgement_keeps_it()
-    {
-        var after = WithComment("LEFT(s.[CMNT], 200)", "dbo.ORD_HDR.CMNT");
-        Comment(after).RiskAck = Ack(Sentinel, "LEFT caps the text at the target length");
-
-        var (check, node) = Validate(RiskyComment(Ack(Truncates)), after);
-
-        Assert.Equal(Sentinel, (string?)AckNode(node)!["risk"]);
-        Assert.DoesNotContain(check.Warnings, w => w.Contains("type risk:"));
-    }
-
-    [Fact]
-    public void Removing_an_acknowledgement_reopens_the_risk()
-    {
-        var (check, node) = Validate(RiskyComment(Ack(Truncates)), RiskyComment());
-
-        Assert.Null(AckNode(node));
-        Assert.Contains($"app.Orders.Comment: type risk: {Truncates}", check.Warnings);
-    }
-
-    // ---- carry-over ------------------------------------------------------------------------------------------------------
+    // ---- carry-over: its own sequence ------------------------------------------------------------------------------------
 
     private static CatalogSnapshot WithColumn(CatalogSnapshot catalog, string table, string column, Func<ColumnInfo, ColumnInfo> change) =>
         catalog with
@@ -445,70 +289,40 @@ public class MappingRiskTests
                 : t with { Columns = t.Columns.Select(c => c.Name == column ? change(c) : c).ToList() }).ToList()
         };
 
-    private static ColumnMap CarriedComment(CatalogSnapshot src, CatalogSnapshot tgt, MappingPayload previous) =>
-        Comment(AutoMapper.Map(src, tgt, Synonyms.Default(), new MatchOptions(), previous));
+    private static ColumnMap Carried(CatalogSnapshot src, MappingPayload previous) =>
+        Comment(AutoMapper.Map(src, SampleCatalogs.Target(), Synonyms.Default(), new MatchOptions(), previous));
 
     [Fact]
-    public void An_acknowledgement_made_through_a_human_edit_survives_an_automap_rerun_and_still_matches()
+    public void Carry_over_recomputes_a_bare_column_when_its_source_type_changed()
     {
-        using var project = TempProject.Create();
-        var services = project.Services.WithSampleCatalogs();
-        services.ApproveBefore(PhaseName.Mapping);
-        var draftLike = RiskyComment();
-        Comment(draftLike).RiskClass = null;   // as the auto-mapper stores it: typeRisk only; Validate backfills the class
-        services.AddMapping(draftLike, PhaseStatus.AwaitingReview, "human");
-        var ack = JsonNode.Parse($$"""{"risk":"{{Truncates}}","reason":"values over 200 characters are notes we can lose"}""");
-        var applied = services.Workflow.HumanEdit(new Patch("mapping", 0, [new("add", "/tables/app.Orders/columns/Comment/riskAck", ack)], []));
-        Assert.True(applied.Ok, string.Join("\n", applied.Errors));
-        var stored = Json.Deserialize<MappingPayload>(services.Artifacts.Get(PhaseName.Mapping, applied.Version!.Value)!.PayloadJson);
-        Assert.Equal("may truncate (source max)|varchar(500)->nvarchar(200)", Comment(stored).RiskClass);
-        Assert.False(MappingValidator.HasOpenTypeRisk(Comment(stored)));
+        var previous = WithComment("s.[CMNT]", "dbo.ORD_HDR.CMNT");
+        Comment(previous).TypeRisk = Truncates;
+        var widened = WithColumn(SampleCatalogs.Source(), "dbo.ORD_HDR", "CMNT", c => c with { MaxLength = 150, Profile = null });
 
-        var carried = CarriedComment(SampleCatalogs.Source(), SampleCatalogs.Target(), stored);
+        var carried = Carried(widened, previous);
 
         Assert.Equal(MapMethod.Carried, carried.Method);
-        Assert.Equal(Truncates, carried.TypeRisk);
-        Assert.Equal(Truncates, carried.RiskAck?.Risk);
-        Assert.False(MappingValidator.HasOpenTypeRisk(carried));
+        Assert.Null(carried.TypeRisk);
     }
 
     [Fact]
-    public void Carry_over_refreshes_the_token_when_only_the_observed_length_moved()
+    public void Carry_over_keeps_a_custom_expression_column_verbatim_and_writes_no_sentinel()
     {
-        // Same declared types, a different sampled maximum: "(source max 300)" becomes "(source max 297)".
-        var src = WithColumn(SampleCatalogs.Source(), "dbo.ORD_HDR", "CMNT", c => c with { Profile = c.Profile! with { MaxLen = 297 } });
+        var legacy = WithComment("LEFT(s.[CMNT], 200)", "dbo.ORD_HDR.CMNT");   // stored before the model: no text
+        Assert.Null(Carried(SampleCatalogs.Source(), legacy).TypeRisk);
 
-        var carried = CarriedComment(src, SampleCatalogs.Target(), RiskyComment(Ack(Truncates)));
-
-        Assert.Equal("may truncate (source max 297)", carried.TypeRisk);
-        Assert.Equal("may truncate (source max 297)", carried.RiskAck?.Risk);
-        Assert.Equal("values over 200 characters are notes we can lose", carried.RiskAck?.Reason);
-        Assert.False(MappingValidator.HasOpenTypeRisk(carried));
+        var sentinelled = WithComment("LEFT(s.[CMNT], 200)", "dbo.ORD_HDR.CMNT");
+        Comment(sentinelled).TypeRisk = Sentinel;
+        var changedSource = WithColumn(SampleCatalogs.Source(), "dbo.ORD_HDR", "CMNT", c => c with { MaxLength = 4000 });
+        Assert.Equal(Sentinel, Carried(changedSource, sentinelled).TypeRisk);
     }
 
     [Fact]
-    public void Carry_over_clears_the_acknowledgement_when_a_declared_type_changed_even_though_the_text_did_not()
+    public void Carry_over_of_a_column_with_no_expression_and_no_default_has_no_risk()
     {
-        // nvarchar(200) -> nvarchar(250) against an observed 300: the text stays "may truncate (source max 300)".
-        var tgt = WithColumn(SampleCatalogs.Target(), "app.Orders", "Comment", c => c with { MaxLength = 250 });
+        var previous = WithComment(null, "dbo.ORD_HDR.CMNT");
+        Comment(previous).TypeRisk = "stale text";
 
-        var carried = CarriedComment(SampleCatalogs.Source(), tgt, RiskyComment(Ack(Truncates)));
-
-        Assert.Equal(Truncates, carried.TypeRisk);
-        Assert.Equal("may truncate (source max)|varchar(500)->nvarchar(250)", carried.RiskClass);
-        Assert.Null(carried.RiskAck);
-        Assert.True(MappingValidator.HasOpenTypeRisk(carried));
-    }
-
-    [Fact]
-    public void Carry_over_keeps_a_custom_expression_column_verbatim()
-    {
-        var previous = WithComment("LEFT(s.[CMNT], 200)", "dbo.ORD_HDR.CMNT");
-        (Comment(previous).TypeRisk, Comment(previous).RiskClass, Comment(previous).RiskAck) = (Sentinel, TypeCompat.UnevaluatedClass, Ack(Sentinel, "capped"));
-        var src = WithColumn(SampleCatalogs.Source(), "dbo.ORD_HDR", "CMNT", c => c with { MaxLength = 4000 });
-
-        var carried = CarriedComment(src, SampleCatalogs.Target(), previous);
-
-        Assert.Equal((Sentinel, TypeCompat.UnevaluatedClass, Sentinel, "capped"), (carried.TypeRisk, carried.RiskClass, carried.RiskAck?.Risk, carried.RiskAck?.Reason));
+        Assert.Null(Carried(SampleCatalogs.Source(), previous).TypeRisk);
     }
 }

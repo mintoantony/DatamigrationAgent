@@ -46,9 +46,7 @@ public static class MappingCarryOver
                     Confidence = cm.Confidence,
                     Method = MapMethod.Carried,
                     Rationale = cm.Rationale,
-                    TypeRisk = cm.TypeRisk,
-                    RiskClass = cm.RiskClass,
-                    RiskAck = cm.RiskAck is { } ack ? new RiskAck { Risk = ack.Risk, Reason = ack.Reason } : null   // verbatim (G4)
+                    TypeRisk = cm.TypeRisk
                 };
                 RecomputeBareRisk(map, carried, column, src);
                 map.Columns[column.Name] = carried;
@@ -59,22 +57,16 @@ public static class MappingCarryOver
     }
 
     /// <summary>Job drafts never pass through Validate, so a source type can change under a kept column between discoveries.
-    /// A column with a non-null expr that is a bare single-source reference (alias resolved against the carried table's sources
-    /// and from) is re-evaluated against the current catalogs, with the source profile. Every other column keeps its stored
-    /// typeRisk, riskClass and riskAck verbatim (residual: a type change beneath a custom expression is not re-evaluated).
-    /// For a re-evaluated column, in this order: no risk → the acknowledgement is dropped; the recomputed riskClass differs from
-    /// the stored one → the acknowledgement is cleared (clearing beats refreshing); otherwise, while the hazard class matches and
-    /// only the wording drifted (an observed length, a sample count), riskAck.risk is refreshed to the current text.</summary>
+    /// Carry-over's own sequence (there is no stored version and no patch), first match wins:
+    /// expr null and default null → no risk; a bare single-source reference (alias resolved against the carried table's sources
+    /// and from) → recompute the text through TypeCompat with the source profile; everything else → keep the stored typeRisk
+    /// verbatim, no sentinel (residual: a type change beneath a custom expression is not re-evaluated).</summary>
     private static void RecomputeBareRisk(TableMap map, ColumnMap carried, ColumnInfo target, CatalogSnapshot src)
     {
+        if (carried.Expr is null && carried.Default is null) { carried.TypeRisk = null; return; }
         if (carried.Expr is null || MappingValidator.BareSingleSource(map, carried, src) is not { } hit) return;
         var risk = TypeCompat.Check(ColumnType.From(hit.Column), ColumnType.From(target), hit.Column.Profile).Risk;
-        risk = string.IsNullOrWhiteSpace(risk) ? null : risk;
-        var riskClass = TypeCompat.RiskClass(risk, hit.Column, target);
-        if (risk is null || !TypeCompat.SameRiskClass(carried.RiskClass, riskClass)) carried.RiskAck = null;
-        else if (carried.RiskAck is { } ack && ack.Risk != risk && TypeCompat.SameHazard(ack.Risk, risk)) ack.Risk = risk;
-        carried.TypeRisk = risk;
-        carried.RiskClass = riskClass;
+        carried.TypeRisk = string.IsNullOrWhiteSpace(risk) ? null : risk;
     }
 
     /// <summary>Copies kept drop decisions whose source table/column still exists into <paramref name="into"/> (method carried).</summary>

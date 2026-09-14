@@ -18,14 +18,53 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
     public string Agent => "mapping-architect";
     public string JobKind => "automap";
 
-    /// <summary>True while attention or blockers remain. An unacknowledged type risk reaches this through attention; there is
-    /// deliberately no risk clause of its own and no method-based exemption.</summary>
+    /// <summary>Evaluated once when the automap job completes. True when any holds:
+    /// (1) attention (the confidence band) or a blocker;
+    /// (2) a type risk on a column the auto-mapper assigned in this run (exact, fuzzy or vector) rather than kept;
+    /// (3) a kept bare column whose recomputed risk text differs from the text in the version BEFORE this draft. The job stores
+    ///     the draft before calling this, so the latest artifact is normally the draft itself and is skipped.
+    /// Risks never count as attention. Skip tables load no data and are exempt from (2) and (3).</summary>
     public bool NeedsAgent(JsonNode draft)
     {
         ArgumentNullException.ThrowIfNull(draft);
         var (src, tgt) = Catalogs();
         var m = Parse(draft);
-        return MappingValidator.Attention(m, Options()).Count > 0 || MappingValidator.Blockers(m, src, tgt).Count > 0;
+        if (MappingValidator.Attention(m, Options()).Count > 0 || MappingValidator.Blockers(m, src, tgt).Count > 0) return true;
+        var previous = PreviousVersion(draft);
+        foreach (var (tableKey, map) in m.Tables ?? new())
+        {
+            if (map is null || map.Kind == "skip") continue;
+            foreach (var (name, cm) in map.Columns ?? new())
+            {
+                if (cm is null) continue;
+                if (!MappingCarryOver.IsKept(cm.Method))
+                {
+                    if (MappingValidator.HasTypeRisk(cm)) return true;
+                    continue;
+                }
+                if (previous is null || cm.Expr is null || MappingValidator.BareSingleSource(map, cm, src) is null) continue;
+                var before = MappingValidator.FindTableMap(previous, tableKey) is { } pm ? MappingValidator.FindColumnMap(pm, name) : null;
+                if (before is not null && Blank(before.TypeRisk) != Blank(cm.TypeRisk)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>The mapping version that precedes <paramref name="draft"/>: the latest artifact when the draft is not stored yet,
+    /// otherwise the highest version below it. Null when there is none or it cannot be read.</summary>
+    private MappingPayload? PreviousVersion(JsonNode draft)
+    {
+        var latest = services.Artifacts.Latest(PhaseName.Mapping);
+        if (latest is null) return null;
+        var row = latest;
+        if (JsonNode.DeepEquals(JsonNode.Parse(latest.PayloadJson), draft))
+        {
+            var earlier = services.Artifacts.List(PhaseName.Mapping).Where(a => a.Version < latest.Version).Select(a => (int?)a.Version).LastOrDefault();
+            row = earlier is int v ? services.Artifacts.Get(PhaseName.Mapping, v) : null;
+        }
+        if (row is null) return null;
+        try { return Json.Deserialize<MappingPayload>(row.PayloadJson); }
+        catch (Exception e) when (e is JsonException or NotSupportedException or InvalidOperationException) { return null; }
     }
 
     public JsonNode BuildPacket(ModuleContext ctx, PacketMode mode)
@@ -38,9 +77,10 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
             : MappingPacket.Rework(m, src, tgt, Options(), ctx.OpenFeedback);
     }
 
-    /// <summary>Errors reject the payload. When it is accepted, each column's engine-owned <c>typeRisk</c> and author-owned
-    /// <c>riskAck</c> are reconciled — IN PLACE on <paramref name="payload"/>, because the engine stores that very node —
-    /// before blockers and attention are computed, so the stored warnings match the stored payload.</summary>
+    /// <summary>Order: parse → structural errors (no normalisation when there are any) → type-risk normalisation, IN PLACE on
+    /// <paramref name="payload"/> because the engine stores that very node → warnings. Warning classes, in this order:
+    /// ownership ("typeRisk is computed by dbm"), blockers, attention (the confidence band), and type risks
+    /// ("&lt;table&gt;.&lt;column&gt;: type risk: &lt;typeRisk&gt;", one per risk, never counted as attention).</summary>
     public PayloadCheck Validate(ModuleContext ctx, JsonNode payload)
     {
         ArgumentNullException.ThrowIfNull(ctx);
@@ -57,6 +97,7 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
         if (errors.Count == 0) NormaliseRisks(payload, m, Baseline(ctx), src, tgt, warnings);
         warnings.AddRange(MappingValidator.Blockers(m, src, tgt));
         warnings.AddRange(MappingValidator.Attention(m, Options()));
+        warnings.AddRange(MappingValidator.RiskWarnings(m));
         return new PayloadCheck(errors, warnings);
     }
 
@@ -75,15 +116,15 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
         return MappingPacket.Summary(Parse(payload), src, tgt, Options());
     }
 
-    // ---- the Risk model: engine-owned typeRisk/riskClass, author-owned riskAck -------------------------------------
+    // ---- type risks: engine-owned typeRisk --------------------------------------------------------------------------
 
-    /// <summary>Risk normalisation, in place on the node the engine stores, for a payload with no structural errors.
-    /// CHANGED (Risk model §5, G2): the table or column is absent from ctx.Current, the table's sources or from changed, or the
-    /// column's trimmed expr, default or case-insensitive sourceColumns set changed.
-    /// typeRisk and riskClass, first match wins (G1): (1) unchanged → Current's verbatim; (2) expr and default null → none;
-    /// (3) bare single-source reference → TypeCompat with the source profile; (4) anything else → the sentinel.
-    /// A supplied typeRisk is never stored; it earns a warning when present and different from Current's (§1).
-    /// riskAck: see <see cref="NormaliseAck"/>.</summary>
+    /// <summary>Normalisation, in place on the node the engine stores, for a payload with no structural errors.
+    /// CHANGED: the column or its table is absent from the stored version, the table's sources (ordered, case-insensitive) or
+    /// trimmed from differ, or the column's trimmed expr, trimmed default or case-insensitive sourceColumns set differ.
+    /// First match wins: (1) not changed: the stored typeRisk verbatim; (2) expr null and default null: no risk;
+    /// (3) expr non-null and a bare single-source reference: TypeCompat with the source profile, as the auto-mapper computes it;
+    /// (4) everything else: <see cref="TypeCompat.UnevaluatedRisk"/>.
+    /// An incoming typeRisk is never stored; it earns a warning when present and different from the stored version's.</summary>
     private static void NormaliseRisks(JsonNode payload, MappingPayload m, MappingPayload? baseline, CatalogSnapshot src, CatalogSnapshot tgt,
         List<string> warnings)
     {
@@ -99,80 +140,24 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
                 if (columnNode is not JsonObject columnObj || !map.Columns.TryGetValue(name, out var cm)) continue;
                 if (target.FindColumn(name) is not { } targetColumn) continue;
                 var old = before is null ? null : MappingValidator.FindColumnMap(before, name);
-                var key = $"{tableKey}.{name}";
                 if (Blank(cm.TypeRisk) is { } supplied && supplied != Blank(old?.TypeRisk))
-                    warnings.Add($"{key}: typeRisk is computed by dbm; the supplied value was ignored");
+                    warnings.Add($"{tableKey}.{name}: typeRisk is computed by dbm; the supplied value was ignored");
 
-                var changed = tableChanged || old is null || !SameColumn(old, cm);
-                string? risk, riskClass;
-                if (!changed)
-                    (risk, riskClass) = (Blank(old!.TypeRisk), BackfillClass(map, old, targetColumn, src));
+                string? risk;
+                if (!(tableChanged || old is null || !SameColumn(old, cm)))
+                    risk = Blank(old!.TypeRisk);
                 else if (cm.Expr is null && cm.Default is null)
-                    (risk, riskClass) = (null, null);
-                else if (MappingValidator.BareSingleSource(map, cm, src) is { } hit)
-                {
+                    risk = null;
+                else if (cm.Expr is not null && MappingValidator.BareSingleSource(map, cm, src) is { } hit)
                     risk = Blank(TypeCompat.Check(ColumnType.From(hit.Column), ColumnType.From(targetColumn), hit.Column.Profile).Risk);
-                    riskClass = TypeCompat.RiskClass(risk, hit.Column, targetColumn);
-                }
                 else
-                    (risk, riskClass) = (MappingValidator.UnevaluatedRisk, TypeCompat.UnevaluatedClass);
+                    risk = TypeCompat.UnevaluatedRisk;
 
-                var ack = NormaliseAck(key, cm.RiskAck, old?.RiskAck, risk, changed, warnings);
                 cm.TypeRisk = risk;
-                cm.RiskClass = riskClass;
-                cm.RiskAck = ack;
                 SetProperty(columnObj, "typeRisk", risk is null ? null : JsonValue.Create(risk));
-                SetProperty(columnObj, "riskClass", riskClass is null ? null : JsonValue.Create(riskClass));
-                SetProperty(columnObj, "riskAck", ack is null ? null : new JsonObject { ["risk"] = ack.Risk, ["reason"] = ack.Reason });
             }
         }
     }
-
-    /// <summary>An unchanged column keeps Current's riskClass. A risk stored before riskClass existed (the auto-mapper writes only
-    /// typeRisk) gets its class filled in — only for a bare column whose recomputed text is identical to the stored one, so the
-    /// class provably describes that stored risk; otherwise the stored value, possibly null, is kept.</summary>
-    private static string? BackfillClass(TableMap map, ColumnMap old, ColumnInfo targetColumn, CatalogSnapshot src)
-    {
-        if (old.RiskClass is not null || Blank(old.TypeRisk) is not { } stored) return old.RiskClass;
-        if (old.Expr is null || MappingValidator.BareSingleSource(map, old, src) is not { } hit) return null;
-        var risk = TypeCompat.Check(ColumnType.From(hit.Column), ColumnType.From(targetColumn), hit.Column.Profile).Risk;
-        return risk == stored ? TypeCompat.RiskClass(risk, hit.Column, targetColumn) : null;
-    }
-
-    /// <summary>riskAck is taken from the node as supplied; the engine only decides whether it may stand (§2, G3, G5).
-    /// SUPPLIED by this change = present and different from Current's (the one comparison against Current that §2 allows).
-    /// - an acknowledgement without a reason is no acknowledgement: stored as absent;
-    /// - no computed risk → dropped, with a warning;
-    /// - a changed column clears an acknowledgement this change did not supply (it cited a transform, sources or a binding that no
-    ///   longer hold — this also covers every riskClass change, since a class can only change on a changed column);
-    /// - finally, while the hazard class still matches, riskAck.risk is refreshed to the current wording (never the reason).
-    /// Whether it then matches is decided by the predicate alone; a supplied acknowledgement is reported either way.</summary>
-    private static RiskAck? NormaliseAck(string key, RiskAck? incoming, RiskAck? current, string? risk, bool changed, List<string> warnings)
-    {
-        if (incoming is not null && string.IsNullOrWhiteSpace(incoming.Reason)) incoming = null;
-        var supplied = incoming is not null && !SameAck(incoming, current);
-        if (incoming is null) return null;
-        if (risk is null)
-        {
-            warnings.Add($"{key}: riskAck dropped: dbm computes no type risk for this column");
-            return null;
-        }
-        if (changed && !supplied)
-        {
-            warnings.Add($"{key}: riskAck cleared: the column changed, so it acknowledged a different conversion");
-            return null;
-        }
-        var ack = new RiskAck { Risk = incoming.Risk, Reason = incoming.Reason };
-        if (ack.Risk != risk && TypeCompat.SameHazard(ack.Risk, risk)) ack.Risk = risk;
-        if (supplied)
-            warnings.Add(ack.Risk == risk
-                ? $"{key}: risk acknowledged: {risk} (reason: {ack.Reason})"
-                : $"{key}: riskAck does not name the current risk; its risk must be: {risk}");
-        return ack;
-    }
-
-    private static bool SameAck(RiskAck a, RiskAck? b) =>
-        b is not null && string.Equals(a.Risk, b.Risk, StringComparison.Ordinal) && string.Equals(a.Reason, b.Reason, StringComparison.Ordinal);
 
     private static bool SameBinding(TableMap a, TableMap b) =>
         SameText(a.From, b.From) && (a.Sources ?? []).SequenceEqual(b.Sources ?? [], StringComparer.OrdinalIgnoreCase);

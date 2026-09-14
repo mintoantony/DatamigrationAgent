@@ -275,14 +275,17 @@ public class MappingValidatorTests
     [InlineData(MapMethod.Human, 1.0)]
     [InlineData(MapMethod.Agent, 1.0)]
     [InlineData(MapMethod.Fuzzy, 0.95)]
-    public void An_unacknowledged_type_risk_is_attention_whatever_the_method_and_confidence(MapMethod method, double confidence)
+    public void A_type_risk_is_never_attention_it_is_its_own_warning_class(MapMethod method, double confidence)
     {
+        // RULE REVERSED (Task 3.4 fix round 1, final risk model §5): this test first pinned that a risky exact or human column IS
+        // attention. Per-column acknowledgement was cut, so a risk could never leave attention; risks are now their own warning
+        // class and attention is the confidence band only.
         var m = SampleMappings.Approved();
         var comment = m.Tables["app.Orders"].Columns["Comment"];
         (comment.Method, comment.Confidence, comment.TypeRisk) = (method, confidence, "may truncate (source max 300)");
 
-        Assert.Equal(["app.Orders.Comment: type risk: may truncate (source max 300)"], MappingValidator.Attention(m, Options));
-        Assert.True(MappingValidator.ColumnNeedsAttention(comment, Options));
+        Assert.Empty(MappingValidator.Attention(m, Options));
+        Assert.Equal(["app.Orders.Comment: type risk: may truncate (source max 300)"], MappingValidator.RiskWarnings(m));
     }
 
     [Theory]
@@ -295,83 +298,45 @@ public class MappingValidatorTests
         m.Tables["app.Orders"].Columns["Comment"].TypeRisk = risk;
 
         Assert.False(MappingValidator.HasTypeRisk(m.Tables["app.Orders"].Columns["Comment"]));
-        Assert.Empty(MappingValidator.Attention(m, Options));
+        Assert.Empty(MappingValidator.RiskWarnings(m));
     }
 
     [Fact]
-    public void A_column_below_the_band_with_a_type_risk_is_listed_once_with_the_risk_text_last()
+    public void A_column_below_the_band_with_a_type_risk_is_attention_once_and_a_risk_once()
     {
         var m = SampleMappings.Approved();
         var comment = m.Tables["app.Orders"].Columns["Comment"];
         (comment.Method, comment.Confidence, comment.TypeRisk) = (MapMethod.Fuzzy, 0.5, "may truncate (source max 300)");
 
-        Assert.Equal(["app.Orders.Comment: s.[CMNT] needs review (confidence 0.50, fuzzy); type risk: may truncate (source max 300)"],
-            MappingValidator.Attention(m, Options));
+        Assert.Equal(["app.Orders.Comment: s.[CMNT] needs review (confidence 0.50, fuzzy)"], MappingValidator.Attention(m, Options));
+        Assert.Equal(["app.Orders.Comment: type risk: may truncate (source max 300)"], MappingValidator.RiskWarnings(m));
     }
 
     [Theory]
-    [InlineData(MapMethod.Human, 1.0)]
-    [InlineData(MapMethod.Fuzzy, 0.5)]
-    public void The_attention_message_ends_with_the_stored_risk_verbatim_so_it_can_be_copied(MapMethod method, double confidence)
+    [InlineData("may truncate (source max 100) (sampled 1,000 rows fit; not proof for the full table)")]
+    [InlineData("not evaluated: custom expression")]
+    [InlineData("non-ASCII characters may be lost; may truncate (source max 300)")]
+    public void The_risk_warning_ends_with_the_stored_risk_verbatim(string risk)
     {
-        // Risk model §7: the acknowledgement workflow depends on copying this text into riskAck.risk.
-        const string risk = "may truncate (source max 100) (sampled 1,000 rows fit; not proof for the full table)";
+        // Risk model §5: "<table>.<column>: type risk: <typeRisk>", pinned by the substring after the prefix.
         var m = SampleMappings.Approved();
-        var comment = m.Tables["app.Orders"].Columns["Comment"];
-        (comment.Method, comment.Confidence, comment.TypeRisk) = (method, confidence, risk);
+        m.Tables["app.Orders"].Columns["Comment"].TypeRisk = risk;
 
-        var message = Assert.Single(MappingValidator.Attention(m, Options));
+        var line = Assert.Single(MappingValidator.RiskWarnings(m));
 
-        Assert.StartsWith("app.Orders.Comment: ", message);
-        const string marker = "type risk: ";
-        Assert.Equal(comment.TypeRisk, message[(message.LastIndexOf(marker, StringComparison.Ordinal) + marker.Length)..]);
-    }
-
-    public static TheoryData<RiskAck?, bool> Acks() => new()
-    {
-        { new RiskAck { Risk = "may truncate (source max 300)", Reason = "notes over 200 chars are expendable" }, false },
-        { null, true },
-        { new RiskAck(), true },                                                                       // null members
-        { new RiskAck { Risk = "may truncate (source max 300)", Reason = "  " }, true },                // no reason
-        { new RiskAck { Risk = null, Reason = "reflexive" }, true },                                    // names no hazard
-        { new RiskAck { Risk = "", Reason = "reflexive" }, true },
-        { new RiskAck { Risk = "may truncate (source max 297)", Reason = "old wording" }, true },       // exact equality only
-        { new RiskAck { Risk = "time part dropped", Reason = "a different hazard" }, true },
-    };
-
-    [Theory]
-    [MemberData(nameof(Acks))]
-    public void The_risk_predicate_is_exact_equality_of_the_named_risk_plus_a_reason(RiskAck? ack, bool open)
-    {
-        var m = SampleMappings.Approved();
-        var comment = m.Tables["app.Orders"].Columns["Comment"];
-        (comment.TypeRisk, comment.RiskAck) = ("may truncate (source max 300)", ack);
-
-        Assert.Equal(open, MappingValidator.HasOpenTypeRisk(comment));
-        Assert.Equal(open ? 1 : 0, MappingValidator.Attention(m, Options).Count);
-        Assert.Equal(!open, MappingValidator.HasAcknowledgedTypeRisk(comment));
+        const string prefix = "app.Orders.Comment: " + MappingValidator.RiskWarningMarker;
+        Assert.StartsWith(prefix, line);
+        Assert.Equal(m.Tables["app.Orders"].Columns["Comment"].TypeRisk, line[prefix.Length..]);
     }
 
     [Fact]
-    public void An_acknowledged_sentinel_is_closed_like_any_other_risk()
+    public void Risk_warnings_skip_skipped_tables_and_the_approved_fixture_has_none()
     {
-        var comment = new ColumnMap
-        {
-            TypeRisk = MappingValidator.UnevaluatedRisk,
-            RiskAck = new RiskAck { Risk = MappingValidator.UnevaluatedRisk, Reason = "LEFT caps it at 200" }
-        };
-        Assert.False(MappingValidator.HasOpenTypeRisk(comment));
-    }
-
-    [Fact]
-    public void Unset_engine_and_author_risk_fields_are_omitted_from_the_stored_json()
-    {
-        var json = Json.Serialize(SampleMappings.Approved());
-        Assert.DoesNotContain("riskAck", json);
-        Assert.DoesNotContain("riskClass", json);
+        Assert.Empty(MappingValidator.RiskWarnings(SampleMappings.Approved()));
         var m = SampleMappings.Approved();
-        m.Tables["app.Orders"].Columns["Comment"].RiskAck = new RiskAck { Risk = "r", Reason = "why" };
-        Assert.Contains("\"riskAck\":{\"risk\":\"r\",\"reason\":\"why\"}", Json.Serialize(m));
+        m.Tables["app.Orders"].Kind = "skip";
+        m.Tables["app.Orders"].Columns["Comment"].TypeRisk = "may truncate (source max 300)";
+        Assert.Empty(MappingValidator.RiskWarnings(m));
     }
 
     [Theory]

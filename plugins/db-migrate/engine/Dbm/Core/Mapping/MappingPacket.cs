@@ -24,8 +24,7 @@ public static class MappingPacket
         ["expr"] = "T-SQL over the FROM aliases: s = sources[0]; other aliases are declared in from",
         ["sourceColumns"] = "every schema.table.column the expr or its join reads (drives coverage)",
         ["candidates"] = "next best sources with score and why (name, type, structure, profile)",
-        ["typeRisk"] = "computed by dbm, never written by you; riskClass likewise",
-        ["riskAck"] = "the only way to clear a type risk: {risk: exact typeRisk text accepted, reason: why it is acceptable}",
+        ["typeRisk"] = "data-loss hazard computed by dbm; never write it. Transform it away, or say in summary why it is acceptable",
         ["paths"] = "/tables/{target}/{field}, /tables/{target}/columns/{column}/{field}, /drops/{schema.table or schema.table.column}"
     };
 
@@ -67,7 +66,7 @@ public static class MappingPacket
             ["options"] = new JsonObject { ["autoAccept"] = options.AutoAccept, ["candidate"] = options.Candidate },
             ["blockers"] = Strings(blockers),
             ["attention"] = Strings(attention),
-            ["acknowledged"] = Acknowledged(m),
+            ["typeRisks"] = Strings(MappingValidator.RiskWarnings(m)),
             ["confident"] = confident,
             ["detail"] = detail,
             ["uncovered"] = Uncovered(m, src),
@@ -96,7 +95,7 @@ public static class MappingPacket
             ["summary"] = Summary(m, src, tgt, options),
             ["blockers"] = Strings(MappingValidator.Blockers(m, src, tgt)),
             ["attention"] = Strings(MappingValidator.Attention(m, options)),
-            ["acknowledged"] = Acknowledged(m),
+            ["typeRisks"] = Strings(MappingValidator.RiskWarnings(m)),
             ["contexts"] = contexts,
             ["hint"] = Hint
         };
@@ -264,20 +263,18 @@ public static class MappingPacket
         obj["confidence"] = R(cm.Confidence);
         obj["method"] = EnumText.ToText(cm.Method);
         if (MappingValidator.HasTypeRisk(cm)) obj["typeRisk"] = cm.TypeRisk;
-        if (cm.RiskAck is { } ack) obj["riskAck"] = AckNode(ack);
         if (cm.Rationale is not null) obj["rationale"] = cm.Rationale;
         if (cm.Candidates is { Count: > 0 }) obj["candidates"] = Candidates(cm.Candidates);
         return obj;
     }
 
-    /// <summary>A table with an OPEN type risk (<see cref="MappingValidator.HasOpenTypeRisk"/>) is never summarised as confident,
-    /// whatever its method or confidence. An acknowledged risk does not force detail; it is listed under "acknowledged" instead.
-    /// Skip tables are exempt: they load no data, so there is no conversion to be risky about.</summary>
+    /// <summary>A table carrying any type risk is never summarised as confident, whatever its method or confidence, so the agent
+    /// always sees the risk in detail. Skip tables are exempt: they load no data, so there is no conversion to be risky about.</summary>
     private static bool IsConfident(TableInfo t, TableMap map, List<string> blockers, MatchOptions options)
     {
         if (blockers.Any(b => Mentions(b, t.Key))) return false;
         if (map.Kind == "skip") return true;
-        if (map.Columns.Values.Any(MappingValidator.HasOpenTypeRisk)) return false;
+        if (map.Columns.Values.Any(MappingValidator.HasTypeRisk)) return false;
         if (map.Sources.Count == 0 || MappingValidator.NeedsReview(map.Method, map.Confidence, options)) return false;
         return !map.Columns.Values.Any(c => MappingValidator.NeedsReview(c.Method, c.Confidence, options));
     }
@@ -288,35 +285,11 @@ public static class MappingPacket
     private static void AddTypeRisks(JsonObject obj, MappingPayload m, Func<string, TableMap, ColumnMap, bool> include)
     {
         var risks = new JsonObject();
-        var acks = new JsonObject();
         foreach (var (tableKey, map) in m.Tables)
             foreach (var (name, cm) in map.Columns)
-            {
-                if (!MappingValidator.HasTypeRisk(cm) || !include(tableKey, map, cm)) continue;
-                risks[$"{tableKey}.{name}"] = cm.TypeRisk;
-                if (cm.RiskAck is { } ack) acks[$"{tableKey}.{name}"] = AckNode(ack);
-            }
+                if (MappingValidator.HasTypeRisk(cm) && include(tableKey, map, cm)) risks[$"{tableKey}.{name}"] = cm.TypeRisk;
         if (risks.Count > 0) obj["typeRisks"] = risks;
-        if (acks.Count > 0) obj["riskAcks"] = acks;
     }
-
-    /// <summary>Every acknowledged risk in non-skip tables, so the approver and the agent see acknowledgements as a set
-    /// (they are not attention, and must not be invisible). Deliberately not part of <see cref="Summary"/>.</summary>
-    public static JsonArray Acknowledged(MappingPayload m)
-    {
-        ArgumentNullException.ThrowIfNull(m);
-        var list = new JsonArray();
-        foreach (var (tableKey, map) in m.Tables.OrderBy(kv => kv.Key, StringComparer.Ordinal))
-        {
-            if (map.Kind == "skip") continue;
-            foreach (var (name, cm) in map.Columns.OrderBy(kv => kv.Key, StringComparer.Ordinal))
-                if (MappingValidator.HasAcknowledgedTypeRisk(cm))
-                    list.Add(new JsonObject { ["column"] = $"{tableKey}.{name}", ["typeRisk"] = cm.TypeRisk, ["reason"] = cm.RiskAck!.Reason });
-        }
-        return list;
-    }
-
-    private static JsonObject AckNode(RiskAck ack) => new() { ["risk"] = ack.Risk, ["reason"] = ack.Reason };
 
     private static void Guard(MappingPayload m, CatalogSnapshot src, CatalogSnapshot tgt, MatchOptions options)
     {

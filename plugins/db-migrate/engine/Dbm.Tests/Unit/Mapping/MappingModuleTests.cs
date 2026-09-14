@@ -42,31 +42,54 @@ public class MappingModuleTests
     }
 
     [Fact]
-    public void Needs_agent_for_an_unacknowledged_type_risk_even_when_nothing_else_is_open()
+    public void Needs_agent_for_a_type_risk_on_a_column_the_auto_mapper_assigned_but_not_on_a_kept_one()
     {
         using var project = TempProject.Create();
         var module = new MappingModule(project.Services.WithSampleCatalogs());
         var m = SampleMappings.Approved();
         var comment = m.Tables["app.Orders"].Columns["Comment"];
-        // The auto-mapper's shape for varchar(300) -> nvarchar(200): fuzzy, at or above the auto-accept band.
-        (comment.Method, comment.Confidence, comment.TypeRisk) = (MapMethod.Fuzzy, 0.88, "may truncate (source max 300)");
-        Assert.True(module.NeedsAgent(Json.ToNode(m)));
+        comment.TypeRisk = "may truncate (source max 300)";
 
-        foreach (var method in new[] { MapMethod.Exact, MapMethod.Agent, MapMethod.Human, MapMethod.Carried })
+        foreach (var assigned in new[] { MapMethod.Exact, MapMethod.Fuzzy })   // at or above the band: no attention
         {
-            comment.Method = method;   // method never exempts a risk (C3): only an acknowledgement does
-            comment.RiskAck = null;
-            Assert.True(module.NeedsAgent(Json.ToNode(m)), method.ToString());
-            comment.RiskAck = new RiskAck { Risk = comment.TypeRisk, Reason = "accepted" };
-            Assert.False(module.NeedsAgent(Json.ToNode(m)), method.ToString());
+            (comment.Method, comment.Confidence) = (assigned, 0.9);
+            Assert.True(module.NeedsAgent(Json.ToNode(m)), assigned.ToString());
         }
-        comment.RiskAck = null;
+        foreach (var kept in new[] { MapMethod.Carried, MapMethod.Human, MapMethod.Agent })
+        {
+            comment.Method = kept;   // no previous version stored: nothing to compare the kept text with
+            Assert.False(module.NeedsAgent(Json.ToNode(m)), kept.ToString());
+        }
+    }
 
-        comment.Method = MapMethod.Exact;
-        m.Tables["app.Orders"].Kind = "skip";   // a skipped table loads nothing, so its risk is no hazard
-        m.Drops["dbo.ORD_HDR"] = new DropDecision("test", MapMethod.Human);
-        m.Drops["dbo.ORD_STATUS"] = new DropDecision("test", MapMethod.Human);
-        Assert.False(module.NeedsAgent(Json.ToNode(m)));
+    [Fact]
+    public void Needs_agent_when_rediscovery_changes_a_kept_bare_column_risk_compared_with_the_version_before_the_draft()
+    {
+        using var project = TempProject.Create();
+        var services = project.Services.WithSampleCatalogs();
+        var module = new MappingModule(services);
+        var approved = SampleMappings.Approved();
+        approved.Tables["app.Orders"].Columns["Comment"].TypeRisk = "may truncate (source max 300)";
+        approved.Tables["app.Customers"].Columns["CreatedAt"].TypeRisk = "fractional seconds rounded to 0 digits";
+        approved.Tables["app.Orders"].Columns["OrderDate"].TypeRisk = "fractional seconds rounded to 0 digits";
+        services.AddMapping(approved, PhaseStatus.Running, "human");
+
+        // Same catalogs: carry-over reproduces the stored texts. The job stores the draft before NeedsAgent, as the engine does.
+        var same = AutoMapper.Map(SampleCatalogs.Source(), SampleCatalogs.Target(), Synonyms.Default(), new MatchOptions(), approved);
+        services.AddMapping(same, PhaseStatus.Running);
+        Assert.False(module.NeedsAgent(Json.ToNode(same)));
+
+        // Rediscovery widens the source: the kept bare Comment column's recomputed risk text changes.
+        var src = SampleCatalogs.Source();
+        src = src with
+        {
+            Tables = src.Tables.Select(t => t.Key != "dbo.ORD_HDR" ? t
+                : t with { Columns = t.Columns.Select(c => c.Name == "CMNT" ? c with { MaxLength = 4000, Profile = c.Profile! with { MaxLen = 3000 } } : c).ToList() }).ToList()
+        };
+        var redrafted = AutoMapper.Map(src, SampleCatalogs.Target(), Synonyms.Default(), new MatchOptions(), same);
+        Assert.Equal("may truncate (source max 3000)", redrafted.Tables["app.Orders"].Columns["Comment"].TypeRisk);
+        services.AddMapping(redrafted, PhaseStatus.Running);
+        Assert.True(module.NeedsAgent(Json.ToNode(redrafted)));
     }
 
     [Fact]
