@@ -6196,3 +6196,63 @@ The FINAL JavaScript risk scope above was written before `riskClass` existed. On
 **`riskClass` is engine-owned. The browser never writes it and never diffs it.** It is a second engine-owned field on a column map, and the view must exclude it from the diffed column properties exactly as it excludes `typeRisk`. Otherwise the acknowledgement control emits an operation for it the moment it rebuilds a column object, and the engine warns about a field the browser had no business sending.
 
 The browser does not display it either. It is an identity used to decide when an acknowledgement has outlived its hazard, not something a reviewer reads — the reviewer reads `typeRisk`.
+
+### RISK MODEL AMENDMENT 2 — section 5 was neither ordered nor exhaustive, and three ways an acknowledgement outlives its hazard
+
+Section 5 claimed its cases were exhaustive by construction. They were not: they overlapped, and they said nothing about a column absent from `ctx.Current`. Three further paths let an acknowledgement survive a hazard it never covered.
+
+#### G1 — Section 5 becomes an ordered sequence, first match wins
+
+```
+(1) not changed                                  -> keep ctx.Current's typeRisk verbatim
+(2) expr null AND default null                   -> no risk
+(3) expr non-null AND bare single-source ref     -> recompute via TypeCompat, with the source profile
+(4) everything else                              -> sentinel
+```
+
+Case (4) is a true catch-all, and only with the order does the exhaustiveness claim hold. As an unordered set the cases collided: a coverage-only listing (`expr` null, `default` null, one `sourceColumns` entry) matched both "not bare, so sentinel" and "expr and default null, so no risk"; a bare reference carrying a `default` matched both recompute and sentinel — and `default` applies only when `expr` is null, so bare must win.
+
+An alias that cannot be resolved from `sources[0]` or from the table's `from` is **not bare**, and therefore falls to case (4). Parsing a `FROM` clause is best-effort: a parse miss yields the sentinel, never an error.
+
+#### G2 — Absent from `ctx.Current` is changed
+
+"Changed" was defined only as a comparison, which left a column — or a whole table — that does not appear in `ctx.Current` falling into case (1) and keeping a risk that does not exist. That stores a brand-new mapping with no risk text.
+
+The paths are ordinary, not exotic: the auto-mapper skips identity columns with no key match and the playbook tells the agent to add them; a human removes and re-adds a table map; a patch adds a table the draft lacked.
+
+**A column, or its table, absent from `ctx.Current` is changed.**
+
+#### G3 — An acknowledgement dies on any change, not only an expression change
+
+Section 2 cleared `riskAck` when `expr` changed. Every other change trigger in section 5 — `sourceColumns`, `default`, the table's `sources` or `from` — left it standing. Because a sentinel matches its own class, a new sentinel written after one of those changes is silenced by the old acknowledgement.
+
+Concretely: a two-source column carrying a sentinel is acknowledged "the join yields the code verbatim"; later only `from` changes, so the alias now joins a different table whose column is `nvarchar(max)` into `varchar(10)`; the column is changed and non-bare, a fresh sentinel is written, the class matches, and an unevaluated truncation shows no attention.
+
+**Clear `riskAck` whenever the column is changed by section 5's definition, unless the same patch supplies a new acknowledgement.**
+
+#### G4 — Carry-over must copy `riskAck`
+
+`MappingCarryOver` builds each kept column from an **explicit field list**. A field not named there is silently dropped, so every automap re-run — re-approval, rediscovery, retry — would strip every acknowledgement and return every acknowledged risk to attention.
+
+**Carry-over copies `riskAck` verbatim**, exactly as it copies `typeRisk`; the predicate then decides whether it still matches. Test it: acknowledge a risk, re-run automap, and the acknowledgement is present and still matching.
+
+#### G5 — The engine refreshes the token, so the predicate is plain equality in both languages
+
+Section 3 requires the predicate to be identical in C# and JavaScript, while `HazardClass` is C#-only. That left the browser with no algorithm to mirror, and the obvious shortcut — exact text equality — makes the UI disagree with the server precisely when the class matters, after a rediscovery changes an observed length.
+
+During normalisation, and in carry-over, **when an acknowledgement's class still matches the current risk but its text differs, the engine rewrites `riskAck.risk` to the current text.** `reason` is never touched. The shared predicate then becomes plain string equality in both languages, and the only fuzzy comparison lives in one C# function.
+
+**Order matters:** check `riskClass` first and clear the acknowledgement if the class changed; only then, if the class still matches and the text has drifted, refresh the token. Clearing beats refreshing.
+
+This is the engine touching an author-owned field, deliberately and narrowly: only the token half, and only to re-point an acknowledgement that is still valid at the current wording.
+
+#### G6 — Corrections and precision
+
+- **Attention is the confidence band OR the risk predicate.** Section 3's name collides with the existing confidence-band check and could be read as replacing it. It does not. `IsConfident` uses band-or-risk, which is what it already does.
+- **Section 1's examples are swapped.** A field-level edit leaves the old value in the node; a whole-object replace omits it. The rule — present and different from `ctx.Current` means written — is unchanged.
+- **Section 2's "no comparison against `ctx.Current`"** is overstated: deciding whether *this* change supplied the acknowledgement requires exactly that one comparison. Nothing else does.
+- **The packet emits `riskAck` beside `typeRisk`** on detail columns, not only in the acknowledged list, or an agent in rework sees a risk with no sign it was accepted.
+- **Malformed `riskAck` shapes** — a bare string from the old shape, null members, an array — belong in the malformed-payload matrix. It is an object now.
+- **Carried artifacts skip `Validate`**, so a malformed `riskAck` can reach the automap job, which catches only deserialisation failures. The predicate must tolerate an odd but well-formed acknowledgement without throwing.
+- **The invariant covers type-conversion hazards.** Nullability — a left join feeding a `NOT NULL` target — and join fan-out are real hazards outside this model, and nothing here should be read as covering them.
+- **Milestone 4 calls this same predicate** rather than re-deriving "acknowledged", or the project grows a third definition of it. Recorded with the other M4 rulings.
