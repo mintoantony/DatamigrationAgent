@@ -6775,3 +6775,17 @@ For each surviving hit, the question is whether deleting it would change any tes
 A skipped table loads no data, so a type risk on one of its columns describes a conversion that will never happen. Surfacing it is noise in a channel whose whole value depends on being signal — the failure that made a never-zero attention count useless.
 
 **Skip tables are excluded from every risk surface**: the top-level risk list, the risk warnings, every packet context including the general one, and `NeedsAgent`. "All of them" means every risk that exists in the risk channel, and a skip table never enters it.
+
+### 7a. Correction — the agent trigger must not compare a draft against a draft
+
+§7 condition 3 says a kept bare column is compared against "the version before this draft". That is wrong whenever the preceding version is **itself a script draft**, which happens on an ordinary path: the job is retried from drafting, or rediscovery runs again before the agent does. The earlier draft already carries the recomputed text, so the retried draft compares equal, the trigger goes quiet, and the phase moves to review with the agent never having seen the changed hazard. That breaks §14.
+
+**Condition 3 compares against the latest version NOT authored by the script** — the last agent, human or approved version. A script draft is never the comparand.
+
+Test it on the failing path rather than the simple one: rediscovery changes a kept bare column, the draft fires the trigger, the job is retried from drafting, and the retried draft must fire it again.
+
+### 2a. Correction — a blank default is not a default
+
+§2 case (2) tests `expr` null and `default` **null**. An empty or whitespace default therefore falls to the catch-all and is stored with the sentinel, reading as "not evaluated: custom expression" for a column that has no expression and no usable default. The blocker rules already treat such a column as having no default, so the two disagree.
+
+**Case (2) is `expr` blank and `default` blank**, using the same present-and-not-whitespace predicate as everywhere else in this model.
