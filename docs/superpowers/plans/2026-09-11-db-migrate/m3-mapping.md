@@ -6152,3 +6152,39 @@ The two earlier JavaScript scope sections above are **historical**. They describ
 **Acknowledged risks are visible as a set.** Their own count, separate from open attention, with a filter that lists them, so an approver signs them off deliberately. An acknowledgement removes a column from attention, and attention is the mechanism that reaches a human — one that nobody sees defeats the review it belongs to.
 
 **Remove `typeRisk` from the diffed column properties.** The view currently lists it, so the client would emit an operation for it the moment the acknowledgement control rebuilds a column object.
+
+### RISK MODEL AMENDMENT — `riskClass`, because a class derived from text cannot see a declared-type change
+
+Section 4 said `HazardClass` is derived from the stored text alone. That cannot satisfy section 7's own pin, and the implementer proved it: a target widening from `nvarchar(200)` to `nvarchar(250)` against a `varchar(300)` source produces `"may truncate (source max 300)"` both times, because the **target** length never appears in the risk text. A real declared-type change is therefore invisible to any text-derived class, and an acknowledgement of the old hazard survives a change to the conversion it described.
+
+This was a choice I got wrong. The old class can only come from parsing the stored text or from a stored field; both had been rejected earlier, I picked text, and text does not work.
+
+#### `riskClass` — engine-owned, stored
+
+Written alongside `typeRisk`, by the engine only, on the same occasions:
+
+- omitted entirely when there is no risk;
+- composed of the **hazard kind** plus the **declared** source and target types — for example `truncate|varchar(300)->nvarchar(200)`;
+- **never** observed lengths and never sample counts. Those are exactly what made text comparison unstable, since the profiler samples without an `ORDER BY` and an observed maximum can differ between discoveries of unchanged data;
+- the sentinel carries its own class value, which matches nothing else, including another sentinel.
+
+The browser must not diff it, for the same reason it must not diff `typeRisk`: the engine owns both.
+
+It is not part of Milestone 4's mapping hash, which is already restricted to SQL-relevant fields.
+
+#### Invalidation by class change
+
+When the engine computes a risk for a column and the newly computed `riskClass` differs from the stored one, it **clears `riskAck`**. The hazard has changed, so the acknowledgement was of a different hazard.
+
+This applies wherever the engine computes a risk — in `Validate` and in carry-over alike. Carry-over is the case that forces the field to exist at all: after rediscovery the catalog that produced the original risk is gone, so the old class cannot be recomputed and can only be read back from the payload.
+
+#### The predicate is unchanged, and the two mechanisms are distinct
+
+Section 3's predicate stands as written. `HazardClass` survives, derived from text as before, and is used **only** for the acknowledgement-to-risk match inside that predicate, where stripping observed lengths and sample suffixes is exactly right.
+
+The two mechanisms do different jobs and neither can do the other's:
+
+- **normalised text matching** stops an acknowledgement that names nothing — the reflexive-acknowledgement defence;
+- **class change** invalidates an acknowledgement whose hazard genuinely moved, including changes no text reveals.
+
+An implementer who finds themselves collapsing the two into one comparison has lost one of those properties; say which, and stop.
