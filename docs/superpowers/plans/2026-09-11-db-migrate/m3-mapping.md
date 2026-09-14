@@ -6702,3 +6702,22 @@ This is the rule §6 serves and the one §11 scopes. It was stated in text this 
 The view's attention status and count **exclude type risks**, exactly as the server's do. The risk count and filter are separate and always visible.
 
 This is the one rule where the two languages could silently diverge, because the earlier design made a risk an attention item and the reversal is invisible unless stated on both sides.
+
+### 13a. The removal inventory, derived rather than remembered
+
+Section 13 named six files and leaned on "every field, node and helper that carries them" to sweep the rest. Derived from the commit itself, the mechanism touches **fifteen**. The nine it did not name:
+
+- `MappingModule.cs` — 33 lines, including the acknowledgement normaliser and the class backfill, neither of which section 13 mentions at all
+- `MappingMalformedPayloadTests.cs` — the acknowledgement malformed shapes
+- `MappingValidatorTests.cs`
+- `MappingPacketTests.cs`
+- `MappingValidator.cs` — the acknowledgement half of the predicate
+- `MappingFlowTests.cs`
+- `MappingModuleTests.cs`
+- `MappingArchitectAgentTests.cs`
+
+Identifiers to remove entirely: the acknowledgement field, the class field, the hazard-class helper, both comparison helpers, the acknowledgement normaliser, the class backfill, and the `acknowledged` packet field.
+
+**Do not trust this list either.** It is the second attempt at the same enumeration, and the first was short by nine files. The completion criterion is mechanical: after deletion, a case-insensitive search of the engine and plugin tree for those identifiers returns nothing outside git history. That check does not depend on the list being right, which is the property every enumeration in this document has lacked.
+
+One judgement the search cannot make: `acknowledged` may survive in prose that is still correct — a comment or a playbook sentence about a human having seen a risk, rather than about the deleted field. Read each hit before removing it.
