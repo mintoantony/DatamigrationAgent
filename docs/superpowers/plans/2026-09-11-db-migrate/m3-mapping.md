@@ -6420,3 +6420,43 @@ The sentinel risk text and the sentinel `riskClass` value each live in a single 
 Amendment 4 K6 stated the sentinel as a dual rule: in the predicate, sentinel text equals sentinel text; in the `riskClass` check, a newly computed sentinel class never equals the stored one. **L3 deleted the second half.** K6 second clause is therefore stale and is struck.
 
 The whole of the sentinel rule is now the first half, and it is not a rule so much as a consequence: under plain string equality, identical sentinel text compares equal and the acknowledgement stands. Nothing anywhere treats the sentinel differently from any other risk.
+
+---
+
+## THE RISK MODEL, FINAL — per-column acknowledgement is CUT
+
+**This section is normative and supersedes every risk statement above it, including all five amendments.** Where anything above conflicts, this wins and the passage above is wrong rather than merely older.
+
+Per-column acknowledgement is removed. The stopping rule recorded earlier has fired: it said that anything needing a **new** rule rather than a removal means the mechanism is cut, and the sampled-marker refresh needs one. A profiler that samples `TOP n` without an `ORDER BY` moves a column between the hard and soft forms of a truncation risk across rediscoveries of unchanged data; the refresh rule covers soft-to-hard and says nothing about hard-to-soft, so an acknowledged column drops into attention and returns with nothing having changed. Closing that requires another rule, on a sub-mechanism that had drawn a HIGH finding on each of the previous six verification passes while buying exactly one property: that the attention count can reach zero while risks exist.
+
+### What is deleted
+
+`riskAck`, `riskClass`, `HazardClass`, the exact-match rule, the token refresh and its sampled-marker condition, the class-change and absent-class clearing rules, the acknowledgement half of the any-change clearing rule, carry-over copying of the two removed fields, the auto-mapper class writer, the ownership warnings and malformed shapes for the two removed fields, the per-column acknowledgement control in the browser, and the Milestone 4 acknowledgement ruling — M4 keeps one warning per risk, using the shared sentinel constant.
+
+### What is kept
+
+Engine-owned `typeRisk` and its ownership rule; the ordered cases in `Validate`; the carry-over sequence with its bare recompute; the sentinel and its shared constants; the pinned attention message; the recorded residual for pre-model custom expressions; the confident-table rule; the malformed-payload rejection in full; and the visibility infrastructure — count, filter and packet list.
+
+### What replaces it
+
+1. **Attention is the confidence band and blockers.** A type risk no longer creates an attention item. This reverses the earlier rule that made a risk count as needing review.
+
+2. **Type risks are their own always-visible channel** — their own count, their own filter, their own list in the work packet and in the review screen. They are never hidden behind a band that has nothing to do with them.
+
+3. **`IsConfident` remains risk-present.** A table carrying any type risk is detailed rather than summarised, so the agent always sees every risk. The invariant that a type-conversion hazard reaches both the human and the agent is unchanged and is now carried by this rule alone.
+
+4. **`NeedsAgent` fires on attention, or on the draft containing any type risk.** It is evaluated once, when a job completes, so it cannot loop.
+
+5. **The playbook**: for each type risk, either transform it away, or say in the `summary` why it is acceptable. There is no field to write and nothing to clear. `rationale` keeps its existing purpose.
+
+6. **Approval carries one explicit confirmation.** When a version contains type risks, approving it requires an explicit acknowledgement flag on the approve call; without it the approval is rejected and names the count. The review screen lists the risks being signed off.
+
+   Approval is already per version, so this sign-off needs no invalidation, no class, no token, no refresh and no carry-over state. A new version is a new sign-off.
+
+   **Scope note:** this touches the approve path rather than the mapping module. It belongs to the Task 3.5 round together with the review-screen list, or to Milestone 6 if it reaches too far into closed work. It is **required**, not optional — items 1 to 5 make every risk visible, and only this makes a human confirm having seen them.
+
+### What this costs, stated plainly
+
+There is no machine-checked per-column record of *why* a particular risk was accepted. `summary` and `rationale` carry that in prose, unchecked — which is acceptable precisely because nothing machine-reads them, so nothing can be silently defeated by writing the wrong thing into them.
+
+And a reviewer confirms the risks on every approval, including risks they accepted in a previous version. One confirmation per approval is a small price against roughly fifteen rules spread across three codebases.
