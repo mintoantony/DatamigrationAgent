@@ -5557,3 +5557,40 @@ Fix with the idiom this file already uses: guard every column-map lookup with `O
 - A test that fails if `typeRisk` stops rendering. There is none today.
 - A test that fails if a dirty view is destroyed by a shell re-render — drive it through the comment-post path, which is the real workflow.
 - The "blockers mirror MappingValidator" test currently compares hand-copied strings and never runs the C# validator and the JS against one fixture, so C#/JS drift goes unnoticed. Pin the two against a shared fixture.
+
+### AMENDMENT CORRECTIONS (fix round 1, second pass)
+
+These replace the corresponding parts of A1, A2, A3 and A4 above. They came from the reviewer checking the first pass at source. A5 and A6 are unchanged.
+
+#### A3 corrected — the reason, and a missing site
+
+The first pass credited `findKey` with making table level safe. That is wrong. `findKey` protects column **reads** only. Table keys are written with plain bracket access in `setSource` (~:748), `skipTable` (~:757) and `diff` (~:570-571, `t in at` / `t in bt`).
+
+What actually protects them is the **dotted-key invariant**: a table key is always `schema.table`, so it always contains a dot and can never equal `__proto__`, `toString` or `constructor`. The same invariant protects `drops`, `covered`/`dropped`, `byTable`/`missing` and `view.expanded`. Cite the invariant, not `findKey`.
+
+**Missing site, now in scope:** `diff` (~:578-579), `c in ac` / `c in bc`. For a removed column named `toString`, `in` is true through the prototype, so no remove op is emitted and the deletion silently fails to save. A3 therefore covers `editColumn`, `restoreIfUnchanged` **and** `diff`.
+
+**Test design:** a prototype-key test must use a dotless **column** name. A test using a dotless **table** key would exercise a state that cannot occur; do not write one.
+
+#### A4 corrected — concrete matching rule, and the regression trap
+
+`tableStatus` must match `key + ':'` **or** `key + '.' + <a column of that target table> + ':'`, using the target column list from the context.
+
+**Trap:** column blockers read `"app.Customers.FirstName: ..."`, and a table row must still turn red for its own column blockers. A fix that tests only `key + ':'` regresses that and breaks the existing passing test `statuses and attention follow the auto-accept band`. Deleting the `key + '.'` branch outright is the wrong fix.
+
+**Required test pair:** (1) a blocker on `app.Customers.Old` must not mark `app.Customers`; (2) a genuine column blocker still does mark its table.
+
+`columnStatus` stays out of this round but is **not** proven safe: a target table literally named `app.Customers.Name` yields a blocker that `columnStatus('app.Customers', 'Name')` matches. Known residual, deliberately deferred.
+
+#### A2 corrected — the predicate must ignore method and confidence
+
+The `typeRisk` check keys on a non-empty `typeRisk` **alone**. It must not be routed through `needsReview`, and must not carry any fuzzy/vector or confidence test. `needsReview` gates on `method` being `fuzzy` or `vector`, so reusing it leaves `exact` matches and `human` edits invisible — precisely the rows the deferred stale-risk finding produces.
+
+Parity tests must cover **both** an `exact` row carrying a risk and a `human` row carrying a risk, on the C# and JS sides.
+
+#### A1 corrected — two further paths
+
+- A **failed** save (`res.ok === false`, or the catch path) must leave the view dirty. Clear `before` only on success. The guard must still block re-render while the failure toast is up, or the user loses the edits the save just failed to persist.
+- **Approve** and **Request changes** from the review bar while dirty have no defined behaviour today, and the guard would strand the view on the old version after the phase moves on. While dirty, both must first make the user resolve the edits — save or discard — and after the action succeeds the view must re-render even though the guard would otherwise block it, because the phase has moved and the editable view is no longer valid. If `ctx.refresh` has no way to force a render, add one.
+
+The A1 invariant is unchanged and still governs. These two paths are further examples, not a new exhaustive list.
