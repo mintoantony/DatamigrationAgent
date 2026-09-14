@@ -105,6 +105,10 @@ public class TypeCompatTests
     [InlineData("decimal(9,0)", "int", null, null, null, "Widening", null)]
     [InlineData("decimal(12,0)", "int", null, null, null, "Risky", "overflow possible")]
     [InlineData("decimal(12,0)", "int", null, "0", "100", "Widening", "sampled")]
+    // Mixed Hard+Soft in one result: the fractional-truncation hazard is Hard (a range sample is no evidence about it)
+    // and forces Risky, even though the 0..100 profile satisfies the overflow hazard. Pins that sample evidence can
+    // never launder away an unrelated real risk — the invariant the T3.1 review's Critical turned on.
+    [InlineData("decimal(12,2)", "int", null, "0", "100", "Risky", "fractional part truncated")]
     [InlineData("numeric(18,0)", "bigint", null, null, null, "Widening", null)]
     [InlineData("decimal(10,2)", "float", null, null, null, "Widening", null)]
     [InlineData("decimal(20,2)", "float", null, null, null, "Risky", "precision loss")]
