@@ -267,6 +267,7 @@ public sealed class WorkflowEngine(DbmServices services)
     /// <summary>Submits draft feedback; requires at least one open item; phase → reworking.</summary>
     public void RequestChanges(PhaseName phase) => services.Db.InTransaction(() =>
     {
+        if (!Phases.Reviewable.Contains(phase)) throw new WorkflowException($"{phase.Text()} cannot be reworked.");
         var row = services.Phases.Get(phase);
         if (row.Status != PhaseStatus.AwaitingReview)
             throw new WorkflowException($"{phase.Text()} is {EnumText.ToText(row.Status)}; changes can be requested only while it awaits review.");
@@ -371,6 +372,8 @@ public sealed class WorkflowEngine(DbmServices services)
         var row = services.Phases.Get(phase);
         if (row.Status is PhaseStatus.Pending or PhaseStatus.Stale) return;
         services.Phases.ClearApproval(phase);
+        // Open/draft feedback targeted the version this phase is leaving behind; it must not survive the cascade.
+        if (services.Feedback.CloseOpenAndDrafts(phase) > 0) Publish("feedback_changed", new { phase });
         SetStatus(phase, PhaseStatus.Stale);
     }
 

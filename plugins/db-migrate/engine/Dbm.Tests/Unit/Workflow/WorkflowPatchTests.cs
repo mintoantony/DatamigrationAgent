@@ -115,10 +115,14 @@ public class WorkflowPatchTests
         FakeServices.DriveToAnalysisDraft(s);
 
         var bad = s.Workflow.ApplyPatch(SummaryPatch("analysis", 0, "x"));
-        var good = s.Workflow.ApplyPatch(SummaryPatch("analysis", 0, "A proper summary"));
 
         Assert.Equal(new[] { "summary too short" }, bad.Errors);
+        Assert.Null(s.Artifacts.Get(PhaseName.Analysis, 1));
+
+        var good = s.Workflow.ApplyPatch(SummaryPatch("analysis", 0, "A proper summary"));
+
         Assert.True(good.Ok);
+        Assert.Equal(1, good.Version);
         Assert.Equal(new[] { "consider listing risks" }, good.Warnings);
     }
 

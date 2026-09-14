@@ -24,6 +24,16 @@ public sealed class FeedbackRepo(StateDb db)
     public int SubmitDrafts(PhaseName phase) =>
         db.Execute("UPDATE feedback SET status = 'open' WHERE phase = $Phase AND status = 'draft'", new { Phase = phase });
 
+    /// <summary>
+    /// Declines every open/draft item of the phase (they were written about a version that is now superseded);
+    /// addressed/declined items are untouched. Returns how many were closed.
+    /// </summary>
+    public int CloseOpenAndDrafts(PhaseName phase) =>
+        db.Execute("""
+            UPDATE feedback SET status = 'declined', response = 'Superseded: the phase changed before this was addressed.'
+            WHERE phase = $Phase AND status IN ('open', 'draft')
+            """, new { Phase = phase });
+
     public IReadOnlyList<FeedbackRow> List(PhaseName phase, FeedbackStatus? status = null) =>
         status is null
             ? db.Query($"SELECT {Columns} FROM feedback WHERE phase = $Phase ORDER BY id", Map, new { Phase = phase })

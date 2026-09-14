@@ -1,4 +1,5 @@
 using Dbm.Core;
+using Dbm.Core.Patching;
 using Dbm.Core.State;
 using Dbm.Core.Workflow;
 using Dbm.Tests.Support;
@@ -346,5 +347,64 @@ public class WorkflowTransitionTests
         Assert.Equal(PhaseStatus.Stale, StatusOf(s, PhaseName.Analysis));
         Assert.Equal(PhaseStatus.Stale, StatusOf(s, PhaseName.Mapping));
         Assert.Equal(PhaseStatus.Pending, StatusOf(s, PhaseName.Sql));
+    }
+
+    [Fact]
+    public void Going_stale_closes_open_feedback_so_it_does_not_survive_the_cascade()
+    {
+        using var tw = new TestWorkspace();
+        using var s = FakeServices.Open(tw.Ws);
+        FakeServices.DriveToReview(s, PhaseName.Mapping);
+        var item = s.Feedback.Add(PhaseName.Mapping, 1, null, "Explain the mapping");
+        s.Workflow.RequestChanges(PhaseName.Mapping);
+        Assert.Equal(PhaseStatus.Reworking, StatusOf(s, PhaseName.Mapping));
+
+        s.Workflow.Reopen(PhaseName.Analysis);
+
+        Assert.Equal(PhaseStatus.Stale, StatusOf(s, PhaseName.Mapping));
+        Assert.Empty(s.Feedback.List(PhaseName.Mapping, FeedbackStatus.Open));
+        Assert.NotEqual(FeedbackStatus.Open, s.Feedback.Get(item.Id)!.Status);
+
+        s.Workflow.Approve(PhaseName.Analysis);   // reruns Mapping's job with carry-over
+        FakeServices.CompleteNextJob(s, FakeServices.Draft("mapping redraft"));
+        Assert.Equal(PhaseStatus.Drafting, StatusOf(s, PhaseName.Mapping));
+        FakeServices.ApplySummary(s, PhaseName.Mapping, "mapping v2");
+
+        Assert.Equal(PhaseStatus.AwaitingReview, StatusOf(s, PhaseName.Mapping));
+        Assert.Empty(s.Feedback.List(PhaseName.Mapping, FeedbackStatus.Open));
+        var ex = Assert.Throws<WorkflowException>(() => s.Workflow.RequestChanges(PhaseName.Mapping));
+        Assert.Contains("at least one feedback item", ex.Message);
+    }
+
+    [Fact]
+    public void Request_changes_is_rejected_on_a_non_reviewable_phase()
+    {
+        using var tw = new TestWorkspace();
+        using var s = FakeServices.Open(tw.Ws);
+        FakeServices.DriveToReview(s, PhaseName.Sql);
+        s.Workflow.Approve(PhaseName.Sql);
+        Assert.Equal(PhaseStatus.AwaitingReview, StatusOf(s, PhaseName.Ready));
+        s.Feedback.Add(PhaseName.Ready, 0, null, "note");
+
+        Assert.Throws<WorkflowException>(() => s.Workflow.RequestChanges(PhaseName.Ready));
+
+        Assert.Equal(PhaseStatus.AwaitingReview, StatusOf(s, PhaseName.Ready));
+    }
+
+    [Fact]
+    public void Approve_request_changes_and_human_edit_are_rejected_on_a_stale_phase()
+    {
+        using var tw = new TestWorkspace();
+        using var s = FakeServices.Open(tw.Ws);
+        FakeServices.DriveToReview(s, PhaseName.Sql);
+
+        s.Workflow.Reopen(PhaseName.Analysis);   // Mapping and Sql become stale
+
+        Assert.Equal(PhaseStatus.Stale, StatusOf(s, PhaseName.Mapping));
+        Assert.Throws<WorkflowException>(() => s.Workflow.Approve(PhaseName.Mapping));
+        Assert.Throws<WorkflowException>(() => s.Workflow.RequestChanges(PhaseName.Mapping));
+        var edit = s.Workflow.HumanEdit(new Patch("mapping", 1, [], []));
+        Assert.False(edit.Ok);
+        Assert.Contains("direct edits are allowed only while it awaits review", edit.Errors.Single());
     }
 }
