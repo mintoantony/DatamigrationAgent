@@ -21,8 +21,12 @@ public static class DriftChecker
     private static async Task<bool> ChangedAsync(DbmServices services, Side side, CancellationToken ct)
     {
         var saved = services.Catalog.Fingerprint(side);
-        var connectionString = services.Connections.GetConnectionString(side);
-        if (saved is null || connectionString is null) return false;   // nothing discovered yet: nothing to drift from
+        if (saved is null) return false;   // nothing discovered yet: nothing to drift from
+        // A fingerprint WAS saved, so there is something to compare against; a missing connection string means the
+        // comparison cannot be made, not that it came out clean. Throw so the caller's existing "couldn't verify"
+        // policy applies (DriftGuardAsync warns and allows) instead of silently reporting "no drift".
+        var connectionString = services.Connections.GetConnectionString(side)
+            ?? throw new InvalidOperationException($"{EnumText.ToText(side)}: no connection string saved; cannot verify against the saved fingerprint.");
         var meta = services.Connections.GetMeta(side) ?? await SqlConnect.ProbeAsync(connectionString, ct);
         await using var conn = await SqlConnect.OpenAsync(connectionString, ct);
         var current = await CatalogExtractor.ExtractAsync(conn, meta, ct);

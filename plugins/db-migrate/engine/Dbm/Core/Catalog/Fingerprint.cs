@@ -16,6 +16,8 @@ public static class Fingerprint
             .Select(t => new
             {
                 t.Key,
+                // IsRowVersion is deliberately not projected: CatalogExtractor derives it as (DataType == "timestamp"),
+                // so DataType already carries that information and no schema change can flip one without the other.
                 Columns = t.Columns.Select(c => new
                 {
                     c.Name, c.DataType, c.MaxLength, c.Precision, c.Scale, c.IsNullable, c.IsIdentity,

@@ -52,4 +52,26 @@ public sealed class FingerprintTests
         Assert.NotEqual(fp, Fingerprint.Compute(added));
         Assert.NotEqual(fp, Fingerprint.Compute(trigger));
     }
+
+    [Fact]
+    public void Collation_change_alters_hash()
+    {
+        var baseline = TestCatalogs.LegacyShop();
+        var recollated = WithTable(baseline, "dbo.CUST", t => t with
+        {
+            Columns = t.Columns.Select(c => c.Name == "CUST_NM" ? c with { Collation = "Latin1_General_BIN2" } : c).ToList(),
+        });
+        Assert.NotEqual(Fingerprint.Compute(baseline), Fingerprint.Compute(recollated));
+    }
+
+    [Fact]
+    public void Index_reordering_does_not_alter_hash()
+    {
+        var baseline = WithTable(TestCatalogs.LegacyShop(), "dbo.CUST", t => t with
+        {
+            Indexes = t.Indexes.Append(new IndexInfo("IX_CUST_NM", false, false, false, new List<string> { "CUST_NM" })).ToList(),
+        });
+        var reordered = WithTable(baseline, "dbo.CUST", t => t with { Indexes = Enumerable.Reverse(t.Indexes).ToList() });
+        Assert.Equal(Fingerprint.Compute(baseline), Fingerprint.Compute(reordered));
+    }
 }
