@@ -168,7 +168,13 @@ public sealed class FeedbackCommand : ICommand
     }
 }
 
-/// <summary>`dbm run-jobs` — run queued jobs in this process (no server needed).</summary>
+/// <summary>
+/// `dbm run-jobs` — run queued jobs in this process (no server needed). Takes the same exclusive server.lock as
+/// `dbm serve`: a running server already has its own JobRunner draining the queue, and without this a server
+/// starting mid-run would see the job this command is executing as "running" left over from a crash and requeue
+/// it — the same double-run WebHost.RunAsync's own lock now prevents for the server itself. If a server already
+/// owns the lock, this command does no work rather than race it.
+/// </summary>
 public sealed class RunJobsCommand : ICommand
 {
     public string Name => "run-jobs";
@@ -176,8 +182,25 @@ public sealed class RunJobsCommand : ICommand
 
     public async Task<int> RunAsync(Args args, CliContext ctx)
     {
-        using var services = ctx.OpenProject();
-        var ran = await new JobRunner(services).RunPendingAsync(CancellationToken.None);
-        return Output.Ok(ctx, new { ok = true, ran });
+        var ws = ctx.RequireProject();
+        FileStream serverLock;
+        try
+        {
+            serverLock = new FileStream(ws.ServerLockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        }
+        catch (IOException ex) when (WebHost.IsLockHeldByAnotherProcess(ex))
+        {
+            return Output.Ok(ctx, new { ok = true, ran = 0, skipped = "server_running" });
+        }
+        try
+        {
+            using var services = ctx.OpenServices(ws);
+            var ran = await new JobRunner(services).RunPendingAsync(CancellationToken.None);
+            return Output.Ok(ctx, new { ok = true, ran });
+        }
+        finally
+        {
+            serverLock.Dispose();
+        }
     }
 }

@@ -62,7 +62,21 @@ public static class ServerControl
         throw new InvalidOperationException($"The dbm server did not start within {StartTimeout.TotalSeconds:0} s; see {ws.ServerLogPath}");
     }
 
-    /// <summary>POST /api/shutdown, wait ≤ 5 s for the server to remove server.json; kill it if it does not.</summary>
+    /// <summary>How long to wait for server.lock to be released after asking the server to shut down.</summary>
+    internal static TimeSpan LockReleaseTimeout = TimeSpan.FromSeconds(10);
+
+    /// <summary>How long to wait for server.lock to be released after killing an identified server process.</summary>
+    internal static TimeSpan KillGraceTimeout = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// POST /api/shutdown, then wait for <c>server.lock</c> to be released — the process has actually finished
+    /// <see cref="WebHost.RunAsync"/>, including draining its job/event loops — rather than for server.json to
+    /// disappear, which a killed process never gets the chance to delete itself. Falls back to killing the
+    /// recorded PID only once its identity is confirmed (name and OS start time); if identity can't be confirmed,
+    /// or the kill itself fails (e.g. an elevated server), this throws rather than silently leaving a live server
+    /// unaccounted for. server.json is deleted only once the server is known to be gone: cleanly, by a confirmed
+    /// kill, or because the recorded PID is positively a different process.
+    /// </summary>
     public static async Task StopAsync(Workspace ws)
     {
         var info = ReadInfo(ws);
@@ -79,23 +93,86 @@ public static class ServerControl
             // not answering: fall through to the kill below
         }
 
-        for (var i = 0; i < 25; i++)
+        if (await WaitForLockReleaseAsync(ws, LockReleaseTimeout))
         {
-            if (ReadInfo(ws) is not { } current || current.Pid != info.Pid) return;   // stopped cleanly (or replaced)
-            await Task.Delay(200);
+            if (ReadInfo(ws) is { } clean && clean.Pid == info.Pid) File.Delete(ws.ServerJsonPath);
+            return;
         }
 
+        Process? process;
         try
         {
-            using var process = Process.GetProcessById(info.Pid);
-            if (process.Id != Environment.ProcessId && IsSameServer(process) && StartTimeMatches(process, info))
-                process.Kill(entireProcessTree: true);
+            process = Process.GetProcessById(info.Pid);
         }
         catch (ArgumentException)
         {
-            // already exited
+            process = null;   // already exited
         }
+
+        if (process is not null)
+        {
+            using (process)
+            {
+                if (process.Id != Environment.ProcessId)
+                {
+                    bool identifiedAsServer;
+                    try
+                    {
+                        identifiedAsServer = IsSameServer(process) && StartTimeMatches(process, info);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new InvalidOperationException(
+                            $"dbm server PID {info.Pid} is still running and could not be identified ({ex.Message}); leaving it running.");
+                    }
+
+                    if (identifiedAsServer)
+                    {
+                        try
+                        {
+                            process.Kill(entireProcessTree: true);
+                        }
+                        catch (Exception ex)
+                        {
+                            throw new InvalidOperationException(
+                                $"dbm server PID {info.Pid} is still running and could not be stopped (elevated?): {ex.Message}");
+                        }
+
+                        if (!await WaitForLockReleaseAsync(ws, KillGraceTimeout))
+                            throw new InvalidOperationException($"dbm server PID {info.Pid} is still running and could not be stopped.");
+                    }
+                    // else: the recorded PID is positively a different process (crashed and reused) — nothing to kill.
+                }
+            }
+        }
+
         if (ReadInfo(ws) is { } stale && stale.Pid == info.Pid) File.Delete(ws.ServerJsonPath);
+    }
+
+    /// <summary>True once server.lock can be opened exclusively — the definitive "the server process has fully
+    /// exited RunAsync" signal, unlike server.json's disappearance which a killed process never gets to do itself.</summary>
+    private static bool ProbeLockFree(Workspace ws)
+    {
+        try
+        {
+            using var probe = new FileStream(ws.ServerLockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+    }
+
+    private static async Task<bool> WaitForLockReleaseAsync(Workspace ws, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (true)
+        {
+            if (ProbeLockFree(ws)) return true;
+            if (DateTime.UtcNow >= deadline) return false;
+            await Task.Delay(200);
+        }
     }
 
     public static void OpenBrowser(string url)
@@ -185,22 +262,18 @@ public static class ServerControl
     /// <summary>
     /// A process can only be the one that wrote <paramref name="info"/> if the OS started it at or before
     /// <see cref="ServerInfo.StartedAt"/> (the server records that timestamp itself, after it has already been
-    /// running for a little while). If the PID was reused for an unrelated process after the real server crashed,
-    /// that process necessarily started later than the stale <c>server.json</c> it happens to match on PID alone.
-    /// A tolerance absorbs clock-source differences between <see cref="Process.StartTime"/> and <see cref="Clock"/>
-    /// plus how long process/service startup can legitimately take before <see cref="ServerInfo"/> is created.
+    /// running for a little while — startup latency only ever pushes <see cref="ServerInfo.StartedAt"/> later
+    /// relative to the process's real OS start time, so it can only help a genuine match). If the PID was reused
+    /// for an unrelated process after the real server crashed, that process necessarily started later than the
+    /// stale <c>server.json</c> it happens to match on PID alone. The tolerance exists only to absorb clock-source
+    /// skew between <see cref="Process.StartTime"/> and <see cref="Clock"/>; it is deliberately small — false
+    /// negatives are safe (the caller reports the PID and refuses to act), false positives are not (they authorise
+    /// killing an unrelated process tree).
     /// </summary>
-    internal static readonly TimeSpan StartTimeTolerance = TimeSpan.FromSeconds(30);
+    internal static readonly TimeSpan StartTimeTolerance = TimeSpan.FromSeconds(5);
 
-    internal static bool StartTimeMatches(Process process, ServerInfo info)
-    {
-        try
-        {
-            return process.StartTime.ToUniversalTime() <= info.StartedAt.UtcDateTime + StartTimeTolerance;
-        }
-        catch (Exception)
-        {
-            return false;
-        }
-    }
+    /// <summary>Throws if <see cref="Process.StartTime"/> can't be read (e.g. access denied for an elevated
+    /// process) — the caller must treat that as "can't confirm identity", not as a silent non-match.</summary>
+    internal static bool StartTimeMatches(Process process, ServerInfo info) =>
+        process.StartTime.ToUniversalTime() <= info.StartedAt.UtcDateTime + StartTimeTolerance;
 }

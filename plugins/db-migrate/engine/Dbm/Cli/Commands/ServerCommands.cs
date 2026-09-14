@@ -24,14 +24,12 @@ public sealed class ServeCommand : ICommand
             Console.SetError(TextWriter.Null);
         }
         var output = detached ? TextWriter.Null : ctx.Out;
-        var started = false;
-        await WebHost.RunAsync(ws, args.Int("port", 0), CancellationToken.None, ctx.ServicesFactory, info =>
+        var result = await WebHost.RunAsync(ws, args.Int("port", 0), CancellationToken.None, ctx.ServicesFactory, info =>
         {
-            started = true;
             output.WriteLine(Json.Serialize(new { ok = true, url = info.UiUrl, pid = info.Pid }));
             output.Flush();
         });
-        if (started) return 0;
+        if (result == WebHostStartResult.Started) return 0;
 
         // WebHost.RunAsync returned early without starting: another process already owns this workspace
         // (a live server answered health, or it holds the exclusive server.lock). Never silently exit as if we served.

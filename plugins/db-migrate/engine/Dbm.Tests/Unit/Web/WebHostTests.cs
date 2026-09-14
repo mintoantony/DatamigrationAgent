@@ -59,7 +59,25 @@ public class WebHostTests
             },
             _ => onStartedCalled = true);
 
-        await second.WaitAsync(TimeSpan.FromSeconds(5));
+        try
+        {
+            var result = await second.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(WebHostStartResult.AlreadyRunning, result);
+        }
+        finally
+        {
+            // If exclusivity regressed and `second` actually started serving, this must still shut it down —
+            // otherwise a leaked server keeps the workspace directory from being deleted at the end of the test.
+            cts2.Cancel();
+            try
+            {
+                await second;
+            }
+            catch (Exception)
+            {
+                // already observed above, or cancelled before it ever started
+            }
+        }
 
         Assert.False(factoryCalled);
         Assert.False(onStartedCalled);

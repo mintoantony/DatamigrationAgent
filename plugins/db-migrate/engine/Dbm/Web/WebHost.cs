@@ -14,35 +14,45 @@ using Microsoft.Extensions.Logging;
 
 namespace Dbm.Web;
 
+/// <summary>What <see cref="WebHost.RunAsync"/> did — only known once it returns, since a started server blocks in
+/// this call for its entire lifetime. Replaces the "started" flag callers used to infer from whether their
+/// <c>onStarted</c> callback fired.</summary>
+public enum WebHostStartResult
+{
+    /// <summary>Ran the server to completion (until shutdown).</summary>
+    Started,
+
+    /// <summary>Returned immediately: another process already owns this workspace (live server, or holds server.lock).</summary>
+    AlreadyRunning,
+}
+
 public static class WebHost
 {
+    private const int LockRetryAttempts = 5;
+    private static readonly TimeSpan LockRetryDelay = TimeSpan.FromMilliseconds(200);
+
     /// <summary>
     /// Serves wwwroot + API on 127.0.0.1:<paramref name="port"/> (0 = pick a free port) until <paramref name="ct"/> fires or
-    /// POST /api/shutdown. Writes server.json when started, deletes it when stopped. Returns immediately if another live
-    /// server already owns the workspace, or if another process already holds the workspace's exclusive server.lock
-    /// (the OS releases the lock if that process crashes, so a stale lock never blocks a later start).
+    /// POST /api/shutdown. Writes server.json when started, deletes it when stopped. Returns
+    /// <see cref="WebHostStartResult.AlreadyRunning"/> immediately if another live server already owns the workspace,
+    /// or if another process already holds the workspace's exclusive server.lock (the OS releases the lock if that
+    /// process crashes, so a stale lock never blocks a later start).
     /// </summary>
     /// <param name="servicesFactory">Test hook (fake modules/handlers). Default: DbmServices.Open(ws).</param>
     /// <param name="onStarted">Called once the server listens (ServeCommand prints the URL).</param>
-    public static async Task RunAsync(Workspace ws, int port, CancellationToken ct,
+    public static async Task<WebHostStartResult> RunAsync(Workspace ws, int port, CancellationToken ct,
         Func<Workspace, DbmServices>? servicesFactory = null, Action<ServerInfo>? onStarted = null)
     {
         var existing = ServerControl.ReadInfo(ws);
-        if (existing is not null && existing.Pid != Environment.ProcessId && await ServerControl.IsAliveAsync(existing, ct)) return;
+        if (existing is not null && existing.Pid != Environment.ProcessId && await ServerControl.IsAliveAsync(existing, ct))
+            return WebHostStartResult.AlreadyRunning;
 
         Directory.CreateDirectory(ws.Dir);
-        FileStream serverLock;
+        var log = new FileLog(ws.ServerLogPath);
+        var serverLock = await TryAcquireLockAsync(ws, log, ct);
+        if (serverLock is null) return WebHostStartResult.AlreadyRunning;
         try
         {
-            serverLock = new FileStream(ws.ServerLockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-        }
-        catch (IOException)
-        {
-            return;   // another process is already serving this workspace
-        }
-        try
-        {
-            var log = new FileLog(ws.ServerLogPath);
             var services = (servicesFactory ?? (w => DbmServices.Open(w)))(ws);
             try
             {
@@ -111,11 +121,51 @@ public static class WebHost
             {
                 services.Dispose();
             }
+            return WebHostStartResult.Started;
         }
         finally
         {
             serverLock.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Opens server.lock exclusively, retrying briefly first — a momentary open by antivirus/OneDrive on a
+    /// freshly created file should not be mistaken for another server owning the workspace. Only a genuine sharing
+    /// violation is treated as "held"; any other <see cref="IOException"/> (missing directory, disk error, …)
+    /// surfaces instead of being swallowed as "already running".
+    /// </summary>
+    private static async Task<FileStream?> TryAcquireLockAsync(Workspace ws, FileLog log, CancellationToken ct)
+    {
+        for (var attempt = 1; attempt <= LockRetryAttempts; attempt++)
+        {
+            try
+            {
+                return new FileStream(ws.ServerLockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException ex) when (IsLockHeldByAnotherProcess(ex))
+            {
+                if (attempt == LockRetryAttempts)
+                {
+                    log.Write("info", "server.lock is held by another process; not starting (workspace already served).");
+                    return null;
+                }
+                await Task.Delay(LockRetryDelay, ct);
+            }
+        }
+        return null;
+    }
+
+    /// <summary>True only for a genuine lock/sharing conflict (Win32 ERROR_SHARING_VIOLATION/ERROR_LOCK_VIOLATION,
+    /// or EAGAIN/EWOULDBLOCK on POSIX) — never for an unrelated <see cref="IOException"/> such as a missing
+    /// directory, which must surface rather than be read as "another server is running".</summary>
+    internal static bool IsLockHeldByAnotherProcess(IOException ex)
+    {
+        const int ErrorSharingViolation = 32;
+        const int ErrorLockViolation = 33;
+        var code = ex.HResult & 0xFFFF;
+        if (OperatingSystem.IsWindows()) return code == ErrorSharingViolation || code == ErrorLockViolation;
+        return code == 11 /* EAGAIN (Linux) */ || code == 35 /* EWOULDBLOCK (macOS/BSD) */;
     }
 
     private static async Task ErrorBoundaryAsync(HttpContext ctx, RequestDelegate next, FileLog log)
