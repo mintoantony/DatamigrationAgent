@@ -1,0 +1,107 @@
+using Dbm.Core.Sql;
+using Dbm.Core.SqlGen;
+using Xunit;
+
+namespace Dbm.Tests.Unit.SqlGen;
+
+public class TopoSortTests
+{
+    static readonly string[] SampleNodes = ["app.OrderLines", "app.Orders", "app.Customers", "app.Addresses", "app.Products", "app.AuditEvents"];
+    static readonly (string Child, string Parent)[] SampleEdges =
+    [
+        ("app.Addresses", "app.Customers"),   // FK_Addresses_Customers (CustomerId NOT NULL)
+        ("app.Customers", "app.Addresses"),   // FK_Customers_PrimaryAddress (PrimaryAddressId NULL) -> cycle
+        ("app.Orders", "app.Customers"),
+        ("app.Orders", "app.Addresses"),
+        ("app.OrderLines", "app.Orders"),
+        ("app.OrderLines", "app.Products"),
+    ];
+
+    [Fact]
+    public void Chain_puts_parents_first()
+    {
+        var r = TopoSort.Sort(["c", "b", "a"], [("c", "b"), ("b", "a")]);
+        Assert.Equal(["a", "b", "c"], r.Order);
+        Assert.Empty(r.Cycles);
+        Assert.Empty(r.CycleEdges);
+    }
+
+    [Fact]
+    public void Independent_nodes_are_ordinal_sorted()
+    {
+        var r = TopoSort.Sort(["app.b", "app.C", "app.a"], []);
+        Assert.Equal(["app.C", "app.a", "app.b"], r.Order);   // ordinal: 'C' (0x43) < 'a' (0x61)
+    }
+
+    [Fact]
+    public void Sample_cycle_is_broken_on_the_nullable_edge()
+    {
+        var nullable = new HashSet<(string, string)> { ("app.Customers", "app.Addresses"), ("app.Orders", "app.Addresses") };
+        var r = TopoSort.Sort(SampleNodes, SampleEdges, (c, p) => nullable.Contains((c, p)));
+        Assert.Equal(["app.AuditEvents", "app.Customers", "app.Products", "app.Addresses", "app.Orders", "app.OrderLines"], r.Order);
+        var cycle = Assert.Single(r.Cycles);
+        Assert.Equal(["app.Addresses", "app.Customers"], cycle);
+        Assert.Equal([("app.Customers", "app.Addresses")], r.CycleEdges);
+    }
+
+    [Fact]
+    public void Without_preference_the_first_edge_in_ordinal_order_is_cut()
+    {
+        var r = TopoSort.Sort(SampleNodes, SampleEdges);
+        Assert.Equal([("app.Addresses", "app.Customers")], r.CycleEdges);
+        Assert.Equal(["app.Addresses", "app.AuditEvents", "app.Products", "app.Customers", "app.Orders", "app.OrderLines"], r.Order);
+    }
+
+    [Fact]
+    public void Self_reference_is_a_cycle_edge()
+    {
+        var r = TopoSort.Sort(["hr.Employee", "hr.Dept"], [("hr.Employee", "hr.Employee"), ("hr.Employee", "hr.Dept")]);
+        Assert.Equal(["hr.Dept", "hr.Employee"], r.Order);
+        Assert.Equal(["hr.Employee"], Assert.Single(r.Cycles));
+        Assert.Equal([("hr.Employee", "hr.Employee")], r.CycleEdges);
+    }
+
+    [Fact]
+    public void Three_node_cycle_needs_one_cut()
+    {
+        var r = TopoSort.Sort(["a", "b", "c"], [("a", "b"), ("b", "c"), ("c", "a")]);
+        Assert.Equal([("a", "b")], r.CycleEdges);
+        Assert.Equal(["a", "c", "b"], r.Order);
+        Assert.Equal(["a", "b", "c"], Assert.Single(r.Cycles));
+    }
+
+    [Fact]
+    public void Two_separate_cycles_are_both_broken()
+    {
+        var r = TopoSort.Sort(["a", "b", "x", "y"], [("a", "b"), ("b", "a"), ("x", "y"), ("y", "x")]);
+        Assert.Equal(2, r.Cycles.Count);
+        Assert.Equal([("a", "b"), ("x", "y")], r.CycleEdges);
+        Assert.Equal(["a", "x", "b", "y"], r.Order);
+    }
+
+    [Fact]
+    public void Unknown_and_duplicate_edges_are_ignored()
+    {
+        var r = TopoSort.Sort(["a", "b"], [("b", "a"), ("b", "a"), ("b", "zzz"), ("qqq", "a")]);
+        Assert.Equal(["a", "b"], r.Order);
+        Assert.Empty(r.CycleEdges);
+    }
+
+    [Fact]
+    public void Result_is_deterministic_regardless_of_input_order()
+    {
+        var a = TopoSort.Sort(SampleNodes, SampleEdges);
+        var b = TopoSort.Sort(Enumerable.Reverse(SampleNodes).ToArray(), Enumerable.Reverse(SampleEdges).ToArray());
+        Assert.Equal(a.Order, b.Order);
+        Assert.Equal(a.CycleEdges, b.CycleEdges);
+    }
+}
+
+public class SqlQuoteTests
+{
+    [Fact] public void Ident_doubles_closing_brackets() => Assert.Equal("[Order]]Lines]", SqlQuote.Ident("Order]Lines"));
+    [Fact] public void Table_quotes_both_parts() => Assert.Equal("[app].[Orders]", SqlQuote.Table("app", "Orders"));
+    [Fact] public void TableKey_splits_on_first_dot() => Assert.Equal("[dbo].[My.Table]", SqlQuote.TableKey("dbo.My.Table"));
+    [Fact] public void TableKey_rejects_keys_without_schema() => Assert.Throws<ArgumentException>(() => SqlQuote.TableKey("Customer"));
+    [Fact] public void Literal_is_unicode_with_doubled_quotes() => Assert.Equal("N'O''Brien'", SqlQuote.Literal("O'Brien"));
+}
