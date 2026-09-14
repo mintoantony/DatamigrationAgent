@@ -220,7 +220,15 @@ public class AutoMapperTests
     {
         var m = AutoMapper.Map(Src, Tgt, Synonyms.Default(), new MatchOptions(), SampleMappings.Approved());
         Assert.Empty(MappingValidator.Blockers(m, Src, Tgt));
-        Assert.Empty(MappingValidator.Attention(m, new MatchOptions()));
+        // Task 3.4 fix round 1 (D3): carry-over recomputes the risk of bare single-source columns. These three hazards are REAL —
+        // datetime to datetime2(0) rounds fractional seconds, varchar(300) into nvarchar(200) may truncate — and were invisible
+        // only because the hand-written fixture never recorded them. This used to assert no attention at all.
+        Assert.Equal(
+        [
+            "app.Customers.CreatedAt: type risk: fractional seconds rounded to 0 digits",
+            "app.Orders.Comment: type risk: may truncate (source max 300)",
+            "app.Orders.OrderDate: type risk: fractional seconds rounded to 0 digits",
+        ], MappingValidator.Attention(m, new MatchOptions()));
         Assert.All(m.Tables.Values.SelectMany(t => t.Columns.Values), c => Assert.Equal(MapMethod.Carried, c.Method));
     }
 }

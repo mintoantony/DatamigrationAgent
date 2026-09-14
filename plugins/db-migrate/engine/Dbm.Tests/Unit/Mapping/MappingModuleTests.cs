@@ -42,7 +42,7 @@ public class MappingModuleTests
     }
 
     [Fact]
-    public void Needs_agent_for_an_undecided_type_risk_even_when_nothing_else_is_open()
+    public void Needs_agent_for_an_unacknowledged_type_risk_even_when_nothing_else_is_open()
     {
         using var project = TempProject.Create();
         var module = new MappingModule(project.Services.WithSampleCatalogs());
@@ -52,11 +52,15 @@ public class MappingModuleTests
         (comment.Method, comment.Confidence, comment.TypeRisk) = (MapMethod.Fuzzy, 0.88, "may truncate (source max 300)");
         Assert.True(module.NeedsAgent(Json.ToNode(m)));
 
-        foreach (var decided in new[] { MapMethod.Agent, MapMethod.Human, MapMethod.Carried })
+        foreach (var method in new[] { MapMethod.Exact, MapMethod.Agent, MapMethod.Human, MapMethod.Carried })
         {
-            comment.Method = decided;
-            Assert.False(module.NeedsAgent(Json.ToNode(m)), decided.ToString());
+            comment.Method = method;   // method never exempts a risk (C3): only an acknowledgement does
+            comment.RiskAck = null;
+            Assert.True(module.NeedsAgent(Json.ToNode(m)), method.ToString());
+            comment.RiskAck = new RiskAck { Risk = comment.TypeRisk, Reason = "accepted" };
+            Assert.False(module.NeedsAgent(Json.ToNode(m)), method.ToString());
         }
+        comment.RiskAck = null;
 
         comment.Method = MapMethod.Exact;
         m.Tables["app.Orders"].Kind = "skip";   // a skipped table loads nothing, so its risk is no hazard
@@ -157,175 +161,5 @@ public class MappingModuleTests
         Assert.Equal(Truncates, (string?)rework["contexts"]![0]!["context"]!["map"]!["typeRisk"]);
     }
 
-    // ---- B7: a remap re-evaluates its own type risk ------------------------------------------------------------------
-
     private const string Truncates = "may truncate (source max 300)";
-
-    private static MappingPayload WithComment(string expr, string sourceColumn, MapMethod method = MapMethod.Human, string? risk = null)
-    {
-        var m = SampleMappings.Approved();
-        m.Tables["app.Orders"].Columns["Comment"] = new ColumnMap
-        {
-            Expr = expr, SourceColumns = [sourceColumn], Confidence = 1, Method = method, TypeRisk = risk
-        };
-        return m;
-    }
-
-    private static JsonObject CommentNode(JsonNode payload) => payload["tables"]!["app.Orders"]!["columns"]!["Comment"]!.AsObject();
-
-    [Fact]
-    public void A_remap_onto_a_lossy_source_gains_the_risk()
-    {
-        using var project = TempProject.Create();
-        var services = project.Services.WithSampleCatalogs();
-        var module = new MappingModule(services);
-        var before = WithComment("s.[ORD_ID]", "dbo.ORD_HDR.ORD_ID");            // int -> nvarchar(200): no risk
-        var payload = Json.ToNode(WithComment("s.[CMNT]", "dbo.ORD_HDR.CMNT"));   // varchar(300) -> nvarchar(200)
-
-        var check = module.Validate(Ctx(services, before), payload);
-
-        Assert.True(check.Ok, string.Join("\n", check.Errors));
-        Assert.Equal(Truncates, (string?)CommentNode(payload)["typeRisk"]);
-        Assert.Contains($"app.Orders.Comment: type risk: {Truncates}", check.Warnings);
-    }
-
-    [Fact]
-    public void A_remap_away_from_a_lossy_source_loses_the_risk()
-    {
-        using var project = TempProject.Create();
-        var services = project.Services.WithSampleCatalogs();
-        var module = new MappingModule(services);
-        var before = WithComment("s.[CMNT]", "dbo.ORD_HDR.CMNT", risk: Truncates);
-        var payload = Json.ToNode(WithComment("s.[ORD_ID]", "dbo.ORD_HDR.ORD_ID", risk: Truncates));   // stale risk left behind
-        CommentNode(payload)["TypeRisk"] = "a differently-cased duplicate";
-        CommentNode(payload).Remove("typeRisk");
-
-        var check = module.Validate(Ctx(services, before), payload);
-
-        Assert.True(check.Ok, string.Join("\n", check.Errors));
-        Assert.DoesNotContain(CommentNode(payload), kv => kv.Key.Equals("typeRisk", StringComparison.OrdinalIgnoreCase));
-        Assert.DoesNotContain(check.Warnings, w => w.StartsWith("app.Orders.Comment"));
-    }
-
-    [Fact]
-    public void An_empty_expression_with_one_source_column_is_recomputed()
-    {
-        using var project = TempProject.Create();
-        var services = project.Services.WithSampleCatalogs();
-        var module = new MappingModule(services);
-        var after = WithComment("s.[CMNT]", "dbo.ORD_HDR.CMNT");
-        after.Tables["app.Orders"].Columns["Comment"].Expr = null;
-        var payload = Json.ToNode(after);
-
-        Assert.True(module.Validate(Ctx(services, SampleMappings.Approved()), payload).Ok);
-        Assert.Equal(Truncates, (string?)CommentNode(payload)["typeRisk"]);
-    }
-
-    [Fact]
-    public void An_unchanged_column_keeps_its_risk_text_byte_for_byte()
-    {
-        using var project = TempProject.Create();
-        var services = project.Services.WithSampleCatalogs();
-        var module = new MappingModule(services);
-        const string agentWording = "Agent: CMNT values over 200 chars exist in 3 rows — accepted, see rationale.";
-        var before = WithComment("s.[CMNT]", "dbo.ORD_HDR.CMNT", MapMethod.Agent, agentWording);
-        var after = WithComment("s.[CMNT]", "DBO.ORD_HDR.cmnt", MapMethod.Agent, agentWording);   // same source, other case
-        after.Tables["app.Orders"].Columns["Comment"].Rationale = "unrelated save";
-        after.Tables["app.Customers"].Columns["Email"].Expr = "LOWER(s.[EMAIL_ADDR])";              // another column changes
-        var payload = Json.ToNode(after);
-
-        Assert.True(module.Validate(Ctx(services, before), payload).Ok);
-
-        Assert.Equal(agentWording, (string?)CommentNode(payload)["typeRisk"]);
-    }
-
-    [Fact]
-    public void A_human_custom_expression_replaces_the_stale_risk_with_the_custom_expression_attention()
-    {
-        using var project = TempProject.Create();
-        var services = project.Services.WithSampleCatalogs();
-        var module = new MappingModule(services);
-        var before = WithComment("s.[CMNT]", "dbo.ORD_HDR.CMNT", risk: Truncates);
-        var payload = Json.ToNode(WithComment("CAST(s.[CMNT] AS nvarchar(200))", "dbo.ORD_HDR.CMNT", risk: Truncates));
-
-        var check = module.Validate(Ctx(services, before), payload);
-
-        Assert.True(check.Ok, string.Join("\n", check.Errors));
-        Assert.Equal(MappingModule.CustomExpressionRisk, (string?)CommentNode(payload)["typeRisk"]);
-        Assert.Contains("app.Orders.Comment: type risk: custom expression: type risk not evaluated", check.Warnings);
-        Assert.DoesNotContain(check.Warnings, w => w.Contains(Truncates));
-    }
-
-    [Fact]
-    public void An_agent_custom_expression_keeps_exactly_what_the_patch_says()
-    {
-        using var project = TempProject.Create();
-        var services = project.Services.WithSampleCatalogs();
-        var module = new MappingModule(services);
-        var before = WithComment("s.[CMNT]", "dbo.ORD_HDR.CMNT", risk: Truncates);
-
-        var fixedByAgent = Json.ToNode(WithComment("LEFT(s.[CMNT], 200)", "dbo.ORD_HDR.CMNT", MapMethod.Agent));
-        Assert.True(module.Validate(Ctx(services, before), fixedByAgent).Ok);
-        Assert.False(CommentNode(fixedByAgent).ContainsKey("typeRisk"));     // no re-flag of the agent's own fix
-
-        var keptByAgent = Json.ToNode(WithComment("RTRIM(s.[CMNT])", "dbo.ORD_HDR.CMNT", MapMethod.Agent, Truncates));
-        Assert.True(module.Validate(Ctx(services, before), keptByAgent).Ok);
-        Assert.Equal(Truncates, (string?)CommentNode(keptByAgent)["typeRisk"]);
-    }
-
-    [Fact]
-    public void A_multi_source_bare_reference_counts_as_custom()
-    {
-        using var project = TempProject.Create();
-        var services = project.Services.WithSampleCatalogs();
-        var module = new MappingModule(services);
-        var after = SampleMappings.Approved();
-        after.Tables["app.Orders"].Columns["StatusCode"].Expr = "st.[STATUS_CD] ";   // whitespace edit, still two source columns
-        var payload = Json.ToNode(after);
-
-        Assert.True(module.Validate(Ctx(services, SampleMappings.Approved()), payload).Ok);
-
-        Assert.Equal(MappingModule.CustomExpressionRisk, (string?)payload["tables"]!["app.Orders"]!["columns"]!["StatusCode"]!["typeRisk"]);
-    }
-
-    [Fact]
-    public void A_payload_with_errors_is_not_normalised()
-    {
-        using var project = TempProject.Create();
-        var services = project.Services.WithSampleCatalogs();
-        var module = new MappingModule(services);
-        var after = WithComment("s.[CMNT]", "dbo.ORD_HDR.CMNT");
-        after.Tables["app.Nope"] = new TableMap();
-        var payload = Json.ToNode(after);
-
-        Assert.False(module.Validate(Ctx(services, SampleMappings.Approved()), payload).Ok);
-        Assert.False(CommentNode(payload).ContainsKey("typeRisk"));
-    }
-
-    [Fact]
-    public void The_recomputed_risk_is_stored_by_a_human_edit_and_read_back()
-    {
-        using var project = TempProject.Create();
-        var services = project.Services.WithSampleCatalogs();
-        services.ApproveBefore(PhaseName.Mapping);
-        services.AddMapping(WithComment("s.[ORD_ID]", "dbo.ORD_HDR.ORD_ID"), PhaseStatus.AwaitingReview, "human");
-        static JsonNode J(string json) => JsonNode.Parse(json)!;
-        var patch = new Patch("mapping", 0,
-        [
-            new("replace", "/tables/app.Orders/columns/Comment",
-                J("""{"expr":"s.[CMNT]","sourceColumns":["dbo.ORD_HDR.CMNT"],"confidence":1,"method":"human"}""")),
-        ], []);
-
-        var applied = services.Workflow.HumanEdit(patch);
-
-        Assert.True(applied.Ok, string.Join("\n", applied.Errors));
-        var stored = services.Artifacts.Get(PhaseName.Mapping, applied.Version!.Value)!;
-        Assert.Equal(Truncates, Json.Deserialize<MappingPayload>(stored.PayloadJson).Tables["app.Orders"].Columns["Comment"].TypeRisk);
-        Assert.Contains($"app.Orders.Comment: type risk: {Truncates}", applied.Warnings);
-
-        // …and it reaches the agent from the stored version.
-        var module = new MappingModule(services);
-        var ctx = new ModuleContext { Services = services, Current = stored, OpenFeedback = [] };
-        Assert.Equal(Truncates, (string?)module.BuildPacket(ctx, PacketMode.Draft)["detail"]![0]!["columns"]!["Comment"]!["typeRisk"]);
-    }
 }

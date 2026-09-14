@@ -39,42 +39,42 @@ public class MappingArchitectAgentTests
 
         var result = Json.FromNode<MappingPayload>(JsonPatch.Apply(Json.ToNode(draft), patch.Ops));
 
-        Assert.Equal(("mapping", 0, 24), (patch.Phase, patch.BaseVersion, patch.Ops.Count));
+        Assert.Equal(("mapping", 0), (patch.Phase, patch.BaseVersion));
         Assert.Empty(MappingValidator.Errors(result, SampleCatalogs.Source(), SampleCatalogs.Target()));
         Assert.Empty(MappingValidator.Blockers(result, SampleCatalogs.Source(), SampleCatalogs.Target()));
     }
 
     [Fact]
-    public void Example_patch_never_silently_deletes_a_type_risk()
+    public void Example_patch_passes_its_own_procedure_through_the_dry_run_path()
     {
-        // B8: a replaced column keeps the draft's typeRisk unless its rationale says the new expression handles the hazard.
+        // E5: through the workflow's dry-run patch path, so MappingModule.Validate and the Risk model run on the playbook's own
+        // example. Step 7 requires every blocker and attention item cleared; acknowledgement output is informational warnings.
         var text = AgentText();
-        Assert.Contains("copy its `typeRisk` across unchanged", text);
         var marker = text.IndexOf("<!-- example-patch -->", StringComparison.Ordinal);
         var start = text.IndexOf("```json", marker, StringComparison.Ordinal) + "```json".Length;
         var patch = Patch.Parse(text[start..text.IndexOf("```", start, StringComparison.Ordinal)]);
         var draft = AutoMapper.Map(SampleCatalogs.Source(), SampleCatalogs.Target(), Synonyms.Default(), new MatchOptions());
-
         using var project = TempProject.Create();
         var services = project.Services.WithSampleCatalogs();
         services.ApproveBefore(Dbm.Core.State.PhaseName.Mapping);
         services.AddMapping(draft, Dbm.Core.State.PhaseStatus.Drafting);
-        var applied = services.Workflow.ApplyPatch(patch);   // through Validate, so the recompute runs too
-        Assert.True(applied.Ok, string.Join("\n", applied.Errors));
-        var result = Json.Deserialize<MappingPayload>(services.Artifacts.Get(Dbm.Core.State.PhaseName.Mapping, applied.Version!.Value)!.PayloadJson);
 
-        var checkedColumns = 0;
-        foreach (var op in patch.Ops.Where(o => o.Path.Split('/') is { Length: 5 } p && p[3] == "columns"))
-        {
-            var (table, column) = (op.Path.Split('/')[2], op.Path.Split('/')[4]);
-            var before = draft.Tables[table].Columns[column];
-            if (!MappingValidator.HasTypeRisk(before)) continue;
-            checkedColumns++;
-            var after = result.Tables[table].Columns[column];
-            if (after.TypeRisk != before.TypeRisk)
-                Assert.Contains("risk", after.Rationale ?? "", StringComparison.OrdinalIgnoreCase);
-        }
-        Assert.True(checkedColumns >= 3, $"only {checkedColumns} risky columns replaced by the example");
-        Assert.Equal("fractional seconds rounded to 0 digits", result.Tables["app.Customers"].Columns["CreatedAt"].TypeRisk);
+        var dry = services.Workflow.ApplyPatch(patch, dryRun: true);
+
+        Assert.True(dry.Ok, string.Join(Environment.NewLine, dry.Errors));
+        var open = dry.Warnings.Where(w => !w.Contains(": risk acknowledged: ", StringComparison.Ordinal)).ToList();
+        Assert.True(open.Count == 0, "still open after the example patch: " + string.Join(Environment.NewLine, open));
+        Assert.Contains(patch.Ops, o => o.Value?.ToJsonString().Contains("\"riskAck\"") == true);
+        Assert.DoesNotContain(patch.Ops, o => o.Value?.ToJsonString().Contains("\"typeRisk\"") == true || o.Path.EndsWith("/typeRisk"));
+    }
+
+    [Fact]
+    public void Playbook_teaches_one_risk_channel()
+    {
+        var text = AgentText();
+        Assert.Contains("`typeRisk` is computed by dbm. Never write it and never remove it", text);
+        Assert.Contains("A type risk is cleared only by `riskAck`", text);
+        Assert.DoesNotContain("copy its `typeRisk`", text);
+        Assert.DoesNotContain("keeping the risk with a rationale", text);
     }
 }

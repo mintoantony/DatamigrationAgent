@@ -275,7 +275,7 @@ public class MappingValidatorTests
     [InlineData(MapMethod.Human, 1.0)]
     [InlineData(MapMethod.Agent, 1.0)]
     [InlineData(MapMethod.Fuzzy, 0.95)]
-    public void A_column_carrying_a_type_risk_is_attention_whatever_its_method_and_confidence(MapMethod method, double confidence)
+    public void An_unacknowledged_type_risk_is_attention_whatever_the_method_and_confidence(MapMethod method, double confidence)
     {
         var m = SampleMappings.Approved();
         var comment = m.Tables["app.Orders"].Columns["Comment"];
@@ -299,31 +299,109 @@ public class MappingValidatorTests
     }
 
     [Fact]
-    public void A_column_below_the_band_with_a_type_risk_is_listed_once()
+    public void A_column_below_the_band_with_a_type_risk_is_listed_once_with_the_risk_text_last()
     {
         var m = SampleMappings.Approved();
         var comment = m.Tables["app.Orders"].Columns["Comment"];
         (comment.Method, comment.Confidence, comment.TypeRisk) = (MapMethod.Fuzzy, 0.5, "may truncate (source max 300)");
 
-        Assert.Equal(["app.Orders.Comment: s.[CMNT] needs review (confidence 0.50, fuzzy)"], MappingValidator.Attention(m, Options));
+        Assert.Equal(["app.Orders.Comment: s.[CMNT] needs review (confidence 0.50, fuzzy); type risk: may truncate (source max 300)"],
+            MappingValidator.Attention(m, Options));
     }
 
     [Theory]
-    [InlineData("s.[CMNT]", "CMNT")]
-    [InlineData("  s . [CMNT]  ", "CMNT")]
-    [InlineData("s.CMNT", "CMNT")]
-    [InlineData("[CMNT]", "CMNT")]
-    [InlineData("CMNT", "CMNT")]
-    [InlineData("[odd]]name]", "odd]name")]
-    [InlineData("st.[STATUS_CD]", "STATUS_CD")]
-    [InlineData("CAST(s.[CMNT] AS nvarchar(200))", null)]
-    [InlineData("LEFT(s.[CMNT], 200)", null)]
-    [InlineData("'N/A'", null)]
-    [InlineData("s.[A] + s.[B]", null)]
-    [InlineData("", null)]
-    [InlineData(null, null)]
-    public void BareColumnName_recognises_only_a_single_column_reference(string? expr, string? expected) =>
-        Assert.Equal(expected, MappingValidator.BareColumnName(expr));
+    [InlineData(MapMethod.Human, 1.0)]
+    [InlineData(MapMethod.Fuzzy, 0.5)]
+    public void The_attention_message_ends_with_the_stored_risk_verbatim_so_it_can_be_copied(MapMethod method, double confidence)
+    {
+        // Risk model §7: the acknowledgement workflow depends on copying this text into riskAck.risk.
+        const string risk = "may truncate (source max 100) (sampled 1,000 rows fit; not proof for the full table)";
+        var m = SampleMappings.Approved();
+        var comment = m.Tables["app.Orders"].Columns["Comment"];
+        (comment.Method, comment.Confidence, comment.TypeRisk) = (method, confidence, risk);
+
+        var message = Assert.Single(MappingValidator.Attention(m, Options));
+
+        Assert.StartsWith("app.Orders.Comment: ", message);
+        const string marker = "type risk: ";
+        Assert.Equal(comment.TypeRisk, message[(message.LastIndexOf(marker, StringComparison.Ordinal) + marker.Length)..]);
+    }
+
+    public static TheoryData<RiskAck?, bool> Acks() => new()
+    {
+        { new RiskAck { Risk = "may truncate (source max 300)", Reason = "notes over 200 chars are expendable" }, false },
+        { null, true },
+        { new RiskAck(), true },                                                                       // null members
+        { new RiskAck { Risk = "may truncate (source max 300)", Reason = "  " }, true },                // no reason
+        { new RiskAck { Risk = null, Reason = "reflexive" }, true },                                    // names no hazard
+        { new RiskAck { Risk = "", Reason = "reflexive" }, true },
+        { new RiskAck { Risk = "may truncate (source max 297)", Reason = "old wording" }, true },       // exact equality only
+        { new RiskAck { Risk = "time part dropped", Reason = "a different hazard" }, true },
+    };
+
+    [Theory]
+    [MemberData(nameof(Acks))]
+    public void The_risk_predicate_is_exact_equality_of_the_named_risk_plus_a_reason(RiskAck? ack, bool open)
+    {
+        var m = SampleMappings.Approved();
+        var comment = m.Tables["app.Orders"].Columns["Comment"];
+        (comment.TypeRisk, comment.RiskAck) = ("may truncate (source max 300)", ack);
+
+        Assert.Equal(open, MappingValidator.HasOpenTypeRisk(comment));
+        Assert.Equal(open ? 1 : 0, MappingValidator.Attention(m, Options).Count);
+        Assert.Equal(!open, MappingValidator.HasAcknowledgedTypeRisk(comment));
+    }
+
+    [Fact]
+    public void An_acknowledged_sentinel_is_closed_like_any_other_risk()
+    {
+        var comment = new ColumnMap
+        {
+            TypeRisk = MappingValidator.UnevaluatedRisk,
+            RiskAck = new RiskAck { Risk = MappingValidator.UnevaluatedRisk, Reason = "LEFT caps it at 200" }
+        };
+        Assert.False(MappingValidator.HasOpenTypeRisk(comment));
+    }
+
+    [Fact]
+    public void Unset_engine_and_author_risk_fields_are_omitted_from_the_stored_json()
+    {
+        var json = Json.Serialize(SampleMappings.Approved());
+        Assert.DoesNotContain("riskAck", json);
+        Assert.DoesNotContain("riskClass", json);
+        var m = SampleMappings.Approved();
+        m.Tables["app.Orders"].Columns["Comment"].RiskAck = new RiskAck { Risk = "r", Reason = "why" };
+        Assert.Contains("\"riskAck\":{\"risk\":\"r\",\"reason\":\"why\"}", Json.Serialize(m));
+    }
+
+    [Theory]
+    [InlineData("s.[CMNT]", "dbo.ORD_HDR.CMNT", null, true)]
+    [InlineData("  s.[CMNT]  ", "dbo.ORD_HDR.CMNT", null, true)]
+    [InlineData("S.[cmnt]", "DBO.ord_hdr.CMNT", null, true)]
+    [InlineData("st.[STATUS_CD]", "dbo.ORD_STATUS.STATUS_CD", null, true)]      // alias declared in from
+    [InlineData("s.[NOTES]", "dbo.ORD_HDR.CMNT", null, false)]                  // reads another column than it names
+    [InlineData("st.[CMNT]", "dbo.ORD_HDR.CMNT", null, false)]                  // alias bound to another table
+    [InlineData("x.[CMNT]", "dbo.ORD_HDR.CMNT", null, false)]                   // alias the FROM parse cannot resolve
+    [InlineData("s.CMNT", "dbo.ORD_HDR.CMNT", null, false)]                     // not bracketed
+    [InlineData("[CMNT]", "dbo.ORD_HDR.CMNT", null, false)]                     // no alias
+    [InlineData("s . [CMNT]", "dbo.ORD_HDR.CMNT", null, false)]
+    [InlineData("CAST(s.[CMNT] AS nvarchar(200))", "dbo.ORD_HDR.CMNT", null, false)]
+    [InlineData("s.[CMNT]", "dbo.ORD_HDR.CMNT", "''", true)]                    // a default applies only when expr is null
+    [InlineData("'N/A'", null, null, false)]                                    // literal, no source column
+    public void Bare_single_source_reference_is_defined_tightly(string expr, string? sourceColumn, string? dflt, bool bare)
+    {
+        var orders = SampleMappings.Approved().Tables["app.Orders"];   // merge: sources[0] = dbo.ORD_HDR (s), st = dbo.ORD_STATUS
+        var cm = new ColumnMap { Expr = expr, SourceColumns = sourceColumn is null ? [] : [sourceColumn], Default = dflt };
+
+        Assert.Equal(bare, MappingValidator.BareSingleSource(orders, cm, SampleCatalogs.Source()) is not null);
+    }
+
+    [Fact]
+    public void Bare_reference_with_two_source_columns_is_not_bare()
+    {
+        var orders = SampleMappings.Approved().Tables["app.Orders"];
+        Assert.Null(MappingValidator.BareSingleSource(orders, orders.Columns["StatusCode"], SampleCatalogs.Source()));
+    }
 
     [Fact]
     public void Public_validator_methods_reject_null_arguments()

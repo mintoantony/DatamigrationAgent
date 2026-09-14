@@ -41,13 +41,16 @@ public class MappingFlowTests
         static JsonNode J(string json) => JsonNode.Parse(json)!;
         var ops = new List<PatchOp>
         {
-            new("replace", "/tables/app.Customers/columns/FirstName", J("""{"expr":"LEFT(s.[CUST_NM], CHARINDEX(' ', s.[CUST_NM] + ' ') - 1)","sourceColumns":["dbo.CUST.CUST_NM"],"confidence":1,"method":"agent","rationale":"First word of CUST_NM."}""")),
-            new("replace", "/tables/app.Customers/columns/LastName", J("""{"expr":"LTRIM(SUBSTRING(s.[CUST_NM], CHARINDEX(' ', s.[CUST_NM] + ' ') + 1, 100))","sourceColumns":["dbo.CUST.CUST_NM"],"confidence":1,"method":"agent","rationale":"Remainder of CUST_NM after the first space."}""")),
+            new("replace", "/tables/app.Customers/columns/FirstName", J("""{"expr":"LEFT(s.[CUST_NM], CHARINDEX(' ', s.[CUST_NM] + ' ') - 1)","sourceColumns":["dbo.CUST.CUST_NM"],"confidence":1,"method":"agent","rationale":"First word of CUST_NM.","riskAck":{"risk":"not evaluated: custom expression","reason":"Names sample at 19 characters; nvarchar(50) holds the first word."}}""")),
+            new("replace", "/tables/app.Customers/columns/LastName", J("""{"expr":"LTRIM(SUBSTRING(s.[CUST_NM], CHARINDEX(' ', s.[CUST_NM] + ' ') + 1, 100))","sourceColumns":["dbo.CUST.CUST_NM"],"confidence":1,"method":"agent","rationale":"Remainder of CUST_NM after the first space.","riskAck":{"risk":"not evaluated: custom expression","reason":"Surnames longer than 50 characters are accepted as a rare truncation."}}""")),
             new("replace", "/tables/app.Orders/kind", J("\"merge\"")),
             new("replace", "/tables/app.Orders/sources", J("""["dbo.ORD_HDR","dbo.ORD_STATUS"]""")),
             new("add", "/tables/app.Orders/from", J("\"[dbo].[ORD_HDR] AS s JOIN [dbo].[ORD_STATUS] AS st ON st.[STATUS_ID] = s.[STATUS_ID]\"")),
             new("replace", "/tables/app.Orders/method", J("\"agent\"")),
-            new("replace", "/tables/app.Orders/columns/StatusCode", J("""{"expr":"st.[STATUS_CD]","sourceColumns":["dbo.ORD_STATUS.STATUS_CD","dbo.ORD_HDR.STATUS_ID"],"confidence":1,"method":"agent","rationale":"Status code from the ORD_STATUS lookup."}""")),
+            new("replace", "/tables/app.Orders/columns/StatusCode", J("""{"expr":"st.[STATUS_CD]","sourceColumns":["dbo.ORD_STATUS.STATUS_CD","dbo.ORD_HDR.STATUS_ID"],"confidence":1,"method":"agent","rationale":"Status code from the ORD_STATUS lookup.","riskAck":{"risk":"not evaluated: custom expression","reason":"STATUS_CD values fit the target column verbatim."}}""")),
+            // The table rebind above changes every Orders column, so their recomputed risks are acknowledged in the same patch.
+            new("add", "/tables/app.Orders/columns/OrderDate/riskAck", J("""{"risk":"fractional seconds rounded to 0 digits","reason":"Seconds are enough."}""")),
+            new("add", "/tables/app.Orders/columns/Comment/riskAck", J("""{"risk":"may truncate (source max 300)","reason":"Long comments may lose their tail."}""")),
             new("add", "/drops/dbo.CUST.FAX_NO", J("""{"reason":"ShopV2 has no fax column.","method":"agent"}""")),
             new("add", "/drops/dbo.ORD_STATUS.STATUS_ID", J("""{"reason":"Lookup key; Orders stores the code.","method":"agent"}""")),
             new("add", "/drops/dbo.ORD_STATUS.STATUS_DESC", J("""{"reason":"Descriptions are not stored in ShopV2.","method":"agent"}""")),
@@ -56,6 +59,10 @@ public class MappingFlowTests
 
         var dry = services.Workflow.ApplyPatch(patch, dryRun: true);
         Assert.True(dry.Ok, string.Join("\n", dry.Errors));
+        // E5: no column this patch wrote or rebound is left with an open type risk. Band proposals it did not touch stay open on purpose:
+        // this patch only resolves blockers.
+        Assert.DoesNotContain(dry.Warnings, w => (w.StartsWith("app.Orders.") || w.StartsWith("app.Customers.FirstName:") || w.StartsWith("app.Customers.LastName:"))
+            && w.Contains("type risk: "));
         var applied = services.Workflow.ApplyPatch(patch);
 
         Assert.True(applied.Ok, string.Join("\n", applied.Errors));

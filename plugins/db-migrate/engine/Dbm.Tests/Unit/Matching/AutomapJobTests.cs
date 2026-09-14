@@ -51,7 +51,10 @@ public class AutomapJobTests
 
         var result = await new AutomapJob().RunAsync(Ctx(services, log), CancellationToken.None);
 
-        Assert.Equal("6 tables mapped, 0 need attention, 0 blockers", result.Summary);
+        // Task 3.4 fix round 1 (D3): 3, not 0. Carry-over recomputes bare columns and surfaces three real hazards the hand-written
+        // approved fixture never recorded (Customers.CreatedAt and Orders.OrderDate round fractional seconds, Orders.Comment may
+        // truncate). The earlier zero pinned a convenient falsehood.
+        Assert.Equal("6 tables mapped, 3 need attention, 0 blockers", result.Summary);
         var m = Json.FromNode<MappingPayload>(result.DraftPayload!);
         Assert.Equal(MapMethod.Carried, m.Tables["app.Customers"].Columns["FirstName"].Method);
         Assert.Contains(log, l => l.Contains("carry-over v0"));

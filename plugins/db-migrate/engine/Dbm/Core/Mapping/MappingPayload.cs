@@ -30,8 +30,18 @@ public sealed class ColumnMap
     public double Confidence { get; set; }
     public MapMethod Method { get; set; }
     public string? Rationale { get; set; }
-    public string? TypeRisk { get; set; }
+    public string? TypeRisk { get; set; }                 // engine-owned: computed, recomputed and restored by dbm, never by an author
+    public string? RiskClass { get; set; }                // engine-owned: hazard class + declared types; decides when an acknowledgement dies
+    public RiskAck? RiskAck { get; set; }                 // author-owned: the risk text accepted and why; null = unacknowledged
     public List<Candidate>? Candidates { get; set; }
+}
+
+/// <summary>An acknowledgement of one specific hazard. <see cref="Risk"/> is the exact typeRisk text being accepted (the token that
+/// proves the author named it); <see cref="Reason"/> says why it is acceptable.</summary>
+public sealed class RiskAck
+{
+    public string? Risk { get; set; }
+    public string? Reason { get; set; }
 }
 
 public sealed record Candidate(string Source, double Score, string Why);

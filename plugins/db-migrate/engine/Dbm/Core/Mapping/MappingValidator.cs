@@ -7,6 +7,10 @@ namespace Dbm.Core.Mapping;
 public static class MappingValidator
 {
     public static readonly IReadOnlyList<string> Kinds = ["direct", "merge", "lookup", "skip"];
+
+    /// <summary>The typeRisk dbm stores when a changed column's conversion cannot be evaluated. An ordinary risk string: it
+    /// flows through <see cref="HasOpenTypeRisk"/> with no special-casing.</summary>
+    public const string UnevaluatedRisk = TypeCompat.UnevaluatedRisk;
     private static readonly StringComparer Ci = StringComparer.OrdinalIgnoreCase;
 
     /// <summary>Errors reject a payload. INVARIANT: any payload with no errors can be processed by MappingPacket (Summary, Draft,
@@ -120,12 +124,14 @@ public static class MappingValidator
             foreach (var (name, cm) in ColumnsOf(map).OrderBy(kv => kv.Key, StringComparer.Ordinal))
             {
                 if (cm is null || !ColumnNeedsAttention(cm, options)) continue;
-                if (NeedsReview(cm.Method, cm.Confidence, options))
-                    list.Add(cm.Expr is null
-                        ? Inv($"{key}.{name}: unmapped (best candidate {cm.Confidence:0.00})")
-                        : Inv($"{key}.{name}: {cm.Expr} needs review (confidence {cm.Confidence:0.00}, {EnumText.ToText(cm.Method)})"));
-                else
-                    list.Add($"{key}.{name}: type risk: {cm.TypeRisk}");
+                // One entry per column. The risk text always comes LAST and verbatim after "type risk: ", so an author can copy it
+                // into riskAck.risk: "<table>.<column>: type risk: <typeRisk>", or the band message followed by "; type risk: <typeRisk>".
+                var risk = HasOpenTypeRisk(cm) ? $"type risk: {cm.TypeRisk}" : null;
+                if (!NeedsReview(cm.Method, cm.Confidence, options)) { list.Add($"{key}.{name}: {risk}"); continue; }
+                var band = cm.Expr is null
+                    ? Inv($"{key}.{name}: unmapped (best candidate {cm.Confidence:0.00})")
+                    : Inv($"{key}.{name}: {cm.Expr} needs review (confidence {cm.Confidence:0.00}, {EnumText.ToText(cm.Method)})");
+                list.Add(risk is null ? band : $"{band}; {risk}");
             }
         }
         return list;
@@ -135,30 +141,78 @@ public static class MappingValidator
     public static bool NeedsReview(MapMethod method, double confidence, MatchOptions options) =>
         method is MapMethod.Fuzzy or MapMethod.Vector && confidence < options.AutoAccept;
 
-    /// <summary>The column-level attention predicate (JS parity): a script proposal below the auto-accept band, OR a carried
-    /// type risk. The type-risk half deliberately ignores method and confidence — an exact match or a human edit carrying a
-    /// data-loss hazard is attention.</summary>
+    /// <summary>Column-level attention: a script proposal below the auto-accept band, OR an open type risk. The type-risk half
+    /// ignores method and confidence (an exact match or a human edit carrying a hazard is attention).</summary>
     public static bool ColumnNeedsAttention(ColumnMap cm, MatchOptions options) =>
-        NeedsReview(cm.Method, cm.Confidence, options) || HasTypeRisk(cm);
+        NeedsReview(cm.Method, cm.Confidence, options) || HasOpenTypeRisk(cm);
 
-    /// <summary>THE one "carries a type risk" predicate, used by attention, packet confidence and the packet's typeRisk field:
-    /// typeRisk is present and not whitespace. JS mirror: <c>typeof cm.typeRisk === 'string' &amp;&amp; cm.typeRisk.trim() !== ''</c>.</summary>
+    /// <summary>THE risk predicate (Risk model §3 with G5; JS mirrors this line): typeRisk is present and non-blank, and not
+    /// (riskAck.reason is non-blank and riskAck.risk equals typeRisk exactly). Payload-only. The engine refreshes riskAck.risk to
+    /// the current wording while the hazard class still matches, which is why plain ordinal equality is enough here. The sentinel
+    /// is an ordinary risk. Tolerates any well-formed acknowledgement, including null members.</summary>
+    public static bool HasOpenTypeRisk(ColumnMap? cm) =>
+        !string.IsNullOrWhiteSpace(cm?.TypeRisk)
+        && !(cm.RiskAck is { } ack && !string.IsNullOrWhiteSpace(ack.Reason) && string.Equals(ack.Risk, cm.TypeRisk, StringComparison.Ordinal));
+
+    /// <summary>typeRisk is present and not whitespace.</summary>
     public static bool HasTypeRisk(ColumnMap? cm) => !string.IsNullOrWhiteSpace(cm?.TypeRisk);
 
-    /// <summary>When <paramref name="expr"/> is a bare reference to one column — <c>[Name]</c>, <c>Name</c>, <c>alias.[Name]</c>
-    /// or <c>alias.Name</c>, surrounding whitespace ignored, <c>]]</c> unescaped — returns that column name; otherwise null.
-    /// A null or blank expression is not a reference (callers decide what an empty expression means).</summary>
-    public static string? BareColumnName(string? expr)
+    /// <summary>A risk that is present and acknowledged (so not attention): listed for the approver as a set.</summary>
+    public static bool HasAcknowledgedTypeRisk(ColumnMap? cm) => HasTypeRisk(cm) && !HasOpenTypeRisk(cm);
+
+    /// <summary>A column is a bare single-source reference when ALL hold: the expression (trimmed) is exactly
+    /// <c>alias.[Column]</c>; the alias is one declared in the table's <c>from</c>, or <c>s</c> for <c>sources[0]</c> when
+    /// <c>from</c> does not declare it; that table and column equal the single <c>sourceColumns</c> entry
+    /// (case-insensitive). A default does not matter: it applies only when expr is null. An alias the FROM parse cannot
+    /// resolve is not bare (best effort; a miss yields the sentinel, never an error). Returns the source column, or null.</summary>
+    public static (TableInfo Table, ColumnInfo Column)? BareSingleSource(TableMap map, ColumnMap cm, CatalogSnapshot src)
     {
-        if (string.IsNullOrWhiteSpace(expr)) return null;
-        var match = BareReference.Match(expr);
+        ArgumentNullException.ThrowIfNull(map);
+        ArgumentNullException.ThrowIfNull(cm);
+        ArgumentNullException.ThrowIfNull(src);
+        if (cm.Expr is null || cm.SourceColumns is not { Count: 1 } || cm.SourceColumns[0] is not { } only) return null;
+        var match = BareReference.Match(cm.Expr.Trim());
         if (!match.Success) return null;
-        return match.Groups["b"].Success ? match.Groups["b"].Value.Replace("]]", "]") : match.Groups["p"].Value;
+        var alias = match.Groups["alias"].Value;
+        var tableKey = FromAliases(map.From).TryGetValue(alias, out var declared) ? declared
+            : string.Equals(alias, "s", StringComparison.OrdinalIgnoreCase) && map.Sources is { Count: > 0 } ? map.Sources[0]
+            : null;
+        if (tableKey is null || src.FindTable(tableKey) is not { } table) return null;
+        var column = table.FindColumn(match.Groups["col"].Value.Replace("]]", "]"));
+        if (column is null || ResolveSourceColumn(src, only) is not { } named) return null;
+        return named.Table.Key == table.Key && named.Column.Name == column.Name ? (table, column) : null;
     }
 
     private static readonly System.Text.RegularExpressions.Regex BareReference = new(
-        @"^\s*(?:(?:\[(?:[^\]]|\]\])+\]|[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*)?(?:\[(?<b>(?:[^\]]|\]\])+)\]|(?<p>[A-Za-z_@#][A-Za-z0-9_@#$]*))\s*$",
+        @"^(?<alias>[A-Za-z_][A-Za-z0-9_]*)\.\[(?<col>(?:[^\]]|\]\])+)\]$",
         System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    // "[schema].[table] AS alias", "schema.table alias" — the table references a FROM clause declares.
+    private static readonly System.Text.RegularExpressions.Regex FromTable = new(
+        @"(?<schema>\[(?:[^\]]|\]\])+\]|[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*(?<name>\[(?:[^\]]|\]\])+\]|[A-Za-z_][A-Za-z0-9_]*)\s+(?:AS\s+)?(?<alias>[A-Za-z_][A-Za-z0-9_]*)",
+        System.Text.RegularExpressions.RegexOptions.CultureInvariant | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    private static readonly HashSet<string> NotAliases = new(Ci)
+        { "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "OUTER", "ON", "WHERE", "WITH", "APPLY", "AS", "AND", "OR", "NOT", "IS", "IN", "GROUP", "ORDER", "UNION" };
+
+    private static Dictionary<string, string> FromAliases(string? from)
+    {
+        var aliases = new Dictionary<string, string>(Ci);
+        if (string.IsNullOrWhiteSpace(from)) return aliases;
+        foreach (System.Text.RegularExpressions.Match m in FromTable.Matches(from))
+        {
+            var alias = m.Groups["alias"].Value;
+            if (NotAliases.Contains(alias)) continue;
+            aliases.TryAdd(alias, $"{Unquote(m.Groups["schema"].Value)}.{Unquote(m.Groups["name"].Value)}");
+        }
+        return aliases;
+    }
+
+    private static string Unquote(string part)
+    {
+        var p = part.Trim();
+        return p.StartsWith('[') && p.EndsWith(']') ? p[1..^1].Replace("]]", "]") : p;
+    }
 
     /// <summary>Source columns ("schema.table.column") neither referenced by a non-skip map nor dropped.</summary>
     public static List<string> UncoveredSourceColumns(MappingPayload m, CatalogSnapshot src)

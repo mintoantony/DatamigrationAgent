@@ -166,6 +166,31 @@ public class MappingPacketTests
     }
 
     [Fact]
+    public void An_acknowledged_risk_keeps_its_table_confident_and_is_listed_as_acknowledged()
+    {
+        var m = SampleMappings.Approved();
+        var comment = m.Tables["app.Orders"].Columns["Comment"];
+        (comment.TypeRisk, comment.RiskAck) = (Truncates, new RiskAck { Risk = Truncates, Reason = "notes over 200 chars are expendable" });
+
+        var data = Draft(m);
+
+        Assert.Equal(6, data["confident"]!.AsArray().Count);
+        Assert.Empty(data["attention"]!.AsArray());
+        var ack = Assert.Single(data["acknowledged"]!.AsArray())!;
+        Assert.Equal(("app.Orders.Comment", Truncates, "notes over 200 chars are expendable"),
+            ((string?)ack["column"], (string?)ack["typeRisk"], (string?)ack["reason"]));
+        Assert.Equal("6 tables, 35 columns mapped, 4 drops, 0 attention, 0 blockers",
+            MappingPacket.Summary(m, SampleCatalogs.Source(), SampleCatalogs.Target(), Options));   // E6: no acknowledgement count
+
+        comment.Method = MapMethod.Fuzzy;   // detailed for another reason: the detail column shows the acknowledgement beside the risk
+        comment.Confidence = 0.5;
+        var column = Draft(m)["detail"]!.AsArray().Single()!["columns"]!["Comment"]!;
+        Assert.Equal(Truncates, (string?)column["typeRisk"]);
+        Assert.Equal(Truncates, (string?)column["riskAck"]!["risk"]);
+        Assert.Equal("notes over 200 chars are expendable", (string?)column["riskAck"]!["reason"]);
+    }
+
+    [Fact]
     public void A_skipped_table_carrying_a_risk_stays_confident()
     {
         var m = SampleMappings.Approved();

@@ -313,4 +313,47 @@ public class TypeCompatTests
     {
         Assert.Equal(family, TypeCompat.Family(type));
     }
+
+    // ---- Task 3.4 fix round 1: HazardClass and RiskClass -------------------------------------------------------------
+
+    [Theory]
+    [InlineData("may truncate (source max 300)", "may truncate (source max)")]
+    [InlineData("may truncate (source max 297)", "may truncate (source max)")]
+    [InlineData("may truncate (source length unbounded)", "may truncate (source max)")]
+    [InlineData("may truncate (source max 100) (sampled 1,000 rows fit; not proof for the full table)", "may truncate (source max)")]
+    [InlineData("may truncate (source max 8000 bytes)", "may truncate (source max)")]
+    [InlineData("overflow possible (target int) (sampled 1,000 rows fit; not proof for the full table)", "overflow possible (target int)")]
+    [InlineData("non-ASCII characters may be lost; may truncate (source max 300)", "non-ASCII characters may be lost; may truncate (source max)")]
+    [InlineData("may truncate (needs 11 characters)", "may truncate (needs 11 characters)")]
+    [InlineData("fractional seconds rounded to 0 digits", "fractional seconds rounded to 0 digits")]
+    [InlineData("not evaluated: custom expression", TypeCompat.UnevaluatedClass)]
+    [InlineData("", null)]
+    [InlineData("  ", null)]
+    [InlineData(null, null)]
+    public void HazardClass_strips_only_what_a_reprofile_of_unchanged_data_can_flip(string? risk, string? expected) =>
+        Assert.Equal(expected, TypeCompat.HazardClass(risk));
+
+    [Fact]
+    public void SameHazard_never_matches_null_or_the_sentinel()
+    {
+        Assert.True(TypeCompat.SameHazard("may truncate (source max 300)", "may truncate (source max 297) (sampled 10 rows fit; not proof for the full table)"));
+        Assert.False(TypeCompat.SameHazard("may truncate (source max 300)", "time part dropped"));
+        Assert.False(TypeCompat.SameHazard(TypeCompat.UnevaluatedRisk, TypeCompat.UnevaluatedRisk));
+        Assert.False(TypeCompat.SameHazard(null, null));
+    }
+
+    [Fact]
+    public void RiskClass_is_the_hazard_class_over_the_declared_types()
+    {
+        var src = new ColumnInfo("CMNT", 1, "varchar", 500, 0, 0, true, false, false, false, null, null, null);
+        var tgt = new ColumnInfo("Comment", 1, "nvarchar", 200, 0, 0, true, false, false, false, null, null, null);
+
+        Assert.Equal("may truncate (source max)|varchar(500)->nvarchar(200)", TypeCompat.RiskClass("may truncate (source max 297)", src, tgt));
+        Assert.NotEqual(TypeCompat.RiskClass("may truncate (source max 300)", src, tgt),
+            TypeCompat.RiskClass("may truncate (source max 300)", src, tgt with { MaxLength = 250 }));
+        Assert.Null(TypeCompat.RiskClass(null, src, tgt));
+        Assert.Equal(TypeCompat.UnevaluatedClass, TypeCompat.RiskClass(TypeCompat.UnevaluatedRisk, src, tgt));
+        Assert.False(TypeCompat.SameRiskClass(TypeCompat.UnevaluatedClass, TypeCompat.UnevaluatedClass));
+        Assert.False(TypeCompat.SameRiskClass(null, null));
+    }
 }
