@@ -27,6 +27,7 @@ public static class CommandRegistry
         new DiscoverCommand(),   // T2.5
         new SearchCommand(),     // T2.5
         new ShowCommand(),       // T2.5
+        new MapAutoCommand(),    // T3.3
         // Later milestones append their commands below this line.
     ];
 }
