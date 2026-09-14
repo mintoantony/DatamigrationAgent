@@ -5798,3 +5798,17 @@ Rule 1 says an unchanged column keeps its existing `typeRisk` verbatim, without 
 #### C7 — Wording
 
 B7's test paragraph says "build the payloads for these tests inline", repeating the phrasing already corrected in B5. It means the same narrow thing: **do not edit `SampleMappings.cs`.** Copying the approved fixture and setting a risk on the copy inside a test is expected and is not a fixture change.
+
+### Task 3.5 — JavaScript scope correction (follows the Task 3.4 third pass)
+
+The Task 3.4 third-pass corrections change what the Task 3.5 round must implement in JavaScript. This section overrides the earlier A2 text wherever they differ.
+
+**There is no custom-expression attention predicate, in either language.** An earlier draft added one (a column whose expression is not a bare single-source reference counts as needing review). It is withdrawn — it would have forced the agent to revert the very expressions written to fix a risk, and it broke the existing suite against the shared fixture. Do not implement a JavaScript mirror of it. If you find one already written, delete it.
+
+**The attention predicate gains an acknowledgement.** A column needs review when it carries a `typeRisk` **and** its `riskAck` is absent or blank. Both halves are payload-only, so the C# and JavaScript implementations stay mirrorable.
+
+**Mirror, do not invent.** The C# predicate lands first, in the Task 3.4 round. Read the committed C# and mirror it. Do not write a parallel implementation from this description — two implementations of one rule, written independently in two languages by two agents, is precisely the drift this project has already flagged as a hazard elsewhere.
+
+**The sentinel is an ordinary risk.** A changed column whose expression is not a bare single-source reference carries the risk string `"not evaluated: custom expression"`. It is a `typeRisk` like any other: it flows through the same predicate, renders in the same place, and needs no special-casing. If the UI branches on that text anywhere, something is wrong with the design rather than with the UI.
+
+**`riskAck` must render.** Show it next to the risk it acknowledges, so a reviewer can see both that a hazard exists and why it was accepted. A risk shown without its acknowledgement reads as an unresolved problem; an acknowledgement shown without its risk hides the hazard.
