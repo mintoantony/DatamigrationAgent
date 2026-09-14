@@ -6797,3 +6797,9 @@ Test it on the failing path rather than the simple one: rediscovery changes a ke
 **An absence assertion counts as a guard only if a mutation that reintroduces the mechanism makes it fail.** If no such mutation exists, the assertion is decoration: it should be deleted or replaced by one that bites.
 
 The same test applies to any assertion of a negative, not only to these. A test that passes by construction reads exactly like a test that passes because the property holds, and only a mutation distinguishes them.
+
+### 7b. Wording correction — there is no approved category
+
+§7a says the comparand is "the latest version not authored by the script — the last agent, human or approved version". The final clause is wrong and it propagated into the implementation comment: **approval is not an authorship**. A version is authored by the script, the agent or a human, and approval is a separate property the comparison never consults.
+
+**The comparand is the latest version not authored by the script.** Nothing more. A script version that was itself approved is skipped, which is harmless: such a version reaches review only if its carried texts already matched the comparand.
