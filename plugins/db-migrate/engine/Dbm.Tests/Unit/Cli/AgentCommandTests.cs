@@ -133,7 +133,7 @@ public class AgentCommandTests
         await Wait.UntilAsync(() => server.Services.Phases.Get(PhaseName.Analysis).Status == PhaseStatus.AwaitingReview);
 
         var waiting = CliRunner.RunAsync(tw.Ws, factory, "await", "--timeout", "30");
-        await Task.Delay(500);
+        await Wait.UntilAsync(async () => (await server.GetJsonAsync("/api/state"))["project"]!["agentOnline"]!.GetValue<bool>());
         Assert.False(waiting.IsCompleted);
         server.Services.Feedback.Add(PhaseName.Analysis, 0, null, "Explain the heap");
         server.Services.Workflow.RequestChanges(PhaseName.Analysis);
@@ -164,7 +164,7 @@ public class AgentCommandTests
         var server = await WebTestServer.StartAsync(tw.Ws, factory);
 
         var waiting = CliRunner.RunAsync(tw.Ws, factory, "await");
-        await Task.Delay(500);
+        await Wait.UntilAsync(async () => (await server.GetJsonAsync("/api/state"))["project"]!["agentOnline"]!.GetValue<bool>());
         await server.DisposeAsync();
         var r = await waiting.WaitAsync(TimeSpan.FromSeconds(20));
 
