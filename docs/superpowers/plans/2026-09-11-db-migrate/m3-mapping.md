@@ -6460,3 +6460,17 @@ Engine-owned `typeRisk` and its ownership rule; the ordered cases in `Validate`;
 There is no machine-checked per-column record of *why* a particular risk was accepted. `summary` and `rationale` carry that in prose, unchecked — which is acceptable precisely because nothing machine-reads them, so nothing can be silently defeated by writing the wrong thing into them.
 
 And a reviewer confirms the risks on every approval, including risks they accepted in a previous version. One confirmation per approval is a small price against roughly fifteen rules spread across three codebases.
+
+### Task 3.5 JavaScript — FINAL, after the acknowledgement cut
+
+Every earlier Task 3.5 JavaScript risk section is **historical**. Per-column acknowledgement is cut, so the fields and the control those sections describe do not exist. Implement this section and the final risk model only.
+
+**No `riskAck`, no `riskClass`, no acknowledgement control.** Delete any of it that exists in the view. There is no acknowledgement anywhere in the browser, no token, no class, and no per-column sign-off.
+
+**Attention is the confidence band and blockers only.** A type risk does not create an attention item. This reverses the earlier rule that made a risk count as needing review.
+
+**Type risks are their own channel, always visible.** Their own count, their own filter, their own list. A reviewer sees every risk in the version without opening a row, and without it hiding behind a band that has nothing to do with it.
+
+**The browser never writes `typeRisk`.** The engine owns it; the screen displays it. A patch from the browser carrying a risk value is ignored by the engine and earns a warning.
+
+**Approval confirms the risks.** When the version carries type risks, the review screen lists them and approval requires an explicit confirmation; without it the approve call is rejected and names the count. This is required rather than optional — the channel above makes every risk visible, and only the confirmation makes a person confirm having seen them. If it reaches too far into closed workflow code, it moves to Milestone 6 as its own task, and that decision is recorded rather than assumed.
