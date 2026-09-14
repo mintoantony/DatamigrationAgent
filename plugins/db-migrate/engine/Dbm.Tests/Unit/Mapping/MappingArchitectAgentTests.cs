@@ -83,7 +83,8 @@ public class MappingArchitectAgentTests
     public void Playbook_teaches_the_engine_owned_risk_and_names_the_warning_classes()
     {
         var text = AgentText();
-        Assert.Contains("`typeRisk` is computed by dbm. Never write it and never remove it", text);
+        Assert.Contains("`typeRisk` is computed by dbm. Never write it**", text);
+        Assert.DoesNotContain("never remove it", text);   // contradicted "omit typeRisk on a whole-object replace"
         Assert.Contains("or say in `summary` why it is acceptable", text);
         Assert.Contains("are **expected to remain**", text);
         Assert.DoesNotContain("riskAck", text);

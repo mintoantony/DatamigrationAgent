@@ -61,7 +61,7 @@ public class MappingModuleTests
     }
 
     [Fact]
-    public void Needs_agent_when_rediscovery_changes_a_kept_bare_column_risk_compared_with_the_version_before_the_draft()
+    public void Needs_agent_when_a_kept_bare_column_risk_differs_from_the_latest_version_not_authored_by_the_script()
     {
         using var project = TempProject.Create();
         var services = project.Services.WithSampleCatalogs();

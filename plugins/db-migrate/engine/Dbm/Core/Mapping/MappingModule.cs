@@ -22,7 +22,7 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
     /// (1) attention (the confidence band) or a blocker;
     /// (2) a type risk on a column the auto-mapper assigned in this run rather than kept: method is not carried;
     /// (3) a kept (carried) bare column whose recomputed risk text differs from the text in the latest version NOT authored by the
-    ///     script (the last agent, human or approved version) — never another script draft (§7a).
+    ///     script — never another script draft (§7a).
     /// Risks never count as attention. Skip tables load no data and are exempt from (2) and (3).</summary>
     public bool NeedsAgent(JsonNode draft)
     {
@@ -50,9 +50,9 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
         return false;
     }
 
-    /// <summary>The comparand for condition 3: the latest mapping version NOT authored by the script — the last agent, human or
-    /// approved version. A script draft is never the comparand, so a retried job (or a second rediscovery before the agent ran)
-    /// cannot compare a draft against a draft and go quiet. Null when there is none or it cannot be read.</summary>
+    /// <summary>The comparand for condition 3: the latest mapping version not authored by the script. A script draft is never
+    /// the comparand, so a retried job (or a second rediscovery before the agent ran) cannot compare a draft against a draft and
+    /// go quiet. Null when there is none or it cannot be read.</summary>
     private MappingPayload? PreviousVersion()
     {
         var meta = services.Artifacts.List(PhaseName.Mapping).LastOrDefault(a => a.Author != "script");
