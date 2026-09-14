@@ -6048,3 +6048,85 @@ They are not retro-sentinelled: doing so would flag every long-approved expressi
 #### F8 — The browser must stop diffing the risk field
 
 The mapping view lists `typeRisk` among the column properties it diffs, so the client will emit an operation for it the moment anything rebuilds a column object — which the acknowledgement UI in the Task 3.5 round will do. Remove `typeRisk` from the diffed column properties. The engine owns it; the browser sends only `riskAck`.
+
+---
+
+## THE RISK MODEL — normative, and it replaces everything above it
+
+**This section supersedes every earlier statement about `typeRisk`, `riskAck`, sentinels, recomputation, invalidation and carry-over of risks.** Sections B1 through F8 and all their corrections are **historical**. Read them for context if you like; do not implement them. Where anything above conflicts with this section, this section wins and the passage above is wrong, not merely older.
+
+Nine passes of appending corrections produced a document containing twenty-seven conflicts, eight of which no reading rule can settle because they conflict with equally live text or with themselves. That is not implementable, so it is replaced rather than patched again.
+
+Everything outside the risk model — B2's malformed-payload rejection, B3's null guards, B4, B5's tests, E5's test route, E6, the playbook scope in E4 — stands as written.
+
+### 1. Ownership
+
+`typeRisk` is computed by the engine and only by the engine. No agent patch and no human edit ever writes or removes it. An incoming `typeRisk` is ignored: never stored, never merged, never used as a token.
+
+Warn, naming the column, when the incoming node carries a `typeRisk` that is **present and different from `ctx.Current`'s** for that column. Absent means not written; equal means carried through by a whole-object replace. Never compare against the value the engine just computed.
+
+### 2. The acknowledgement
+
+`riskAck` is author-owned, and it carries its own token:
+
+```
+riskAck: { "risk": "<the exact typeRisk text being accepted>", "reason": "<why it is acceptable>" }
+```
+
+It is taken from the incoming node as supplied. Absent means no acknowledgement. There is no rule anywhere that preserves, restores or invalidates an acknowledgement by comparing against `ctx.Current` — the predicate below does all of that work by itself.
+
+Drop an acknowledgement, with a warning naming the column, when its column has no computed risk. Never reject the patch for it.
+
+Clear an acknowledgement when the column's `expr` changed, unless the same change supplies a new one. An acknowledgement that cites a transform must not outlive that transform.
+
+### 3. The one predicate
+
+A column **needs review** when:
+
+> `typeRisk` is present and non-blank, **and not** (`riskAck.reason` is non-blank **and** `HazardClass(riskAck.risk)` equals `HazardClass(typeRisk)`).
+
+Identical in C# and JavaScript. Payload-only: it reads nothing but the column itself. This single predicate decides attention, and it is the only place an acknowledgement has any effect.
+
+It closes the reflexive-acknowledgement hole by construction: the token lives in the field the author is writing, so an acknowledgement that names nothing matches nothing. And it makes invalidation automatic — a changed hazard produces a different class, so the old acknowledgement stops matching without any comparison against the previous version.
+
+### 4. `HazardClass`
+
+`TypeCompat.HazardClass(string? risk)` maps a risk text to a stable class, derived from the text alone:
+
+- strip the observed length (`(source max N)`, with or without a `bytes` suffix);
+- strip the sampled-rows suffix;
+- the sentinel is its own class and matches nothing else;
+- null or blank maps to no class, which matches nothing.
+
+It must be derivable from stored text, because at carry-over time the catalog that produced the original risk is gone. This is also what makes the profiler's sampling harmless: `TOP n` without an `ORDER BY` means an observed maximum can differ between discoveries of unchanged data, and comparing classes rather than texts stops that re-prompting a human who already acknowledged the hazard.
+
+### 5. When the engine computes a risk
+
+A column is **changed** when its own `expr`, `sourceColumns` or `default` changed, or when its table's `sources` or `from` changed. Compare `expr` trimmed, and `sourceColumns` as a case-insensitive set.
+
+A column is a **bare single-source reference** when all hold: the expression is exactly an alias, a dot and a bracketed column name; the alias resolves to `sources[0]` or to an alias declared in the table's `from`; and the resulting table-and-column equals the single `sourceColumns` entry, case-insensitively.
+
+Then, for each column:
+
+- **unchanged** → keep `ctx.Current`'s `typeRisk` verbatim;
+- **changed and bare** → recompute through `TypeCompat`, passing the source column's profile, exactly as the auto-mapper does, so the texts match;
+- **changed, with a non-null `default`, or with zero source columns, or otherwise not bare** → write the sentinel, `"not evaluated: custom expression"`;
+- **changed, `expr` null and `default` null** → no risk.
+
+Carry-over follows the same rules, recomputing bare columns and leaving custom-expression columns' stored text alone.
+
+### 6. Ordering inside `Validate`
+
+Parse → B2's structural errors, returning if any → risk normalisation → blockers and attention. Normalising before the structural checks would dereference the very nulls B2 exists to reject.
+
+### 7. Where risks surface
+
+`IsConfident` uses the **needs-review** predicate of section 3, so an acknowledged risk does not force a table into detail. Skip tables remain exempt. Acknowledged risks instead surface as their own count and list, in the work packet, in the review screen, and as dry-run warnings — a human approver signs them off as a set.
+
+The attention message for a risk is pinned: `<table>.<column>: type risk: <typeRisk>`, with the risk text last and verbatim, so an author can copy it into an acknowledgement. Pin it with a test asserting the substring after the prefix equals the stored `typeRisk`. A column that is both below the confidence band and risky must still show the risk text; a message that omits it makes the acknowledgement unwritable.
+
+### 8. The residual, and the invariant it qualifies
+
+The invariant "a risk must never be absent from a conversion that carries a hazard" is qualified here, deliberately: **custom-expression columns stored before this model existed carry no risk text and no sentinel, and keep none while they stay unchanged.** They take a sentinel the first time they are edited.
+
+They are not retro-sentinelled. Doing so would flag every long-approved expression in every existing project at once — the withdrawn "every custom expression needs review" rule arriving by another route. The approved sample fixture's seven custom expressions are exactly this state, and they must stay green.
