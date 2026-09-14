@@ -11,6 +11,7 @@ public sealed class Workspace
         Dir = Path.Combine(Root, DirName);
         StateDbPath = Path.Combine(Dir, "state.db");
         ServerJsonPath = Path.Combine(Dir, "server.json");
+        ServerLockPath = Path.Combine(Dir, "server.lock");
         ServerLogPath = Path.Combine(Dir, "server.log");
         ExportsDir = Path.Combine(Dir, "exports");
         WorkDir = Path.Combine(Dir, "work");
@@ -20,6 +21,7 @@ public sealed class Workspace
     public string Dir { get; }
     public string StateDbPath { get; }
     public string ServerJsonPath { get; }
+    public string ServerLockPath { get; }
     public string ServerLogPath { get; }
     public string ExportsDir { get; }
     public string WorkDir { get; }

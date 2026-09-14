@@ -88,7 +88,8 @@ public static class ServerControl
         try
         {
             using var process = Process.GetProcessById(info.Pid);
-            if (process.Id != Environment.ProcessId && IsSameServer(process)) process.Kill(entireProcessTree: true);
+            if (process.Id != Environment.ProcessId && IsSameServer(process) && StartTimeMatches(process, info))
+                process.Kill(entireProcessTree: true);
         }
         catch (ArgumentException)
         {
@@ -176,6 +177,28 @@ public static class ServerControl
             return name.Equals("dotnet", StringComparison.OrdinalIgnoreCase) || name.Equals("Dbm", StringComparison.OrdinalIgnoreCase);
         }
         catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// A process can only be the one that wrote <paramref name="info"/> if the OS started it at or before
+    /// <see cref="ServerInfo.StartedAt"/> (the server records that timestamp itself, after it has already been
+    /// running for a little while). If the PID was reused for an unrelated process after the real server crashed,
+    /// that process necessarily started later than the stale <c>server.json</c> it happens to match on PID alone.
+    /// A tolerance absorbs clock-source differences between <see cref="Process.StartTime"/> and <see cref="Clock"/>
+    /// plus how long process/service startup can legitimately take before <see cref="ServerInfo"/> is created.
+    /// </summary>
+    internal static readonly TimeSpan StartTimeTolerance = TimeSpan.FromSeconds(30);
+
+    internal static bool StartTimeMatches(Process process, ServerInfo info)
+    {
+        try
+        {
+            return process.StartTime.ToUniversalTime() <= info.StartedAt.UtcDateTime + StartTimeTolerance;
+        }
+        catch (Exception)
         {
             return false;
         }

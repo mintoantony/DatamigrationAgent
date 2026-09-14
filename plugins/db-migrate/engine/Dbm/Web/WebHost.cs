@@ -19,7 +19,8 @@ public static class WebHost
     /// <summary>
     /// Serves wwwroot + API on 127.0.0.1:<paramref name="port"/> (0 = pick a free port) until <paramref name="ct"/> fires or
     /// POST /api/shutdown. Writes server.json when started, deletes it when stopped. Returns immediately if another live
-    /// server already owns the workspace.
+    /// server already owns the workspace, or if another process already holds the workspace's exclusive server.lock
+    /// (the OS releases the lock if that process crashes, so a stale lock never blocks a later start).
     /// </summary>
     /// <param name="servicesFactory">Test hook (fake modules/handlers). Default: DbmServices.Open(ws).</param>
     /// <param name="onStarted">Called once the server listens (ServeCommand prints the URL).</param>
@@ -30,68 +31,90 @@ public static class WebHost
         if (existing is not null && existing.Pid != Environment.ProcessId && await ServerControl.IsAliveAsync(existing, ct)) return;
 
         Directory.CreateDirectory(ws.Dir);
-        var log = new FileLog(ws.ServerLogPath);
-        var services = (servicesFactory ?? (w => DbmServices.Open(w)))(ws);
+        FileStream serverLock;
         try
         {
-            var info = new ServerInfo(port == 0 ? FreePort() : port, Environment.ProcessId, NewToken(), Clock.Now());
-            var broadcaster = new Broadcaster(services.Events);
-            services.Sink = broadcaster;
-            var state = new WebState
-            {
-                Services = services,
-                Broadcaster = broadcaster,
-                Presence = new AgentPresence(services, broadcaster),
-                Info = info,
-                Log = log,
-            };
-
-            var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions
-            {
-                ContentRootPath = AppContext.BaseDirectory,
-                WebRootPath = Path.Combine(AppContext.BaseDirectory, "wwwroot"),
-            });
-            builder.Logging.ClearProviders();
-            builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = TimeSpan.FromSeconds(5));
-            builder.WebHost.ConfigureKestrel(k => k.Listen(IPAddress.Loopback, info.Port));
-
-            await using var app = builder.Build();
-            app.Use((ctx, next) => ErrorBoundaryAsync(ctx, next, log));
-            app.Use((ctx, next) => TokenGuard.InvokeAsync(ctx, next, info));
-            app.UseDefaultFiles();
-            app.UseStaticFiles(new StaticFileOptions
-            {
-                OnPrepareResponse = c => c.Context.Response.Headers.CacheControl = "no-store",
-            });
-            EndpointRegistry.MapAll(app, state);
-
-            app.Lifetime.ApplicationStarted.Register(() =>
-            {
-                WriteInfo(ws, info);
-                log.Write("info", $"server started on {info.BaseUrl} (pid {info.Pid})");
-                onStarted?.Invoke(info);
-            });
-
-            using var background = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            var jobs = Task.Run(() => new JobRunner(services).RunLoopAsync(background.Token));
-            var pump = Task.Run(() => new EventPump(services.Events, broadcaster, log).RunAsync(background.Token));
+            serverLock = new FileStream(ws.ServerLockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        }
+        catch (IOException)
+        {
+            return;   // another process is already serving this workspace
+        }
+        try
+        {
+            var log = new FileLog(ws.ServerLogPath);
+            var services = (servicesFactory ?? (w => DbmServices.Open(w)))(ws);
             try
             {
-                await app.StartAsync(ct);
-                await app.WaitForShutdownAsync(ct);
+                var info = new ServerInfo(port == 0 ? FreePort() : port, Environment.ProcessId, NewToken(), Clock.Now());
+                var broadcaster = new Broadcaster(services.Events);
+                services.Sink = broadcaster;
+                var state = new WebState
+                {
+                    Services = services,
+                    Broadcaster = broadcaster,
+                    Presence = new AgentPresence(services, broadcaster),
+                    Info = info,
+                    Log = log,
+                };
+
+                var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions
+                {
+                    ContentRootPath = AppContext.BaseDirectory,
+                    WebRootPath = Path.Combine(AppContext.BaseDirectory, "wwwroot"),
+                });
+                builder.Logging.ClearProviders();
+                builder.Services.Configure<HostOptions>(o => o.ShutdownTimeout = TimeSpan.FromSeconds(5));
+                builder.WebHost.ConfigureKestrel(k => k.Listen(IPAddress.Loopback, info.Port));
+
+                await using var app = builder.Build();
+                app.Use((ctx, next) => ErrorBoundaryAsync(ctx, next, log));
+                app.Use((ctx, next) => TokenGuard.InvokeAsync(ctx, next, info));
+                app.UseDefaultFiles();
+                app.UseStaticFiles(new StaticFileOptions
+                {
+                    OnPrepareResponse = c => c.Context.Response.Headers.CacheControl = "no-store",
+                });
+                EndpointRegistry.MapAll(app, state);
+
+                app.Lifetime.ApplicationStarted.Register(() =>
+                {
+                    WriteInfo(ws, info);
+                    log.Write("info", $"server started on {info.BaseUrl} (pid {info.Pid})");
+                    onStarted?.Invoke(info);
+                });
+
+                using var background = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                var jobs = Task.CompletedTask;
+                var pump = Task.CompletedTask;
+                try
+                {
+                    // Bind first: a process that fails to bind (lost the free-port race, port in use, …) must never
+                    // touch the job table, so the loops below only start once Kestrel is actually accepting requests.
+                    await app.StartAsync(ct);
+                    jobs = Task.Run(() => new JobRunner(services).RunLoopAsync(background.Token));
+                    pump = Task.Run(() => new EventPump(services.Events, broadcaster, log).RunAsync(background.Token));
+                    await app.WaitForShutdownAsync(ct);
+                }
+                finally
+                {
+                    background.Cancel();
+                    // Removed before draining: once Kestrel has stopped, server.json must not keep advertising a
+                    // server that can no longer answer requests, however long the job/pump drain takes.
+                    DeleteInfo(ws, info);
+                    await Quietly(jobs);
+                    await Quietly(pump);
+                    log.Write("info", "server stopped");
+                }
             }
             finally
             {
-                background.Cancel();
-                await Quietly(jobs);
-                await Quietly(pump);
-                DeleteInfo(ws, info);
-                log.Write("info", "server stopped");
+                services.Dispose();
             }
         }
         finally
         {
-            services.Dispose();
+            serverLock.Dispose();
         }
     }
 

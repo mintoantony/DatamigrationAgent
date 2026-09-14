@@ -1,5 +1,7 @@
 using System.Net;
+using System.Net.Sockets;
 using System.Text.Json.Nodes;
+using Dbm.Core;
 using Dbm.Core.State;
 using Dbm.Tests.Support;
 using Dbm.Web;
@@ -38,6 +40,64 @@ public class WebHostTests
         Assert.Equal(HttpStatusCode.OK, status);
         await server.Completion.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.False(File.Exists(tw.Ws.ServerJsonPath));
+    }
+
+    [Fact]
+    public async Task Second_start_for_the_same_workspace_returns_early_while_the_first_holds_the_lock()
+    {
+        using var tw = new TestWorkspace();
+        await using var first = await WebTestServer.StartAsync(tw.Ws);
+
+        using var cts2 = new CancellationTokenSource();
+        var factoryCalled = false;
+        var onStartedCalled = false;
+        var second = WebHost.RunAsync(tw.Ws, 0, cts2.Token,
+            w =>
+            {
+                factoryCalled = true;
+                return FakeServices.Factory()(w);
+            },
+            _ => onStartedCalled = true);
+
+        await second.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.False(factoryCalled);
+        Assert.False(onStartedCalled);
+        Assert.True(await ServerControl.IsAliveAsync(first.Info));
+    }
+
+    [Fact]
+    public async Task Lock_is_released_when_the_server_exits_so_a_later_start_succeeds()
+    {
+        using var tw = new TestWorkspace();
+        var first = await WebTestServer.StartAsync(tw.Ws);
+        await first.DisposeAsync();
+
+        await using var second = await WebTestServer.StartAsync(tw.Ws);
+
+        Assert.True(await ServerControl.IsAliveAsync(second.Info));
+    }
+
+    [Fact]
+    public async Task A_server_that_fails_to_bind_leaves_job_rows_untouched()
+    {
+        using var tw = new TestWorkspace();
+        tw.Ws.EnsureCreated();
+        using var seed = FakeServices.Open(tw.Ws);
+        var jobId = seed.Jobs.Enqueue("discover", null);
+        seed.Jobs.MarkRunning(jobId);
+        seed.Dispose();
+
+        using var blocker = new TcpListener(IPAddress.Loopback, 0);
+        blocker.Start();
+        var occupiedPort = ((IPEndPoint)blocker.LocalEndpoint).Port;
+
+        using var cts = new CancellationTokenSource();
+        await Assert.ThrowsAnyAsync<Exception>(() =>
+            WebHost.RunAsync(tw.Ws, occupiedPort, cts.Token, FakeServices.Factory()));
+
+        using var check = FakeServices.Open(tw.Ws);
+        Assert.Equal(JobStatus.Running, check.Jobs.Get(jobId)!.Status);
     }
 
     [Fact]
