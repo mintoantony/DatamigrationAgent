@@ -6534,3 +6534,122 @@ Deferring it would create a breaking change across two milestones: Milestones 4 
 - the server rejects approval when the phase carries type risks and the flag is absent, or names a version other than the current one, with `409` and `{"error":"risk_confirmation_required","message":"version N has K type risks; confirm them to approve"}`.
 
 The check belongs in the approve handler ahead of the approval guards, since the guards cannot see the request. `WorkflowEngine.Approve` is unchanged. Approval exists only over HTTP, with no CLI equivalent, so the flag is human-only by construction and no agent can set it.
+
+---
+
+# THE RISK MODEL — the only normative risk text in this plan
+
+**Every other statement about type risks anywhere in this file is void.** Not superseded, not historical-but-consultable: void. This section states every rule in full and references nothing by description. If a rule is not written here, it is not a rule.
+
+The earlier chain — the model, five amendments, the cut, its completion, and four JavaScript risk sections — is kept in git history and must not be implemented. Commits `0b14193` through `53481c1`.
+
+## 1. Ownership
+
+`typeRisk` is computed by the engine and only by the engine. No agent patch and no human edit ever writes or removes it. An incoming `typeRisk` is ignored: never stored, never merged.
+
+Warn, naming the column, when the incoming node carries a `typeRisk` that is present and different from the stored version's value for that column. Absent means not written. Equal means carried through by a field-level edit that left the old value in place; a whole-object replace omits the field entirely.
+
+There is **no** acknowledgement field, no risk class field, and no per-column sign-off. A type risk is never cleared by anyone; it is transformed away, or it is signed off at approval.
+
+## 2. When the engine computes a risk — `Validate`
+
+A column is **changed** when its own `expr`, `sourceColumns` or `default` differ from the stored version, when its table's `sources` or `from` differ, **or when the column or its table is absent from the stored version entirely**. Compare `expr` trimmed, and `sourceColumns` as a case-insensitive set.
+
+A column is a **bare single-source reference** when all hold: the expression is exactly an alias, a dot and a bracketed column name; the alias resolves to `sources[0]` or to an alias declared in the table's `from`; and the resulting table-and-column equals the single `sourceColumns` entry, case-insensitively. An alias that cannot be resolved is **not** bare — a `FROM`-clause parse miss yields the sentinel, never an error.
+
+Ordered, first match wins:
+
+```
+(1) not changed                              -> keep the stored typeRisk verbatim
+(2) expr null AND default null               -> no risk
+(3) expr non-null AND bare single-source ref -> recompute via TypeCompat, passing the
+                                                source column's profile, exactly as the
+                                                auto-mapper does, so the texts match
+(4) everything else                          -> the sentinel
+```
+
+Case (4) is a true catch-all; the order makes the cases disjoint.
+
+Ordering inside `Validate`: parse, then the structural errors, returning if any, then this normalisation, then blockers and attention. Normalising first would dereference the very nulls the structural checks exist to reject.
+
+## 3. When the engine computes a risk — carry-over
+
+Carry-over has no stored version to compare against and no patch. It has its own sequence, first match wins:
+
+```
+expr null AND default null   -> no risk
+bare single-source reference -> recompute text
+everything else              -> keep the stored typeRisk verbatim (no sentinel)
+```
+
+Section 2's ordered cases do not apply here.
+
+## 4. The sentinel
+
+The sentinel risk text lives in **one C# constant**, referenced everywhere and never copied as a literal — including by later milestones. It reads `not evaluated: custom expression` and it is an ordinary risk in every other respect: it renders where risks render, it is counted where risks are counted, and nothing anywhere treats it specially.
+
+## 5. Risks are not attention
+
+Attention is the confidence band and blockers. **A type risk never creates an attention item**, is never counted in the attention total, and never satisfies `NeedsAgent`'s attention test.
+
+`Validate` emits **one warning per type risk**, in this exact format, as its own warning class:
+
+```
+<table>.<column>: type risk: <typeRisk>
+```
+
+The risk text is last and verbatim, so it can be read and quoted. Pin it with a test asserting the substring after the prefix equals the stored `typeRisk`.
+
+This warning class is why the agent can see the risks its own patch created: the packet it was given predates its patch, so without this line a remap onto a lossier source would be invisible to it.
+
+## 6. Where risks surface
+
+- **`IsConfident` is risk-present.** A table carrying any type risk is detailed rather than summarised, in draft packets. Skip tables remain exempt.
+- **Both packet modes carry a risk list.** Draft and rework alike. Rework has no confident/detail split, so without this a rework packet would carry no risks at all — and feedback anchored on a source column would ask an agent to remap without telling it the target truncates. The rework contexts anchored on a source column, a source table, or general feedback each carry the risks of the columns they concern.
+- **The review screen** shows a type-risk count, a filter, and the list.
+
+## 7. `NeedsAgent`
+
+Fires when any of these holds:
+
+- there is attention or a blocker; **or**
+- a type risk sits on a column the auto-mapper **assigned in this run** rather than kept; **or**
+- a **kept bare column's recomputed risk text differs from the text in the version before this draft**.
+
+The third condition must compare against the version preceding the draft. The job stores the draft before calling `NeedsAgent`, so the latest artifact *is* the draft and comparing against it compares the draft with itself. Test it: rediscovery changes a kept bare column's source type, and `NeedsAgent` returns true.
+
+Evaluated once when a job completes, so it cannot loop.
+
+## 8. The playbook
+
+For each type risk: transform it away, or say in `summary` why it is acceptable. There is no field to write and nothing to clear. `rationale` keeps its existing purpose and is not a risk channel.
+
+**The step that resolves warnings names its classes by prefix.** Blockers and attention items must be resolved. Lines matching the type-risk prefix are satisfied by a transform *or* by a summary sentence, and are **expected to remain**. Without this, an agent obeying "resolve every warning" transforms away risks a reviewer wanted kept, or writes non-bare expressions to swap the text — the trap that caused the custom-expression rule to be withdrawn.
+
+## 9. Approval
+
+When the **Mapping** phase carries type risks, approval requires a flag naming the version being signed off. Sql-phase warnings also contain risk text; this rule is Mapping-only.
+
+- the approve call carries `confirmRisksVersion`;
+- approval is rejected when the phase carries type risks and the flag is absent, or names a version other than the current one;
+- the rejection is `409` with `{"error":"risk_confirmation_required","message":"version N has K type risks; confirm them to approve"}`.
+
+The check sits in the approve handler ahead of the approval guards, which cannot see the request. `WorkflowEngine.Approve` is unchanged. Approval exists only over HTTP, so the flag is human-only by construction.
+
+Approval is per version, so a new version is a new sign-off, and none of this needs stored state.
+
+## 10. The browser
+
+Never writes `typeRisk`. Displays it. Excludes it from the diffed column properties. There is no acknowledgement control, no class field, and no per-column sign-off anywhere in the view.
+
+## 11. Scope and residual
+
+The invariant is about **type-conversion hazards**. Nullability — a left join feeding a `NOT NULL` target — and join fan-out are real hazards entirely outside this model, and nothing here should be read as covering them.
+
+**Residual, deliberate:** custom-expression columns stored before this model carry no risk text and keep none while unchanged. They take a sentinel the first time they are edited. They are not retro-sentinelled, because flagging every long-approved expression in every existing project at once is the withdrawn rule by another route. The approved sample fixture's seven custom expressions are exactly this state and must stay green.
+
+## 12. Tests that are not changed by this model
+
+The two carry-over tests — the approved mapping carrying no attention, and the automap summary reading zero attention — **do not change**. Risks are not attention, so carry-over's bare recompute adds risk text to `CreatedAt`, `OrderDate` and `Comment` without adding attention. Assert that those three columns carry `typeRisk`.
+
+Any test asserting that a risky column is attention must be reverted, deliberately and with a comment recording that the rule reversed.
