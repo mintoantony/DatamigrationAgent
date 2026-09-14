@@ -24,6 +24,9 @@ public static class CommandRegistry
         new ArtifactCommand(),
         new FeedbackCommand(),
         new RunJobsCommand(),
+        new DiscoverCommand(),   // T2.5
+        new SearchCommand(),     // T2.5
+        new ShowCommand(),       // T2.5
         // Later milestones append their commands below this line.
     ];
 }

@@ -35,6 +35,11 @@ public sealed class DbmServices : IDisposable
     public EventRepo Events { get; }
     public JobRepo Jobs { get; }
     public ConnectionRepo Connections { get; }
+
+    // T2.5: catalog snapshots + search vectors (a stateless wrapper over Db, created on first use)
+    private CatalogRepo? _catalog;
+    public CatalogRepo Catalog => _catalog ??= new CatalogRepo(Db);
+
     public IEventSink Sink { get; set; }
     public WorkflowEngine Workflow { get; }
     public IReadOnlyDictionary<PhaseName, IPhaseModule> Modules { get; private set; } = new Dictionary<PhaseName, IPhaseModule>();

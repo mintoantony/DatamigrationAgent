@@ -19,9 +19,11 @@ public static class Fingerprint
                 Columns = t.Columns.Select(c => new
                 {
                     c.Name, c.DataType, c.MaxLength, c.Precision, c.Scale, c.IsNullable, c.IsIdentity,
-                    c.IsComputed, c.ComputedDefinition, c.DefaultDefinition,
+                    c.IsComputed, c.ComputedDefinition, c.DefaultDefinition, c.Collation,
                 }),
-                Indexes = t.Indexes.Select(i => new { i.Name, i.IsPrimaryKey, i.IsUnique, i.IsClustered, i.Columns }),
+                // Sorted by name (not index_id, a creation-order artifact) so differently-ordered DDL hashes identically.
+                Indexes = t.Indexes.OrderBy(i => i.Name, StringComparer.Ordinal)
+                    .Select(i => new { i.Name, i.IsPrimaryKey, i.IsUnique, i.IsClustered, i.Columns }),
                 ForeignKeys = t.ForeignKeys.Select(f => new { f.Name, f.Columns, f.RefSchema, f.RefTable, f.RefColumns }),
                 t.TriggerNames,
                 t.TemporalType,
