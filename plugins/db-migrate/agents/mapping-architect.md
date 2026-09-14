@@ -27,12 +27,12 @@ Read the packet file (absolute path given by the orchestrator) with the Read too
 `data` in **draft** mode:
 - `legend`, `options` (`autoAccept`, `candidate`), `hint`
 - `blockers` — why approval is impossible now; `attention` — script proposals below the auto-accept band
-- `typeRisks` — every column carrying a type risk, one line each: `<table>.<column>: type risk: <typeRisk>`
+- `typeRisks` — every column carrying a type risk, as an object: `{"<schema.table>.<Column>": "<risk text>"}`
 - `confident` — tables that need nothing (`target`, `source`, `confidence`, `columns`); a table carrying a type risk is always detailed instead
 - `detail` — tables that need work: `kind`, `sources`, `from`, `filter`, `confidence`, `method`, `tableCandidates`, `targetColumns` (name, type, nullable, identity, computed, rowversion, default, pk, fk → referenced column), `columns` (the current map per target column: expr, sourceColumns, default, confidence, method, typeRisk, candidates with score and why), `sourceTables` (up to 3 source tables with column types, null/distinct ratios, semantic class, max length, up to 3 sample values)
 - `uncovered` — source columns neither mapped nor dropped (`schema.table.column type`); `drops` — current drop decisions
 
-`data` in **rework** mode: `summary`, `blockers`, `attention`, `typeRisks`, `contexts` (one per feedback id: the slice its anchor points at — a table detail for `tablemap:`, a column detail with candidate profiles for `colmap:`, a source column profile plus `usedBy` for `column:src:`), `hint`.
+`data` in **rework** mode: `summary`, `blockers`, `attention`, `typeRisks`, `contexts` (one per feedback id: the slice its anchor points at — a table detail for `tablemap:`, a column detail with candidate profiles for `colmap:`, a source column profile plus `usedBy` for `column:src:`, a source table plus `usedBy` for `table:src:`, `uncovered` and `drops` for general feedback; the `column:src:`, `table:src:` and general contexts also carry `typeRisks` for the columns they concern, and the column maps in `tablemap:`/`colmap:` contexts show `typeRisk`), `hint`.
 
 ## Mapping model (JSON, camelCase)
 
@@ -44,11 +44,12 @@ Read the packet file (absolute path given by the orchestrator) with the Read too
     "filter": "optional WHERE predicate without WHERE",
     "confidence": 1, "method": "agent", "rationale": "one sentence",
     "columns": {"<TargetColumn>": {"expr": "T-SQL", "sourceColumns": ["schema.table.column"], "default": "T-SQL when expr is null",
-                                   "confidence": 1, "method": "agent", "rationale": "one sentence", "typeRisk": "(computed by dbm; never written — rule 8)"}}}},
+                                   "confidence": 1, "method": "agent", "rationale": "one sentence"}}}},
  "drops": {"<schema.table>|<schema.table.column>": {"reason": "why it is not migrated", "method": "agent"}},
  "notes": []}
 ```
 
+- Column maps you read in the packet may also show `typeRisk`. It is computed by dbm (rule 8): never include it in a column object you write, not even when replacing a whole column — copying it earns a warning.
 - **direct** — one source table. **merge** — several sources joined in `from`. **lookup** — the primary source plus lookup tables, also expressed with `from`. **skip** — the target table is not loaded (needs a rationale). A **split** is several target tables whose `sources[0]` is the same source table.
 - Expressions are T-SQL scalar expressions over the FROM aliases; `s` is always `sources[0]`. Quote identifiers with brackets (`s.[CUST_NM]`). Target keys (table and column names) use the exact catalog case.
 

@@ -175,6 +175,31 @@ public class MappingRiskTests
         Assert.Equal("fractional seconds rounded to 0 digits", (string?)node["tables"]!["app.Orders"]!["columns"]!["OrderDate"]!["typeRisk"]);
     }
 
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void A_blank_default_is_no_default_and_carries_no_risk(string blank)
+    {
+        // §2a: case (2) is expr blank and default blank, the predicate the blocker rules already use.
+        var before = WithComment("s.[CMNT]", "dbo.ORD_HDR.CMNT");
+        Comment(before).TypeRisk = Truncates;
+        var after = WithComment(null, "dbo.ORD_HDR.CMNT");
+        Comment(after).Default = blank;
+
+        var (_, node) = Validate(before, after);
+
+        Assert.False(CommentNode(node).ContainsKey("typeRisk"));
+    }
+
+    [Fact]
+    public void Carry_over_treats_a_blank_default_as_no_default()
+    {
+        var previous = WithComment(null, "dbo.ORD_HDR.CMNT");
+        (Comment(previous).Default, Comment(previous).TypeRisk) = ("  ", "stale text");
+
+        Assert.Null(Comment(AutoMapper.Map(SampleCatalogs.Source(), SampleCatalogs.Target(), Synonyms.Default(), new MatchOptions(), previous)).TypeRisk);
+    }
+
     [Fact]
     public void A_default_is_a_conversion_and_takes_the_sentinel()
     {
@@ -214,6 +239,28 @@ public class MappingRiskTests
 
         Assert.False(new MappingModule(services).Validate(ctx, node).Ok);
         Assert.False(CommentNode(node).ContainsKey("typeRisk"));
+    }
+
+    [Fact]
+    public void A_rejected_payload_never_quotes_a_supplied_typeRisk_back_as_a_risk_line()
+    {
+        // F5: the payload was not normalised, so its typeRisk is the author's; the warnings must not present it as an engine risk.
+        using var project = TempProject.Create();
+        var services = project.Services.WithSampleCatalogs();
+        var after = WithComment("s.[CMNT]", "dbo.ORD_HDR.CMNT");
+        Comment(after).TypeRisk = "an author's invented risk";
+        after.Tables["app.Nope"] = new TableMap();
+        var ctx = new ModuleContext
+        {
+            Services = services,
+            Current = new ArtifactRow(1, PhaseName.Mapping, 3, Json.Serialize(SampleMappings.Approved()), "human", null, DateTimeOffset.UtcNow),
+            OpenFeedback = []
+        };
+
+        var check = new MappingModule(services).Validate(ctx, Json.ToNode(after));
+
+        Assert.False(check.Ok);
+        Assert.DoesNotContain(check.Warnings, w => w.Contains("type risk:"));
     }
 
     [Fact]

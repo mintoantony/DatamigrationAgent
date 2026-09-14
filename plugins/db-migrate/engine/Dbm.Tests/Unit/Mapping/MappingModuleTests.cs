@@ -88,6 +88,17 @@ public class MappingModuleTests
         Assert.Equal("may truncate (source max 3000)", redrafted.Tables["app.Orders"].Columns["Comment"].TypeRisk);
         services.AddMapping(redrafted, PhaseStatus.Running);
         Assert.True(module.NeedsAgent(Json.ToNode(redrafted)));
+
+        // §7a, the failing path: the job is retried from drafting before the agent ran. Carry-over reads the latest artifact —
+        // the first changed draft, which already carries the new text — so a draft-to-draft comparison would go quiet here.
+        var retried = AutoMapper.Map(src, SampleCatalogs.Target(), Synonyms.Default(), new MatchOptions(), redrafted);
+        Assert.Equal("may truncate (source max 3000)", retried.Tables["app.Orders"].Columns["Comment"].TypeRisk);
+        services.AddMapping(retried, PhaseStatus.Running);
+        Assert.True(module.NeedsAgent(Json.ToNode(retried)));
+
+        // Once a non-script version carries the new text, the same retried draft no longer triggers.
+        services.AddMapping(retried, PhaseStatus.AwaitingReview, "agent");
+        Assert.False(module.NeedsAgent(Json.ToNode(retried)));
     }
 
     [Fact]

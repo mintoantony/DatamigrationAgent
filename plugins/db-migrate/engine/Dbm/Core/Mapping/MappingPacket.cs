@@ -281,9 +281,6 @@ public static class MappingPacket
         return !map.Columns.Values.Any(c => MappingValidator.NeedsReview(c.Method, c.Confidence, options));
     }
 
-    /// <summary>Adds <c>typeRisks: {"schema.table.Column": risk}</c> for every column selected by <paramref name="include"/> that
-    /// carries a type risk; omitted when there are none. Rework contexts that name target columns only by key use this so the
-    /// risk is not lost on the rework path.</summary>
     /// <summary>The packet risk list, in both modes: <c>typeRisks: {"schema.table.Column": risk}</c> for every column carrying a
     /// type risk in a non-skip table (a skipped table loads no data). Always present, possibly empty.</summary>
     public static JsonObject RiskMap(MappingPayload m)
@@ -299,7 +296,8 @@ public static class MappingPacket
         return risks;
     }
 
-    /// <summary>Rework contexts' <c>typeRisks</c> map for the columns <paramref name="include"/> selects; skip tables never
+    /// <summary>Adds <c>typeRisks: {"schema.table.Column": risk}</c> for every column selected by <paramref name="include"/> that
+    /// carries a type risk, so rework contexts that name target columns only by key do not lose the risk. Skip tables never
     /// contribute (they load no data), including in the general context. Omitted when empty.</summary>
     private static void AddTypeRisks(JsonObject obj, MappingPayload m, Func<string, TableMap, ColumnMap, bool> include)
     {

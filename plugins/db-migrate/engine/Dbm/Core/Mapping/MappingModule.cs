@@ -21,8 +21,8 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
     /// <summary>Evaluated once when the automap job completes. True when any holds:
     /// (1) attention (the confidence band) or a blocker;
     /// (2) a type risk on a column the auto-mapper assigned in this run rather than kept: method is not carried;
-    /// (3) a kept (carried) bare column whose recomputed risk text differs from the text in the version BEFORE this draft. The job stores
-    ///     the draft before calling this, so the latest artifact is normally the draft itself and is skipped.
+    /// (3) a kept (carried) bare column whose recomputed risk text differs from the text in the latest version NOT authored by the
+    ///     script (the last agent, human or approved version) — never another script draft (§7a).
     /// Risks never count as attention. Skip tables load no data and are exempt from (2) and (3).</summary>
     public bool NeedsAgent(JsonNode draft)
     {
@@ -30,7 +30,7 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
         var (src, tgt) = Catalogs();
         var m = Parse(draft);
         if (MappingValidator.Attention(m, Options()).Count > 0 || MappingValidator.Blockers(m, src, tgt).Count > 0) return true;
-        var previous = PreviousVersion(draft);
+        var previous = PreviousVersion();
         foreach (var (tableKey, map) in m.Tables ?? new())
         {
             if (map is null || map.Kind == "skip") continue;
@@ -50,19 +50,13 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
         return false;
     }
 
-    /// <summary>The mapping version that precedes <paramref name="draft"/>: the latest artifact when the draft is not stored yet,
-    /// otherwise the highest version below it. Null when there is none or it cannot be read.</summary>
-    private MappingPayload? PreviousVersion(JsonNode draft)
+    /// <summary>The comparand for condition 3: the latest mapping version NOT authored by the script — the last agent, human or
+    /// approved version. A script draft is never the comparand, so a retried job (or a second rediscovery before the agent ran)
+    /// cannot compare a draft against a draft and go quiet. Null when there is none or it cannot be read.</summary>
+    private MappingPayload? PreviousVersion()
     {
-        var latest = services.Artifacts.Latest(PhaseName.Mapping);
-        if (latest is null) return null;
-        var row = latest;
-        if (JsonNode.DeepEquals(JsonNode.Parse(latest.PayloadJson), draft))
-        {
-            var earlier = services.Artifacts.List(PhaseName.Mapping).Where(a => a.Version < latest.Version).Select(a => (int?)a.Version).LastOrDefault();
-            row = earlier is int v ? services.Artifacts.Get(PhaseName.Mapping, v) : null;
-        }
-        if (row is null) return null;
+        var meta = services.Artifacts.List(PhaseName.Mapping).LastOrDefault(a => a.Author != "script");
+        if (meta is null || services.Artifacts.Get(PhaseName.Mapping, meta.Version) is not { } row) return null;
         try { return Json.Deserialize<MappingPayload>(row.PayloadJson); }
         catch (Exception e) when (e is JsonException or NotSupportedException or InvalidOperationException) { return null; }
     }
@@ -80,7 +74,7 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
     /// <summary>Order: parse → structural errors (no normalisation when there are any) → type-risk normalisation, IN PLACE on
     /// <paramref name="payload"/> because the engine stores that very node → warnings. Warning classes, in this order:
     /// ownership ("typeRisk is computed by dbm"), blockers, attention (the confidence band), and type risks
-    /// ("&lt;table&gt;.&lt;column&gt;: type risk: &lt;typeRisk&gt;", one per risk, never counted as attention).</summary>
+    /// ("&lt;table&gt;.&lt;column&gt;: type risk: &lt;typeRisk&gt;", one per risk, never counted as attention; omitted for a rejected payload).</summary>
     public PayloadCheck Validate(ModuleContext ctx, JsonNode payload)
     {
         ArgumentNullException.ThrowIfNull(ctx);
@@ -97,7 +91,9 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
         if (errors.Count == 0) NormaliseRisks(payload, m, Baseline(ctx), src, tgt, warnings);
         warnings.AddRange(MappingValidator.Blockers(m, src, tgt));
         warnings.AddRange(MappingValidator.Attention(m, Options()));
-        warnings.AddRange(MappingValidator.RiskWarnings(m));
+        // A rejected payload was not normalised, so its typeRisk values are whatever the author supplied: never quote them back
+        // as engine risk lines.
+        if (errors.Count == 0) warnings.AddRange(MappingValidator.RiskWarnings(m));
         return new PayloadCheck(errors, warnings);
     }
 
@@ -121,7 +117,8 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
     /// <summary>Normalisation, in place on the node the engine stores, for a payload with no structural errors.
     /// CHANGED: the column or its table is absent from the stored version, the table's sources (ordered, case-insensitive) or
     /// trimmed from differ, or the column's trimmed expr, trimmed default or case-insensitive sourceColumns set differ.
-    /// First match wins: (1) not changed: the stored typeRisk verbatim; (2) expr null and default null: no risk;
+    /// First match wins: (1) not changed: the stored typeRisk verbatim; (2) expr blank and default blank (present-and-not-whitespace
+    /// predicate, as the blocker rules use): no risk;
     /// (3) expr non-null and a bare single-source reference: TypeCompat with the source profile, as the auto-mapper computes it;
     /// (4) everything else: <see cref="TypeCompat.UnevaluatedRisk"/>.
     /// An incoming typeRisk is never stored; it earns a warning when present and different from the stored version's.
@@ -150,7 +147,7 @@ public sealed class MappingModule(DbmServices services) : IPhaseModule
                 string? risk;
                 if (!(tableChanged || old is null || !SameColumn(old, cm)))
                     risk = Blank(old!.TypeRisk);
-                else if (cm.Expr is null && cm.Default is null)
+                else if (Blank(cm.Expr) is null && Blank(cm.Default) is null)
                     risk = null;
                 else if (cm.Expr is not null && MappingValidator.BareSingleSource(map, cm, src) is { } hit)
                     risk = Blank(TypeCompat.Check(ColumnType.From(hit.Column), ColumnType.From(targetColumn), hit.Column.Profile).Risk);

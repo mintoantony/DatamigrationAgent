@@ -54,7 +54,10 @@ public class AutomapJobTests
         Assert.Equal("6 tables mapped, 0 need attention, 0 blockers", result.Summary);
         var m = Json.FromNode<MappingPayload>(result.DraftPayload!);
         Assert.Equal(MapMethod.Carried, m.Tables["app.Customers"].Columns["FirstName"].Method);
-        Assert.Equal("may truncate (source max 300)", m.Tables["app.Orders"].Columns["Comment"].TypeRisk);   // a risk, not attention
+        // Risk model §12/§13: carry-over's bare recompute gives these three their real risk text without adding attention.
+        Assert.Equal("fractional seconds rounded to 0 digits", m.Tables["app.Customers"].Columns["CreatedAt"].TypeRisk);
+        Assert.Equal("fractional seconds rounded to 0 digits", m.Tables["app.Orders"].Columns["OrderDate"].TypeRisk);
+        Assert.Equal("may truncate (source max 300)", m.Tables["app.Orders"].Columns["Comment"].TypeRisk);
         Assert.Contains(log, l => l.Contains("carry-over v0"));
     }
 

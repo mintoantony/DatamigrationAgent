@@ -58,12 +58,12 @@ public static class MappingCarryOver
 
     /// <summary>Job drafts never pass through Validate, so a source type can change under a kept column between discoveries.
     /// Carry-over's own sequence (there is no stored version and no patch), first match wins:
-    /// expr null and default null → no risk; a bare single-source reference (alias resolved against the carried table's sources
+    /// expr blank and default blank → no risk; a bare single-source reference (alias resolved against the carried table's sources
     /// and from) → recompute the text through TypeCompat with the source profile; everything else → keep the stored typeRisk
     /// verbatim, no sentinel (residual: a type change beneath a custom expression is not re-evaluated).</summary>
     private static void RecomputeBareRisk(TableMap map, ColumnMap carried, ColumnInfo target, CatalogSnapshot src)
     {
-        if (carried.Expr is null && carried.Default is null) { carried.TypeRisk = null; return; }
+        if (string.IsNullOrWhiteSpace(carried.Expr) && string.IsNullOrWhiteSpace(carried.Default)) { carried.TypeRisk = null; return; }
         if (carried.Expr is null || MappingValidator.BareSingleSource(map, carried, src) is not { } hit) return;
         var risk = TypeCompat.Check(ColumnType.From(hit.Column), ColumnType.From(target), hit.Column.Profile).Risk;
         carried.TypeRisk = string.IsNullOrWhiteSpace(risk) ? null : risk;
