@@ -5454,3 +5454,106 @@ EOF
   - The agent's complete example patch applies with `JsonPatch` and leaves no errors or blockers.
 - **Browser check.** `views/mapping.js` was rendered in a harness with stubbed `DBM` core at 1280 px and 400 px, in light and dark. It found two bugs, both fixed here: popovers ignored `hidden`, and the page overflowed at 400 px. The save path and read-only mode were exercised. The full-app manual checklist (Step 10) still needs a human.
 - **Residual risks.** Real data beyond the sample may need more synonyms; teams extend `~/.dbmigrate/synonyms.json`, and the auto-mapper only proposes — the agent and the human decide.
+
+---
+
+## Task 3.5 — AMENDMENT (fix round 1): defects found in review
+
+These are defects in the plan text above, not in the implementation. The committed code matches the original brief byte-for-byte; the brief was wrong. Everything below replaces or adds to the corresponding part of Task 3.5.
+
+### A1 — The shell must never destroy unsaved human edits (replaces the dirty-guard design)
+
+**INVARIANT (this is the spec; the triggers listed afterwards are examples, not an exhaustive list):**
+
+> No code path may replace a rendered view whose `isDirty()` reports true, unless the user explicitly asked for it. If you find a path that reaches `renderView` and is not listed below, the invariant covers it too — fix it and say so.
+
+The original text made `views/mapping.js` `onEvent` toast "Save or discard your edits, then reload the view." That guard cannot work: `app.js` `onEvent` runs the view's handler first and then calls `scheduleRefresh()` unconditionally, and `refresh()` re-renders whenever `viewKey` changes. `render()` rebuilds `view.work` from `ctx.artifact.payload` every time, so the edits are gone 150 ms after the toast.
+
+Known triggers (again: examples): posting or deleting a comment (`components/review.js` calls `ctx.refresh()`, and a new feedback id changes `viewKey`); `artifact_created`; `agent_presence` flipping `agentOnline`; any job status change; any phase status change.
+
+**`wwwroot/js/app.js`** — add the helper and use it in `refresh`:
+
+```js
+  function viewDirty() {
+    var v = S.view;
+    if (!v || typeof v.isDirty !== 'function') return false;
+    try { return !!v.isDirty(S.ctx); } catch (err) { return false; }
+  }
+```
+
+In `refresh`, replace the re-render block with:
+
+```js
+        var key = viewKey(row);
+        if (force === true || key !== S.viewKey) {
+          if (force !== true && viewDirty()) {
+            // Keep the human's unsaved work. Do NOT advance S.viewKey: the render
+            // happens on the next refresh after the edits are saved or discarded.
+          } else {
+            S.viewKey = key;
+            renderView(row);
+          }
+        }
+```
+
+`renderChrome()` and `DBM.review.refresh(S.ctx)` continue to run in both branches — only the view re-render is skipped.
+
+**`wwwroot/js/views/mapping.js`** — three changes that make the hook work:
+
+1. Export the hook:
+
+```js
+  DBM.views.mapping = { title: 'Mapping', render: render, onEvent: onEvent, isDirty: function () { return isDirty(current); } };
+```
+
+2. **Save must clear dirty BEFORE refreshing.** In `saveEdits`, on success, set `view.before = clone(view.work);` before `view.ctx.refresh();`. Without this the new guard skips the post-save re-render and the user sits on a stale version after saving — the save path is the one case where dirty state must be cleared rather than protected.
+
+3. **Discard must refresh.** The Discard handler becomes:
+
+```js
+  function () { view.work = clone(view.before); redraw(view); view.ctx.refresh(); }
+```
+
+so the view picks up any version that arrived while the user was editing.
+
+`onEvent`'s toast stays: it is now true advice rather than dead code.
+
+### A2 — A column carrying a `typeRisk` needs review (C# and JS must agree)
+
+`needsReview` only flags `method === 'fuzzy' || 'vector'` below the auto-accept score, so an `exact` — or `human` — match carrying a data-loss hazard shows as OK, counts 0 in the KPI, and is hidden by the "Needs review" filter. The amber tag exists only inside the expanded row, which a reviewer triaging by filter never opens. The C# mirror has the identical gap.
+
+- `wwwroot/js/views/mapping.js`: `columnStatus` returns `'attention'` when `cm && cm.typeRisk` is a non-empty string, in addition to the existing `needsReview` test. `attentionCount` counts such columns. `tableStatus` returns `'attention'` when any of its columns does.
+- `Dbm/Core/Mapping/MappingValidator.cs`: `Attention` and `NeedsReview` gain the same rule, so the two implementations stay in step.
+- Add a test on **both** sides asserting that a column with `method: 'exact'`, `confidence: 1` and a non-empty `typeRisk` is attention, not ok.
+
+### A3 — Column names that collide with Object.prototype (scope: column level only)
+
+`editColumn` (`t.columns[column] || (t.columns[column] = {...})`) and `restoreIfUnchanged` (`bt.columns[column]`, `at.columns[column]`) use raw bracket access. A target column named `__proto__` returns `Object.prototype` — truthy — so the edit writes onto the prototype, `diff` returns `[]` so the edit cannot be saved, and every object on the page then carries `expr`/`method`/`confidence`, corrupting `blockers()` and `needsReview()`. `toString`, `valueOf` and `constructor` yield built-ins and the edit is silently dropped. These are legal SQL Server identifiers and the schema is foreign input.
+
+Fix with the idiom this file already uses: guard every column-map lookup with `Object.prototype.hasOwnProperty.call(...)` before treating a hit as a real entry.
+
+**Do not touch `findKey`.** It already opens with `Object.prototype.hasOwnProperty.call(obj, key)` and then iterates `Object.keys`, so table-level lookup is prototype-safe. The defect is confined to the column level.
+
+### A4 — mentions() must not match across a dot boundary (table level only)
+
+`mentions(line, key)` tests `l.indexOf(k + '.') === 0`, so the blocker `"app.Customers.Old: no table mapping"` marks the unrelated, clean `app.Customers` as Blocker and `blockerTarget` can jump to the wrong row. Table names may legally contain dots. Match only when the character after the key begins a message (`':'`) or when the remainder is a single further segment that the line actually attributes to this table.
+
+`columnStatus` is **not** affected — its prefix is `tableKey + '.' + column + ':'`, with the trailing colon, so `Name` cannot collide with `NameOld`. Leave it alone.
+
+### A5 — /api/mapping/context must honour the error contract
+
+- `?version=abc`: the handler binds `(int? version)`, so binding fails before the handler runs and the caller gets a bare 400, or a 500 `internal` through the error boundary in Development. Accept the raw query value and return `{"error":"bad_request","message":"..."}` — the exact shape the Global Constraints require.
+- `?version=99` where no such version exists: currently 200 with `"version": null` and an empty `blockers` array, which reads as "nothing blocks approval". Return 404 `{"error":"not_found","message":"..."}`, matching the sibling `GET /api/artifact/{phase}/{version}`.
+- Use `ApiResults.Json` with `Json.Options` rather than `Results.Content(node.ToJsonString(), "application/json")`, so this endpoint serialises the way every other one does.
+- Add tests for both failure paths; neither is covered today.
+
+### A6 — Two smaller corrections
+
+- `contextFromPayload` hard-codes `autoAccept` as `0.85`. An exported page must use the project's real setting, or its statuses and Needs-review count disagree with the live screen whenever the setting differs.
+- The context endpoint computes an `attention` value the view never reads. Either render it or stop computing it; do not ship a payload field with no consumer.
+
+### Test-coverage requirements added by this amendment
+
+- A test that fails if `typeRisk` stops rendering. There is none today.
+- A test that fails if a dirty view is destroyed by a shell re-render — drive it through the comment-post path, which is the real workflow.
+- The "blockers mirror MappingValidator" test currently compares hand-copied strings and never runs the C# validator and the JS against one fixture, so C#/JS drift goes unnoticed. Pin the two against a shared fixture.
