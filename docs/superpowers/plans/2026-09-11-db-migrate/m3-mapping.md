@@ -5697,3 +5697,43 @@ The candidates popover shows source, score and reason, but no per-candidate risk
 - The recompute survives a round trip: validate, store, re-read, and the stored artifact carries the new risk.
 
 Build the payloads for these tests inline. Do **not** modify the shared approved-mapping fixture — see B5.
+
+### AMENDMENT CORRECTIONS (Task 3.4, second pass)
+
+From the reviewer checking the first pass at source. B1's `NeedsAgent` half and B1's rework clause were already correct and are unchanged — they are restated here only because they are easy to drop while fixing the summary path.
+
+#### B1 corrected — where the risk check goes, and one predicate everywhere
+
+**Skip tables are exempt, deliberately.** `IsConfident` returns true for `kind: "skip"` before it looks at columns. A skipped table loads no data, so a carried risk on one of its columns is not a hazard. Leave the skip return first and put the risk check after it. This is the one exemption to B1's "unconditional" wording, and it is an exemption because there is no conversion to be risky about — not because the risk is unimportant.
+
+**Use one predicate in both places.** `ColumnMapNode` currently tests `TypeRisk is not null` while B1 asks `IsConfident` for "non-null, non-empty". Mixed, an empty-string risk would render in a detailed table without being the thing that made it detailed. Both sites use the same test: present and not whitespace.
+
+**Do not exempt agent-, human- or carry-decided columns from `IsConfident`.** It is tempting, because carried risks keep a table detailed on every later draft even after a `CAST` fixed it, which costs packet tokens on re-runs. Accept that cost. Exempting them reintroduces exactly the stale-risk seam B7 exists to close; the right relief is B7's recompute clearing risks it can prove are handled.
+
+#### B8 — the agent's own patch must not delete the risk (new)
+
+The playbook tells the agent to replace the whole column object, and the Mapping-model block describes `typeRisk` as "risk text from the auto-mapper" without saying whether to carry it forward. The worked example patch replaces `Customers.CreatedAt` — whose risk is `"fractional seconds rounded to 0 digits"` — with an object containing no `typeRisk`. So an applied agent patch **deletes the hazard from the stored artifact**, and the UI stops showing it from that version on.
+
+This is the packet-to-patch return leg. B1 fixes what the agent is *shown*; nothing yet governs what it is allowed to *remove*.
+
+- Add a playbook rule: when replacing a column object, copy `typeRisk` across unchanged, unless the new expression handles the hazard — and when it does, say so in `rationale`.
+- Fix the worked example patch to follow that rule, since an example that contradicts the rule is what the agent will actually imitate.
+- B7's recompute will later restore the risk for bare single-source expressions, but it cannot infer one for a `CAST`, so the playbook rule is the real protection and remains necessary after B7 lands.
+
+#### B5 corrected — copy the fixture, do not rebuild it
+
+The earlier wording, "new tests must build their own payload", is misleading. `SampleMappings.Approved()` constructs a fresh object on every call and holds no static cache, so **taking a copy and setting a `TypeRisk` on one column inside a test is not a fixture change** — existing tests in this milestone already do exactly that. Nobody should hand-build six tables.
+
+The rule is narrower than it sounded: **do not edit `SampleMappings.cs`.** Everything else is allowed.
+
+Three tests are required, because no single one kills every mutation:
+
+1. **Draft packet.** An `Approved()` copy with a `TypeRisk` set on a high-confidence column. Assert the table is absent from `confident` (six become five) **and** that the detail entry's column carries the exact risk text. This kills both the `IsConfident` regression and the line that writes `typeRisk` into the column node.
+2. **Rework packet.** The same payload with a `colmap:` anchor; assert the context's map carries the risk. The rework path reaches the column node through a different caller, so test 1 does not cover it.
+3. **Through `MappingModule.BuildPacket`** with `ctx.Current` holding the serialised payload. Nothing in this milestone currently round-trips a non-null `TypeRisk` through the JSON options, because the shared fixture has none — so a rename or a `[JsonIgnore]` on the property would pass tests 1 and 2 and still ship the bug.
+
+Optionally, and free: assert that a real auto-mapper draft's known risky columns carry `typeRisk` in the packet. That uses genuine scorer output with no fixture change, but it cannot catch the `IsConfident` gap, because those tables are detailed for other reasons anyway.
+
+#### B7 residual, extended
+
+`Candidate.Why` carries only a coarse marker such as "type risky" or "widening", never the risk text. An agent switching a column to a candidate source cannot see that candidate's hazard, and the column also keeps the previous pairing's `TypeRisk`, which is stale in the other direction. The recompute closes the second half. The first half stays on the deferred list with the popover display.
