@@ -6188,3 +6188,11 @@ The two mechanisms do different jobs and neither can do the other's:
 - **class change** invalidates an acknowledgement whose hazard genuinely moved, including changes no text reveals.
 
 An implementer who finds themselves collapsing the two into one comparison has lost one of those properties; say which, and stop.
+
+### Task 3.5 JavaScript — addendum for `riskClass`
+
+The FINAL JavaScript risk scope above was written before `riskClass` existed. One addition, and it is the same rule that already applies to `typeRisk`:
+
+**`riskClass` is engine-owned. The browser never writes it and never diffs it.** It is a second engine-owned field on a column map, and the view must exclude it from the diffed column properties exactly as it excludes `typeRisk`. Otherwise the acknowledgement control emits an operation for it the moment it rebuilds a column object, and the engine warns about a field the browser had no business sending.
+
+The browser does not display it either. It is an identity used to decide when an acknowledgement has outlived its hazard, not something a reviewer reads — the reviewer reads `typeRisk`.
