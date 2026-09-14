@@ -5658,3 +5658,42 @@ Required tests:
 ### B6 — Note on `ctx.Services`
 
 The module captures `DbmServices` through its constructor and ignores `ctx.Services` everywhere. This is harmless today because the registry passes the same instance, but a test constructing a `ModuleContext` with different services would not notice. Not a required fix; recorded so it is a deliberate choice rather than an accident.
+
+### B7 — A human remap must re-evaluate its own type risk
+
+This is the seventh defect, found in Task 3.5's review but fixed here because this is where the mapping payload is validated.
+
+**INVARIANT (this is the spec; the mechanics beneath it are how, not what):**
+
+> A stored `typeRisk` must always describe the conversion the payload currently specifies. It must never survive a change to the column's source, and it must never be absent from a conversion that carries a hazard.
+
+`editColumn`, `useCandidate` and `mapToTarget` change `expr`, `sourceColumns` and `default`, then set `method: human`, `confidence: 1` — and leave the auto-mapper's `typeRisk` untouched. Nothing recomputes it. Both directions are wrong: a risk from the *old* source pair is now asserted against a *new* conversion, and — worse — remapping onto a genuinely lossy source shows **no** risk at all, and the saved version carries none.
+
+#### Where it goes, and the constraint that decides it
+
+`MappingModule.Validate`, after the parse-error return and before blockers and attention are computed, so the stored warnings match the stored payload.
+
+**It must write into the `JsonObject` that the engine stores, not into the deserialised object.** `WorkflowEngine.Apply` passes the patched node to `Validate` and then stores *that same node* by reference. Assigning to a parsed POCO's property persists nothing — the finding would close while the bug remained, which is worse than not fixing it.
+
+Normalising the node in place does **not** break the `IPhaseModule` contract. It is already the established pattern in this design: Milestone 4's `SqlModule` specifies the same thing in its own words, "the payload node is normalised in place … so the flags reach the new version". Normalisation-on-accept and error-rejection are different operations.
+
+#### Rules
+
+1. **Only recompute columns that changed.** Diff each column's `expr` and `sourceColumns` against `ctx.Current`. A column whose source is untouched keeps its existing `typeRisk` verbatim — otherwise an agent's deliberate risk wording gets overwritten on every unrelated save.
+2. **Bare single-source expressions are recomputed.** When the column resolves to exactly one source column and the expression is empty or is exactly a bare reference to that column, resolve both column types from the catalogs, call `TypeCompat`, and write the resulting risk string to `typeRisk` — or remove the property when there is no risk.
+3. **Anything else clears the risk and is flagged.** A `CAST`, `CASE`, `LEFT`, literal, or multi-source expression cannot have its risk inferred, and the old risk is provably stale because the source changed. Remove `typeRisk` and let the column be caught by the new attention rule below. Do **not** re-flag such a column with the old text: the agent may have written that expression specifically to fix the risk, and re-flagging its own fix is how a correct change gets reverted.
+4. **New attention rule, payload-only, both languages.** A column whose expression is custom (not a bare single-source reference) counts as needing review, with the reason "custom expression: type risk not evaluated". It must be computable from the payload alone so the C# and JS implementations can stay in parity, exactly like the `typeRisk` rule added in B-series amendment A2.
+
+#### Deliberately out of scope, recorded as a residual
+
+The candidates popover shows source, score and reason, but no per-candidate risk, so a human chooses without seeing it. Adding a risk to the candidate record would reach back into the auto-mapper and the payload model, both of which are closed work, this late in the milestone. With rules 1–3 in place the human sees the true risk immediately *after* choosing rather than before. Recorded as a known residual rather than fixed.
+
+#### Tests
+
+- A remap onto a lossy source produces a risk that was not there before.
+- A remap away from a lossy source removes the risk that was there before.
+- A column whose source did not change keeps its existing risk text byte-for-byte, including text an agent wrote.
+- A `CAST` expression clears the risk and produces the custom-expression attention instead of re-flagging.
+- The recompute survives a round trip: validate, store, re-read, and the stored artifact carries the new risk.
+
+Build the payloads for these tests inline. Do **not** modify the shared approved-mapping fixture — see B5.
