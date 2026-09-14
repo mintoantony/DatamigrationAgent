@@ -5927,3 +5927,56 @@ The Task 3.4 fifth pass makes `typeRisk` engine-owned and introduces `riskAck`. 
 **A human must be able to acknowledge a risk.** `riskAck` is settable from the mapping screen, next to the risk it acknowledges, through the ordinary human-edit path. Without it, a human-only review — no agent run, or a reviewer who never requests rework — can never clear attention, and the signal the acknowledgement exists to protect is lost anyway.
 
 **Acknowledged risks must be visible as a set.** An acknowledgement removes a column from attention, and attention is the mechanism that reaches a human. Show acknowledged risks as their own count, separate from open attention, with a filter that lists them, so an approver signs them off deliberately rather than never seeing them. An acknowledgement hidden from the approver defeats the review it belongs to.
+
+### AMENDMENT CORRECTION (Task 3.4, seventh pass) — supersession, and an acknowledgement must name its hazard
+
+Six passes of appending corrections have left older passages contradicting newer ones. This pass strikes the stale text explicitly, closes the last acknowledgement hole, and finishes the playbook rewrite that D2 started but did not scope fully.
+
+**Reading rule for this document:** where any earlier passage conflicts with a later one, the later one wins. The strikes below are the conflicts found so far; if you find another, it resolves the same way — tell me, and do not pick one yourself.
+
+#### E1 — Passages that are superseded and must not be implemented
+
+- **B7 rule 3's original text** ("remove `typeRisk` and let the column be caught by the new attention rule below") — superseded by C1 and then by D1. The engine writes the risk; nothing "lets it be caught" by a rule that no longer exists.
+- **B7's test bullet** ("a `CAST` expression clears the risk and produces the custom-expression attention instead of re-flagging") — **struck.** It is a test for withdrawn rule 4. C1 deleted the rule; this bullet survived by oversight. Do not write this test.
+- **B8's original instruction** ("copy `typeRisk` across unchanged, unless the new expression handles the hazard — and when it does, say so in `rationale`") — superseded by D2. Copying is impossible now; the engine owns the field.
+- **C2's sentence** ("if the new expression handles the hazard, remove the risk and say so in `rationale`") — **struck.** D2 closed the `rationale` route, but the fourth pass said "everything else in C1 through C7 stands", which kept this sentence alive and contradicting it. There is one channel: `riskAck`.
+
+#### E2 — An acknowledgement must name the hazard it accepts
+
+This closes the reflexive-acknowledgement hole. `riskAck` suppresses attention, so an acknowledgement written without knowing what it suppresses is a way to hide a hazard nobody evaluated — and an agent that sets `riskAck` on every column it writes, imitating the required-fields list, achieves exactly that with no bad intent.
+
+**An incoming `riskAck` is honoured only if the incoming `typeRisk` equals the risk the engine computed for that column.** Otherwise the acknowledgement is dropped and the column remains in attention.
+
+D1 is unchanged: the incoming `typeRisk` is never **stored**. Here it is read purely as a confirmation token — the author must state which hazard they are accepting. A blank acknowledgement, or one written before the hazard existed, therefore fails.
+
+The dry-run loop converges without anyone guessing: the warning prints the computed risk text, the author copies it next to their acknowledgement, and the next dry-run passes.
+
+This also supplies D4's invalidation directly — a changed hazard produces different computed text, so an old acknowledgement no longer matches and drops — and it applies equally in carry-over, which removes the problem of a sentinel comparing equal to itself forever.
+
+#### E3 — The sentinel is too eager
+
+D1 writes the sentinel for any changed non-bare expression. Narrower and more honest: when a column's expression changed but its **`sourceColumns` set did not**, the stored risk still describes that same source pair, so keep `ctx.Current`'s text. Write the sentinel only when the `sourceColumns` set itself changed and the expression is not a bare single-source reference.
+
+The sentinel then appears rarely and means what it says — nothing could be evaluated — instead of appearing on every expression edit and teaching everyone to ignore it.
+
+#### E4 — The playbook rewrite, fully scoped
+
+D2 changed the main instruction and the worked example. Three further places in `mapping-architect.md` still teach the closed route, and an agent follows whichever it reads first:
+
+- the **mapping-model block** lists `typeRisk` as a field the author writes, and has no `riskAck` field;
+- the **required-column-fields rule** lists what every column map must set, without `riskAck`;
+- the **packet legend** describes the `method` values but never says how a risk is cleared.
+
+All three must say the same thing: the engine owns `typeRisk`; a risk is cleared only by `riskAck`, which must quote the risk text it accepts.
+
+**The complete example patch must pass its own procedure.** As written it leaves six columns in attention while step 7 requires clearing them, and the surrounding text claims success. Rework it so the example satisfies the procedure it demonstrates. An example that contradicts the rules is what the agent imitates.
+
+#### E5 — The test that hides all of this
+
+The complete-example-patch test applies the patch with raw `JsonPatch.Apply` and calls the validator directly, so `MappingModule.Validate` never runs on it — rules 1 to 3, C1, C5 and the whole acknowledgement mechanism are untested against the playbook's own example. It also asserts only errors and blockers, never attention.
+
+Apply it through the workflow's dry-run patch path instead, and assert there are no warnings — or at minimum no attention. The playbook-style flow test needs the same treatment. This is the only test that fails when the playbook teaches a route the code no longer honours.
+
+#### E6 — Keep acknowledgement counts out of `Summarize`
+
+D5's acknowledged-risk count belongs to the work packet and the UI context. It must **not** go into `Summarize`, whose output is pinned by assertions such as the zero-attention, zero-blockers summary string. A display concern must not move a load-bearing assertion.
