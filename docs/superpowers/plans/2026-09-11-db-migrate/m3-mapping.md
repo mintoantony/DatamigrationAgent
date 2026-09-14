@@ -5909,3 +5909,11 @@ Recorded here because they are caused by this milestone's change and must not be
 
 1. **Custom SQL is silently discarded.** M4 keeps a human's hand-written SQL for a table only when a hash of the whole table mapping matches, and that hash covers `typeRisk`, `riskAck`, `candidates`, `rationale` and `confidence` — none of which affect the generated SQL. Acknowledging a risk, a carry-over recompute, or a sentinel write each change the hash and throw the custom SQL away. The M4 hash must cover only SQL-relevant fields: the table's kind, sources, from and filter, and per column the expression, source columns and default.
 2. **Sentinels and acknowledged risks become SQL-plan warnings.** M4 emits a warning for every non-empty `typeRisk` and does not consult `riskAck`. A DBA reading the SQL review would see `"not evaluated: custom expression"` as a plan warning. M4 must skip acknowledged risks and must not render a sentinel as a data-loss warning.
+
+### AMENDMENT CORRECTION (Task 3.4, sixth pass) — D5 drops rather than rejects
+
+D5 opened by saying that setting `riskAck` on a column carrying no risk should be rejected with a validation error. That punishes caution. Consider the honest case: an author remaps a column to a safer source and sets an acknowledgement out of prudence, the engine then computes no risk for it, and a well-meaning patch fails validation for being careful.
+
+An acknowledgement on a column with no risk is harmless noise. Acknowledgement-spraying only matters where a risk actually exists, and the remaining bullets of D5 already expose that case by counting and listing acknowledged risks where a human reads them before approval.
+
+Corrected: **drop** a `riskAck` whose column has an empty computed `typeRisk`, and record a warning naming the column. Never reject the patch for it.
