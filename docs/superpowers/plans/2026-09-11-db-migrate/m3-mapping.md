@@ -6130,3 +6130,25 @@ The attention message for a risk is pinned: `<table>.<column>: type risk: <typeR
 The invariant "a risk must never be absent from a conversion that carries a hazard" is qualified here, deliberately: **custom-expression columns stored before this model existed carry no risk text and no sentinel, and keep none while they stay unchanged.** They take a sentinel the first time they are edited.
 
 They are not retro-sentinelled. Doing so would flag every long-approved expression in every existing project at once — the withdrawn "every custom expression needs review" rule arriving by another route. The approved sample fixture's seven custom expressions are exactly this state, and they must stay green.
+
+### Task 3.5 — JavaScript risk scope, FINAL (follows the Risk model)
+
+The two earlier JavaScript scope sections above are **historical**. They describe `riskAck` as a string and carry a sentinel rule the Risk model narrowed. Implement this section and the Risk model only.
+
+**Read the Risk model section first.** It is normative for both languages. This section says only which parts land in the browser.
+
+**Never write `typeRisk`.** The engine owns it absolutely. The screen displays it; the browser never sends it. A patch from the browser carrying a risk value is ignored by the engine and earns a warning.
+
+**The predicate is mirrored, not reinvented.** Read the committed C# and mirror it exactly:
+
+> a column needs review when `typeRisk` is present and non-blank, and not (`riskAck.reason` is non-blank and `HazardClass(riskAck.risk)` equals `HazardClass(typeRisk)`).
+
+`HazardClass` is mirrored from the committed C# too, with the same stripping rules and the same treatment of the sentinel as a class matching nothing else. Two implementations of one rule written independently in two languages is the drift hazard this project has already flagged elsewhere; the C# lands first precisely so this side can copy it.
+
+**`riskAck` is a structured value**, `{ risk, reason }`. The acknowledgement control must put the exact `typeRisk` text into `risk` — the user should never have to retype or reformat it — and the user's own words into `reason`. An acknowledgement whose `risk` does not match the current hazard is not an acknowledgement, so the UI must not let a stale one look valid.
+
+**A human must be able to acknowledge.** The control sits next to the risk it acknowledges and goes through the ordinary human-edit path. Without it a human-only review — no agent run, or a reviewer who never requests rework — can never clear attention, and the signal the mechanism exists to protect is lost anyway.
+
+**Acknowledged risks are visible as a set.** Their own count, separate from open attention, with a filter that lists them, so an approver signs them off deliberately. An acknowledgement removes a column from attention, and attention is the mechanism that reaches a human — one that nobody sees defeats the review it belongs to.
+
+**Remove `typeRisk` from the diffed column properties.** The view currently lists it, so the client would emit an operation for it the moment the acknowledgement control rebuilds a column object.
