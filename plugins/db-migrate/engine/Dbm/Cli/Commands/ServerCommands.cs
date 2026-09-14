@@ -33,8 +33,12 @@ public sealed class ServeCommand : ICommand
 
         // WebHost.RunAsync returned early without starting: another process already owns this workspace
         // (a live server answered health, or it holds the exclusive server.lock). Never silently exit as if we served.
+        // Written through the same `output` writer as the normal path (not Output.Ok/ctx.Out), so --detached's
+        // stdout suppression above covers this line too.
         var owner = ServerControl.ReadInfo(ws);
-        return Output.Ok(ctx, new { ok = true, alreadyRunning = true, url = owner?.UiUrl ?? "" });
+        output.WriteLine(Json.Serialize(new { ok = true, alreadyRunning = true, url = owner?.UiUrl ?? "" }));
+        output.Flush();
+        return 0;
     }
 }
 
