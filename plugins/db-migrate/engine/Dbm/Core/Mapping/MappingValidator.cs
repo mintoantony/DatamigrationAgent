@@ -104,9 +104,11 @@ public static class MappingValidator
     public static List<string> UncoveredSourceColumns(MappingPayload m, CatalogSnapshot src) =>
         UncoveredByTable(m, src).SelectMany(x => x.Missing.Select(c => $"{x.Table.Key}.{c.Name}")).ToList();
 
-    /// <summary>Resolves "schema.table.column" (split on the last '.') against a catalog.</summary>
-    public static (TableInfo Table, ColumnInfo Column)? ResolveSourceColumn(CatalogSnapshot catalog, string key)
+    /// <summary>Resolves "schema.table.column" (split on the last '.') against a catalog. A null or empty
+    /// key (e.g. a null element inside a "sourceColumns" JSON array) resolves to nothing, like an unknown key.</summary>
+    public static (TableInfo Table, ColumnInfo Column)? ResolveSourceColumn(CatalogSnapshot catalog, string? key)
     {
+        if (string.IsNullOrEmpty(key)) return null;
         var dot = key.LastIndexOf('.');
         if (dot <= 0 || dot == key.Length - 1) return null;
         var table = catalog.FindTable(key[..dot]);

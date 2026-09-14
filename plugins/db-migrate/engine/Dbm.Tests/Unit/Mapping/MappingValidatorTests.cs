@@ -203,7 +203,9 @@ public class MappingValidatorTests
     [InlineData("dbo.CUST", false)]
     [InlineData("dbo.CUST.", false)]
     [InlineData("CUST_NM", false)]
-    public void ResolveSourceColumn_splits_on_the_last_dot(string key, bool found)
+    [InlineData(null, false)]
+    [InlineData("", false)]
+    public void ResolveSourceColumn_splits_on_the_last_dot(string? key, bool found)
     {
         Assert.Equal(found, MappingValidator.ResolveSourceColumn(SampleCatalogs.Source(), key) is not null);
     }
@@ -267,12 +269,37 @@ public class MappingValidatorTests
     }
 
     [Fact]
-    public void Validator_methods_do_not_throw_on_malformed_entries_and_collections()
+    public void Null_element_inside_source_columns_list_produces_the_existing_unknown_source_column_message()
+    {
+        // Exact repro: a JSON null INSIDE an otherwise non-null "sourceColumns" array (not the array itself, nor
+        // the containing objects, being null) previously threw inside ResolveSourceColumn.
+        var json = "{\"tables\":{\"app.Products\":{\"kind\":\"direct\",\"sources\":[\"dbo.PROD\"],\"columns\":" +
+                   "{\"Name\":{\"expr\":\"s.[PROD_NM]\",\"sourceColumns\":[null]}}}},\"drops\":{}}";
+        var m = Json.Deserialize<MappingPayload>(json);
+
+        var errors = MappingValidator.Errors(m, SampleCatalogs.Source(), SampleCatalogs.Target());
+
+        Assert.Equal(["app.Products.Name: unknown source column ''"], errors);
+    }
+
+    [Fact]
+    public void Validator_methods_do_not_throw_on_malformed_entries_collections_or_elements_inside_them()
     {
         var m = new MappingPayload();
         m.Tables["app.Customers"] = null!;
         m.Tables["app.Products"] = new TableMap { Kind = "direct", Sources = null!, Columns = null! };
-        m.Tables["app.Orders"] = new TableMap { Kind = "direct", Sources = ["dbo.ORD_HDR"], Columns = new() { ["OrderId"] = null! } };
+        m.Tables["app.Orders"] = new TableMap
+        {
+            Kind = "direct",
+            Sources = ["dbo.ORD_HDR"],
+            Columns = new()
+            {
+                ["OrderId"] = null!,
+                ["CustomerId"] = new ColumnMap { Expr = "s.[CUST_ID]", SourceColumns = ["dbo.ORD_HDR.CUST_ID", null!] },
+            }
+        };
+        // A null element inside an otherwise non-null Sources list.
+        m.Tables["app.Addresses"] = new TableMap { Kind = "direct", Sources = ["dbo.ADDR", null!], Columns = new() };
         m.Drops["dbo.CUST"] = null!;
         var src = SampleCatalogs.Source();
         var tgt = SampleCatalogs.Target();
@@ -284,6 +311,8 @@ public class MappingValidatorTests
 
         Assert.Contains("target table 'app.Customers' has no mapping (expected an object)", errors);
         Assert.Contains("app.Orders.OrderId: no column mapping (expected an object)", errors);
+        Assert.Contains("app.Orders.CustomerId: unknown source column ''", errors);
+        Assert.Contains("app.Addresses: unknown source table ''", errors);
         Assert.Contains("drop 'dbo.CUST' has no decision (expected an object)", errors);
         Assert.Contains(blockers, b => b.StartsWith("app.Products: no source table"));
         Assert.NotNull(attention);
