@@ -5917,3 +5917,13 @@ D5 opened by saying that setting `riskAck` on a column carrying no risk should b
 An acknowledgement on a column with no risk is harmless noise. Acknowledgement-spraying only matters where a risk actually exists, and the remaining bullets of D5 already expose that case by counting and listing acknowledged risks where a human reads them before approval.
 
 Corrected: **drop** a `riskAck` whose column has an empty computed `typeRisk`, and record a warning naming the column. Never reject the patch for it.
+
+### Task 3.5 — JavaScript scope, second addition (follows the Task 3.4 fifth pass)
+
+The Task 3.4 fifth pass makes `typeRisk` engine-owned and introduces `riskAck`. Three consequences land in this round. They are written here because an implementer reading only this section would otherwise never see them.
+
+**Never write `typeRisk` from the browser.** The engine computes, recomputes and restores it. The screen displays it and sends only `riskAck`. A patch from the browser carrying a risk value is ignored by the engine and earns a warning.
+
+**A human must be able to acknowledge a risk.** `riskAck` is settable from the mapping screen, next to the risk it acknowledges, through the ordinary human-edit path. Without it, a human-only review — no agent run, or a reviewer who never requests rework — can never clear attention, and the signal the acknowledgement exists to protect is lost anyway.
+
+**Acknowledged risks must be visible as a set.** An acknowledgement removes a column from attention, and attention is the mechanism that reaches a human. Show acknowledged risks as their own count, separate from open attention, with a filter that lists them, so an approver signs them off deliberately rather than never seeing them. An acknowledgement hidden from the approver defeats the review it belongs to.
