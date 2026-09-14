@@ -6321,3 +6321,62 @@ Recorded as a residual alongside section 8's pre-model columns.
 `riskClass` is engine-owned exactly as `typeRisk` is: an incoming value is ignored, and a value present and differing from `ctx.Current`'s earns a warning naming the column.
 
 The malformed-payload matrix gains: `riskClass` that is not a string; `riskAck` in the old plain-string shape; `riskAck` with null members; `riskAck` as an array. Each must be rejected or tolerated without throwing, on the same full chain as the rest of the matrix.
+
+### RISK MODEL AMENDMENT 4 — carry-over gets its own sequence, and the token refresh stops laundering
+
+"Carry-over follows the same rules" was unimplementable. The token refresh, placed in `Validate`, did nothing but accept inexact acknowledgements. And J3's second half protected exactly the case the class exists to catch. Three corrections, one reversal, two smaller.
+
+#### K1 — Carry-over has its own sequence; G1 and G3 govern `Validate` only
+
+G1 compares against `ctx.Current`, and carry-over has neither a `ctx.Current` nor a patch — a kept column is copied from the previous artifact field for field. Neither literal reading works:
+
+- if kept columns are "not changed", bare columns are **never** recomputed after rediscovery, which silently undoes the recompute and removes the only reason `riskClass` exists;
+- if kept columns are "changed", every kept custom expression reaches the catch-all and takes a sentinel — retro-sentinelling every long-approved expression, contradicting section 8, failing the committed carry-over test with seven sentinels, and then having G3 clear every acknowledgement, contradicting G4.
+
+**Carry-over sequence, first match wins:**
+
+```
+expr null AND default null   -> no risk
+bare single-source reference -> recompute text and class;
+                                clear riskAck on a class change, else refresh the token
+everything else              -> keep stored typeRisk, riskClass and riskAck verbatim
+                                (no sentinel; G3's clearing does not apply)
+```
+
+**G1 and G3 apply to `Validate` only.**
+
+#### K2 — The unchanged row keeps the class too
+
+G1's first row says an unchanged column keeps `ctx.Current`'s `typeRisk`. It keeps `riskClass` as well. `riskAck` continues to come from the incoming node, subject to G3. Without this an unchanged column loses its class inside `Validate` and lands in the text-without-class state this field exists to prevent.
+
+#### K3 — The token refresh happens only in carry-over
+
+Inside one `Validate` the catalog does not change, so a genuine acknowledgement's text cannot drift. The only thing a fuzzy refresh does there is **launder an inexact incoming token**: an acknowledgement of `{risk: "may truncate", reason: "fine"}` matches every truncation column by family, is rewritten to the exact current text, and is honoured. One generic phrase sprayed across a patch defeats the naming requirement, and the stored artifact then shows its author quoting texts they never wrote.
+
+**An acknowledgement supplied in a patch must match `typeRisk` exactly.** That is easy rather than harsh, because section 7 pins the attention message so the exact text is there to copy.
+
+**Refresh happens only in carry-over**, where text genuinely drifts because rediscovery re-sampled the data. `Validate` needs no fuzzy comparison at all, and `HazardClass` is therefore used in exactly one place.
+
+#### K4 — Refresh must not cross the sampled boundary; this replaces J5
+
+A soft truncation risk carries a sampled-rows marker; the hard form does not. The declared types are identical either way, so the class is unchanged and the family matches — and a refresh across that boundary rewrites a human's acknowledgement, whose stated reason was that the sampled rows fit, into one that appears to accept a truncation the data has since **proven**.
+
+**Refresh only when the sampled marker is present on both sides, or absent on both sides. A soft-to-hard transition clears the acknowledgement.**
+
+This is monotone and cannot oscillate: a sampled scan can miss long values but cannot invent them, so hardening is evidence while softening is sampling noise.
+
+It replaces J5, which recorded this as a residual. That was decided before it was clear the engine would be actively **rewriting** the acknowledgement rather than merely leaving a stale one standing — a stale acknowledgement is a gap, while a rewritten one puts words in a person's mouth.
+
+#### K5 — A stored risk with no stored class clears; this reverses J3's second half
+
+J3 said an absent stored class counts as unknown and never invalidates. That protects exactly the case the class was introduced to catch: with no class, the check is skipped and refresh proceeds on the text family alone, so a target narrowed from `nvarchar(200)` to `nvarchar(50)` under an unchanged `"may truncate (source max 300)"` keeps its acknowledgement.
+
+**A stored risk text with no stored class clears the acknowledgement. Never refresh it.**
+
+The cost is a one-time re-acknowledgement for artifacts written before this model, and it stops entirely once the auto-mapper writes the class (J3's first half) and carry-over copies it (J2) — both unchanged.
+
+#### K6 — Strike the stale JavaScript instruction
+
+The JavaScript risk scope still tells its implementer to mirror `HazardClass`, "with the same treatment of the sentinel as a class matching nothing else". Both halves are now wrong: the browser needs no class function at all, and read literally that sentence makes a sentinel column impossible to acknowledge, because sentinel would never match sentinel in the predicate.
+
+**That sentence is struck.** The dual rule, stated once: in the **predicate**, sentinel text equals sentinel text and the acknowledgement stands; in the **`riskClass` check**, a newly computed sentinel class never equals the stored one, so a changed custom column always loses its acknowledgement.
