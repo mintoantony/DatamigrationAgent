@@ -56,6 +56,7 @@ public class TypeCompatTests
     [InlineData("decimal(9,0)", "int", null, null, null, "Widening", null)]
     [InlineData("decimal(12,0)", "int", null, null, null, "Risky", "overflow possible")]
     [InlineData("decimal(12,0)", "int", null, "0", "100", "Widening", "overflow possible")]
+    [InlineData("decimal(12,2)", "int", null, "0", "100", "Risky", "fractional part truncated")]
     [InlineData("numeric(18,0)", "bigint", null, null, null, "Widening", null)]
     [InlineData("decimal(10,2)", "float", null, null, null, "Widening", null)]
     [InlineData("decimal(20,2)", "float", null, null, null, "Risky", "precision loss")]
@@ -209,6 +210,24 @@ public class TypeCompatTests
         CompatLevel.Incompatible => 0.0,
         _ => throw new ArgumentOutOfRangeException(nameof(level))
     };
+
+    [Fact]
+    public void Hard_and_sample_supported_soft_risks_combine_without_dropping_either()
+    {
+        // decimal(12,2) -> int hits both paths at once: the fractional part is ALWAYS truncated (Hard, unrelated to
+        // any sample), while the overflow check is satisfied by the 0..100 profile (Soft). The Hard item must still
+        // force Risky overall (a sample can never launder away an unrelated real risk — the point of this whole
+        // fix round), and the Soft item's "sampled" evidence marker must still survive in the combined text rather
+        // than being silently dropped when combined with a Hard item.
+        var profile = new ColumnProfile(1000, 0, null, "0", "100", null, null, null, [], []);
+        var result = TypeCompat.Check(ColumnType.Parse("decimal(12,2)"), ColumnType.Parse("int"), profile);
+
+        Assert.Equal(CompatLevel.Risky, result.Level);
+        Assert.Equal(0.5, result.Score);
+        Assert.NotNull(result.Risk);
+        Assert.Contains("fractional part truncated", result.Risk);
+        Assert.Contains("sampled", result.Risk);
+    }
 
     [Fact]
     public void Sample_supported_widening_keeps_the_hazard_text_and_marks_it_as_sampled()
