@@ -207,4 +207,86 @@ public class MappingValidatorTests
     {
         Assert.Equal(found, MappingValidator.ResolveSourceColumn(SampleCatalogs.Source(), key) is not null);
     }
+
+    [Fact]
+    public void Attention_orders_flagged_columns_within_a_table_by_name()
+    {
+        var m = SampleMappings.Approved();
+        var customers = m.Tables["app.Customers"].Columns;
+        // Declared in SampleMappings as Phone (index 4) before Notes (index 8); alphabetically Notes < Phone,
+        // so this only passes if Attention sorts columns instead of relying on dictionary insertion order.
+        customers["Phone"].Method = MapMethod.Fuzzy;
+        customers["Phone"].Confidence = 0.5;
+        customers["Notes"].Method = MapMethod.Fuzzy;
+        customers["Notes"].Confidence = 0.5;
+
+        var attention = MappingValidator.Attention(m, Options);
+
+        Assert.Equal(
+        [
+            "app.Customers.Notes: CAST(s.[NOTES] AS nvarchar(max)) needs review (confidence 0.50, fuzzy)",
+            "app.Customers.Phone: s.[PHONE_NO] needs review (confidence 0.50, fuzzy)",
+        ], attention);
+    }
+
+    [Fact]
+    public void Errors_does_not_throw_on_null_table_and_drop_entries_from_json()
+    {
+        // System.Text.Json happily deserializes a JSON null into a non-nullable dictionary value.
+        var json = "{\"tables\":{\"app.Customers\":null},\"drops\":{\"dbo.CUST\":null}}";
+        var m = Json.Deserialize<MappingPayload>(json);
+
+        var errors = MappingValidator.Errors(m, SampleCatalogs.Source(), SampleCatalogs.Target());
+
+        Assert.Equal(
+        [
+            "target table 'app.Customers' has no mapping (expected an object)",
+            "drop 'dbo.CUST' has no decision (expected an object)",
+        ], errors);
+    }
+
+    [Fact]
+    public void Errors_does_not_throw_on_null_column_map_entry_from_json()
+    {
+        var json = "{\"tables\":{\"app.Products\":{\"kind\":\"direct\",\"sources\":[\"dbo.PROD\"],\"columns\":{\"Name\":null}}},\"drops\":{}}";
+        var m = Json.Deserialize<MappingPayload>(json);
+
+        var errors = MappingValidator.Errors(m, SampleCatalogs.Source(), SampleCatalogs.Target());
+
+        Assert.Contains("app.Products.Name: no column mapping (expected an object)", errors);
+    }
+
+    [Fact]
+    public void Null_sources_and_columns_collections_from_json_are_treated_as_empty()
+    {
+        var json = "{\"tables\":{\"app.Products\":{\"kind\":\"direct\",\"sources\":null,\"columns\":null}},\"drops\":{}}";
+        var m = Json.Deserialize<MappingPayload>(json);
+
+        Assert.Empty(MappingValidator.Errors(m, SampleCatalogs.Source(), SampleCatalogs.Target()));
+        Assert.Contains(Blockers(m), b => b.StartsWith("app.Products: no source table"));
+    }
+
+    [Fact]
+    public void Validator_methods_do_not_throw_on_malformed_entries_and_collections()
+    {
+        var m = new MappingPayload();
+        m.Tables["app.Customers"] = null!;
+        m.Tables["app.Products"] = new TableMap { Kind = "direct", Sources = null!, Columns = null! };
+        m.Tables["app.Orders"] = new TableMap { Kind = "direct", Sources = ["dbo.ORD_HDR"], Columns = new() { ["OrderId"] = null! } };
+        m.Drops["dbo.CUST"] = null!;
+        var src = SampleCatalogs.Source();
+        var tgt = SampleCatalogs.Target();
+
+        var errors = MappingValidator.Errors(m, src, tgt);
+        var blockers = MappingValidator.Blockers(m, src, tgt);
+        var attention = MappingValidator.Attention(m, Options);
+        var uncovered = MappingValidator.UncoveredSourceColumns(m, src);
+
+        Assert.Contains("target table 'app.Customers' has no mapping (expected an object)", errors);
+        Assert.Contains("app.Orders.OrderId: no column mapping (expected an object)", errors);
+        Assert.Contains("drop 'dbo.CUST' has no decision (expected an object)", errors);
+        Assert.Contains(blockers, b => b.StartsWith("app.Products: no source table"));
+        Assert.NotNull(attention);
+        Assert.NotNull(uncovered);
+    }
 }
