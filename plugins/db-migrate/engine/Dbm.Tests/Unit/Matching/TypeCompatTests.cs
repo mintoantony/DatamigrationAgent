@@ -21,11 +21,11 @@ public class TypeCompatTests
     [InlineData("smallint", "int", null, null, null, "Widening", null)]
     [InlineData("int", "bigint", null, null, null, "Widening", null)]
     [InlineData("bigint", "int", null, null, null, "Risky", "overflow possible")]
-    [InlineData("bigint", "int", null, "1", "1000", "Widening", null)]
+    [InlineData("bigint", "int", null, "1", "1000", "Widening", "overflow possible")]
     [InlineData("int", "tinyint", null, "-5", "10", "Risky", "overflow possible")]
     [InlineData("int", "decimal(10,0)", null, null, null, "Widening", null)]
     [InlineData("int", "decimal(9,0)", null, null, null, "Risky", "overflow possible")]
-    [InlineData("int", "decimal(9,0)", null, "1", "5000", "Widening", null)]
+    [InlineData("int", "decimal(9,0)", null, "1", "5000", "Widening", "overflow possible")]
     [InlineData("int", "money", null, null, null, "Widening", null)]
     [InlineData("int", "smallmoney", null, null, null, "Risky", "overflow possible")]
     [InlineData("int", "float", null, null, null, "Widening", null)]
@@ -51,11 +51,11 @@ public class TypeCompatTests
     [InlineData("decimal(19,4)", "decimal(10,2)", null, null, null, "Risky", "rounded to 2 decimal places")]
     [InlineData("decimal(19,4)", "decimal(10,4)", null, null, null, "Risky", "overflow possible (target decimal(10,4))")]
     [InlineData("decimal(10,2)", "decimal(12,2)", null, null, null, "Widening", null)]
-    [InlineData("decimal(12,2)", "decimal(10,2)", null, "0", "99.5", "Widening", null)]
+    [InlineData("decimal(12,2)", "decimal(10,2)", null, "0", "99.5", "Widening", "overflow possible")]
     [InlineData("decimal(10,2)", "int", null, null, null, "Risky", "fractional part truncated")]
     [InlineData("decimal(9,0)", "int", null, null, null, "Widening", null)]
     [InlineData("decimal(12,0)", "int", null, null, null, "Risky", "overflow possible")]
-    [InlineData("decimal(12,0)", "int", null, "0", "100", "Widening", null)]
+    [InlineData("decimal(12,0)", "int", null, "0", "100", "Widening", "overflow possible")]
     [InlineData("numeric(18,0)", "bigint", null, null, null, "Widening", null)]
     [InlineData("decimal(10,2)", "float", null, null, null, "Widening", null)]
     [InlineData("decimal(20,2)", "float", null, null, null, "Risky", "precision loss")]
@@ -84,7 +84,7 @@ public class TypeCompatTests
     [InlineData("varchar(100)", "nvarchar(100)", null, null, null, "Widening", null)]
     [InlineData("varchar(100)", "nvarchar(200)", null, null, null, "Widening", null)]
     [InlineData("varchar(100)", "nvarchar(50)", null, null, null, "Risky", "may truncate (source max 100)")]
-    [InlineData("varchar(100)", "nvarchar(50)", 40, null, null, "Widening", null)]
+    [InlineData("varchar(100)", "nvarchar(50)", 40, null, null, "Widening", "may truncate (source max 100)")]
     [InlineData("varchar(500)", "nvarchar(200)", 300, null, null, "Risky", "may truncate (source max 300)")]
     [InlineData("varchar(500)", "nvarchar(200)", null, null, null, "Risky", "may truncate (source max 500)")]
     [InlineData("nvarchar(50)", "varchar(50)", null, null, null, "Risky", "non-ASCII characters may be lost")]
@@ -94,7 +94,7 @@ public class TypeCompatTests
     [InlineData("text", "nvarchar(max)", null, null, null, "Widening", null)]
     [InlineData("text", "varchar(max)", null, null, null, "Widening", null)]
     [InlineData("text", "nvarchar(200)", null, null, null, "Risky", "may truncate (source length unbounded)")]
-    [InlineData("text", "nvarchar(200)", 150, null, null, "Widening", null)]
+    [InlineData("text", "nvarchar(200)", 150, null, null, "Widening", "may truncate (source length unbounded)")]
     [InlineData("ntext", "nvarchar(max)", null, null, null, "Widening", null)]
     [InlineData("ntext", "varchar(max)", null, null, null, "Risky", "non-ASCII characters may be lost")]
     [InlineData("varchar(max)", "text", null, null, null, "Widening", null)]
@@ -113,7 +113,7 @@ public class TypeCompatTests
     // binary
     [InlineData("varbinary(10)", "varbinary(20)", null, null, null, "Widening", null)]
     [InlineData("varbinary(20)", "varbinary(10)", null, null, null, "Risky", "may truncate (source max 20 bytes)")]
-    [InlineData("varbinary(20)", "varbinary(10)", 8, null, null, "Widening", null)]
+    [InlineData("varbinary(20)", "varbinary(10)", 8, null, null, "Widening", "may truncate (source max 20 bytes)")]
     [InlineData("image", "varbinary(max)", null, null, null, "Widening", null)]
     [InlineData("binary(16)", "uniqueidentifier", null, null, null, "Risky", "conversion may fail")]
     [InlineData("varbinary(10)", "varchar(10)", null, null, null, "Risky", "bytes reinterpreted as characters")]
@@ -123,7 +123,7 @@ public class TypeCompatTests
     // date
     [InlineData("date", "datetime2(0)", null, null, null, "Widening", null)]
     [InlineData("date", "datetime", null, null, null, "Risky", "dates before 1753 fail")]
-    [InlineData("date", "datetime", null, "2000-01-01", "2020-12-31", "Widening", null)]
+    [InlineData("date", "datetime", null, "2000-01-01", "2020-12-31", "Widening", "dates before 1753 fail")]
     [InlineData("date", "smalldatetime", null, null, null, "Risky", "dates outside 1900-2079 fail")]
     [InlineData("date", "datetimeoffset(7)", null, null, null, "Risky", "time zone offset assumed +00:00")]
     [InlineData("date", "varchar(10)", null, null, null, "Widening", null)]
@@ -149,7 +149,7 @@ public class TypeCompatTests
     [InlineData("smalldatetime", "datetime", null, null, null, "Widening", null)]
     [InlineData("datetime", "smalldatetime", null, null, null, "Risky", "seconds dropped")]
     [InlineData("datetime2(7)", "datetime", null, null, null, "Risky", "fractional seconds rounded to 1/300 s")]
-    [InlineData("datetime2(0)", "datetime", null, "2000-01-01", "2001-01-01", "Widening", null)]
+    [InlineData("datetime2(0)", "datetime", null, "2000-01-01", "2001-01-01", "Widening", "dates before 1753 fail")]
     [InlineData("datetimeoffset(7)", "datetime2(7)", null, null, null, "Risky", "time zone offset dropped")]
     [InlineData("datetime", "datetimeoffset(7)", null, null, null, "Risky", "time zone offset assumed +00:00")]
     [InlineData("datetime", "varchar(30)", null, null, null, "Widening", null)]
@@ -194,9 +194,36 @@ public class TypeCompatTests
 
         var result = TypeCompat.Check(ColumnType.Parse(src), ColumnType.Parse(tgt), profile);
 
-        Assert.Equal(Enum.Parse<CompatLevel>(level), result.Level);
+        var expectedLevel = Enum.Parse<CompatLevel>(level);
+        Assert.Equal(expectedLevel, result.Level);
+        Assert.Equal(ScoreFor(expectedLevel), result.Score);
         if (risk is null) Assert.Null(result.Risk);
         else Assert.Contains(risk, result.Risk);
+    }
+
+    private static double ScoreFor(CompatLevel level) => level switch
+    {
+        CompatLevel.Exact => 1.0,
+        CompatLevel.Widening => 0.9,
+        CompatLevel.Risky => 0.5,
+        CompatLevel.Incompatible => 0.0,
+        _ => throw new ArgumentOutOfRangeException(nameof(level))
+    };
+
+    [Fact]
+    public void Sample_supported_widening_keeps_the_hazard_text_and_marks_it_as_sampled()
+    {
+        // The invariant this pins down: a sampled profile may LOWER Risky to Widening, but must never DELETE the
+        // caveat — Risk is the only channel that carries the hazard on to the mapping phase's typeRisk field.
+        var profile = new ColumnProfile(1000, 0, null, "1", "1000", null, null, null, [], []);
+        var result = TypeCompat.Check(ColumnType.Parse("bigint"), ColumnType.Parse("int"), profile);
+
+        Assert.Equal(CompatLevel.Widening, result.Level);
+        Assert.Equal(0.9, result.Score);
+        Assert.NotNull(result.Risk);
+        Assert.Contains("overflow possible", result.Risk);
+        Assert.Contains("sampled", result.Risk);
+        Assert.Contains("1,000", result.Risk);
     }
 
     [Theory]
@@ -233,6 +260,27 @@ public class TypeCompatTests
     public void Parse_reads_declarations(string text, string type, int maxLength, int precision, int scale)
     {
         Assert.Equal(new ColumnType(type, maxLength, precision, scale), ColumnType.Parse(text));
+    }
+
+    [Theory]
+    [InlineData("decimal(x,4)")]
+    [InlineData("nvarchar(50")]
+    [InlineData("nvarchar()")]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Parse_never_throws_on_malformed_input(string text)
+    {
+        var result = ColumnType.Parse(text);
+        Assert.NotNull(result);
+    }
+
+    [Theory]
+    [InlineData("decimal(x,4)", "decimal")]
+    [InlineData("nvarchar(50", "nvarchar")]
+    [InlineData("nvarchar()", "nvarchar")]
+    public void Parse_degrades_a_malformed_size_to_the_no_argument_result(string malformed, string bareType)
+    {
+        Assert.Equal(ColumnType.Parse(bareType), ColumnType.Parse(malformed));
     }
 
     [Theory]

@@ -10,17 +10,21 @@ public sealed record ColumnType(string DataType, int MaxLength, int Precision, i
     public static ColumnType From(ColumnInfo c) => new(c.DataType.ToLowerInvariant(), c.MaxLength, c.Precision, c.Scale);
 
     /// <summary>Parses declaration text such as "int", "nvarchar(50)", "varchar(max)", "decimal(19,4)", "datetime2(3)".
-    /// Lengths follow the catalog convention: characters for (n)char/(n)varchar, bytes for (var)binary, -1 = max, 0 otherwise.</summary>
+    /// Lengths follow the catalog convention: characters for (n)char/(n)varchar, bytes for (var)binary, -1 = max, 0 otherwise.
+    /// Never throws: this runs inside a background job, so an unclosed paren, an empty argument list or a non-numeric
+    /// size argument degrades to exactly the result the bare type name (no parentheses at all) would produce, rather
+    /// than killing the job.</summary>
     public static ColumnType Parse(string declaration)
     {
         var text = declaration.Trim().ToLowerInvariant();
         var open = text.IndexOf('(');
+        var close = open < 0 ? -1 : text.IndexOf(')', open + 1);
         var name = open < 0 ? text : text[..open].Trim();
-        var args = open < 0
+        var rawArgs = open < 0 || close < 0
             ? Array.Empty<string>()
-            : text[(open + 1)..text.LastIndexOf(')')].Split(',', StringSplitOptions.TrimEntries);
-        int Arg(int index, int fallback) => args.Length <= index ? fallback
-            : args[index] == "max" ? -1 : int.Parse(args[index], CultureInfo.InvariantCulture);
+            : text[(open + 1)..close].Split(',', StringSplitOptions.TrimEntries);
+        var args = ParseArgs(rawArgs);
+        int Arg(int index, int fallback) => args.Length > index && args[index] is int n ? n : fallback;
         return name switch
         {
             "char" or "nchar" or "binary" or "varchar" or "nvarchar" or "varbinary" => new(name, Arg(0, 1), 0, 0),
@@ -41,6 +45,21 @@ public sealed record ColumnType(string DataType, int MaxLength, int Precision, i
             _ => new(name, 0, 0, 0)
         };
     }
+
+    /// <summary>Parses every raw argument as an integer or the literal "max" (-1). If ANY argument is malformed
+    /// (non-numeric, or an empty string from something like "nvarchar()"), the whole list degrades to empty so
+    /// callers fall back exactly as if no parentheses were present at all — see the class doc on <see cref="Parse"/>.</summary>
+    private static int?[] ParseArgs(string[] raw)
+    {
+        var parsed = new int?[raw.Length];
+        for (var i = 0; i < raw.Length; i++)
+        {
+            if (raw[i] == "max") { parsed[i] = -1; continue; }
+            if (!int.TryParse(raw[i], NumberStyles.Integer, CultureInfo.InvariantCulture, out var n)) return Array.Empty<int?>();
+            parsed[i] = n;
+        }
+        return parsed;
+    }
 }
 
 public sealed record TypeCompatResult(CompatLevel Level, double Score, string? Risk);
@@ -51,6 +70,11 @@ public static class TypeCompat
 
     // Len: characters or bytes, long.MaxValue = max. P: integer digits (Int), precision (Dec/Approx). S: scale / fractional-second digits.
     private readonly record struct N(string Name, Fam Fam, long Len, int P, int S, bool Unicode = false, int Rank = 0, bool Offset = false);
+
+    // A single risk contributor. Hard = always a real caveat, never softened by evidence. Soft = a sampled profile
+    // positively confirmed safety for THIS caveat, but a TOP-n sample is evidence, not proof, so the hazard text is
+    // retained (with a "sampled" marker) rather than erased — see Combine and the INVARIANT it encodes.
+    private readonly record struct RiskItem(string Text, bool Hard);
 
     private const long Max = long.MaxValue;
     private static readonly TypeCompatResult ExactResult = new(CompatLevel.Exact, 1.0, null);
@@ -96,7 +120,11 @@ public static class TypeCompat
         };
     }
 
-    /// <summary>Coarse family name used by the auto-mapper's profile scoring.</summary>
+    /// <summary>Coarse family name used by the auto-mapper's profile scoring. Deliberately diverges from
+    /// <see cref="TypeTraits.TypeClass"/>: float/real get their own "float" family here because their conversion
+    /// risk profile (precision loss) differs sharply from exact decimals, and bit stays "bit" rather than being
+    /// lumped as TypeTraits' "flag" or folded into integer/decimal. Do not "fix" the two into agreement — they
+    /// answer different questions (conversion scoring here vs. profiling there).</summary>
     public static string Family(string dataType) => Norm(new ColumnType(dataType.ToLowerInvariant(), 0, 0, 0)).Fam switch
     {
         Fam.Int => "integer",
@@ -157,8 +185,16 @@ public static class TypeCompat
 
     private static TypeCompatResult FromInt(N s, N t, ColumnProfile? p) => t.Fam switch
     {
-        Fam.Int => t.Rank >= s.Rank || Fits(p, IntMin(t), IntMax(t)) ? WideningResult : Risky($"overflow possible (target {t.Name})"),
-        Fam.Dec => t.P - t.S >= s.P || Fits(p, -DecLimit(t), DecLimit(t)) ? WideningResult : Risky($"overflow possible (target {Display(t)})"),
+        Fam.Int => t.Rank >= s.Rank
+            ? WideningResult
+            : p is { } prof && Fits(prof, IntMin(t), IntMax(t))
+                ? SoftenedWidening($"overflow possible (target {t.Name})", prof)
+                : Risky($"overflow possible (target {t.Name})"),
+        Fam.Dec => t.P - t.S >= s.P
+            ? WideningResult
+            : p is { } prof && Fits(prof, -DecLimit(t), DecLimit(t))
+                ? SoftenedWidening($"overflow possible (target {Display(t)})", prof)
+                : Risky($"overflow possible (target {Display(t)})"),
         Fam.Approx => t.P == 24 && s.Rank >= 3 ? Risky("precision loss above 7 significant digits")
             : t.P == 53 && s.Rank == 4 ? Risky("precision loss above 15 significant digits")
             : WideningResult,
@@ -172,16 +208,22 @@ public static class TypeCompat
 
     private static TypeCompatResult FromDec(N s, N t, ColumnProfile? p)
     {
-        var risks = new List<string>();
+        var risks = new List<RiskItem>();
         switch (t.Fam)
         {
             case Fam.Int:
-                if (s.S > 0) risks.Add("fractional part truncated");
-                if (s.P - s.S > t.P - 1 && !Fits(p, IntMin(t), IntMax(t))) risks.Add($"overflow possible (target {t.Name})");
+                if (s.S > 0) risks.Add(Hard("fractional part truncated"));
+                if (s.P - s.S > t.P - 1)
+                    risks.Add(p is { } prof && Fits(prof, IntMin(t), IntMax(t))
+                        ? Soft($"overflow possible (target {t.Name})", prof)
+                        : Hard($"overflow possible (target {t.Name})"));
                 return Combine(risks);
             case Fam.Dec:
-                if (t.P - t.S < s.P - s.S && !Fits(p, -DecLimit(t), DecLimit(t))) risks.Add($"overflow possible (target {Display(t)})");
-                if (t.S < s.S) risks.Add($"rounded to {t.S} decimal places");
+                if (t.P - t.S < s.P - s.S)
+                    risks.Add(p is { } prof2 && Fits(prof2, -DecLimit(t), DecLimit(t))
+                        ? Soft($"overflow possible (target {Display(t)})", prof2)
+                        : Hard($"overflow possible (target {Display(t)})"));
+                if (t.S < s.S) risks.Add(Hard($"rounded to {t.S} decimal places"));
                 return Combine(risks);
             case Fam.Approx:
                 return s.P <= (t.P == 24 ? 7 : 15) ? WideningResult : Risky("precision loss (approximate type)");
@@ -235,15 +277,18 @@ public static class TypeCompat
 
     private static TypeCompatResult StrToStr(N s, N t, ColumnProfile? p)
     {
-        var risks = new List<string>();
-        if (s.Unicode && !t.Unicode) risks.Add("non-ASCII characters may be lost");
+        var risks = new List<RiskItem>();
+        if (s.Unicode && !t.Unicode) risks.Add(Hard("non-ASCII characters may be lost"));
         if (t.Len < s.Len)
         {
+            var declaredHazard = s.Len == Max ? "may truncate (source length unbounded)" : $"may truncate (source max {s.Len})";
             var observed = p?.MaxLen;
-            if (observed is null || observed > t.Len)
-                risks.Add(observed is int m ? $"may truncate (source max {m})"
-                    : s.Len == Max ? "may truncate (source length unbounded)"
-                    : $"may truncate (source max {s.Len})");
+            if (observed is int m && m > t.Len)
+                risks.Add(Hard($"may truncate (source max {m})"));
+            else if (observed is int && p is { } prof)
+                risks.Add(Soft(declaredHazard, prof));
+            else
+                risks.Add(Hard(declaredHazard));
         }
         return Combine(risks);
     }
@@ -253,10 +298,12 @@ public static class TypeCompat
         switch (t.Fam)
         {
             case Fam.Bin:
-                if (t.Len >= s.Len || p?.MaxLen is int fits && fits <= t.Len) return WideningResult;
-                return Risky(p?.MaxLen is int m ? $"may truncate (source max {m} bytes)"
-                    : s.Len == Max ? "may truncate (source length unbounded)"
-                    : $"may truncate (source max {s.Len} bytes)");
+                if (t.Len >= s.Len) return WideningResult;
+                var declaredHazard = s.Len == Max ? "may truncate (source length unbounded)" : $"may truncate (source max {s.Len} bytes)";
+                var observed = p?.MaxLen;
+                if (observed is int m && m > t.Len) return Risky($"may truncate (source max {m} bytes)");
+                if (observed is int && p is { } prof) return SoftenedWidening(declaredHazard, prof);
+                return Risky(declaredHazard);
             case Fam.Str:
                 return Risky("bytes reinterpreted as characters");
             case Fam.Guid:
@@ -274,8 +321,8 @@ public static class TypeCompat
     {
         Fam.DateTime => t.Name switch
         {
-            "smalldatetime" => DatesWithin(p, 1900, 2079) ? WideningResult : Risky("dates outside 1900-2079 fail"),
-            "datetime" => DatesWithin(p, 1753, 9999) ? WideningResult : Risky("dates before 1753 fail"),
+            "smalldatetime" => DateRisk(p, 1900, 2079, "dates outside 1900-2079 fail"),
+            "datetime" => DateRisk(p, 1753, 9999, "dates before 1753 fail"),
             "datetimeoffset" => Risky("time zone offset assumed +00:00"),
             _ => WideningResult
         },
@@ -299,26 +346,26 @@ public static class TypeCompat
         switch (t.Fam)
         {
             case Fam.DateTime:
-                var risks = new List<string>();
+                var risks = new List<RiskItem>();
                 if (t.Name == "smalldatetime")
                 {
-                    if (s.Name != "smalldatetime") risks.Add("seconds dropped");
-                    if (!DatesWithin(p, 1900, 2079)) risks.Add("dates outside 1900-2079 fail");
+                    if (s.Name != "smalldatetime") risks.Add(Hard("seconds dropped"));
+                    risks.Add(DateRiskItem(p, 1900, 2079, "dates outside 1900-2079 fail"));
                 }
                 else if (t.Name == "datetime")
                 {
                     if (s.Name is "datetime2" or "datetimeoffset")
                     {
-                        if (s.S > 0) risks.Add("fractional seconds rounded to 1/300 s");
-                        if (!DatesWithin(p, 1753, 9999)) risks.Add("dates before 1753 fail");
+                        if (s.S > 0) risks.Add(Hard("fractional seconds rounded to 1/300 s"));
+                        risks.Add(DateRiskItem(p, 1753, 9999, "dates before 1753 fail"));
                     }
                 }
                 else if (t.S < s.S)
                 {
-                    risks.Add($"fractional seconds rounded to {t.S} digits");
+                    risks.Add(Hard($"fractional seconds rounded to {t.S} digits"));
                 }
-                if (s.Offset && !t.Offset) risks.Add("time zone offset dropped");
-                if (!s.Offset && t.Offset) risks.Add("time zone offset assumed +00:00");
+                if (s.Offset && !t.Offset) risks.Add(Hard("time zone offset dropped"));
+                if (!s.Offset && t.Offset) risks.Add(Hard("time zone offset assumed +00:00"));
                 return Combine(risks);
             case Fam.Date:
                 return Risky("time part dropped");
@@ -351,8 +398,34 @@ public static class TypeCompat
     private static TypeCompatResult ToText(N t, int needed) =>
         t.Len >= needed ? WideningResult : Risky($"may truncate (needs {needed} characters)");
 
-    private static TypeCompatResult Combine(List<string> risks) =>
-        risks.Count == 0 ? WideningResult : Risky(string.Join("; ", risks));
+    /// <summary>A date/datetime range caveat: Risky by default, softened to a sampled Widening when the profile's
+    /// observed Min/Max prove the sampled rows fall inside [fromYear, toYear].</summary>
+    private static TypeCompatResult DateRisk(ColumnProfile? p, int fromYear, int toYear, string hazard) =>
+        Combine(new List<RiskItem> { DateRiskItem(p, fromYear, toYear, hazard) });
+
+    private static RiskItem DateRiskItem(ColumnProfile? p, int fromYear, int toYear, string hazard) =>
+        p is { } prof && DatesWithin(prof, fromYear, toYear) ? Soft(hazard, prof) : Hard(hazard);
+
+    private static RiskItem Hard(string text) => new(text, true);
+
+    private static RiskItem Soft(string hazard, ColumnProfile p) => new(SampledCaveat(hazard, p), false);
+
+    /// <summary>INVARIANT: a sampled profile may lower a caveat's Level from Risky to Widening, but it must never
+    /// delete the caveat — Risk is the only channel that carries the hazard on to Task 3.3's mapping and the
+    /// mapping-architect agent's CAST/CONVERT/CASE decisions. So the declared hazard text is always retained, with an
+    /// explicit "sampled" marker (and the sample size) making clear a TOP-n read is evidence, not proof.</summary>
+    private static string SampledCaveat(string hazard, ColumnProfile p) =>
+        $"{hazard} (sampled {p.SampledRows.ToString("N0", CultureInfo.InvariantCulture)} rows fit; not proof for the full table)";
+
+    private static TypeCompatResult SoftenedWidening(string hazard, ColumnProfile p) =>
+        new(CompatLevel.Widening, 0.9, SampledCaveat(hazard, p));
+
+    private static TypeCompatResult Combine(List<RiskItem> risks)
+    {
+        if (risks.Count == 0) return WideningResult;
+        var text = string.Join("; ", risks.Select(r => r.Text));
+        return risks.Any(r => r.Hard) ? Risky(text) : new TypeCompatResult(CompatLevel.Widening, 0.9, text);
+    }
 
     private static TypeCompatResult Risky(string risk) => new(CompatLevel.Risky, 0.5, risk);
     private static TypeCompatResult Incompatible(string risk) => new(CompatLevel.Incompatible, 0.0, risk);
@@ -364,15 +437,13 @@ public static class TypeCompat
     private static double IntMax(N t) => t.Name switch { "tinyint" => 255, "smallint" => short.MaxValue, "int" => int.MaxValue, _ => long.MaxValue };
     private static double DecLimit(N t) => Math.Pow(10, t.P - t.S) - Math.Pow(10, -t.S);
 
-    private static bool Fits(ColumnProfile? p, double min, double max) =>
-        p is not null
-        && double.TryParse(p.Min, NumberStyles.Float, CultureInfo.InvariantCulture, out var lo)
+    private static bool Fits(ColumnProfile p, double min, double max) =>
+        double.TryParse(p.Min, NumberStyles.Float, CultureInfo.InvariantCulture, out var lo)
         && double.TryParse(p.Max, NumberStyles.Float, CultureInfo.InvariantCulture, out var hi)
         && lo >= min && hi <= max;
 
-    private static bool DatesWithin(ColumnProfile? p, int fromYear, int toYear) =>
-        p is not null
-        && DateTime.TryParse(p.Min, CultureInfo.InvariantCulture, DateTimeStyles.None, out var lo)
+    private static bool DatesWithin(ColumnProfile p, int fromYear, int toYear) =>
+        DateTime.TryParse(p.Min, CultureInfo.InvariantCulture, DateTimeStyles.None, out var lo)
         && DateTime.TryParse(p.Max, CultureInfo.InvariantCulture, DateTimeStyles.None, out var hi)
         && lo.Year >= fromYear && hi.Year <= toYear;
 }
