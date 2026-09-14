@@ -14,5 +14,6 @@ public static class JobRegistry
         if (s is null) yield break;   // keeps this an iterator while no handler is registered
         // milestone registrations below
         yield return new Dbm.Core.Catalog.DiscoverJob();   // T2.5
+        yield return new Dbm.Core.Analysis.AnalyzeJob();   // T2.6
     }
 }
