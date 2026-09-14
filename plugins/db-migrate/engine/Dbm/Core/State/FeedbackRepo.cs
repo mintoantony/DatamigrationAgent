@@ -25,14 +25,16 @@ public sealed class FeedbackRepo(StateDb db)
         db.Execute("UPDATE feedback SET status = 'open' WHERE phase = $Phase AND status = 'draft'", new { Phase = phase });
 
     /// <summary>
-    /// Declines every open/draft item of the phase (they were written about a version that is now superseded);
-    /// addressed/declined items are untouched. Returns how many were closed.
+    /// Marks every open/draft item of the phase superseded (they targeted a version the phase is leaving behind),
+    /// pairing them with <paramref name="respondedVersion"/> (the phase's version at the time of the cascade, if any);
+    /// addressed/declined items are untouched. Returns how many were changed.
     /// </summary>
-    public int CloseOpenAndDrafts(PhaseName phase) =>
+    public int CloseOpenAndDrafts(PhaseName phase, int? respondedVersion) =>
         db.Execute("""
-            UPDATE feedback SET status = 'declined', response = 'Superseded: the phase changed before this was addressed.'
+            UPDATE feedback SET status = 'superseded', response = 'The phase changed before this was addressed.',
+                responded_version = $Version
             WHERE phase = $Phase AND status IN ('open', 'draft')
-            """, new { Phase = phase });
+            """, new { Phase = phase, Version = respondedVersion });
 
     public IReadOnlyList<FeedbackRow> List(PhaseName phase, FeedbackStatus? status = null) =>
         status is null

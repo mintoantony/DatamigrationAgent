@@ -373,7 +373,7 @@ public sealed class WorkflowEngine(DbmServices services)
         if (row.Status is PhaseStatus.Pending or PhaseStatus.Stale) return;
         services.Phases.ClearApproval(phase);
         // Open/draft feedback targeted the version this phase is leaving behind; it must not survive the cascade.
-        if (services.Feedback.CloseOpenAndDrafts(phase) > 0) Publish("feedback_changed", new { phase });
+        if (services.Feedback.CloseOpenAndDrafts(phase, row.CurrentVersion) > 0) Publish("feedback_changed", new { phase });
         SetStatus(phase, PhaseStatus.Stale);
     }
 

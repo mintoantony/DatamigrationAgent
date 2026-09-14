@@ -3,7 +3,7 @@ namespace Dbm.Core.State;
 public enum Side { Src, Tgt }
 public enum PhaseName { Setup, Discovery, Analysis, Mapping, Sql, Ready, Transfer, Complete }
 public enum PhaseStatus { Pending, Running, Drafting, AwaitingReview, Reworking, Approved, Stale }
-public enum FeedbackStatus { Draft, Open, Addressed, Declined }
+public enum FeedbackStatus { Draft, Open, Addressed, Declined, Superseded }
 public enum JobStatus { Queued, Running, Done, Failed }
 
 public sealed record ProjectRow(string Name, DateTimeOffset CreatedAt, bool Paused, DateTimeOffset? AgentSeenAt);

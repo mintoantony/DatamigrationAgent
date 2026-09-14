@@ -363,7 +363,9 @@ public class WorkflowTransitionTests
 
         Assert.Equal(PhaseStatus.Stale, StatusOf(s, PhaseName.Mapping));
         Assert.Empty(s.Feedback.List(PhaseName.Mapping, FeedbackStatus.Open));
-        Assert.NotEqual(FeedbackStatus.Open, s.Feedback.Get(item.Id)!.Status);
+        var superseded = s.Feedback.Get(item.Id)!;
+        Assert.Equal(FeedbackStatus.Superseded, superseded.Status);
+        Assert.Equal(1, superseded.RespondedVersion);
 
         s.Workflow.Approve(PhaseName.Analysis);   // reruns Mapping's job with carry-over
         FakeServices.CompleteNextJob(s, FakeServices.Draft("mapping redraft"));
