@@ -102,6 +102,44 @@ public class MappingModuleTests
     }
 
     [Fact]
+    public void Needs_agent_ignores_a_skipped_table_even_when_its_kept_bare_column_risk_changed()
+    {
+        // A skipped table loads no data: neither a changed carried risk (condition 3) nor an assigned risk (condition 2) on it may
+        // dispatch the agent for a conversion that will never run.
+        using var project = TempProject.Create();
+        var services = project.Services.WithSampleCatalogs();
+        var module = new MappingModule(services);
+        static MappingPayload SkippedOrders(string risk, MapMethod method)
+        {
+            var m = SampleMappings.Approved();
+            m.Tables["app.Orders"].Kind = "skip";
+            m.Drops["dbo.ORD_HDR"] = new DropDecision("not migrated", MapMethod.Human);
+            m.Drops["dbo.ORD_STATUS"] = new DropDecision("not migrated", MapMethod.Human);
+            (m.Tables["app.Orders"].Columns["Comment"].TypeRisk, m.Tables["app.Orders"].Columns["Comment"].Method) = (risk, method);
+            return m;
+        }
+        services.AddMapping(SkippedOrders("may truncate (source max 300)", MapMethod.Human), PhaseStatus.AwaitingReview, "human");
+
+        var changed = SkippedOrders("may truncate (source max 3000)", MapMethod.Carried);   // rediscovery moved the observed length
+        services.AddMapping(changed, PhaseStatus.Running);
+        Assert.False(module.NeedsAgent(Json.ToNode(changed)));
+
+        var assigned = SkippedOrders("may truncate (source max 3000)", MapMethod.Fuzzy);
+        assigned.Tables["app.Orders"].Columns["Comment"].Confidence = 0.9;
+        Assert.False(module.NeedsAgent(Json.ToNode(assigned)));
+
+        // Control: the same change on a table that is loaded does fire, so the false above is the exemption, not an accident.
+        var loaded = SampleMappings.Approved();
+        loaded.Tables["app.Orders"].Columns["Comment"].TypeRisk = "may truncate (source max 300)";
+        services.AddMapping(loaded, PhaseStatus.AwaitingReview, "human");
+        var loadedChanged = SampleMappings.Approved();
+        (loadedChanged.Tables["app.Orders"].Columns["Comment"].TypeRisk, loadedChanged.Tables["app.Orders"].Columns["Comment"].Method) =
+            ("may truncate (source max 3000)", MapMethod.Carried);
+        services.AddMapping(loadedChanged, PhaseStatus.Running);
+        Assert.True(module.NeedsAgent(Json.ToNode(loadedChanged)));
+    }
+
+    [Fact]
     public void Needs_agent_while_attention_or_blockers_remain()
     {
         using var project = TempProject.Create();

@@ -256,9 +256,14 @@ public class MappingPacketTests
         var draft = Draft(m);
         var rework = MappingPacket.Rework(m, SampleCatalogs.Source(), SampleCatalogs.Target(), Options, feedback);
 
+        // Draft: the typeRisks assertion guards RiskMap's skip filter (removing it fails here). The DoesNotContain on the draft holds
+        // BY CONSTRUCTION, not by the column-map filter: Blockers skips skip tables, so no blocker mentions one, IsConfident
+        // returns true for it, and its columns are never rendered in a draft. It is kept as a tripwire for a future draft surface.
         Assert.Empty(draft["typeRisks"]!.AsObject());
-        Assert.Empty(rework["typeRisks"]!.AsObject());
         Assert.DoesNotContain(Truncates, draft.ToJsonString());
+        // Rework: load-bearing. The general/column:src/table:src contexts exercise AddTypeRisks' skip filter, and the
+        // tablemap:/colmap: anchors are the only path to ColumnMapNode's skip filter; removing any of them fails here.
+        Assert.Empty(rework["typeRisks"]!.AsObject());
         Assert.DoesNotContain(Truncates, rework.ToJsonString());
     }
 
