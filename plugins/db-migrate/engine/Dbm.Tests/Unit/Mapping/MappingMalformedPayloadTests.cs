@@ -171,6 +171,30 @@ public class MappingMalformedPayloadTests
     }
 
     [Fact]
+    public void An_agent_patch_supplying_withdrawn_fields_stores_an_artifact_without_them_and_warns()
+    {
+        // §13 through the real engine: ApplyPatch → Validate → the stored artifact, re-read from the database.
+        using var project = TempProject.Create();
+        var services = project.Services.WithSampleCatalogs();
+        services.ApproveBefore(PhaseName.Mapping);
+        services.AddMapping(SampleMappings.Approved(), PhaseStatus.Drafting, "script");
+        var patch = new Patch("mapping", 0,
+        [
+            new("add", "/tables/app.Orders/columns/Comment/riskAck", JsonNode.Parse("""{"risk":"may truncate (source max 300)","reason":"fine"}""")),
+            new("add", "/tables/app.Customers/columns/CreatedAt/riskClass", JsonValue.Create("x|datetime->datetime2(0)")),
+        ], [], "old playbook habits");
+
+        var applied = services.Workflow.ApplyPatch(patch);
+
+        Assert.True(applied.Ok, string.Join(Environment.NewLine, applied.Errors));
+        Assert.Contains("app.Orders.Comment: riskAck is not a mapping field; dbm removed it", applied.Warnings);
+        Assert.Contains("app.Customers.CreatedAt: riskClass is not a mapping field; dbm removed it", applied.Warnings);
+        var stored = services.Artifacts.Get(PhaseName.Mapping, applied.Version!.Value)!.PayloadJson;
+        Assert.DoesNotContain("riskAck", stored, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("riskClass", stored, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void A_rejected_human_edit_is_not_stored_and_the_phase_stays_workable()
     {
         using var project = TempProject.Create();
