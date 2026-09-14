@@ -5848,3 +5848,64 @@ The single way to record that an expression handles a hazard is to **set `riskAc
 #### Why the fixture stays green
 
 None of the seven custom expressions in the shared approved fixture — the `LEFT`, the `SUBSTRING`, the two `CAST`s, the subquery, the `CASE`, the two-source column — has **changed**. Rule 3 only touches columns whose `expr` or `sourceColumns` differ from `ctx.Current`, so none of them is sentinelled, and the pinned zero-attention summary string, the assertion that the approved mapping does not need the agent, and the empty-warnings assertion all continue to pass with the fixture untouched.
+
+### AMENDMENT CORRECTION (Task 3.4, fifth pass) — typeRisk becomes server-owned
+
+Three passes have now tried to police what an author may write into `typeRisk`, and each produced a new seam: rule 4 forced the agent to revert its own fixes; C1's sentinel overwrote the agent's deliberate removal; C1's fourth-pass version made the acknowledgement into permission to erase the hazard. The mistake is shared and structural — the author was allowed to write the field at all.
+
+**`typeRisk` is computed by the engine and only by the engine.** No agent patch and no human edit ever writes or removes it. Authors express themselves through `riskAck` alone. This section replaces the parts of B7, B8, C1 and C4 that conflict with it.
+
+#### D1 — The ownership rule
+
+- On every `Validate`, the engine sets each column's `typeRisk` itself: recomputed for a changed bare single-source reference, the sentinel for a changed non-bare expression, and otherwise restored verbatim from `ctx.Current` (C5).
+- An incoming `typeRisk` in a patch is **ignored**, not merged and not trusted. If a patch supplies one that differs from what the engine computes, record a warning naming the column so the behaviour is visible rather than silent.
+- `riskAck` is the only risk-related field an author writes.
+
+This closes, in one rule, the erase seam, the remove-then-restore loop, and the question of whose text wins.
+
+#### D2 — B8 and the playbook shorten
+
+The playbook line becomes: **`typeRisk` is computed by dbm. Never write it and never remove it. If the hazard is handled by your expression, or is real but acceptable, set `riskAck` and say why.**
+
+Delete B8's earlier instruction to copy the risk forward or to remove it with a `rationale`. Both routes are now impossible, and an instruction to do something the engine overrides teaches the agent a move that silently fails. The worked example must set `riskAck` and must not carry a `typeRisk`.
+
+The `rationale` field keeps its existing purpose and is not a risk channel.
+
+#### D3 — C4 narrows to bare columns; two tests change on purpose
+
+Carry-over recomputes **only** columns that are a bare single-source reference. A kept column with a custom expression retains its stored `typeRisk` and `riskAck` verbatim.
+
+This is not a compromise. If a custom expression's risk cannot be evaluated — which is exactly why the sentinel exists — then detecting a type change beneath it gains nothing, because the engine still could not say what the risk became. **Residual, recorded deliberately:** a source type change under a custom expression is not re-evaluated.
+
+Recomputing bare columns correctly surfaces three hazards the hand-written approved fixture never recorded: `Customers.CreatedAt` and `Orders.OrderDate` round fractional seconds, and `Orders.Comment` may truncate. Two committed tests therefore change **on purpose** — the one asserting the carried approved mapping has no attention, and the one pinning a zero-attention summary after carry-over. Change them deliberately, with a comment recording that the risks are genuine and were previously invisible. Do not tune numbers until they pass.
+
+#### D4 — An acknowledgement dies with the hazard it acknowledged
+
+`riskAck` is an acknowledgement of a **specific** hazard, never a standing permission.
+
+In `Validate`: when the engine's computed `typeRisk` for a column differs from the one in `ctx.Current`, clear that column's `riskAck` — unless the incoming patch supplies a `riskAck` that itself differs from `ctx.Current`'s, which is a deliberate new acknowledgement made in the same change.
+
+The same rule decides whether an acknowledgement counts as "made in this change" for D1: an incoming `riskAck` equal to `ctx.Current`'s is the old one being carried along, not a new act.
+
+**The sentinel is never "the same risk".** Comparing risk text by equality makes sentinel equal sentinel, which would let one acknowledgement silence every future hazard on that column. Treat a sentinel on either side as *unknown*, never as unchanged, so an acknowledgement never survives across it.
+
+#### D5 — Acknowledged risks must reach a human
+
+An acknowledgement removes a column from attention, and attention is the mechanism that reaches a human. Something must therefore surface acknowledgements before approval, or the acknowledgement quietly defeats the review it is part of. Nothing in the payload can distinguish a considered acknowledgement from a reflexive one, so the answer is exposure rather than detection:
+
+- Setting `riskAck` on a column carrying **no** risk is meaningless and is the signature of blanket-acknowledging. Reject it with a validation error naming the column.
+- Report acknowledged risks as their own count, separate from open attention, and list them in the review screen and in the agent work packet.
+- The dry-run output lists newly acknowledged risks, so an orchestrator summary shows them.
+
+A human approver signs off on the acknowledgements as a set. They are not hidden merely because they are not blocking.
+
+#### D6 — Humans must be able to acknowledge
+
+`riskAck` is settable from the mapping screen, next to the risk it acknowledges, through the ordinary human-edit path. Without it, a human-only review — no agent run, or a reviewer who never requests rework — can never clear attention, and the signal this whole mechanism exists to protect is lost anyway. This belongs to the Task 3.5 JavaScript round.
+
+#### D7 — Two consequences in Milestone 4, to be fixed there
+
+Recorded here because they are caused by this milestone's change and must not be discovered mid-M4.
+
+1. **Custom SQL is silently discarded.** M4 keeps a human's hand-written SQL for a table only when a hash of the whole table mapping matches, and that hash covers `typeRisk`, `riskAck`, `candidates`, `rationale` and `confidence` — none of which affect the generated SQL. Acknowledging a risk, a carry-over recompute, or a sentinel write each change the hash and throw the custom SQL away. The M4 hash must cover only SQL-relevant fields: the table's kind, sources, from and filter, and per column the expression, source columns and default.
+2. **Sentinels and acknowledged risks become SQL-plan warnings.** M4 emits a warning for every non-empty `typeRisk` and does not consult `riskAck`. A DBA reading the SQL review would see `"not evaluated: custom expression"` as a plan warning. M4 must skip acknowledged risks and must not render a sentinel as a data-loss warning.
