@@ -12,10 +12,9 @@ public sealed class ServeCommand : ICommand
     public async Task<int> RunAsync(Args args, CliContext ctx)
     {
         var ws = ctx.RequireProject();
-        var existing = ServerControl.ReadInfo(ws);
-        if (existing is not null && await ServerControl.IsAliveAsync(existing))
-            return Output.Ok(ctx, new { ok = true, alreadyRunning = true, url = existing.UiUrl });
 
+        // Set up --detached suppression, and the `output` writer every JSON line below goes through, before the
+        // first possible early return — not just before the ones that happen to follow it in source order.
         var detached = args.Flag("detached");
         if (detached)
         {
@@ -24,6 +23,15 @@ public sealed class ServeCommand : ICommand
             Console.SetError(TextWriter.Null);
         }
         var output = detached ? TextWriter.Null : ctx.Out;
+
+        var existing = ServerControl.ReadInfo(ws);
+        if (existing is not null && await ServerControl.IsAliveAsync(existing))
+        {
+            output.WriteLine(Json.Serialize(new { ok = true, alreadyRunning = true, url = existing.UiUrl }));
+            output.Flush();
+            return 0;
+        }
+
         var result = await WebHost.RunAsync(ws, args.Int("port", 0), CancellationToken.None, ctx.ServicesFactory, info =>
         {
             output.WriteLine(Json.Serialize(new { ok = true, url = info.UiUrl, pid = info.Pid }));
@@ -31,14 +39,26 @@ public sealed class ServeCommand : ICommand
         });
         if (result == WebHostStartResult.Started) return 0;
 
-        // WebHost.RunAsync returned early without starting: another process already owns this workspace
-        // (a live server answered health, or it holds the exclusive server.lock). Never silently exit as if we served.
-        // Written through the same `output` writer as the normal path (not Output.Ok/ctx.Out), so --detached's
-        // stdout suppression above covers this line too.
+        // WebHost.RunAsync returned early without starting: another process already owns this workspace (a live
+        // server answered health, or it holds the exclusive server.lock). Only report alreadyRunning when a live
+        // server's URL can actually be confirmed — the lock holder may not have written server.json yet (still
+        // starting) or may have already deleted it (draining), and claiming "already running" with an empty or
+        // stale URL would tell the caller a server is there to talk to when none is reachable.
         var owner = ServerControl.ReadInfo(ws);
-        output.WriteLine(Json.Serialize(new { ok = true, alreadyRunning = true, url = owner?.UiUrl ?? "" }));
+        if (owner is not null && await ServerControl.IsAliveAsync(owner))
+        {
+            output.WriteLine(Json.Serialize(new { ok = true, alreadyRunning = true, url = owner.UiUrl }));
+            output.Flush();
+            return 0;
+        }
+
+        output.WriteLine(Json.Serialize(new
+        {
+            error = "workspace_locked",
+            message = $"another process holds this workspace's server.lock but is not a reachable server; see {ws.ServerLogPath}.",
+        }));
         output.Flush();
-        return 0;
+        return 1;
     }
 }
 

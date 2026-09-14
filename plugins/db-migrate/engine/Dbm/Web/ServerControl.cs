@@ -49,6 +49,14 @@ public static class ServerControl
         var info = ReadInfo(ws);
         if (info is not null && await IsAliveAsync(info, ct)) return info;
 
+        // A previous server for this workspace might still be draining (server.json already gone, but server.lock
+        // still held — server.json is deleted before the drain, not after). Spawning now would just lose the new
+        // process's own lock-acquisition retry and fail; wait for the old one to actually finish first, and fail
+        // rather than spawn into a lock that never frees.
+        if (!await WaitForLockReleaseAsync(ws, LockReleaseTimeout, ct))
+            throw new InvalidOperationException(
+                $"a dbm server for this workspace is still starting or shutting down; see {ws.ServerLogPath}.");
+
         if (SpawnOverrides.TryGetValue(ws.Root, out var spawn)) await spawn(ws, ct);
         else Spawn(ws);
 
@@ -71,33 +79,42 @@ public static class ServerControl
     /// <summary>
     /// POST /api/shutdown, then wait for <c>server.lock</c> to be released — the process has actually finished
     /// <see cref="WebHost.RunAsync"/>, including draining its job/event loops — rather than for server.json to
-    /// disappear, which a killed process never gets the chance to delete itself. Falls back to killing the
-    /// recorded PID only once its identity is confirmed (name and OS start time); if identity can't be confirmed,
-    /// or the kill itself fails (e.g. an elevated server), this throws rather than silently leaving a live server
-    /// unaccounted for. server.json is deleted only once the server is known to be gone: cleanly, by a confirmed
-    /// kill, or because the recorded PID is positively a different process.
+    /// disappear, which a killed process never gets the chance to delete itself, and a starting process may not
+    /// have written yet. The lock is the sole authority on "is anything still running here": every path below,
+    /// whatever it does with the recorded PID, ends in one final lock probe before it is allowed to declare
+    /// success, and <c>server.json</c> is deleted only at that single point once the probe confirms it. If the
+    /// lock is still held and nothing here can identify or safely stop whatever holds it, this throws naming the
+    /// PID rather than silently reporting success.
     /// </summary>
     public static async Task StopAsync(Workspace ws)
     {
         var info = ReadInfo(ws);
-        if (info is null) return;
-        try
+        if (info is not null)
         {
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
-            using var request = new HttpRequestMessage(HttpMethod.Post, $"{info.BaseUrl}/api/shutdown");
-            request.Headers.Add("X-Dbm-Token", info.Token);
-            using var _ = await http.SendAsync(request);
-        }
-        catch (Exception)
-        {
-            // not answering: fall through to the kill below
+            try
+            {
+                using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+                using var request = new HttpRequestMessage(HttpMethod.Post, $"{info.BaseUrl}/api/shutdown");
+                request.Headers.Add("X-Dbm-Token", info.Token);
+                using var _ = await http.SendAsync(request);
+            }
+            catch (Exception)
+            {
+                // not answering: fall through to the kill below
+            }
         }
 
         if (await WaitForLockReleaseAsync(ws, LockReleaseTimeout))
         {
-            if (ReadInfo(ws) is { } clean && clean.Pid == info.Pid) File.Delete(ws.ServerJsonPath);
+            DeleteStaleInfo(ws, info);
             return;
         }
+
+        // The lock is still held. Without a recorded PID there is nothing to identify or kill, but a held lock
+        // means a server genuinely is still running (starting up, or still draining) — never report success.
+        if (info is null)
+            throw new InvalidOperationException(
+                $"a dbm server for this workspace is still starting or shutting down; see {ws.ServerLogPath}.");
 
         Process? process;
         try
@@ -106,51 +123,64 @@ public static class ServerControl
         }
         catch (ArgumentException)
         {
-            process = null;   // already exited
+            process = null;   // the recorded PID has exited; something else may now hold the lock
         }
 
-        if (process is not null)
+        if (process is not null && process.Id != Environment.ProcessId)
         {
             using (process)
             {
-                if (process.Id != Environment.ProcessId)
+                bool identifiedAsServer;
+                try
                 {
-                    bool identifiedAsServer;
+                    identifiedAsServer = IsSameServer(process) && StartTimeMatches(process, info);
+                }
+                catch (Exception ex)
+                {
+                    throw new InvalidOperationException(
+                        $"dbm server PID {info.Pid} is still running and could not be identified ({ex.Message}); leaving it running.");
+                }
+
+                if (identifiedAsServer)
+                {
                     try
                     {
-                        identifiedAsServer = IsSameServer(process) && StartTimeMatches(process, info);
+                        process.Kill(entireProcessTree: true);
                     }
                     catch (Exception ex)
                     {
                         throw new InvalidOperationException(
-                            $"dbm server PID {info.Pid} is still running and could not be identified ({ex.Message}); leaving it running.");
+                            $"dbm server PID {info.Pid} is still running and could not be stopped (elevated?): {ex.Message}");
                     }
-
-                    if (identifiedAsServer)
-                    {
-                        try
-                        {
-                            process.Kill(entireProcessTree: true);
-                        }
-                        catch (Exception ex)
-                        {
-                            throw new InvalidOperationException(
-                                $"dbm server PID {info.Pid} is still running and could not be stopped (elevated?): {ex.Message}");
-                        }
-
-                        if (!await WaitForLockReleaseAsync(ws, KillGraceTimeout))
-                            throw new InvalidOperationException($"dbm server PID {info.Pid} is still running and could not be stopped.");
-                    }
-                    // else: the recorded PID is positively a different process (crashed and reused) — nothing to kill.
                 }
+                // else: the recorded PID is positively a different process (crashed and reused) — nothing to kill;
+                // fall through to the final lock probe below rather than assuming that makes it safe to declare done.
             }
         }
 
-        if (ReadInfo(ws) is { } stale && stale.Pid == info.Pid) File.Delete(ws.ServerJsonPath);
+        // Whether we killed a confirmed match, found the recorded PID already gone, or found it belongs to an
+        // unrelated process: the lock, not the PID check, is what decides "stopped". If it is still held, something
+        // is still running and this must not report success.
+        if (!await WaitForLockReleaseAsync(ws, KillGraceTimeout))
+            throw new InvalidOperationException($"dbm server PID {info.Pid} is still running and could not be stopped.");
+
+        DeleteStaleInfo(ws, info);
+    }
+
+    /// <summary>Deletes server.json only once a lock probe has confirmed the server is gone, and only if it still
+    /// names the process this call was tracking (not one that started in the meantime).</summary>
+    private static void DeleteStaleInfo(Workspace ws, ServerInfo? info)
+    {
+        if (info is null) return;
+        if (ReadInfo(ws) is { } current && current.Pid == info.Pid) File.Delete(ws.ServerJsonPath);
     }
 
     /// <summary>True once server.lock can be opened exclusively — the definitive "the server process has fully
-    /// exited RunAsync" signal, unlike server.json's disappearance which a killed process never gets to do itself.</summary>
+    /// exited RunAsync" signal, unlike server.json's disappearance which a killed process never gets to do itself.
+    /// A missing workspace directory is unambiguously "free": WebHost.RunAsync always creates it before acquiring
+    /// the lock, so there is nothing to hold it if it doesn't exist. Beyond that, only a genuine sharing/lock
+    /// conflict means "held"; any other error (disk error, access denied) surfaces instead of being read as
+    /// "still running".</summary>
     private static bool ProbeLockFree(Workspace ws)
     {
         try
@@ -158,20 +188,24 @@ public static class ServerControl
             using var probe = new FileStream(ws.ServerLockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
             return true;
         }
-        catch (IOException)
+        catch (DirectoryNotFoundException)
+        {
+            return true;
+        }
+        catch (IOException ex) when (WebHost.IsLockHeldByAnotherProcess(ex))
         {
             return false;
         }
     }
 
-    private static async Task<bool> WaitForLockReleaseAsync(Workspace ws, TimeSpan timeout)
+    private static async Task<bool> WaitForLockReleaseAsync(Workspace ws, TimeSpan timeout, CancellationToken ct = default)
     {
         var deadline = DateTime.UtcNow + timeout;
         while (true)
         {
             if (ProbeLockFree(ws)) return true;
             if (DateTime.UtcNow >= deadline) return false;
-            await Task.Delay(200);
+            await Task.Delay(200, ct);
         }
     }
 

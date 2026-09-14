@@ -133,9 +133,10 @@ public static class WebHost
     /// Opens server.lock exclusively, retrying briefly first — a momentary open by antivirus/OneDrive on a
     /// freshly created file should not be mistaken for another server owning the workspace. Only a genuine sharing
     /// violation is treated as "held"; any other <see cref="IOException"/> (missing directory, disk error, …)
-    /// surfaces instead of being swallowed as "already running".
+    /// surfaces instead of being swallowed as "already running". Shared with <c>dbm run-jobs</c> (<c>AgentCommands</c>),
+    /// which takes the same lock so it can never race a concurrently starting server over the job table.
     /// </summary>
-    private static async Task<FileStream?> TryAcquireLockAsync(Workspace ws, FileLog log, CancellationToken ct)
+    internal static async Task<FileStream?> TryAcquireLockAsync(Workspace ws, FileLog? log, CancellationToken ct)
     {
         for (var attempt = 1; attempt <= LockRetryAttempts; attempt++)
         {
@@ -147,7 +148,7 @@ public static class WebHost
             {
                 if (attempt == LockRetryAttempts)
                 {
-                    log.Write("info", "server.lock is held by another process; not starting (workspace already served).");
+                    log?.Write("info", "server.lock is held by another process; not starting (workspace already served).");
                     return null;
                 }
                 await Task.Delay(LockRetryDelay, ct);

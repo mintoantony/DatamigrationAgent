@@ -170,10 +170,13 @@ public sealed class FeedbackCommand : ICommand
 
 /// <summary>
 /// `dbm run-jobs` — run queued jobs in this process (no server needed). Takes the same exclusive server.lock as
-/// `dbm serve`: a running server already has its own JobRunner draining the queue, and without this a server
-/// starting mid-run would see the job this command is executing as "running" left over from a crash and requeue
-/// it — the same double-run WebHost.RunAsync's own lock now prevents for the server itself. If a server already
-/// owns the lock, this command does no work rather than race it.
+/// `dbm serve` (with the same retry as `WebHost.RunAsync`): a running server already has its own JobRunner draining
+/// the queue, and without this a server starting mid-run would see the job this command is executing as "running"
+/// left over from a crash and requeue it — the same double-run WebHost.RunAsync's own lock now prevents for the
+/// server itself. If a server already owns the lock, this command does no work rather than race it — but only
+/// reports that as success when a live, healthy server is confirmed to actually be the one draining the queue;
+/// otherwise (the holder is another run-jobs, or a server that is stopping and will never drain it) it fails
+/// loudly rather than telling the agent its jobs are handled when nothing will run them.
 /// </summary>
 public sealed class RunJobsCommand : ICommand
 {
@@ -183,14 +186,14 @@ public sealed class RunJobsCommand : ICommand
     public async Task<int> RunAsync(Args args, CliContext ctx)
     {
         var ws = ctx.RequireProject();
-        FileStream serverLock;
-        try
+        var serverLock = await WebHost.TryAcquireLockAsync(ws, log: null, CancellationToken.None);
+        if (serverLock is null)
         {
-            serverLock = new FileStream(ws.ServerLockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-        }
-        catch (IOException ex) when (WebHost.IsLockHeldByAnotherProcess(ex))
-        {
-            return Output.Ok(ctx, new { ok = true, ran = 0, skipped = "server_running" });
+            var owner = ServerControl.ReadInfo(ws);
+            if (owner is not null && await ServerControl.IsAliveAsync(owner))
+                return Output.Ok(ctx, new { ok = true, ran = 0, skipped = "server_running" });
+            return Output.Fail(ctx, "workspace_locked",
+                $"another process holds this workspace's server.lock but is not a healthy server; its jobs will not run. See {ws.ServerLogPath}.");
         }
         try
         {

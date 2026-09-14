@@ -1,4 +1,7 @@
 using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
+using Dbm.Core;
 using Dbm.Tests.Support;
 using Dbm.Web;
 
@@ -8,6 +11,57 @@ namespace Dbm.Tests.Integration.Web;
 [Trait("Category", "Integration")]
 public class ServerControlTests
 {
+    /// <summary>
+    /// Spawns a real, detached dbm server as an innocent bystander (so the process-name check alone can't be what
+    /// saves it — it genuinely is named "dotnet"/"Dbm") and points a fabricated, stale server.json at its PID with a
+    /// StartedAt far outside any tolerance for the bystander's real OS start time. A separate workspace's own
+    /// server.lock is held (simulating "still running") so StopAsync is forced past the clean-shutdown path into
+    /// the identify step — where, per T1.7 fix round 3, a positively-mismatched identity is no longer enough to
+    /// declare success while the lock is still held: it must keep server.json and throw naming the PID.
+    /// </summary>
+    [Fact]
+    public async Task StopAsync_never_kills_a_live_process_whose_identity_does_not_match_the_recorded_server()
+    {
+        using var bystanderWs = new TestWorkspace();
+        using (FakeServices.Open(bystanderWs.Ws)) { }   // creates the project so `serve` has something to run
+        try
+        {
+            var bystander = await ServerControl.EnsureRunningAsync(bystanderWs.Ws);
+
+            using var tw = new TestWorkspace();
+            tw.Ws.EnsureCreated();
+            var fakeInfo = new ServerInfo(FreeLoopbackPort(), bystander.Pid, "tok", DateTimeOffset.UnixEpoch);
+            File.WriteAllText(tw.Ws.ServerJsonPath, Json.Serialize(fakeInfo));
+            using var heldLock = new FileStream(tw.Ws.ServerLockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+
+            var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => ServerControl.StopAsync(tw.Ws));
+            Assert.Contains(bystander.Pid.ToString(), ex.Message);
+
+            Assert.True(await ServerControl.IsAliveAsync(bystander));
+            Assert.True(File.Exists(tw.Ws.ServerJsonPath));
+        }
+        finally
+        {
+            try
+            {
+                await ServerControl.StopAsync(bystanderWs.Ws);
+            }
+            catch (Exception)
+            {
+                // best-effort cleanup: never mask the assertions above with a cleanup-time failure
+            }
+        }
+    }
+
+    private static int FreeLoopbackPort()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+        return port;
+    }
+
     [Fact]
     public async Task EnsureRunning_spawns_one_detached_server_and_StopAsync_stops_it()
     {
