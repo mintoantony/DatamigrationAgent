@@ -168,7 +168,7 @@ public static class MappingPacket
         var columns = new JsonObject();
         if (map is not null)
             foreach (var c in t.Columns.OrderBy(c => c.Ordinal))
-                if (MappingValidator.FindColumnMap(map, c.Name) is { } cm) columns[c.Name] = ColumnMapNode(cm);
+                if (MappingValidator.FindColumnMap(map, c.Name) is { } cm) columns[c.Name] = ColumnMapNode(cm, map);
         obj["columns"] = columns;
         var sourceKeys = new List<string>();
         if (map is not null)
@@ -198,7 +198,7 @@ public static class MappingPacket
             obj["sources"] = Strings(map.Sources);
             if (map.From is not null) obj["from"] = map.From;
         }
-        if (cm is not null) obj["map"] = ColumnMapNode(cm);
+        if (cm is not null) obj["map"] = ColumnMapNode(cm, map!);
         var keys = (cm?.SourceColumns ?? []).Concat((cm?.Candidates ?? []).Select(x => x.Source)).Distinct(StringComparer.OrdinalIgnoreCase);
         var profiles = new JsonArray();
         foreach (var key in keys)
@@ -255,14 +255,16 @@ public static class MappingPacket
         return obj;
     }
 
-    private static JsonObject ColumnMapNode(ColumnMap cm)
+    /// <summary>A column's current map. typeRisk is omitted for a skip table: it loads no data, so the risk never enters the risk
+    /// channel on any surface.</summary>
+    private static JsonObject ColumnMapNode(ColumnMap cm, TableMap map)
     {
         var obj = new JsonObject { ["expr"] = cm.Expr };
         if (cm.SourceColumns.Count > 0) obj["sourceColumns"] = Strings(cm.SourceColumns);
         if (cm.Default is not null) obj["default"] = cm.Default;
         obj["confidence"] = R(cm.Confidence);
         obj["method"] = EnumText.ToText(cm.Method);
-        if (MappingValidator.HasTypeRisk(cm)) obj["typeRisk"] = cm.TypeRisk;
+        if (map.Kind != "skip" && MappingValidator.HasTypeRisk(cm)) obj["typeRisk"] = cm.TypeRisk;
         if (cm.Rationale is not null) obj["rationale"] = cm.Rationale;
         if (cm.Candidates is { Count: > 0 }) obj["candidates"] = Candidates(cm.Candidates);
         return obj;
@@ -297,10 +299,12 @@ public static class MappingPacket
         return risks;
     }
 
+    /// <summary>Rework contexts' <c>typeRisks</c> map for the columns <paramref name="include"/> selects; skip tables never
+    /// contribute (they load no data), including in the general context. Omitted when empty.</summary>
     private static void AddTypeRisks(JsonObject obj, MappingPayload m, Func<string, TableMap, ColumnMap, bool> include)
     {
         var risks = new JsonObject();
-        foreach (var (tableKey, map) in m.Tables)
+        foreach (var (tableKey, map) in m.Tables.Where(kv => kv.Value.Kind != "skip"))
             foreach (var (name, cm) in map.Columns)
                 if (MappingValidator.HasTypeRisk(cm) && include(tableKey, map, cm)) risks[$"{tableKey}.{name}"] = cm.TypeRisk;
         if (risks.Count > 0) obj["typeRisks"] = risks;

@@ -238,6 +238,31 @@ public class MappingPacketTests
     }
 
     [Fact]
+    public void A_skipped_table_contributes_no_risk_to_any_packet_surface()
+    {
+        // §15b: a skipped table loads no data, so its risk never enters the risk channel — draft list, every rework context
+        // (the general one included) and the column maps shown for the table.
+        var m = SampleMappings.Approved();
+        m.Tables["app.Orders"].Kind = "skip";
+        m.Tables["app.Orders"].Columns["Comment"].TypeRisk = Truncates;
+        m.Drops["dbo.ORD_HDR"] = new DropDecision("test", MapMethod.Human);
+        m.Drops["dbo.ORD_STATUS"] = new DropDecision("test", MapMethod.Human);
+        var feedback = new[]
+        {
+            Feedback(1, null), Feedback(2, "column:src:dbo.ORD_HDR.CMNT"), Feedback(3, "table:src:dbo.ORD_HDR"),
+            Feedback(4, "tablemap:app.Orders"), Feedback(5, "colmap:app.Orders.Comment"),
+        };
+
+        var draft = Draft(m);
+        var rework = MappingPacket.Rework(m, SampleCatalogs.Source(), SampleCatalogs.Target(), Options, feedback);
+
+        Assert.Empty(draft["typeRisks"]!.AsObject());
+        Assert.Empty(rework["typeRisks"]!.AsObject());
+        Assert.DoesNotContain(Truncates, draft.ToJsonString());
+        Assert.DoesNotContain(Truncates, rework.ToJsonString());
+    }
+
+    [Fact]
     public void Auto_draft_risky_detail_columns_carry_their_risk()
     {
         var m = AutoMapper.Map(SampleCatalogs.Source(), SampleCatalogs.Target(), Synonyms.Default(), Options);
