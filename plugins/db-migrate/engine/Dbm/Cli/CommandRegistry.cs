@@ -10,6 +10,20 @@ public static class CommandRegistry
         new HelpCommand(),
         new VersionCommand(),
         new DoctorCommand(),
-        // Later tasks append their commands below this line.
+        // M1
+        new InitCommand(),
+        new StatusCommand(),
+        new PauseCommand(),
+        new ResumeCommand(),
+        new ServeCommand(),
+        new UiCommand(),
+        new StopCommand(),
+        new NextCommand(),
+        new AwaitCommand(),
+        new ApplyCommand(),
+        new ArtifactCommand(),
+        new FeedbackCommand(),
+        new RunJobsCommand(),
+        // Later milestones append their commands below this line.
     ];
 }

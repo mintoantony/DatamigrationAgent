@@ -1,10 +1,16 @@
 using System.Text;
+using Dbm.Core;
 
 namespace Dbm.Cli;
 
 public static class CliApp
 {
-    public static async Task<int> RunAsync(string[] argv, TextWriter? stdout = null, TextWriter? stderr = null)
+    public static Task<int> RunAsync(string[] argv, TextWriter? stdout = null, TextWriter? stderr = null) =>
+        RunAsync(argv, stdout, stderr, servicesFactory: null);
+
+    /// <summary>Test entry point: lets CliRunner inject a services factory (fake modules/handlers).</summary>
+    internal static async Task<int> RunAsync(string[] argv, TextWriter? stdout, TextWriter? stderr,
+        Func<Workspace, DbmServices>? servicesFactory)
     {
         if (stdout is null) UseUtf8Console();
         var (rest, workspace) = ExtractWorkspace(argv);
@@ -13,6 +19,7 @@ public static class CliApp
             Out = stdout ?? Console.Out,
             Err = stderr ?? Console.Error,
             WorkspaceOverride = workspace,
+            ServicesFactory = servicesFactory,
         };
 
         try
