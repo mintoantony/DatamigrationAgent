@@ -6474,3 +6474,49 @@ Every earlier Task 3.5 JavaScript risk section is **historical**. Per-column ack
 **The browser never writes `typeRisk`.** The engine owns it; the screen displays it. A patch from the browser carrying a risk value is ignored by the engine and earns a warning.
 
 **Approval confirms the risks.** When the version carries type risks, the review screen lists them and approval requires an explicit confirmation; without it the approve call is rejected and names the count. This is required rather than optional — the channel above makes every risk visible, and only the confirmation makes a person confirm having seen them. If it reaches too far into closed workflow code, it moves to Milestone 6 as its own task, and that decision is recorded rather than assumed.
+
+### THE CUT, COMPLETED — four consequences the cut created
+
+These finish the cut rather than repair it. None restores acknowledgement, and no stored field returns. The stopping rule is not in play: removing a mechanism has consequences, and specifying them is part of the removal.
+
+#### M1 — The pinned risk line survives as its own warning class
+
+The cut removed type risks from attention, and the pinned line `<table>.<column>: type risk: <typeRisk>` was emitted from attention. Removing it there deletes type risks from dry-run output entirely.
+
+That blinds the agent to exactly the risks it creates. When an agent remaps a column onto a lossier source, `Validate`'s bare recompute writes a risk that the packet — built before the patch — never showed. With no dry-run line, the agent cannot see it, and the playbook instruction to transform the risk or explain it in `summary` becomes unexecutable. The human still catches it at approval, so correctness holds; but the agent is asked to account for something invisible to it.
+
+**`Validate` emits one warning per type risk, in the pinned format, as a separate warning class.** `Attention()` excludes it, the attention count in `Summarize` excludes it, and `NeedsAgent`'s attention test excludes it. The format is unchanged and keeps its prefix-substring test.
+
+#### M2 — Two fix-round-1 tests pin the reversed rule and must be reverted deliberately
+
+The first fix round added tests asserting that a risky exact-or-human column counts as attention. The cut reverses that rule, so those tests now pin the wrong behaviour. **Revert them deliberately, with a comment recording that the rule reversed and why** — do not adjust them until they pass.
+
+The example-patch test asserts no attention and no blockers, while still expecting the fixture draft's genuine risks as risk warnings: `BirthDate`, `CreatedAt`, `OrderDate` and `Comment`.
+
+#### M3 — `NeedsAgent` is narrower than the cut stated
+
+"Fires on the draft containing any type risk" re-invokes the agent on every later automap run — re-approval, rediscovery, retry — for a project whose risks were explained once, with nothing to do but rewrite the same summary. It is not a loop, but it is a recurring full agent run, and this project treats token cost as a first-order constraint.
+
+**`NeedsAgent` fires on:**
+
+- attention; **or**
+- a type risk on a column the auto-mapper **assigned in this run** rather than kept; **or**
+- a **kept bare column whose recomputed risk text differs from the stored text**.
+
+All three read the payload and carry-over's own recompute. No stored field returns.
+
+#### M4 — The approve confirmation lands in Task 3.5; the Milestone 6 fallback is struck
+
+Deferring it would create a breaking change across two milestones. Milestones 4 and 5 approve mappings and build SQL generation and transfers on them, so every mapping their flows and tests approve would be visibility-only — and a later milestone turning a no-flag approve into an error would then break every one of those flows and tests that approves a mapping carrying a risk.
+
+It is also small. `WorkflowEngine.Approve` is unchanged. The approval guards cannot see the request, so the check sits in the approve handler ahead of the guards, or the guard signature gains the request context — one small change either way. Approval exists only as the HTTP approve endpoint, with no CLI equivalent, so the flag is human-only by construction and no agent can set it.
+
+**The flag names a version, not a boolean.** Two review tabs can diverge: a human edit in one creates version N+1 carrying a new risk while the other still displays version N, and a bare `true` from the stale tab would sign off a version it never showed.
+
+- the approve call carries `confirmRisksVersion` naming the version being signed off;
+- approval is rejected when the phase carries type risks and the flag is absent, or names a version other than the current one;
+- the rejection is `409` with `{"error":"risk_confirmation_required","message":"version N has K type risks; confirm them to approve"}`, matching the global error contract.
+
+#### Still to pin
+
+The carry-over sequence, minus its acknowledgement halves: a bare single-source reference recomputes; everything else keeps its stored `typeRisk` verbatim; `expr` and `default` both null means no risk.
