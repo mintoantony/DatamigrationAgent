@@ -5737,3 +5737,64 @@ Optionally, and free: assert that a real auto-mapper draft's known risky columns
 #### B7 residual, extended
 
 `Candidate.Why` carries only a coarse marker such as "type risky" or "widening", never the risk text. An agent switching a column to a candidate source cannot see that candidate's hazard, and the column also keeps the previous pairing's `TypeRisk`, which is stale in the other direction. The recompute closes the second half. The first half stays on the deferred list with the popover display.
+
+### AMENDMENT CORRECTIONS (Task 3.4, third pass)
+
+B7 rule 4 is **withdrawn**: it contradicted B7 rule 3 and would have broken the existing suite. B8 gains the acknowledgement it was missing. B1 point 2 loses a clause that excluded nothing. Everything not mentioned here stands as written.
+
+#### C1 — B7 rule 4 is withdrawn; rule 3 writes a sentinel instead of deleting
+
+Rule 4 made a custom expression count as needing review, computed from the payload alone. Two things are wrong with that.
+
+It **breaks the existing suite without anyone touching the fixture.** The approved sample mapping is full of non-bare expressions — `LEFT`/`SUBSTRING` on the name columns, `CAST` on the date and notes columns, a subquery for the primary address, a `CASE` for the active flag, and a two-source column. A payload-only rule cannot distinguish a `CAST` written five minutes ago from one approved long ago, so it flags every one of them. That breaks the pinned `"… 0 attention, 0 blockers"` summary string in three tests, the assertion that the approved mapping does not need the agent, and an empty-warnings assertion in the validator tests.
+
+It **contradicts rule 3 in the same section.** The playbook requires the agent to resolve every attention item, and the only way to clear "custom expression: type risk not evaluated" is to rewrite the expression as a bare column reference — that is, to revert the `CAST` that fixed the risk. Rule 3 exists precisely to stop that, and rule 4 reintroduced it by another route.
+
+**Replacement.** Rule 3 no longer deletes `typeRisk` for a changed non-bare expression. It **writes a sentinel** instead:
+
+    typeRisk: "not evaluated: custom expression"
+
+Only columns whose `expr` or `sourceColumns` actually changed are touched, so long-standing expressions in any existing mapping are left exactly as they are. The sentinel travels through the existing risk channel — B1 carries it into the packet, A2 surfaces it as attention, the UI shows it in the same place — so no second predicate is needed anywhere, in either language. It is cleared the same way any other risk is, under C2.
+
+**Rule 4 is deleted.** There is no custom-expression attention predicate, in C# or in JavaScript.
+
+#### C2 — A risk can be acknowledged (resolves A2 against B8)
+
+A2 makes any column carrying a `typeRisk` count as needing review. B8 tells the agent to keep a risk it has accepted rather than deleting it. Together those trap an accepted risk in attention forever: the attention count never reaches zero, dry-run warnings never clear, and `NeedsAgent` fires on every later automap run. The only escape is deleting the risk text — the exact incentive B8 exists to remove.
+
+`ColumnMap` gains one field:
+
+    riskAck: string   // why this risk is acceptable; absent or blank means unacknowledged
+
+The attention predicate becomes: **a column needs review when `typeRisk` is present and `riskAck` is absent or blank.** This stays payload-only, so the C# and JavaScript implementations remain mirrorable. Note it cannot be expressed as a test on `method` — A2's correction forbids method gating, and an acknowledgement by a human and by the agent must behave identically.
+
+`riskAck` must survive into the packet alongside `typeRisk`, must be shown in the UI next to the risk it acknowledges, and must be preserved by carry-over exactly as `typeRisk` is.
+
+B8's playbook rule becomes: when replacing a column object, copy `typeRisk` across unchanged; if the new expression handles the hazard, remove the risk and say so in `rationale`; if the hazard is real but acceptable, keep the risk and set `riskAck` to the reason. The worked example must demonstrate the acknowledgement path, since that is the case it actually represents.
+
+#### C3 — B1 point 2 loses its exclusion
+
+B1 point 2 said `NeedsAgent` returns true for a risky column "not already decided by the agent or a human". That clause excludes nothing, and my stated reason for it was wrong at source: carry-over rewrites every kept column's method to `Carried`, and only agent-, human- and carry-decided columns are kept at all, so a fuzzy column is never carried. Read literally the clause therefore does not exclude carried decisions either.
+
+It is also redundant once A2 lands, because an unacknowledged risk puts the column in attention and `NeedsAgent` already fires on a non-empty attention list.
+
+**Delete the exclusion.** `NeedsAgent` needs no risk clause of its own: an unacknowledged risk reaches it through attention. Do not add one.
+
+#### C4 — Carry-over must not preserve a risk across a source type change
+
+B7's invariant says a stored `typeRisk` must never survive a change to the column's source. A source column's **type** can change under the same name between discoveries — `varchar(100)` becoming `varchar(400)` — and carry-over copies `TypeRisk` verbatim, checking only that the column still exists. Job drafts are stored without passing through `Validate`, so the recompute never runs on that path, and B7 rule 1 then sees no change on every later save and preserves the stale text permanently. Both directions fail: a newly-created hazard shows nothing, and a hazard that has gone away keeps its old text.
+
+Carry-over therefore recomputes, for each kept column: if the mapping is a bare single-source reference, recompute the risk from the current catalogs; otherwise write the C1 sentinel. A `riskAck` is preserved only when the recomputed risk is unchanged — an acknowledgement is of a specific hazard, not a blanket permission.
+
+#### C5 — B7 rule 1 restores a risk that was dropped
+
+Rule 1 says an unchanged column keeps its existing `typeRisk` verbatim, without saying whether "existing" means the incoming payload or `ctx.Current`. It means `ctx.Current`: when a column's `expr` and `sourceColumns` are unchanged but the incoming payload has **lost** its `typeRisk` — an agent replacing the whole column object and omitting it — restore it from `ctx.Current`. With the expression unchanged, a bare-reference hazard cannot have been handled, so restoring is always correct. This makes B8 self-healing for the common case and leaves B8 load-bearing only for changed and custom expressions.
+
+#### C6 — Two details for B7 rule 2
+
+- Pass the source column's profile to the type-compatibility check, exactly as the auto-mapper's column scorer does. Without it the recomputed text differs from the auto-mapper's for the same pair — the sample-supported softening disappears — so a remap back to the original source would produce a different string than the original.
+- An empty expression with a single source column means unmapped or default-only. There is no conversion, so compute no risk.
+
+#### C7 — Wording
+
+B7's test paragraph says "build the payloads for these tests inline", repeating the phrasing already corrected in B5. It means the same narrow thing: **do not edit `SampleMappings.cs`.** Copying the approved fixture and setting a risk on the copy inside a test is expected and is not a fixture change.
