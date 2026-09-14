@@ -39,6 +39,9 @@ public static class AutoMapperBaseline
         ("app.OrderLines", "ProductId", "dbo.ORD_LINE.PROD_ID"),
         ("app.OrderLines", "Quantity", "dbo.ORD_LINE.QTY"),
         ("app.OrderLines", "UnitPrice", "dbo.ORD_LINE.UNIT_PRC"),
+        ("app.AuditEvents", "EventTime", "dbo.AUDIT_LOG.LOG_TS"),
+        ("app.AuditEvents", "UserName", "dbo.AUDIT_LOG.USR"),
+        ("app.AuditEvents", "Action", "dbo.AUDIT_LOG.ACTION_TXT"),
     ];
 
     /// <summary>Returns every deviation from the baseline (empty = pass), so a failing test lists all misses at once.</summary>

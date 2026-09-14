@@ -138,8 +138,14 @@ public class AutoMapperTests
         var dob = m.Tables["app.Customers"].Columns["BirthDate"];
         Assert.Equal("time part dropped", dob.TypeRisk);
         Assert.All(m.Tables.Values.SelectMany(t => t.Columns.Values), c => Assert.True(c.Candidates is null || c.Candidates.Count <= 3));
-        var sources = m.Tables.Values.SelectMany(t => t.Columns.Values).SelectMany(c => c.SourceColumns).ToList();
-        Assert.Equal(sources.Count, sources.Distinct(StringComparer.OrdinalIgnoreCase).Count());   // one-to-one per pair
+        // one-to-one WITHIN each table pair (the spec's guarantee): a source column is used at most once inside any single
+        // target table's column assignments. Nothing forbids two different target tables that share a primary source from
+        // each mapping the same source column - that is legitimate denormalization, so this must not be asserted globally.
+        Assert.All(m.Tables.Values, map =>
+        {
+            var used = map.Columns.Values.SelectMany(c => c.SourceColumns).ToList();
+            Assert.Equal(used.Count, used.Distinct(StringComparer.OrdinalIgnoreCase).Count());
+        });
         Assert.Contains("dbo.ORD_STATUS.STATUS_CD", MappingValidator.UncoveredSourceColumns(m, Src));
         Assert.Empty(MappingValidator.Errors(m, Src, Tgt));
     }
