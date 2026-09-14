@@ -24,6 +24,7 @@ public class ServerControlTests
     {
         using var bystanderWs = new TestWorkspace();
         using (FakeServices.Open(bystanderWs.Ws)) { }   // creates the project so `serve` has something to run
+        var bodySucceeded = false;
         try
         {
             var bystander = await ServerControl.EnsureRunningAsync(bystanderWs.Ws);
@@ -39,16 +40,18 @@ public class ServerControlTests
 
             Assert.True(await ServerControl.IsAliveAsync(bystander));
             Assert.True(File.Exists(tw.Ws.ServerJsonPath));
+            bodySucceeded = true;
         }
         finally
         {
+            // Best-effort cleanup, but only silent after a real test failure: if the assertions above already
+            // passed, a failure here (a leaked detached server) must still be reported, not swallowed.
             try
             {
                 await ServerControl.StopAsync(bystanderWs.Ws);
             }
-            catch (Exception)
+            catch (Exception) when (!bodySucceeded)
             {
-                // best-effort cleanup: never mask the assertions above with a cleanup-time failure
             }
         }
     }

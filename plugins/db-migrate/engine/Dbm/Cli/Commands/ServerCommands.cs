@@ -43,9 +43,11 @@ public sealed class ServeCommand : ICommand
         // server answered health, or it holds the exclusive server.lock). Only report alreadyRunning when a live
         // server's URL can actually be confirmed — the lock holder may not have written server.json yet (still
         // starting) or may have already deleted it (draining), and claiming "already running" with an empty or
-        // stale URL would tell the caller a server is there to talk to when none is reachable.
-        var owner = ServerControl.ReadInfo(ws);
-        if (owner is not null && await ServerControl.IsAliveAsync(owner))
+        // stale URL would tell the caller a server is there to talk to when none is reachable. Waits (bounded by
+        // StartTimeout) rather than checking once, so a lock holder that is legitimately still mid-start (DI build
+        // and Kestrel bind happen before it writes server.json) is not mistaken for a stuck lock.
+        var owner = await ServerControl.WaitForHealthyOwnerAsync(ws);
+        if (owner is not null)
         {
             output.WriteLine(Json.Serialize(new { ok = true, alreadyRunning = true, url = owner.UiUrl }));
             output.Flush();
@@ -86,8 +88,7 @@ public sealed class StopCommand : ICommand
     public async Task<int> RunAsync(Args args, CliContext ctx)
     {
         var ws = ctx.Workspace();
-        var wasRunning = ServerControl.ReadInfo(ws) is not null;
-        await ServerControl.StopAsync(ws);
-        return Output.Ok(ctx, new { ok = true, stopped = wasRunning });
+        var stopped = await ServerControl.StopAsync(ws);
+        return Output.Ok(ctx, new { ok = true, stopped });
     }
 }

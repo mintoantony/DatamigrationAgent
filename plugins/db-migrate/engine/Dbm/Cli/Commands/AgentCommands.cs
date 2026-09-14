@@ -67,8 +67,18 @@ public sealed class AwaitCommand : ICommand
                 // connection reset: handled below
             }
 
-            // Connection lost. Wait (≤ 3 s) for the old server to remove server.json: a clean stop removes it, a crash does not.
-            for (var i = 0; i < 15 && ServerControl.ReadInfo(ws) is { } still && still.Pid == info.Pid; i++) await Task.Delay(200);
+            // Connection lost. Wait (≤ 3 s) for whichever signal comes first: server.json disappearing (the
+            // server's own cleanup — a clean stop) or server.lock freeing (the OS releases it on any exit,
+            // including a crash that never got to run its own cleanup and so never deleted server.json). Once the
+            // lock is free, re-read once more: file gone means it was a clean stop after all; file still naming
+            // the old PID means a crash — reconnect (EnsureRunningAsync will find the lock free and respawn),
+            // rather than inferring a stop from server.json merely outliving a fixed window.
+            for (var i = 0; i < 15; i++)
+            {
+                if (ServerControl.ReadInfo(ws) is null) return Output.Ok(ctx, ServerStopped);
+                if (ServerControl.ProbeLockFree(ws)) break;
+                await Task.Delay(200);
+            }
             if (ServerControl.ReadInfo(ws) is null) return Output.Ok(ctx, ServerStopped);
             if (++reconnects > MaxReconnects)
                 return Output.Fail(ctx, "server_unreachable", $"Lost the connection to the dbm server {MaxReconnects} times; see {ws.ServerLogPath}");
@@ -189,8 +199,10 @@ public sealed class RunJobsCommand : ICommand
         var serverLock = await WebHost.TryAcquireLockAsync(ws, log: null, CancellationToken.None);
         if (serverLock is null)
         {
-            var owner = ServerControl.ReadInfo(ws);
-            if (owner is not null && await ServerControl.IsAliveAsync(owner))
+            // Bounded by StartTimeout rather than checked once: the holder may be legitimately mid-start (DI build
+            // and Kestrel bind happen before it writes server.json), not merely a stuck lock.
+            var owner = await ServerControl.WaitForHealthyOwnerAsync(ws);
+            if (owner is not null)
                 return Output.Ok(ctx, new { ok = true, ran = 0, skipped = "server_running" });
             return Output.Fail(ctx, "workspace_locked",
                 $"another process holds this workspace's server.lock but is not a healthy server; its jobs will not run. See {ws.ServerLogPath}.");

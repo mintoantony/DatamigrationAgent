@@ -1,9 +1,13 @@
 using Dbm.Core.State;
 using Dbm.Core.Workflow;
 using Dbm.Tests.Support;
+using Dbm.Web;
 
 namespace Dbm.Tests.Unit.Cli;
 
+/// <summary>Shortens ServerControl.StartTimeout for the workspace_locked test; ProcessStateCollection keeps that
+/// from racing another test class over the same shared static.</summary>
+[Collection(ProcessStateCollection.Name)]
 public class AgentCommandTests
 {
     private static string WritePatch(TestWorkspace tw, string json)
@@ -119,6 +123,45 @@ public class AgentCommandTests
         Assert.Equal(2, r.Json["ran"]!.GetValue<int>());
         using var check = FakeServices.Open(tw.Ws);
         Assert.Equal(PhaseStatus.Drafting, check.Phases.Get(PhaseName.Analysis).Status);
+    }
+
+    [Fact]
+    public async Task Run_jobs_reports_skipped_when_a_healthy_server_already_holds_the_lock()
+    {
+        using var tw = new TestWorkspace();
+        var factory = FakeServices.Factory();
+        await using var server = await WebTestServer.StartAsync(tw.Ws, factory);
+
+        var r = await CliRunner.RunAsync(tw.Ws, factory, "run-jobs");
+
+        Assert.Equal(0, r.Exit);
+        Assert.True(r.Json["ok"]!.GetValue<bool>());
+        Assert.Equal(0, r.Json["ran"]!.GetValue<int>());
+        Assert.Equal("server_running", r.Json["skipped"]!.GetValue<string>());
+    }
+
+    /// <summary>The lock holder here is not a dbm server at all (a plain FileStream) and never will be, so
+    /// run-jobs must fail loudly rather than tell the agent its jobs are handled when nothing will run them.</summary>
+    [Fact]
+    public async Task Run_jobs_reports_workspace_locked_when_the_holder_never_becomes_a_healthy_server()
+    {
+        using var tw = new TestWorkspace();
+        using (FakeServices.Open(tw.Ws)) { }
+        var saved = ServerControl.StartTimeout;
+        ServerControl.StartTimeout = TimeSpan.FromMilliseconds(500);
+        try
+        {
+            using var heldLock = new FileStream(tw.Ws.ServerLockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+
+            var r = await CliRunner.RunAsync(tw.Ws, null, "run-jobs");
+
+            Assert.Equal(1, r.Exit);
+            Assert.Equal("workspace_locked", r.Json["error"]!.GetValue<string>());
+        }
+        finally
+        {
+            ServerControl.StartTimeout = saved;
+        }
     }
 
     [Fact]
