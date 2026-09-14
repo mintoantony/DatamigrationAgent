@@ -6268,3 +6268,56 @@ So the browser needs **no hazard class at all**, and must not attempt one. The p
 Mirroring a stripping algorithm was the thing that would have made the UI disagree with the server precisely when it mattered — after a rediscovery changes an observed length. With the refresh, both sides compare the same two strings and agree by construction.
 
 Attention remains the confidence band **or** this risk predicate. The risk predicate does not replace the band.
+
+### RISK MODEL AMENDMENT 3 — `riskClass` corrected: no hazard kind, and the two sentinel rules are opposites
+
+Four corrections to `riskClass` itself. Two of them are ways the text and the class end up disagreeing, which is a new failure this field introduced; one removes a component I specified without a source; one makes a sentinel acknowledgeable at all.
+
+#### J1 — The two sentinel rules are deliberately opposite
+
+Two rules mention the sentinel and they must point in opposite directions. I wrote near-identical wording for both, which invites an implementer to apply one rule to the other and make every sentinel column permanently unacknowledgeable.
+
+- **In the predicate**, a sentinel acknowledgement **matches** a sentinel risk. The author named the hazard they accepted; that the hazard is "unevaluable" does not make naming it impossible. Under the plain-equality predicate this falls out naturally — identical text compares equal — and nothing may special-case the sentinel to defeat it.
+- **In invalidation**, a newly written sentinel `riskClass` **never equals** the stored one. A changed custom column always loses its old acknowledgement, because nothing about the new expression was evaluated and the old acceptance cannot carry over.
+
+Pin both with shared test vectors: an acknowledged sentinel column stays out of attention while unchanged, and loses the acknowledgement the moment it changes.
+
+#### J2 — Carry-over copies all three fields
+
+G4 required carry-over to copy `riskAck`. It must copy `riskClass` too, and the omission is worse than it looks. `MappingCarryOver` builds each kept column from an explicit field list, so a field not named there is silently dropped, and dropping the class produces two distinct failures:
+
+- a kept custom-expression column emerges with risk **text but no class** — precisely the disagreement this field was introduced to prevent;
+- a kept bare column is recomputed, and its fresh class is compared against a stored class the copy just discarded, so absent-versus-value reads as "changed" and the acknowledgement is cleared on **every** re-run.
+
+**Carry-over copies `typeRisk`, `riskClass` and `riskAck` verbatim, then recomputes bare columns under the invalidation rule.**
+
+#### J3 — The auto-mapper writes the class, and an absent class never invalidates
+
+The auto-mapper sets the risk text and nothing else, so every script draft would carry text with no class. The first automap re-run then compares a computed class against a stored null, reads "changed", and clears the acknowledgement — every project re-acknowledging every auto-mapper risk once, with the first rediscovery looking like a regression.
+
+Both halves are required:
+
+- **the auto-mapper writes `riskClass`** alongside the risk, through the same helper the recompute uses, so the text and the class cannot drift apart;
+- **an absent stored class counts as unknown and never clears an acknowledgement.** This is needed regardless, for artifacts stored before this model existed.
+
+#### J4 — `riskClass` is declared types only; "hazard kind" is removed
+
+I specified the class as a hazard kind plus the declared types. The kind has no source. `TypeCompat` has no notion of one: it returns a level and a text, and it joins several risk items into a single string. Deriving a kind from that text is the string surgery already rejected; deriving it from the level makes it flip with the unordered sample, which brings back the treadmill this field exists to prevent.
+
+The declared types already identify the conversion completely for a bare column, since the check is a pure function of those types plus the profile.
+
+**`riskClass` is the declared source and target type names for a bare column — for example `varchar(300)->nvarchar(200)` — and the sentinel value otherwise.** Nothing derived from observed data, nothing derived from the level, nothing parsed out of the risk text.
+
+#### J5 — Residual: growing data that proves loss does not re-prompt
+
+Acknowledge a soft truncation risk whose reason cites that the sampled rows fit. A later discovery samples a longer value, the risk hardens, and the text changes — but the declared types are identical, so the class is unchanged and the acknowledgement survives although the evidence it cited has been contradicted.
+
+Noise here runs one way only: a sampled scan can miss long values but cannot invent them, so a soft-to-hard transition is evidence while hard-to-soft is sampling noise. Clearing on the hardening transition would be defensible and monotone. It is **not** adopted, because it reintroduces a level-derived comparison that J4 removes for good reasons, and because the acknowledgement remains visible in the acknowledged list where a human reviews it.
+
+Recorded as a residual alongside section 8's pre-model columns.
+
+#### J6 — Ownership and malformed shapes cover the new field
+
+`riskClass` is engine-owned exactly as `typeRisk` is: an incoming value is ignored, and a value present and differing from `ctx.Current`'s earns a warning naming the column.
+
+The malformed-payload matrix gains: `riskClass` that is not a string; `riskAck` in the old plain-string shape; `riskAck` with null members; `riskAck` as an array. Each must be rejected or tolerated without throwing, on the same full chain as the rest of the matrix.
