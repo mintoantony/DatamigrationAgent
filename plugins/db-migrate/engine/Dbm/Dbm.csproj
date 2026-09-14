@@ -20,4 +20,8 @@
     <Content Update="wwwroot\**" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="Core\State\schema.sql" LogicalName="Dbm.Core.State.schema.sql" />
+  </ItemGroup>
+
 </Project>
