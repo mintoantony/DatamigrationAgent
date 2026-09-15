@@ -248,7 +248,21 @@ public class SqlGeneratorTests
     [Fact]
     public void UnevaluatedWarning_text_is_pinned()
     {
-        Assert.Equal("conversion not evaluated: custom expression", SqlGenerator.UnevaluatedWarning);
+        Assert.Equal("conversion not verified: custom expression", SqlGenerator.UnevaluatedWarning);
+    }
+
+    [Fact]
+    public void No_plan_warning_ever_contains_the_sentinel_risk_text()
+    {
+        var mapping = SampleMappings.Approved();
+        foreach (var map in mapping.Tables.Values)
+            foreach (var column in map.Columns.Values)
+                column.TypeRisk = TypeCompat.UnevaluatedRisk;
+        var plan = SqlGenerator.Generate(mapping, SampleCatalogs.Source(), SampleCatalogs.Target());
+
+        var all = plan.Warnings.Concat(plan.Tasks.Values.SelectMany(t => t.Warnings)).ToList();
+        Assert.Contains(all, w => w.EndsWith(": " + SqlGenerator.UnevaluatedWarning, StringComparison.Ordinal));
+        Assert.DoesNotContain(all, w => w.Contains(TypeCompat.UnevaluatedRisk, StringComparison.Ordinal));
     }
 
     // ---- Amendment: the mapping hash covers only SQL-relevant fields ----------------------------------------------

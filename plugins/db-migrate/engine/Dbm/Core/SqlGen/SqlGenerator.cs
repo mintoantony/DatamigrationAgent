@@ -18,7 +18,7 @@ public static class SqlGenerator
 
     /// <summary>Rendered as "&lt;Col&gt;: " + this for a column whose typeRisk is <see cref="TypeCompat.UnevaluatedRisk"/>: the conversion
     /// could not be evaluated, which is a different claim from a conversion evaluated and found lossy.</summary>
-    public const string UnevaluatedWarning = "conversion not evaluated: custom expression";
+    public const string UnevaluatedWarning = "conversion not verified: custom expression";
 
     public static SqlPlanPayload Generate(MappingPayload mapping, CatalogSnapshot src, CatalogSnapshot tgt, SqlPlanPayload? carryOver = null)
     {
@@ -215,7 +215,7 @@ public static class SqlGenerator
         foreach (var binding in task.Columns)
             if (FindColumnMap(map, binding.Target) is { TypeRisk: { Length: > 0 } risk })
             {
-                // Sentinel first, and exclusive: "not evaluated" is not a data-loss claim, so it never renders as the loss line.
+                // Sentinel first, and exclusive: an unevaluated conversion is not a data-loss claim, so it never renders as the loss line.
                 if (string.Equals(risk, TypeCompat.UnevaluatedRisk, StringComparison.Ordinal))
                     w.Add($"{binding.Target}: {UnevaluatedWarning}");
                 else
