@@ -1,3 +1,4 @@
+using System.Globalization;
 using Dbm.Core.Sql;
 using Dbm.Core.SqlGen;
 using Xunit;
@@ -95,6 +96,80 @@ public class TopoSortTests
         Assert.Equal(a.Order, b.Order);
         Assert.Equal(a.CycleEdges, b.CycleEdges);
     }
+
+    // ---- Fix round 1: ordering rules that were correct but unpinned -------------------------------------------------
+
+    /// <summary>Runs <paramref name="body"/> under en-US, where culture collation puts "app.b" before "app.C" and ordinal does not,
+    /// so a comparer that silently became culture-aware is caught whatever the build machine's own culture is.</summary>
+    static void UnderEnUs(Action body)
+    {
+        var saved = CultureInfo.CurrentCulture;
+        try { CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("en-US"); body(); }
+        finally { CultureInfo.CurrentCulture = saved; }
+    }
+
+    [Fact]
+    public void Nodes_released_at_a_later_level_are_ordinal_sorted()
+    {
+        // Level 0 = a, b. a releases y, then b releases x: without the level sort the order would be a, b, y, x.
+        var r = TopoSort.Sort(["a", "b", "x", "y"], [("y", "a"), ("x", "b")]);
+        Assert.Equal(["a", "b", "x", "y"], r.Order);
+    }
+
+    [Fact]
+    public void Later_levels_use_ordinal_not_culture_order()
+    {
+        UnderEnUs(() =>
+        {
+            Assert.True(string.Compare("app.b", "app.C", StringComparison.CurrentCulture) < 0, "precondition: culture order differs");
+            // Level 0 = app.p, app.q; they release app.b then app.C. Ordinal puts 'C' (0x43) before 'b' (0x62).
+            var r = TopoSort.Sort(["app.b", "app.C", "app.p", "app.q"], [("app.b", "app.p"), ("app.C", "app.q")]);
+            Assert.Equal(["app.p", "app.q", "app.C", "app.b"], r.Order);
+        });
+    }
+
+    [Fact]
+    public void Edge_order_is_ordinal_not_culture_so_the_same_edge_is_cut_everywhere()
+    {
+        UnderEnUs(() =>
+        {
+            // Both edges are equally good; the first in ordinal (child, parent) order is cut. Ordinal: "app.C" < "app.b".
+            var r = TopoSort.Sort(["app.b", "app.C"], [("app.b", "app.C"), ("app.C", "app.b")]);
+            Assert.Equal([("app.C", "app.b")], r.CycleEdges);
+            Assert.Equal(["app.C", "app.b"], r.Order);
+        });
+    }
+
+    [Fact]
+    public void Self_loop_is_cut_before_a_preferred_edge_in_the_same_component()
+    {
+        // One component {a, b} holding a self-loop on a and the preferred edge (b, a). Round 1 cuts the self-loop,
+        // round 2 (a <-> b still cyclic) cuts the preferred edge.
+        var r = TopoSort.Sort(["a", "b"], [("a", "a"), ("a", "b"), ("b", "a")], (c, p) => (c, p) == ("b", "a"));
+        Assert.Equal([("a", "a"), ("b", "a")], r.CycleEdges);
+        Assert.Equal(["a", "b"], Assert.Single(r.Cycles));
+        Assert.Equal(["b", "a"], r.Order);
+    }
+
+    [Fact]
+    public void A_component_still_cyclic_after_one_cut_takes_more_rounds_but_is_reported_once()
+    {
+        // Bidirectional triangle: round 1 cuts (a,b), round 2 cuts (a,c), round 3 cuts (b,c) from the remaining {b, c} cycle.
+        var r = TopoSort.Sort(["a", "b", "c"], [("a", "b"), ("b", "a"), ("b", "c"), ("c", "b"), ("a", "c"), ("c", "a")]);
+        Assert.Equal([("a", "b"), ("a", "c"), ("b", "c")], r.CycleEdges);
+        Assert.Equal(["a", "b", "c"], Assert.Single(r.Cycles));
+        Assert.Equal(["a", "b", "c"], r.Order);
+    }
+
+    [Fact]
+    public void Sort_rejects_null_arguments_naming_the_parameter()
+    {
+        Assert.Throws<ArgumentNullException>("nodes", () => TopoSort.Sort(null!, []));
+        Assert.Throws<ArgumentNullException>("edges", () => TopoSort.Sort(["a"], null!));
+        Assert.Throws<ArgumentNullException>("nodes", () => TopoSort.Sort(null!, [], (_, _) => true));
+        Assert.Throws<ArgumentNullException>("edges", () => TopoSort.Sort(["a"], null!, (_, _) => true));
+        Assert.Throws<ArgumentException>("nodes", () => TopoSort.Sort(["a", null!], []));
+    }
 }
 
 public class SqlQuoteTests
@@ -103,5 +178,7 @@ public class SqlQuoteTests
     [Fact] public void Table_quotes_both_parts() => Assert.Equal("[app].[Orders]", SqlQuote.Table("app", "Orders"));
     [Fact] public void TableKey_splits_on_first_dot() => Assert.Equal("[dbo].[My.Table]", SqlQuote.TableKey("dbo.My.Table"));
     [Fact] public void TableKey_rejects_keys_without_schema() => Assert.Throws<ArgumentException>(() => SqlQuote.TableKey("Customer"));
+    [Fact] public void TableKey_rejects_an_empty_schema() => Assert.Throws<ArgumentException>("key", () => SqlQuote.TableKey(".x"));
+    [Fact] public void TableKey_rejects_an_empty_name() => Assert.Throws<ArgumentException>("key", () => SqlQuote.TableKey("x."));
     [Fact] public void Literal_is_unicode_with_doubled_quotes() => Assert.Equal("N'O''Brien'", SqlQuote.Literal("O'Brien"));
 }

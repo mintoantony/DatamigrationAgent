@@ -1,7 +1,10 @@
 namespace Dbm.Core.SqlGen;
 
 /// <summary>Order = parents first. Cycles = the cyclic strongly connected components found in the input (members sorted ordinally).
-/// CycleEdges = the (child, parent) edges removed to break them.</summary>
+/// CycleEdges = the (child, parent) edges removed to break them.
+/// <para>The order of the <c>Cycles</c> and <c>CycleEdges</c> lists themselves is NOT ordinal: it is Tarjan emission order
+/// (sink components first), round by round. It is still deterministic, a pure function of the ordinally sorted nodes and edges,
+/// so it is identical on every machine and run. Consumers rely on it: SqlGenerator emits PreSql/PostSql in CycleEdges order.</para></summary>
 public sealed record TopoResult(List<string> Order, List<List<string>> Cycles, List<(string Child, string Parent)> CycleEdges);
 
 /// <summary>Deterministic dependency ordering for FK graphs (edge = child depends on parent).</summary>
@@ -22,6 +25,10 @@ public static class TopoSort
     public static TopoResult Sort(IReadOnlyCollection<string> nodes, IReadOnlyCollection<(string Child, string Parent)> edges,
         Func<string, string, bool>? preferBreak)
     {
+        // Explicit guards: nullable annotations are not enforced at runtime on net8.0.
+        ArgumentNullException.ThrowIfNull(nodes);
+        ArgumentNullException.ThrowIfNull(edges);
+        if (nodes.Any(n => n is null)) throw new ArgumentException("Node names must not be null.", nameof(nodes));
         var nodeList = nodes.Distinct(StringComparer.Ordinal).OrderBy(n => n, StringComparer.Ordinal).ToList();
         var nodeSet = new HashSet<string>(nodeList, StringComparer.Ordinal);
         var live = new SortedSet<(string Child, string Parent)>(EdgeOrder);
