@@ -28,6 +28,8 @@ public sealed class SqlGenJob : IJobHandler
             SqlValidator.Apply(plan, report);
             ctx.Log($"sqlgen: validation {(report.Ok ? "ok" : "found errors")}");
         }
+        // Ruling 57: this draft is stored without passing SqlModule.Validate, and carried-over or mapping-derived SQL can hold a lone CR.
+        SqlValidator.RecordBareCarriageReturns(plan);
 
         return new JobResult(Json.ToNode(plan), Summary(plan));
     }

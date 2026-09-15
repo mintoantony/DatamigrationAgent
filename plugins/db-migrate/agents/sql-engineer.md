@@ -56,6 +56,7 @@ given — never `state.db` — and never print or look for connection strings.
   and ends every `MERGE` with `;`. Replace the generated `INSERT … SELECT … FROM #stg;` skeleton with the real logic the
   `tableMap` asks for (lookups, de-duplication, `WHEN MATCHED` updates when the target may already hold the row).
 - No `GO` anywhere; each list element of `preSql`/`postSql` is one self-contained batch.
+- End lines with LF or CRLF only: a bare carriage return (`\r` not followed by `\n`) in any SQL field is an error, because SQL Server treats it as a line break.
 - Change `mode`, `columns` and `keyColumns` only together and consistently. Never patch `errors`, `warnings`, `custom`,
   `countSql` or `mappingHash` — the engine owns them, and a patch that changes `errors`, `warnings` or `custom` (plan or
   task) is rejected. Warnings prefixed `validate:` are recomputed on every check.

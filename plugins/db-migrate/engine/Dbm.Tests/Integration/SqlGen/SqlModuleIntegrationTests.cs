@@ -54,6 +54,38 @@ public sealed class SqlModuleIntegrationTests
         Assert.DoesNotContain(result.Warnings, w => w.Contains("varchar(500) -> nvarchar(200)", StringComparison.Ordinal));
     }
 
+    /// <summary>Ruling 57, live branch: sp_describe accepts a statement a lone CR splits, so the offline check must still reach the
+    /// dry-run, for a global statement and a task statement alike.</summary>
+    [Fact]
+    public async Task Live_dry_run_reports_a_bare_carriage_return()
+    {
+        await using var pair = await SampleDatabases.CreateAsync(1, seed: false);
+        using var project = await SampleProject.CreateAsync(pair);
+        var s = project.Services;
+        SqlGenJobTests.Prepare(s);
+        var plan = Plan();
+        var v = Store(s, plan);
+        var customers = plan.Tasks.Single(kv => kv.Value.Target == "app.Customers").Key;
+        const string hidden = "SELECT 1 AS a -- hidden\rDELETE FROM [app].[Customers];";
+        var ops = new List<PatchOp>
+        {
+            new("add", "/preSql/-", JsonValue.Create(hidden)),
+            new("add", $"/tasks/{customers}/postSql/-", JsonValue.Create(hidden)),
+        };
+
+        var result = s.Workflow.ApplyPatch(new Patch("sql", v, ops, []), dryRun: true);
+
+        Assert.False(result.Ok);
+        var patched = Json.Deserialize<SqlPlanPayload>(Json.Serialize(plan));
+        patched.PreSql.Add(hidden);
+        patched.Tasks[customers].PostSql.Add(hidden);
+        var expected = SqlValidator.FindBareCarriageReturns(patched).Select(f => $"{f.Scope}: {f.Line}").ToList();
+        Assert.Equal(2, expected.Count);
+        Assert.All(expected, e => Assert.Contains(e, result.Errors));
+        Assert.StartsWith("plan: preSql[", expected[0], StringComparison.Ordinal);
+        Assert.StartsWith($"{customers}: postSql[", expected[1], StringComparison.Ordinal);
+    }
+
     /// <summary>H1: the "not validated" marker is re-derived on every run — once live validation does run, it goes, and the plan
     /// is approvable on its merits.</summary>
     [Fact]

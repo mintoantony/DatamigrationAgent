@@ -514,10 +514,192 @@ public sealed class SqlModuleTests : IDisposable
         Assert.Contains("\nmodel: inherit\n", text);
         foreach (var phrase in new[] { "dbm sql validate --patch <patchPath>", "dbm apply <patchPath> --dry-run", "\"globalWarnings\":[…]",
                      $"\"{SqlValidator.SingleTaskGlobalWarning}\"", SqlValidator.NotCheckedMarker.Trim(), "No plan SQL — generated or agent-written — is ever executed",
-                     "session-local temp table in tempdb, dropped at connection close", "state.db", "feedbackId" })
+                     "session-local temp table in tempdb, dropped at connection close", "state.db", "feedbackId", "bare carriage return" })
             Assert.Contains(phrase, text);
         Assert.DoesNotContain("nothing is ever executed", text, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("PARSEONLY", text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // ---------------------------------------------------------------- Ruling 57: a lone CR in any SQL body is an error
+
+    private const string Advice = " (SQL Server treats it as a line break; use CRLF or LF)";
+    private const string Hidden = "-- note\rDELETE FROM app.Customers";
+
+    private static string CrError(string scope, string field, int line) =>
+        $"{scope}: {field}: bare carriage return at line {line}{Advice}";
+
+    /// <summary>The number the review screen shows: the TaskListing line whose text holds the CR.</summary>
+    private static int ListingLineOfCr(TaskPlan task) => TaskListing.Build(task).Single(l => l.Text.Contains('\r')).No;
+
+    /// <summary>The global card numbers the statements joined by a GO line, by TaskListing's rules.</summary>
+    private static int GlobalCardLineOfCr(List<string> statements) =>
+        TaskListing.Build(new TaskPlan { SourceQuery = string.Join("\nGO\n", statements) }).Single(l => l.Text.Contains('\r')).No;
+
+    /// <summary>Harm-first: a stored version whose SQL hides a DELETE behind a comment that SQL Server ends at the CR — stored with no
+    /// evidence at all, as a version from before this rule would be — cannot be approved. The outcome, not a string, is the assertion.</summary>
+    [Fact]
+    public void A_hidden_statement_behind_a_bare_carriage_return_is_not_approvable()
+    {
+        var plan = Plan();
+        plan.Tasks["T05"].PreSql.Insert(0, Hidden);
+        Ctx(plan);
+        _services.Phases.SetStatus(PhaseName.Sql, PhaseStatus.AwaitingReview);
+
+        var ex = Assert.Throws<WorkflowException>(() => _services.Workflow.Approve(PhaseName.Sql));
+
+        Assert.NotEqual(PhaseStatus.Approved, _services.Phases.Get(PhaseName.Sql).Status);
+        Assert.Contains(CrError("T05", "preSql[0]", 1), ex.Details);
+
+        // Control: the same plan without the CR approves, so nothing else blocked it.
+        plan.Tasks["T05"].PreSql[0] = "-- note\r\nDELETE FROM app.Customers";
+        Ctx(plan);
+        _services.Phases.SetStatus(PhaseName.Sql, PhaseStatus.AwaitingReview);
+        _services.Workflow.Approve(PhaseName.Sql);
+        Assert.Equal(PhaseStatus.Approved, _services.Phases.Get(PhaseName.Sql).Status);
+    }
+
+    [Fact]
+    public void The_error_line_is_the_TaskListing_line_that_holds_the_carriage_return()
+    {
+        var plan = Plan();
+        var t05 = plan.Tasks["T05"];
+        t05.PreSql.Insert(0, Hidden);
+        Assert.Equal(1, ListingLineOfCr(t05));
+
+        var t04 = plan.Tasks["T04"];
+        t04.PreSql.Add("UPDATE STATISTICS [app].[Addresses];\r\n");            // lines 1-2 (trailing CRLF numbers an empty line)
+        t04.SourceQuery = "SELECT\r\n    s.[X] AS [X]\r\n" + Hidden + "\r\nFROM [dbo].[T] AS s";
+        var expected = ListingLineOfCr(t04);
+        Assert.Equal(5, expected);
+        var ctx = Ctx(Plan());
+        var payload = Json.ToNode(plan);
+
+        var check = _module.Validate(ctx, payload);
+
+        Assert.False(check.Ok);
+        Assert.Contains(CrError("T05", "preSql[0]", 1), check.Errors);
+        Assert.Contains(CrError("T04", "sourceQuery", expected), check.Errors);
+        Assert.Equal(2, check.Errors.Count(e => e.Contains(SqlValidator.BareCarriageReturnMarker, StringComparison.Ordinal)));
+        // Stored in the task's own errors (the ones that block approval), without the task prefix.
+        Assert.Equal([$"sourceQuery: bare carriage return at line {expected}{Advice}"], Json.FromNode<SqlPlanPayload>(payload).Tasks["T04"].Errors);
+    }
+
+    [Fact]
+    public void Every_occurrence_is_its_own_error()
+    {
+        var plan = Plan();
+        plan.Tasks["T05"].PostSql.Add("-- a\rUPDATE x SET y = 1 -- b\rDELETE FROM app.Customers");
+        var line = ListingLineOfCr(plan.Tasks["T05"]);
+
+        var check = _module.Validate(Ctx(Plan()), Json.ToNode(plan));
+
+        Assert.Equal(2, check.Errors.Count(e => e == CrError("T05", "postSql[0]", line)));
+    }
+
+    [Fact]
+    public void Crlf_and_lf_alone_are_not_errors()
+    {
+        var plan = Plan();
+        plan.Tasks["T05"].SourceQuery = plan.Tasks["T05"].SourceQuery.Replace("\n", "\r\n", StringComparison.Ordinal);
+        plan.Tasks["T04"].PreSql.Add("SELECT 1;\nSELECT 2;\r\n");
+        plan.PreSql.Add("SELECT 1;\r\n\r\nSELECT 2;\n");
+
+        var check = _module.Validate(Ctx(Plan()), Json.ToNode(plan));
+
+        Assert.True(check.Ok, string.Join("; ", check.Errors));
+        Assert.Empty(SqlValidator.FindBareCarriageReturns(plan));
+    }
+
+    /// <summary>Offline (the fixture has no connections): the check still runs, on the global statements too. A global statement's N is
+    /// its line in the screen's global card; the field names the statement.</summary>
+    [Fact]
+    public void The_check_runs_offline_and_covers_the_global_statements()
+    {
+        var plan = Plan();
+        plan.PreSql.Add("SELECT 1;\r\nSELECT 2;");
+        plan.PreSql.Add("SELECT 3;\r\n" + Hidden);
+        plan.PostSql.Insert(0, Hidden);
+        var preLine = GlobalCardLineOfCr(plan.PreSql);
+        var postLine = GlobalCardLineOfCr(plan.PostSql);
+        var ctx = Ctx(Plan());
+        var payload = Json.ToNode(plan);
+
+        var check = _module.Validate(ctx, payload);
+
+        Assert.Contains(OfflineMarker, check.Warnings);
+        Assert.False(check.Ok);
+        var pre = $"preSql[{plan.PreSql.Count - 1}]";
+        Assert.Contains(CrError("plan", pre, preLine), check.Errors);
+        Assert.Contains(CrError("plan", "postSql[0]", postLine), check.Errors);
+        Assert.Equal(1, postLine);
+        var stored = Json.FromNode<SqlPlanPayload>(payload);
+        Assert.Contains($"{pre}: bare carriage return at line {preLine}{Advice}", stored.Errors);
+        Assert.Contains(CrError("plan", pre, preLine), _module.ApprovalBlockers(ctx, payload));
+    }
+
+    /// <summary>A stored version with a bare CR and its error (as sqlgen stores it). The plan is the base of the next patch.</summary>
+    private (SqlPlanPayload Plan, ModuleContext Ctx) StoredWithCr()
+    {
+        var plan = Plan();
+        plan.Tasks["T05"].PreSql.Insert(0, Hidden);
+        SqlValidator.RecordBareCarriageReturns(plan);
+        Assert.Equal([$"preSql[0]: bare carriage return at line 1{Advice}"], plan.Tasks["T05"].Errors);
+        return (plan, Ctx(plan));
+    }
+
+    [Fact]
+    public void A_patch_that_fixes_the_carriage_return_clears_the_error()
+    {
+        var (plan, ctx) = StoredWithCr();
+        var payload = Json.ToNode(plan);
+        payload["tasks"]!["T05"]!["preSql"]![0] = "-- note\r\nDELETE FROM app.Customers";
+
+        var check = _module.Validate(ctx, payload);
+
+        Assert.True(check.Ok, string.Join("; ", check.Errors));
+        Assert.Empty(Json.FromNode<SqlPlanPayload>(payload).Tasks["T05"].Errors);
+    }
+
+    [Fact]
+    public void A_patch_that_leaves_the_carriage_return_keeps_exactly_one_error()
+    {
+        var (plan, ctx) = StoredWithCr();
+        var payload = Json.ToNode(plan);
+        payload["tasks"]!["T04"]!["sourceQuery"] = plan.Tasks["T04"].SourceQuery + "\nWHERE 1 = 1";
+
+        var check = _module.Validate(ctx, payload);
+
+        Assert.Equal([CrError("T05", "preSql[0]", 1)], check.Errors);
+        Assert.Equal([$"preSql[0]: bare carriage return at line 1{Advice}"], Json.FromNode<SqlPlanPayload>(payload).Tasks["T05"].Errors);
+    }
+
+    [Fact]
+    public void A_patch_may_not_delete_the_error_while_the_carriage_return_remains()
+    {
+        var (plan, ctx) = StoredWithCr();
+        var payload = Json.ToNode(plan);
+        payload["tasks"]!["T05"]!["errors"] = new JsonArray();
+
+        var check = _module.Validate(ctx, payload);
+
+        Assert.Equal(["T05: errors is engine-owned (recorded by validation); a patch may not change it"], check.Errors);
+        Assert.Contains(CrError("T05", "preSql[0]", 1), _module.ApprovalBlockers(ctx, Json.ToNode(plan)));
+    }
+
+    [Fact]
+    public void Dry_run_shows_the_bare_carriage_return()
+    {
+        var plan = Plan();
+        Ctx(plan);
+        _services.Phases.SetStatus(PhaseName.Sql, PhaseStatus.Drafting);
+        var current = _services.Phases.Get(PhaseName.Sql).CurrentVersion!.Value;
+
+        var result = _services.Workflow.ApplyPatch(new Dbm.Core.Patching.Patch("sql", current,
+            [new Dbm.Core.Patching.PatchOp("add", "/tasks/T05/preSql/0", JsonValue.Create(Hidden))], []), dryRun: true);
+
+        Assert.False(result.Ok);
+        Assert.Contains(CrError("T05", "preSql[0]", 1), result.Errors);
+        Assert.Equal(current, _services.Phases.Get(PhaseName.Sql).CurrentVersion);
     }
 
     /// <summary>Pins every numbering rule that views/sql.js (T4.5) mirrors: section order, the empty-section skip, CRLF

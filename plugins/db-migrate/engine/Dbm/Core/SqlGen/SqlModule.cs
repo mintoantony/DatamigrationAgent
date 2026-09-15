@@ -108,7 +108,8 @@ public sealed class SqlModule : IPhaseModule
     /// <para>The patch surface may write SQL, never validation evidence: a payload that changes <c>errors</c>, <c>warnings</c>
     /// (plan or task) or <c>custom</c> against the base is rejected before anything is normalised. The engine then writes its own
     /// lines — including, when live validation cannot run, the stored <see cref="SqlPlanSource.SkippedPrefix"/> marker that blocks
-    /// approval (re-derived on every run: added offline, removed live).</para></summary>
+    /// approval (re-derived on every run: added offline, removed live), and, on every run, the bare-CR errors
+    /// (<see cref="SqlValidator.RecordBareCarriageReturns"/>).</para></summary>
     public PayloadCheck Validate(ModuleContext ctx, JsonNode payload)
     {
         ArgumentNullException.ThrowIfNull(ctx);
@@ -158,6 +159,8 @@ public sealed class SqlModule : IPhaseModule
             foreach (var (id, task) in plan.Tasks.OrderBy(kv => kv.Key, StringComparer.Ordinal))
                 errors.AddRange(SqlValidator.CheckShape(task).Select(e => $"{id}: {e}"));
         }
+        // Ruling 57: offline, live or not, every run re-derives the bare-CR errors into the stored errors (a fixed CR clears).
+        errors.AddRange(SqlValidator.RecordBareCarriageReturns(plan));
 
         ReplaceContent(payload.AsObject(), plan);
         return new PayloadCheck(errors, warnings);
@@ -214,6 +217,10 @@ public sealed class SqlModule : IPhaseModule
         var orderSet = new HashSet<string>(plan.Order, StringComparer.Ordinal);
         if (plan.Order.Count != plan.Tasks.Count || !orderSet.SetEquals(plan.Tasks.Keys))
             blockers.Add("order must list every task id exactly once");
+        // Ruling 57: derived from the SQL itself, not only from stored errors, so a version stored before the rule is blocked too.
+        // A global line equals its stored "plan: " blocker, so only lines not already listed are added.
+        var listed = new HashSet<string>(blockers, StringComparer.Ordinal);
+        blockers.AddRange(SqlValidator.FindBareCarriageReturns(plan).Select(f => $"{f.Scope}: {f.Line}").Where(l => !listed.Contains(l)));
         return blockers;
     }
 

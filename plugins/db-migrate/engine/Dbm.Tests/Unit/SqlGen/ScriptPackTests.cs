@@ -47,6 +47,23 @@ public class ScriptPackTests
         Assert.Contains("-- Keys:            (none - the table loads in a single transaction)\n", files["01_app_AuditEvents.sql"]);
     }
 
+    /// <summary>Ruling 57: a bare-CR error is flagged in the pack exactly as any other stored task error — in the task file's
+    /// "Errors (last validation)" header.</summary>
+    [Fact]
+    public void A_bare_carriage_return_error_is_listed_like_any_other_task_error()
+    {
+        var plan = Plan();
+        plan.Tasks["T05"].PreSql.Insert(0, "-- note\rDELETE FROM app.Customers");
+        SqlValidator.RecordBareCarriageReturns(plan);
+        plan.Tasks["T04"].Errors.Add("sourceQuery: Invalid column name 'X'.");
+
+        var files = ScriptPack.BuildFiles(plan, "demo").ToDictionary(f => f.Name, f => f.Content);
+
+        Assert.Contains("-- Errors (last validation):\n--   - sourceQuery: Invalid column name 'X'.\n", files["04_app_Addresses.sql"]);
+        Assert.Contains("-- Errors (last validation):\n--   - preSql[0]: bare carriage return at line 1 (SQL Server treats it as a line break; use CRLF or LF)\n",
+            files["05_app_Orders.sql"]);
+    }
+
     [Fact]
     public void Global_files_hold_the_cycle_statements()
     {
