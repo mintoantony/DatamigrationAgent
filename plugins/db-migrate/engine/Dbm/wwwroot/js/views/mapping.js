@@ -926,7 +926,7 @@
     if (view.held !== next.version) {
       view.held = next.version;
       view.ctx.toast('A newer mapping version (v' + next.version + ') was created. Your unsaved edits to v' + view.ctx.version +
-        ' are kept on screen but can no longer be saved; discard them to load v' + next.version + '.', 'warn');
+        ' are still on screen but cannot be saved against it. Click Discard to drop them and load v' + next.version + '.', 'warn');
     }
     return true;
   }

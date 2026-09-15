@@ -96,14 +96,15 @@ function context() {
   };
 }
 
-const server = { status: 'awaiting_review', version: 3, payloads: { 3: payload() }, feedback: [], posts: [], onEdit: null };
+const server = { status: 'awaiting_review', version: 3, payloads: { 3: payload() }, feedback: [], posts: [], onEdit: null, agentOnline: true };
 let sse = null;
 let lastCtx = null;
 const toasts = [];
+const analysisRenders = [];   // a view without holdRender (stands in for analysis.js / setup.js / pending.js)
 
 function stateDoc() {
   return {
-    project: { name: 'p', paused: false, agentOnline: true },
+    project: { name: 'p', paused: false, agentOnline: server.agentOnline },
     phases: [
       { name: 'setup', status: 'approved', currentVersion: null, approvedVersion: null },
       { name: 'analysis', status: 'approved', currentVersion: 1, approvedVersion: 1 },
@@ -161,7 +162,7 @@ DBM.api = { get, post, del: () => Promise.resolve({}), events: (onEvent) => { ss
 DBM.views = {
   setup: { render() {} },
   pending: { render() {} },
-  analysis: { title: 'Analysis', render(root) { root.appendChild(DBM.h('div', { class: 'analysis' })); } },
+  analysis: { title: 'Analysis', render(root, ctx) { analysisRenders.push({ ctx, args: arguments.length }); root.appendChild(DBM.h('div', { class: 'analysis' })); } },
 };
 vm.runInThisContext(fs.readFileSync(path.join(JS, 'views', 'mapping.js'), 'utf8'), { filename: 'mapping.js' });
 vm.runInThisContext(fs.readFileSync(path.join(JS, 'app.js'), 'utf8'), { filename: 'app.js' });
@@ -284,6 +285,45 @@ test('2b. a held view is released when the phase stops awaiting review (the edit
   assert.equal(header().split(' · ')[0], 'v4', 'released to the new, read-only version');
   assert.equal(barStatus(), null);
   assert.ok(toasts.some((t) => /discarded/.test(t.msg)), 'the user is told the edits were dropped');
+});
+
+test('2c. the hold is not a latch: after Discard the next background refresh renders the new version', async () => {
+  await reset();
+  await editEmail('LOWER(s.[EMAIL_ADDR])');
+  publish(4, payload());
+  sse({ type: 'artifact_created', data: { phase: 'mapping', version: 4 } });
+  await settle(300);
+  assert.equal(header().split(' · ')[0], 'v3', 'held while dirty');
+  byText('button', 'Discard').fire('click');
+  await settle(300);
+  sse({ type: 'agent_presence', data: {} });    // an ordinary later refresh, independent of what Discard itself does
+  await settle(300);
+  assert.equal(header().split(' · ')[0], 'v4', 'no longer dirty, so the refresh goes through');
+  assert.equal(barStatus(), 'No unsaved changes');
+});
+
+test('7. a view without holdRender re-renders exactly as before on every view-key change', async () => {
+  await reset();
+  DBM.app.select('analysis');
+  await settle();
+  const n = analysisRenders.length;
+  const first = analysisRenders[n - 1].ctx;
+  server.agentOnline = false;                   // part of viewKey
+  sse({ type: 'agent_presence', data: {} });
+  await settle(300);
+  server.agentOnline = true;
+  assert.equal(analysisRenders.length, n + 1, 'the key change re-rendered the view');
+  assert.notEqual(analysisRenders[n].ctx, first, 'with a fresh ctx');
+  assert.equal(analysisRenders[n].ctx.state.project.agentOnline, false);
+  assert.equal(view.children.length, 1, 'into a cleared root');
+  sse({ type: 'agent_presence', data: {} });
+  await settle(300);
+  assert.equal(analysisRenders.length, n + 2, 'agentOnline flipped back, so one more render');
+  sse({ type: 'agent_presence', data: {} });
+  await settle(300);
+  assert.equal(analysisRenders.length, n + 2, 'same key: no render');
+  DBM.app.select('mapping');
+  await settle();
 });
 
 test('3. clean view: artifact_created refreshes to the new version as before', async () => {
