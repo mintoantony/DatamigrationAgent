@@ -140,6 +140,22 @@ public class ScriptPackTests
         Assert.Contains("--   - T03: task is missing from order\n", pre);
     }
 
+    /// <summary>N2: a duplicate id in Order exports its task exactly once, at the first position; the WARNING block names the duplicate.</summary>
+    [Fact]
+    public void A_duplicate_order_id_exports_its_task_once()
+    {
+        var plan = Plan();
+        plan.Order.Add("T01");
+
+        var files = ScriptPack.BuildFiles(plan, "demo");
+
+        var t01 = Assert.Single(files, f => f.Content.Contains("-- demo: task T01  app.AuditEvents\n", StringComparison.Ordinal));
+        Assert.Equal("01_app_AuditEvents.sql", t01.Name);
+        Assert.Contains("- order[6]: T01 is listed more than once", files.Single(f => f.Name == "README.md").Content);
+        Assert.Contains("--   - order[6]: T01 is listed more than once\n", files[0].Content);
+        Assert.Single(files.Single(f => f.Name == "README.md").Content.Split('\n'), l => l.StartsWith("| `", StringComparison.Ordinal) && l.Contains("| T01 |", StringComparison.Ordinal));
+    }
+
     /// <summary>Fix round 2 (concern 3): the DBA never sees ApprovalBlockers. A pack of a plan nothing validated says so, with the stored
     /// line verbatim; a validated plan's pack says nothing of the kind.</summary>
     [Fact]
@@ -168,23 +184,36 @@ public class ScriptPackTests
 
     const string Hostile ="x\nCANARY_LF;\rCANARY_CR;\r\nCANARY_CRLF;\u2028CANARY_LS;\u2029CANARY_PS;\u0085CANARY_NEL;\vCANARY_VT;\fCANARY_FF;";
 
-    /// <summary>The SQL bodies ARE executable by design; every other value that reaches the pack is text.</summary>
-    static readonly HashSet<string> SqlBodies = [nameof(TaskPlan.SourceQuery), nameof(TaskPlan.StagingDdl), nameof(TaskPlan.MergeSql),
-        nameof(TaskPlan.PreSql), nameof(TaskPlan.PostSql), nameof(TaskPlan.CountSql)];
+    /// <summary>Plan properties the poisoning skips: the global SQL bodies (executable by design) and Order (its ids are poisoned by
+    /// renaming one task, below, so Order and Tasks keep matching). Pinned by <see cref="Poison_exclusions_are_exactly_the_sql_bodies_and_order"/>.</summary>
+    static readonly HashSet<string> Excluded =
+    [
+        $"{nameof(SqlPlanPayload)}.{nameof(SqlPlanPayload.PreSql)}", $"{nameof(SqlPlanPayload)}.{nameof(SqlPlanPayload.PostSql)}",
+        $"{nameof(SqlPlanPayload)}.{nameof(SqlPlanPayload.Order)}",
+        $"{nameof(TaskPlan)}.{nameof(TaskPlan.SourceQuery)}", $"{nameof(TaskPlan)}.{nameof(TaskPlan.StagingDdl)}",
+        $"{nameof(TaskPlan)}.{nameof(TaskPlan.MergeSql)}", $"{nameof(TaskPlan)}.{nameof(TaskPlan.PreSql)}",
+        $"{nameof(TaskPlan)}.{nameof(TaskPlan.PostSql)}", $"{nameof(TaskPlan)}.{nameof(TaskPlan.CountSql)}",
+    ];
 
-    /// <summary>Poisons, by reflection, every string and string-list property of the plan and its tasks that is not a SQL body —
-    /// so a field added later is hostile here without anyone remembering to list it.</summary>
+    /// <summary>Growing the exclusion list must be a visible decision: this literal fails when it changes.</summary>
+    [Fact]
+    public void Poison_exclusions_are_exactly_the_sql_bodies_and_order()
+    {
+        Assert.Equal(
+            ["SqlPlanPayload.Order", "SqlPlanPayload.PostSql", "SqlPlanPayload.PreSql",
+             "TaskPlan.CountSql", "TaskPlan.MergeSql", "TaskPlan.PostSql", "TaskPlan.PreSql", "TaskPlan.SourceQuery", "TaskPlan.StagingDdl"],
+            Excluded.Order(StringComparer.Ordinal));
+        Assert.Equal("TaskPlan.Mode", ModeKey);
+    }
+
+    const string ModeKey = $"{nameof(TaskPlan)}.{nameof(TaskPlan.Mode)}";
+
+    /// <summary>Poisons, by reflection and recursively, every text value of the plan that is not excluded: string properties, any
+    /// string sequence (List, array, ...), nested records/classes (ColumnBinding), and collections or dictionaries of them — so a field
+    /// added later is hostile here without anyone remembering to list it. A property type it cannot poison fails the test.</summary>
     static SqlPlanPayload Poisoned(SqlPlanPayload plan, bool keepMode)
     {
-        foreach (var p in typeof(SqlPlanPayload).GetProperties())
-            if (p.Name is not (nameof(SqlPlanPayload.PreSql) or nameof(SqlPlanPayload.PostSql) or nameof(SqlPlanPayload.Order) or nameof(SqlPlanPayload.Tasks)))
-                Poison(plan, p);
-        foreach (var task in plan.Tasks.Values)
-        {
-            foreach (var p in typeof(TaskPlan).GetProperties())
-                if (!SqlBodies.Contains(p.Name) && !(keepMode && p.Name == nameof(TaskPlan.Mode))) Poison(task, p);
-            task.Columns = task.Columns.Select(c => new ColumnBinding(c.Source + Hostile, c.Target + Hostile)).ToList();
-        }
+        PoisonObject(plan, keepMode ? [.. Excluded, ModeKey] : Excluded);
         var id = plan.Order[^1];
         var hostileId = id + Hostile;
         plan.Tasks = plan.Tasks.ToDictionary(kv => kv.Key == id ? hostileId : kv.Key, kv => kv.Value, StringComparer.Ordinal);
@@ -192,10 +221,57 @@ public class ScriptPackTests
         return plan;
     }
 
-    static void Poison(object target, System.Reflection.PropertyInfo p)
+    static void PoisonObject(object target, HashSet<string> excluded)
     {
-        if (p.PropertyType == typeof(string)) p.SetValue(target, (string?)p.GetValue(target) + Hostile);
-        else if (p.PropertyType == typeof(List<string>)) ((List<string>)p.GetValue(target)!).Add(Hostile);
+        foreach (var p in target.GetType().GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance))
+        {
+            if (p.GetIndexParameters().Length > 0 || excluded.Contains($"{target.GetType().Name}.{p.Name}")) continue;
+            var type = p.PropertyType;
+            var value = p.GetValue(target);
+            if (type == typeof(string)) p.SetValue(target, (string?)value + Hostile);
+            else if (Nullable.GetUnderlyingType(type) is { } inner ? IsInert(inner) : IsInert(type)) { }
+            else if (type == typeof(string[])) p.SetValue(target, ((string[]?)value ?? Array.Empty<string>()).Append(Hostile).ToArray());
+            else if (value is IList<string> strings && !strings.IsReadOnly) strings.Add(Hostile);
+            else if (value is System.Collections.IDictionary dict) { foreach (var item in dict.Values) PoisonItem(item, excluded, p); }
+            else if (value is System.Collections.IEnumerable items and not IEnumerable<string>) { foreach (var item in items) PoisonItem(item, excluded, p); }
+            else if (value is null && typeof(System.Collections.IEnumerable).IsAssignableFrom(type)) { }
+            else if (type.IsClass && type.Namespace?.StartsWith("Dbm.", StringComparison.Ordinal) == true) { if (value is not null) PoisonObject(value, excluded); }
+            else throw new InvalidOperationException($"Poison cannot reach {target.GetType().Name}.{p.Name} ({type}); teach it, or the H2 test goes blind to that field.");
+        }
+    }
+
+    static void PoisonItem(object? item, HashSet<string> excluded, System.Reflection.PropertyInfo p)
+    {
+        if (item is null) return;
+        if (item is string) throw new InvalidOperationException($"Poison cannot append to the read-only string sequence {p.DeclaringType!.Name}.{p.Name}.");
+        PoisonObject(item, excluded);
+    }
+
+    static bool IsInert(Type t) => t.IsPrimitive || t.IsEnum || t == typeof(decimal) || t == typeof(DateTime) || t == typeof(DateTimeOffset) || t == typeof(Guid);
+
+    /// <summary>The poisoning itself must reach nested and array-typed values, or the test above proves nothing about them.</summary>
+    [Fact]
+    public void Poisoning_reaches_nested_records_and_string_arrays()
+    {
+        var holder = new PoisonProbe { Notes = ["a"], Bindings = [new ColumnBinding("s", "t")], Nested = new PoisonProbe { Name = "n" } };
+        PoisonObject(holder, []);
+        Assert.Equal(["a", Hostile], holder.Notes);
+        Assert.Equal(new ColumnBinding("s" + Hostile, "t" + Hostile), holder.Bindings[0]);
+        Assert.Equal("n" + Hostile, holder.Nested!.Name);
+        Assert.Throws<InvalidOperationException>(() => PoisonObject(new UnpoisonableProbe(), []));
+    }
+
+    public sealed class PoisonProbe
+    {
+        public string Name { get; set; } = "";
+        public string[] Notes { get; set; } = [];
+        public List<ColumnBinding> Bindings { get; set; } = [];
+        public PoisonProbe? Nested { get; set; }
+    }
+
+    public sealed class UnpoisonableProbe
+    {
+        public Uri Where { get; set; } = new("http://example.invalid/");
     }
 
     /// <summary>H2: the pack is run by a DBA with production credentials. No interpolated value may end a `--` comment and start a

@@ -399,6 +399,60 @@ public sealed class SqlModuleTests : IDisposable
         Assert.Null(payload["tasks"]!["T05"]);
     }
 
+    /// <summary>Ruling 63 (N1): deleting a task is allowed, but its evidence does not vanish with it. The re-review's rename route —
+    /// delete T05, add an identical T07 with no warnings — leaves every error and non-validate: warning of T05 as a plan warning,
+    /// verbatim but flattened, in the stored plan and in the dry-run warnings.</summary>
+    [Fact]
+    public void Removing_a_task_carries_its_evidence_into_plan_warnings()
+    {
+        var plan = Plan();
+        var t05 = plan.Tasks["T05"];
+        Assert.Contains("target has 1 trigger(s); not fired unless FireTriggers", t05.Warnings);
+        t05.Errors.Add("sourceQuery: Invalid column name 'X'.");
+        t05.Warnings.Add(SqlValidator.WarningPrefix + "Comment: varchar(500) -> nvarchar(200)");   // recomputed by validation: not carried
+        t05.Warnings.Add("line one\nline two");
+        var ctx = Ctx(plan);
+        var payload = Json.ToNode(plan);
+        var copy = Json.ToNode(t05).AsObject();
+        copy["errors"] = new JsonArray();
+        copy["warnings"] = new JsonArray();
+        payload["tasks"]!.AsObject().Remove("T05");
+        payload["tasks"]!["T07"] = copy;
+        payload["order"]![plan.Order.IndexOf("T05")] = "T07";
+
+        var check = _module.Validate(ctx, payload);
+
+        Assert.True(check.Ok, string.Join("; ", check.Errors));
+        List<string> expected =
+        [
+            "removed task T05 carried: sourceQuery: Invalid column name 'X'.",
+            .. t05.Warnings.Where(w => !w.StartsWith(SqlValidator.WarningPrefix, StringComparison.Ordinal) && w != "line one\nline two")
+                .Select(w => "removed task T05 carried: " + w),
+            "removed task T05 carried: line one line two",
+        ];
+        Assert.Contains("removed task T05 carried: target has 1 trigger(s); not fired unless FireTriggers", expected);
+        Assert.Equal(expected, Stored(payload).Where(w => w.StartsWith("removed task ", StringComparison.Ordinal)));
+        Assert.Equal(expected, check.Warnings.Where(w => w.StartsWith("removed task ", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public void Removing_a_task_without_evidence_carries_nothing()
+    {
+        var plan = Plan();
+        plan.Tasks["T03"].Warnings.Clear();
+        Assert.Empty(plan.Tasks["T03"].Errors);
+        var ctx = Ctx(plan);
+        var payload = Json.ToNode(plan);
+        payload["tasks"]!.AsObject().Remove("T03");
+        payload["order"]!.AsArray().RemoveAt(plan.Order.IndexOf("T03"));
+
+        var check = _module.Validate(ctx, payload);
+
+        Assert.True(check.Ok, string.Join("; ", check.Errors));
+        Assert.Equal([.. plan.Warnings, OfflineMarker], Stored(payload));
+        Assert.Equal([OfflineMarker], check.Warnings);
+    }
+
     /// <summary>M2: a task missing from order would vanish from the script pack and the run; an order id with no task, or listed
     /// twice, is equally wrong. Each is its own error.</summary>
     [Fact]

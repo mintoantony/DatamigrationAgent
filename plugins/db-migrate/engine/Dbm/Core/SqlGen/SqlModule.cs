@@ -130,7 +130,9 @@ public sealed class SqlModule : IPhaseModule
         }
 
         var errors = plan.OrderProblems();
-        var warnings = new List<string>();
+        // Ruling 63: a removed task's evidence does not vanish with it. Engine-authored, so written after the ownership check.
+        var warnings = RemovedTaskEvidence(plan, basePlan);
+        plan.Warnings.AddRange(warnings);
         var skipped = SqlPlanSource.SkippedWarning(ctx.Services);
         if (skipped is null)
         {
@@ -159,6 +161,19 @@ public sealed class SqlModule : IPhaseModule
 
         ReplaceContent(payload.AsObject(), plan);
         return new PayloadCheck(errors, warnings);
+    }
+
+    /// <summary>For every task in the base that the payload no longer has (ordinal id order): one line per error, then per warning that
+    /// validation does not recompute (no <see cref="SqlValidator.WarningPrefix"/>) — "removed task &lt;id&gt; carried: &lt;original line&gt;",
+    /// the original flattened by <see cref="ScriptPack.OneLine"/> and never reworded.</summary>
+    static List<string> RemovedTaskEvidence(SqlPlanPayload plan, SqlPlanPayload? basePlan)
+    {
+        var carried = new List<string>();
+        if (basePlan is null) return carried;
+        foreach (var (id, gone) in basePlan.Tasks.Where(kv => !plan.Tasks.ContainsKey(kv.Key)).OrderBy(kv => kv.Key, StringComparer.Ordinal))
+            foreach (var line in gone.Errors.Concat(gone.Warnings.Where(w => !w.StartsWith(SqlValidator.WarningPrefix, StringComparison.Ordinal))))
+                carried.Add($"removed task {id} carried: {ScriptPack.OneLine(line)}");
+        return carried;
     }
 
     static List<string> WithoutSkippedMarker(List<string> warnings) =>

@@ -43,7 +43,8 @@ public static class ScriptPack
         ArgumentNullException.ThrowIfNull(projectName);
         var problems = plan.OrderProblems();
         var notValidated = plan.Warnings.Where(w => w.StartsWith(SqlPlanSource.SkippedPrefix, StringComparison.Ordinal)).ToList();
-        var ordered = plan.Order.Select(id => (Id: id, Known: plan.Tasks.ContainsKey(id))).ToList();
+        var exported = new HashSet<string>(StringComparer.Ordinal);   // each task exactly once, at its first position in Order
+        var ordered = plan.Order.Select(id => (Id: id, Known: plan.Tasks.ContainsKey(id) && exported.Add(id))).ToList();
         var listed = new HashSet<string>(plan.Order, StringComparer.Ordinal);
         var slots = ordered.Concat(plan.Tasks.Keys.Where(k => !listed.Contains(k)).OrderBy(k => k, StringComparer.Ordinal).Select(k => (Id: k, Known: true))).ToList();
 
