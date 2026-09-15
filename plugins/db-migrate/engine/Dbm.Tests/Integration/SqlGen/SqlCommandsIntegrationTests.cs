@@ -9,7 +9,7 @@ public sealed class SqlCommandsIntegrationTests
 {
     /// <summary>Real registries plus a stand-in Sql module. WorkflowEngine.OnJobDone needs *a* module for the phase to store the
     /// sqlgen draft; SqlModule arrives in T4.4.
-    /// TODO(T4.4): drop this factory (pass null to CliRunner) so the test runs against the real SqlModule.</summary>
+    /// TODO(T4.4): drop this FakeModule factory (pass null to CliRunner) so the test runs against the real SqlModule.</summary>
     private static DbmServices WithFakeSqlModule(Workspace ws) =>
         DbmServices.Open(ws, null, s => ModuleRegistry.Create(s)
             .Append(new FakeModule(PhaseName.Sql, "sql-engineer", "sqlgen") { NeedsAgentResult = false }));
