@@ -11,14 +11,24 @@ namespace Dbm.Tests.Unit.SqlGen;
 /// the engine, so either implementation drifting would land a reviewer's comment on the wrong line without any error.</summary>
 public sealed class TaskListingMirrorTests
 {
+    /// <summary>Exactly one location: the build copies <c>js/fixtures/task-listing.json</c> of THIS project to
+    /// <c>fixtures/task-listing.json</c> under the output directory (see Dbm.Tests.csproj). No upward search, so another checkout's
+    /// copy can never be read in its place.</summary>
+    private static readonly string FixturePath = Path.Combine(AppContext.BaseDirectory, "fixtures", "task-listing.json");
+
     private static JsonElement Fixture()
     {
-        var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        const string relative = "plugins/db-migrate/engine/Dbm.Tests/js/fixtures/task-listing.json";
-        while (dir is not null && !File.Exists(Path.Combine(dir.FullName, relative))) dir = dir.Parent;
-        Assert.NotNull(dir);
-        using var doc = JsonDocument.Parse(File.ReadAllText(Path.Combine(dir!.FullName, relative)));
+        if (!File.Exists(FixturePath))
+            throw new FileNotFoundException($"Shared listing fixture not found at {FixturePath} (it is copied there from Dbm.Tests/js/fixtures by the build).", FixturePath);
+        using var doc = JsonDocument.Parse(File.ReadAllText(FixturePath));
         return doc.RootElement.Clone();
+    }
+
+    [Fact]
+    public void Fixture_is_read_from_the_output_copy_of_this_projects_file()
+    {
+        Assert.Equal(Path.Combine(AppContext.BaseDirectory, "fixtures", "task-listing.json"), FixturePath);
+        Assert.True(File.Exists(FixturePath), $"missing: {FixturePath}");
     }
 
     public static IEnumerable<object[]> ListingCases() =>

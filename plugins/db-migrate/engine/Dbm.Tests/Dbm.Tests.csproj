@@ -20,4 +20,9 @@
     <Using Include="Xunit" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Shared by js/sql-view.test.cjs and Unit/SqlGen/TaskListingMirrorTests.cs, which reads this output copy only. -->
+    <None Include="js\fixtures\task-listing.json" Link="fixtures\task-listing.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

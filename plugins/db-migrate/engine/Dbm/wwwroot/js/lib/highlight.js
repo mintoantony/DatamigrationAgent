@@ -76,8 +76,10 @@
       var nx = src[i + 1];
       var j;
       if (ch === '-' && nx === '-') {
-        j = src.indexOf('\n', i);
-        if (j < 0) j = n;
+        // SQL Server ends a line comment at a lone "\r" as well as "\n": "SELECT 1 AS a -- x<CR>, 2 AS b" returns 2 columns.
+        // Ending it only at "\n" would draw executable SQL after a bare CR as a comment.
+        j = i + 2;
+        while (j < n && src[j] !== '\n' && src[j] !== '\r') j++;
         push('com', src.slice(i, j)); i = j; continue;
       }
       if (ch === '/' && nx === '*') {
@@ -124,9 +126,15 @@
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
+  /* A bare "\r" stays inside its listing line (TaskListing), but SQL Server treats it as a line break and an HTML parser turns it
+     into "\n" — which would put the text after it on an unnumbered visual row. So it is drawn as a visible glyph instead. */
+  var CR_GLYPH = '<span class="tok-cr" title="bare carriage return: SQL Server treats this as a line break">␍</span>';
+
+  function escLine(s) { return esc(s).replace(/\r/g, CR_GLYPH); }
+
   /* One escaped HTML string per source line; tokens that span lines are closed and reopened on each line.
      Lines split exactly like Dbm.Core.SqlGen.TaskListing: "\r\n" becomes "\n", a lone "\r" is NOT a break and stays in its
-     line — the SQL view pairs these strings index-by-index with the listing's line numbers. */
+     line (rendered as a visible glyph) — the SQL view pairs these strings index-by-index with the listing's line numbers. */
   function sqlLines(text) {
     var src = String(text == null ? '' : text).replace(/\r\n/g, '\n');
     var lines = [''];
@@ -134,7 +142,7 @@
       tok.v.split('\n').forEach(function (part, idx) {
         if (idx > 0) lines.push('');
         if (!part) return;
-        lines[lines.length - 1] += tok.c ? '<span class="tok-' + tok.c + '">' + esc(part) + '</span>' : esc(part);
+        lines[lines.length - 1] += tok.c ? '<span class="tok-' + tok.c + '">' + escLine(part) + '</span>' : escLine(part);
       });
     });
     return lines;

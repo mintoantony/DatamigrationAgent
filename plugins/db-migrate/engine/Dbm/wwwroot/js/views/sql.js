@@ -105,22 +105,59 @@
     return ops;
   }
 
+  /* {taskId: string[]} — the contracted shape of taskErrors / taskWarnings. */
+  function isTaskLists(map) {
+    if (!map || typeof map !== 'object' || Array.isArray(map)) return false;
+    return Object.keys(map).every(function (k) { return Array.isArray(map[k]); });
+  }
+
   function countLists(map) {
-    return Object.keys(map || {}).reduce(function (n, k) { return n + ((map[k] || []).length); }, 0);
+    return isTaskLists(map) ? Object.keys(map).reduce(function (n, k) { return n + map[k].length; }, 0) : 0;
   }
 
   /**
-   * Verdict of a POST /api/sql/validate report. globalWarnings is a T4.3 contract: [] means the global statements were checked
-   * and are clean; a missing (or null) list means nobody said, so it is 'unreported' and never 'clean'. Every warning line counts
-   * — "not checked" lines included — so a statement that could not be checked is never shown as a pass.
-   * → {state: 'errors'|'unreported'|'warnings'|'clean', errors, warnings, globalCoverage: 'checked'|'unreported'}
+   * Verdict of a POST /api/sql/validate report. A list that is absent (or not in its contracted shape) means nobody said what was
+   * checked, so the verdict is 'unreported' and never 'clean': globalWarnings must be an array ([] = the global statements were
+   * checked and are clean, T4.3), taskErrors and taskWarnings must each be {taskId: string[]}. Every warning line counts —
+   * "not checked" lines included — so a statement that could not be checked is never shown as a pass. Counts only; warning text
+   * is never inspected.
+   * → {state: 'errors'|'unreported'|'warnings'|'clean', errors, warnings, globalCoverage, taskCoverage: 'checked'|'unreported'}
    */
   function reportSummary(r) {
-    var reported = Array.isArray(r.globalWarnings);
-    var errors = (r.globalErrors || []).length + countLists(r.taskErrors);
-    var warnings = (reported ? r.globalWarnings.length : 0) + countLists(r.taskWarnings);
-    var state = !r.ok || errors ? 'errors' : !reported ? 'unreported' : warnings ? 'warnings' : 'clean';
-    return { state: state, errors: errors, warnings: warnings, globalCoverage: reported ? 'checked' : 'unreported' };
+    var globalReported = Array.isArray(r.globalWarnings);
+    var tasksReported = isTaskLists(r.taskErrors) && isTaskLists(r.taskWarnings);
+    var errors = (Array.isArray(r.globalErrors) ? r.globalErrors.length : 0) + countLists(r.taskErrors);
+    var warnings = (globalReported ? r.globalWarnings.length : 0) + countLists(r.taskWarnings);
+    var state = !r.ok || errors ? 'errors' : !globalReported || !tasksReported ? 'unreported' : warnings ? 'warnings' : 'clean';
+    return {
+      state: state, errors: errors, warnings: warnings,
+      globalCoverage: globalReported ? 'checked' : 'unreported', taskCoverage: tasksReported ? 'checked' : 'unreported',
+    };
+  }
+
+  /* A lone "\r" (not part of "\r\n") — a browser textarea turns it into "\n", so such a field cannot round-trip through one. */
+  function hasBareCr(value) {
+    var texts = Array.isArray(value) ? value : [value];
+    return texts.some(function (s) { return typeof s === 'string' && /\r(?!\n)/.test(s); });
+  }
+
+  /* Line diff of two tasks' listings (TaskListing lines, so a lone CR vs LF is a difference). DBM.diff only ever sees one opaque,
+     break-free key per distinct line, so its own line splitter has nothing to re-split; rows carry the real text with a bare CR
+     made visible. → [{op: 'eq'|'add'|'del', text}] */
+  function diffRows(oldTask, newTask) {
+    var keys = Object.create(null);
+    var texts = [];
+    function keyed(task) {
+      return (task ? listing(task) : []).map(function (l) {
+        if (!(('=' + l.text) in keys)) { keys['=' + l.text] = 'L' + texts.length; texts.push(l.text); }
+        return keys['=' + l.text];
+      }).join('\n');
+    }
+    var a = keyed(oldTask);
+    var b = keyed(newTask);
+    return DBM.diff.lines(a, b).map(function (r) {
+      return { op: r.op, text: texts[Number(r.text.slice(1))].replace(/\r/g, '␍') };
+    });
   }
 
   /* {taskId: number of draft/open comments anchored on the task or one of its lines}, resolved with parseAnchor. */
@@ -200,17 +237,28 @@
 
   // editor: {id, task, areas: {field: textarea}} while a task is being edited; drafts: {id, version, values} so a same-version
   // re-render (a comment posted, agent presence) rebuilds the editor with what was typed rather than the stored SQL.
-  var ui = { selected: null, editing: null, editor: null, drafts: null, diff: null, report: null, busy: false, saving: false, forVersion: undefined, heldWarned: false };
+  // Only fields the user typed into are in drafts.values (the input handler records them), so opening the editor dirties nothing
+  // and an untouched field is never re-derived from its textarea (which would normalise a CR or re-split statements on GO).
+  function freshUi() {
+    return { selected: null, editing: null, editor: null, drafts: null, diff: null, report: null, busy: false, saving: false, forVersion: undefined, heldWarned: false };
+  }
+  var ui = freshUi();
   var mounted = null;
 
   function rerender() { if (mounted) render(mounted.root, mounted.ctx); }
 
+  /* The edits the user actually made: {field: textarea value} for touched, editable fields only. */
+  function touchedEdits() {
+    var e = ui.editor;
+    var edits = {};
+    if (!e || ui.editing !== e.id || !ui.drafts || ui.drafts.id !== e.id) return edits;
+    Object.keys(ui.drafts.values).forEach(function (k) { if (e.areas[k]) edits[k] = e.areas[k].value; });
+    return edits;
+  }
+
   function isDirty() {
     var e = ui.editor;
-    if (!e || ui.editing !== e.id) return false;
-    var edits = {};
-    Object.keys(e.areas).forEach(function (k) { edits[k] = e.areas[k].value; });
-    return editOps(e.id, e.task, edits).length > 0;
+    return !!e && ui.editing === e.id && editOps(e.id, e.task, touchedEdits()).length > 0;
   }
 
   function discard() { ui.editing = null; ui.editor = null; ui.drafts = null; ui.heldWarned = false; }
@@ -240,18 +288,34 @@
     ]);
   }
 
+  /* A verdict belongs to one version. The server validates its CURRENT version; a report is kept only while that is the version on
+     screen when it arrives — a late response after a newer version rendered, or a report on the current version while an older one
+     is viewed, is discarded rather than shown as the verdict on what the reviewer is reading. */
+  function reportFits(report) {
+    return !!report && mounted !== null && typeof report.version === 'number' && report.version === versionOf(mounted.ctx);
+  }
+
   function runValidate(ctx) {
     ui.busy = true;
     rerender();
     ctx.api.post('/api/sql/validate', {}).then(function (report) {
       ui.busy = false;
+      if (!mounted) return;   // the view was left while validating
+      var toast = mounted.ctx.toast || ctx.toast;
+      if (!reportFits(report)) {
+        ui.report = null;
+        rerender();
+        toast('The validation result is for ' + (report && report.version != null ? 'v' + report.version : 'another version') +
+          ', not the version on screen, so it is not shown. Validate again on the current version.', 'info');
+        return;
+      }
       ui.report = report;
       rerender();
       var s = reportSummary(report);
-      if (s.state === 'clean') ctx.toast('Validation passed', 'ok');
-      else if (s.state === 'warnings') ctx.toast('Validation passed with ' + plural(s.warnings, 'warning') + ' — read them before approving', 'warn');
-      else if (s.state === 'unreported') ctx.toast('Validation passed, but the server did not report whether the global statements were checked', 'warn');
-      else ctx.toast('Validation found ' + plural(s.errors, 'error'), 'err');
+      if (s.state === 'clean') toast('Validation passed', 'ok');
+      else if (s.state === 'warnings') toast('Validation passed with ' + plural(s.warnings, 'warning') + ' — read them before approving', 'warn');
+      else if (s.state === 'unreported') toast('Validation passed, but the server did not report what it checked', 'warn');
+      else toast('Validation found ' + plural(s.errors, 'error'), 'err');
     }).catch(function (e) {
       ui.busy = false;
       rerender();
@@ -280,14 +344,20 @@
     var r = ui.report;
     var s = reportSummary(r);
     var rows = [];
-    (r.globalErrors || []).forEach(function (e) { rows.push(el('li', { class: 'sql-count-err' }, ['plan: ' + e])); });
+    (Array.isArray(r.globalErrors) ? r.globalErrors : []).forEach(function (e) { rows.push(el('li', { class: 'sql-count-err' }, ['plan: ' + e])); });
     if (Array.isArray(r.globalWarnings)) r.globalWarnings.forEach(function (w) { rows.push(el('li', { class: 'sql-report-warn' }, ['plan: ' + w])); });
-    else rows.push(el('li', { class: 'sql-report-warn' }, ['plan: the server did not report whether the global pre-load/post-load statements were checked']));
+    else rows.push(el('li', { class: 'sql-report-warn' }, ['plan: global statements: coverage not reported (the response has no globalWarnings list, so the global pre-load/post-load statements may not have been checked)']));
+    if (s.taskCoverage !== 'checked') {
+      var absent = ['taskErrors', 'taskWarnings'].filter(function (f) { return !isTaskLists(r[f]); });
+      rows.push(el('li', { class: 'sql-report-warn' }, ['tasks: task coverage not reported (the response has no usable ' + absent.join(' or ') + ', so tasks may not have been checked)']));
+    }
+    var te = isTaskLists(r.taskErrors) ? r.taskErrors : {};
+    var tw = isTaskLists(r.taskWarnings) ? r.taskWarnings : {};
     var ids = plan.order.slice();
-    Object.keys(r.taskErrors || {}).concat(Object.keys(r.taskWarnings || {})).forEach(function (id) { if (ids.indexOf(id) < 0) ids.push(id); });
+    Object.keys(te).concat(Object.keys(tw)).forEach(function (id) { if (ids.indexOf(id) < 0) ids.push(id); });
     ids.forEach(function (id) {
-      var errs = (r.taskErrors && r.taskErrors[id]) || [];
-      var warns = (r.taskWarnings && r.taskWarnings[id]) || [];
+      var errs = te[id] || [];
+      var warns = tw[id] || [];
       if (!errs.length && !warns.length) return;
       rows.push(el('li', { class: 'sql-report-task' }, [
         plan.tasks[id]
@@ -432,7 +502,7 @@
           if (isNaN(v)) { ui.diff = null; rerender(); return; }
           ctx.api.get('/api/artifact/sql/' + v).then(function (res) {
             var old = findByTarget(res && res.payload, t.target);
-            ui.diff = { id: id, with: v, missing: !old, rows: DBM.diff.lines(old ? listingText(old) : '', listingText(t)) };
+            ui.diff = { id: id, with: v, missing: !old, rows: diffRows(old, t) };
             rerender();
           }).catch(function (err) { ctx.toast(errorText(err, 'Could not load v' + v), 'err'); });
         },
@@ -465,6 +535,8 @@
     fields.push(['postSql', 'Task post-load · TARGET · separate statements with a line containing only GO', joinStatements(t.postSql)]);
 
     var drafts = ui.drafts && ui.drafts.id === id && ui.drafts.version === version ? ui.drafts.values : null;
+    // Evidence fields (custom, errors, warnings) are engine-set and a patch touching them is rejected: editOps only ever emits
+    // ops for the five SQL fields below.
     ui.drafts = { id: id, version: version, values: drafts || {} };
     var areas = {};
     ui.editor = { id: id, task: t, areas: areas };
@@ -473,9 +545,7 @@
 
     function save() {
       if (ui.saving) return;
-      var edits = {};
-      Object.keys(areas).forEach(function (k) { edits[k] = areas[k].value; });
-      var ops = editOps(id, t, edits);
+      var ops = editOps(id, t, touchedEdits());   // only fields the user typed into; untouched fields are never re-derived
       if (!ops.length) { ctx.toast('Nothing changed', 'info'); return; }
       ui.saving = true;
       submit.disabled = true;
@@ -501,6 +571,14 @@
     }
 
     var controls = fields.map(function (f) {
+      if (hasBareCr(t[f[0]])) {
+        // A browser textarea turns a bare CR into a line break, so this field cannot round-trip: shown, never sent.
+        return el('div', { class: 'stack sql-edit-field sql-edit-locked' }, [
+          el('span', { class: 'small muted' }, [f[1]]),
+          el('p', { class: 'small sql-count-warn' }, ['Read-only: this field contains a bare carriage return; edit it through the agent.']),
+          codeBlock(Array.isArray(t[f[0]]) ? joinStatements(t[f[0]]) : t[f[0]]),
+        ]);
+      }
       var initial = drafts && Object.prototype.hasOwnProperty.call(drafts, f[0]) ? drafts[f[0]] : f[2];
       var lines = norm(initial).split('\n').length;
       var ta = el('textarea', {
@@ -579,16 +657,17 @@
     return true;
   }
 
+  /* Leaving resets ALL view state (selection, report, editor, diff, version): a later visit starts fresh. */
   function leave(nextCtx) {
     if (isDirty() && nextCtx && nextCtx.toast) nextCtx.toast('Your unsaved SQL edits were discarded: the SQL view was closed.', 'info');
-    discard();
-    ui.diff = null;
+    ui = freshUi();
     mounted = null;
   }
 
   DBM.sqlView = {
     listing: listing, listingText: listingText, parseAnchor: parseAnchor, sectionBlocks: sectionBlocks, splitStatements: splitStatements,
     joinStatements: joinStatements, editOps: editOps, reportSummary: reportSummary, openCommentsByTask: openCommentsByTask,
+    diffRows: diffRows,
   };
   DBM.views = DBM.views || {};
   DBM.views.sql = { title: 'SQL', render: render, holdRender: holdRender, leave: leave };

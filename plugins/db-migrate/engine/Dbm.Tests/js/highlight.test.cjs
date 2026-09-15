@@ -67,10 +67,37 @@ test('line count is preserved; CRLF normalised; null is empty', () => {
 
 /* The SQL view pairs sqlLines(section)[i] with TaskListing line i; TaskListing keeps a lone \r inside its line, so the
    highlighter must not break a line there or every later line of the section shows the wrong text beside its number. */
+const CR = '<span class="tok-cr" title="bare carriage return: SQL Server treats this as a line break">␍</span>';
+
 test('a lone CR is not a line break (same line split as TaskListing)', () => {
   const lines = H.sqlLines("SELECT 'a\rb'\r\n-- c\rd\nFROM t\r");
   assert.equal(lines.length, 3);
-  assert.equal(lines[2], '<span class="tok-kw">FROM</span> t\r');
+  assert.equal(lines[2], '<span class="tok-kw">FROM</span> t' + CR);
+});
+
+/* F1. SQL Server ends a -- comment at a lone CR (proved on LocalDB: "SELECT 1 AS a -- hidden<CR>, 2 AS b" returns 2 columns).
+   These assert the TOKEN boundary, not the line split: DELETE must never be inside a comment token. */
+test('a -- comment ends at a lone CR, exactly where SQL Server ends it', () => {
+  const toks = H.tokenize('SELECT 1 AS a -- hidden\r, 2 AS b');
+  const coms = toks.filter(t => t.c === 'com');
+  assert.deepEqual(coms.map(t => t.v), ['-- hidden']);
+  const rest = toks.slice(toks.indexOf(coms[0]) + 1);
+  assert.equal(rest.map(t => t.v).join(''), '\r, 2 AS b');
+  assert.ok(rest.some(t => t.c === 'num' && t.v === '2'), 'the second column is code');
+
+  const del = H.tokenize('SELECT a -- note\rDELETE FROM app.Customers\nFROM t');
+  assert.deepEqual(del.filter(t => t.c === 'com').map(t => t.v), ['-- note']);
+  assert.deepEqual(del.find(t => t.v.includes('DELETE')), { c: 'kw', v: 'DELETE' });
+
+  assert.deepEqual(H.tokenize('-- x\r\nSELECT').filter(t => t.c === 'com').map(t => t.v), ['-- x']);
+});
+
+test('a lone CR renders as a visible glyph inside its line, never as a raw CR the HTML parser would break on', () => {
+  const lines = H.sqlLines('SELECT a -- note\rDELETE FROM app.Customers');
+  assert.equal(lines.length, 1);
+  assert.ok(lines[0].includes('<span class="tok-com">-- note</span>' + CR + '<span class="tok-kw">DELETE</span>'), lines[0]);
+  assert.ok(!lines[0].includes('\r'));
+  assert.ok(!H.sqlLines("'a\rb' /* c\rd */ [e\rf]").join('').includes('\r'), 'no raw CR inside strings, comments or identifiers');
 });
 
 test('tokens concatenate back to the input', () => {

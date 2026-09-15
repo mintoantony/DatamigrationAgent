@@ -853,6 +853,10 @@ dl.meta dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
   tab-size: 4; resize: vertical; white-space: pre; overflow-wrap: normal; overflow-x: auto;
 }
 .sql-edit-field { gap: 4px; }
+/* A bare CR inside a listing line (DBM.highlight): SQL Server breaks the line there, so it must stand out, never look like code. */
+.code .tok-cr {
+  color: var(--err); background: var(--err-soft); border-radius: 3px; padding: 0 2px; font-style: normal; font-weight: 700; cursor: help;
+}
 .sql-detail summary { cursor: pointer; }
 @media (max-width: 760px) {
   .sql-layout { grid-template-columns: minmax(0, 1fr); }
