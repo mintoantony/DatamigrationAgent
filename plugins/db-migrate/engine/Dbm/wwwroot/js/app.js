@@ -257,6 +257,9 @@
   function renderView(row, view, ctx) {
     var root = DBM.clear(document.getElementById('view'));
     var rerender = view === S.view;
+    if (S.view && !rerender && S.view.leave) {
+      try { S.view.leave(ctx); } catch (err) { if (window.console) console.error(err); }
+    }
     S.view = view;
     S.ctx = ctx;
     try {

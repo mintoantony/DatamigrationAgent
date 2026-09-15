@@ -119,6 +119,10 @@ function artifact(v) { return { version: v, author: 'agent', summary: 's', creat
 
 function get(url) {
   let body;
+  if (url === '/api/state' && server.failStateOnce) { server.failStateOnce = false; return Promise.reject(new Error('network down')); }
+  if (url.indexOf('/api/mapping/context') === 0 && server.contextDelay) {
+    return new Promise((r) => setTimeout(() => r(context()), server.contextDelay));
+  }
   if (url === '/api/state') body = stateDoc();
   else if (url === '/api/artifact/mapping') body = { current: artifact(server.version), versions: Object.keys(server.payloads).map((v) => ({ version: Number(v) })) };
   else if (/^\/api\/artifact\/mapping\/\d+$/.test(url)) body = artifact(Number(url.split('/').pop()));
@@ -189,12 +193,14 @@ async function reset() {
   server.feedback = [];
   server.posts = [];
   server.onEdit = null;
-  toasts.length = 0;
+  server.contextDelay = 0;
+  server.failStateOnce = false;
   // Leave whatever view the previous test left behind, then come back: every test starts from a first render.
   DBM.app.select('analysis');
   await settle();
   DBM.app.select('mapping');
   await settle();
+  toasts.length = 0;                            // after navigating: leaving a dirty view toasts, and that belongs to the last test
   assert.equal(barStatus(), 'No unsaved changes', 'test starts from a clean first render');
 }
 
@@ -375,6 +381,111 @@ test('9. held view: Save is disabled, Discard stays enabled and loads the new ve
   assert.equal(find(view, (n) => /review-blocked/.test(n.className)), null);
 });
 
+/* ---- review round (task-3.5-a1-review.md): sequences that defeated the first fix ---- */
+
+test('10. H1/P1: a new version arriving while a carried view is still loading its context is held, not rendered', async () => {
+  await reset();
+  await editEmail('LOWER(s.[EMAIL_ADDR])');
+  server.contextDelay = 250;                    // every later context GET is slow
+  server.feedback.push({ id: 11, status: 'draft', anchor: null, text: 'a' });
+  lastCtx.refresh();                            // comment posted: same-version re-render carries the edits
+  await settle(40);                             // the refresh landed; a context GET would still be in flight
+  publish(4, payload());
+  sse({ type: 'artifact_created', data: { phase: 'mapping', version: 4 } });
+  await settle(500);
+  assert.equal(header().split(' · ')[0], 'v3', 'held on the edits\' base');
+  assert.match(barStatus(), /^1 unsaved change/);
+  assert.equal(toasts.filter((t) => t.kind === 'warn' && /v4/.test(t.msg)).length, 1, 'and the user is told');
+});
+
+test('11. H1/P1b: two comments in quick succession keep the edits', async () => {
+  await reset();
+  await editEmail('LOWER(s.[EMAIL_ADDR])');
+  server.contextDelay = 250;
+  server.feedback.push({ id: 12, status: 'draft', anchor: null, text: 'a' });
+  lastCtx.refresh();
+  await settle(40);
+  server.feedback.push({ id: 13, status: 'draft', anchor: null, text: 'b' });
+  lastCtx.refresh();
+  await settle(500);
+  assert.equal(lastCtx.feedback.length, 2, 'both re-renders happened');
+  assert.equal(barStatus(), '1 unsaved change');
+  server.onEdit = () => Promise.resolve({ ok: true, version: 4, warnings: [] });
+  const sent = await save();
+  assert.ok(sent && sent.body.ops.some((o) => o.value === 'LOWER(s.[EMAIL_ADDR])'), 'Save still sends the edit');
+});
+
+test('12. M1: a held view whose edits are reverted by hand releases itself and loads the new version', async () => {
+  await holdOnV4();
+  const ta = find(view, (n) => n.tagName === 'textarea' && n.attributes['aria-label'] === 'Expression for Email');
+  ta.value = 's.[EMAIL_ADDR]';                  // typed back to the original: nothing left to discard
+  ta.fire('input');
+  await settle(300);                            // no SSE event: the view itself must ask again
+  assert.equal(header().split(' · ')[0], 'v4');
+  assert.equal(barStatus(), 'No unsaved changes');
+  assert.equal(isDisabled(reviewButton('Approve')), false);
+  assert.equal(find(view, (n) => /review-blocked/.test(n.className)), null);
+});
+
+test('13. M1/R2: if the release refresh fails, the next ordinary refresh still loads the new version (no latch in the shell)', async () => {
+  await holdOnV4();
+  server.failStateOnce = true;                  // the refresh Discard triggers fails (network blip)
+  byText('button', 'Discard').fire('click');
+  await settle(300);
+  assert.equal(header().split(' · ')[0], 'v3', 'release refresh failed, still on v3');
+  sse({ type: 'agent_presence', data: {} });    // a plain background refresh
+  await settle(300);
+  assert.equal(header().split(' · ')[0], 'v4', 'the shell asked again and the clean view let it through');
+});
+
+test('13b. a failed release does not use up the self-release: edit again, revert again, and the view still releases', async () => {
+  await holdOnV4();
+  server.failStateOnce = true;
+  byText('button', 'Discard').fire('click');
+  await settle(300);
+  assert.equal(header().split(' · ')[0], 'v3', 'first release refresh failed');
+  const collapsed = byText('button', '▸');
+  if (collapsed) collapsed.fire('click');
+  let ta = find(view, (n) => n.tagName === 'textarea' && n.attributes['aria-label'] === 'Expression for Email');
+  ta.value = 'UPPER(s.[EMAIL_ADDR])';
+  ta.fire('input');
+  assert.match(barStatus(), /^1 unsaved change — cannot be saved: v4 is newer/, 'still held while dirty again');
+  ta.value = 's.[EMAIL_ADDR]';
+  ta.fire('input');
+  await settle(300);                            // no SSE event
+  assert.equal(header().split(' · ')[0], 'v4');
+});
+
+test('14. M2/P3: a save rejected because an agent version landed first engages the hold at once', async () => {
+  await reset();
+  server.feedback.push({ id: 14, status: 'draft', anchor: null, text: 'x' });
+  await lastCtx.refresh();
+  await settle();
+  await editEmail('LOWER(s.[EMAIL_ADDR])');
+  server.onEdit = () => {
+    publish(4, payload());                      // the agent's version lands while our POST is in flight
+    sse({ type: 'artifact_created', data: { phase: 'mapping', version: 4 } });
+    return new Promise((r) => setTimeout(() => r({ ok: false, errors: ['baseVersion 3 does not match the current version 4'] }), 400));
+  };
+  byText('button', 'Save as new version').fire('click');
+  await settle(700);                            // past the SSE refresh (held silently while saving) and the rejection; no more events
+  assert.equal(header().split(' · ')[0], 'v3');
+  assert.match(barStatus(), /^1 unsaved change — cannot be saved: v4 is newer/);
+  assert.equal(isDisabled(byText('button', 'Save as new version')), true, 'Save is disabled');
+  assert.equal(isDisabled(reviewButton('Approve')), true, 'Approve cannot sign off v4 from this view');
+  assert.ok(toasts.some((t) => t.kind === 'warn' && /v4/.test(t.msg)), 'the newer-version warning is shown');
+});
+
+test('15. L1: the mapping view being replaced by another view (phase went stale) says the edits were discarded', async () => {
+  await reset();
+  await editEmail('LOWER(s.[EMAIL_ADDR])');
+  server.status = 'stale';                      // pickView now returns the pending view
+  sse({ type: 'state_changed', data: {} });
+  await settle(300);
+  assert.equal(barStatus(), null, 'the mapping view is gone');
+  assert.ok(toasts.some((t) => t.kind === 'warn' && /discarded/.test(t.msg)), 'not silent: ' + JSON.stringify(toasts));
+});
+
 test('3. clean view: artifact_created refreshes to the new version as before', async () => {
   await reset();
   const other = payload();
@@ -448,6 +559,12 @@ test('6. a view that is no longer editable does not get the edits back', async (
   await settle();
   assert.equal(barStatus(), null, 'read-only view has no save bar');
   assert.equal(find(view, (n) => n.tagName === 'textarea'), null);
+  // The read-only view must show v3's committed expression, not the unsaved one (review M3 / mutation R3).
+  const toggle = byText('button', '▸');
+  if (toggle) toggle.fire('click');
+  assert.ok(find(view, (n) => n.tagName === 'code' && n.textContent === 's.[EMAIL_ADDR]'), 'the committed expression is shown');
+  assert.equal(find(view, (n) => n.tagName === 'code' && /LOWER/.test(n.textContent)), null, 'the unsaved edit is not shown as content');
+  assert.ok(toasts.some((t) => /discarded/.test(t.msg)), 'the user is told the edits were dropped');
   server.status = 'awaiting_review';            // editable again on the same version: the dropped edits stay dropped
   await lastCtx.refresh();
   await settle();

@@ -417,9 +417,12 @@
     // A re-render over this view (a comment posted, agent presence, any ctx.refresh) carries unsaved edits across, but only
     // onto the same base version and only into a view that is still editable. A version change never reaches here while
     // dirty: holdRender declines it. A first render (opts.rerender false) never inherits another instance's work.
+    // `context` is carried too: it was fetched for this same version, and a carried view without it would report itself
+    // clean (isDirty needs context) until a refetch returned — long enough for a second re-render to destroy the edits.
     var prev = opts && opts.rerender ? current : null;
     if (isDirty(prev)) {
       if (view.editable && prev.editable && ctx.version === prev.ctx.version) {
+        view.context = prev.context;
         view.before = prev.before;
         view.work = prev.work;
         view.expanded = prev.expanded;
@@ -437,6 +440,7 @@
     if (DBM.components.reviewBar && !window.DBM_EXPORT) view.review = page.appendChild(DBM.components.reviewBar(ctx));
     view.body = el('div', { class: 'stack' }, el('div', { class: 'empty is-loading' }, 'Loading mapping…'));
     page.appendChild(view.body);
+    if (view.context) { draw(view); return; }
     loadContext(ctx, payload).then(function (context) {
       view.context = context;
       draw(view);
@@ -855,8 +859,7 @@
       class: 'btn btn-ghost', on: {
         click: function () {
           view.work = clone(view.before);
-          redraw(view);
-          if (view.held != null) view.ctx.refresh();   // a newer version was held back for these edits: load it now
+          redraw(view);   // updateBar sees a clean held view and releases the hold (loads the newer version)
         }
       }
     }, 'Discard');
@@ -875,6 +878,12 @@
     view.bar.save.disabled = n === 0 || view.saving || view.held != null;   // held: the server would reject the stale baseVersion
     view.bar.save.title = view.held != null ? 'A newer version (v' + view.held + ') exists; these edits cannot be saved against it.' : '';
     view.bar.discard.disabled = n === 0 || view.saving;
+    // A held view that has become clean — by Discard or by typing the edits back out — releases the hold itself instead of
+    // waiting for an unrelated refresh: nothing is left to protect, and its disabled controls would otherwise strand the user.
+    if (n === 0 && view.held != null && !view.releasing && view === current) {
+      view.releasing = true;
+      Promise.resolve(view.ctx.refresh()).then(function () { view.releasing = false; }, function () { view.releasing = false; });
+    }
   }
 
   function saveEdits(view) {
@@ -897,6 +906,10 @@
         if (v.bar) { v.bar.save.classList.remove('is-loading'); updateBar(v); }
       });
       view.ctx.toast('Not saved: ' + message, 'err');
+      // The usual cause is a stale baseVersion: a newer version landed during the POST (its SSE refresh was held silently
+      // while saving). Ask the shell again now, so holdRender engages the hold and disables Save/Approve immediately rather
+      // than whenever some unrelated event next refreshes. On a same-version failure this is a carried re-render.
+      view.ctx.refresh();
     }
     view.ctx.api.post('/api/edit/mapping', patch).then(function (res) {
       if (res && res.ok === false) { failed((res.errors || []).join('; ') || 'rejected'); return; }
@@ -951,6 +964,11 @@
     if (!isDirty(current)) ctx.refresh();
   }
 
+  /** app.js calls this when another view replaces the mapping view (navigation, or the phase going stale). */
+  function leave(nextCtx) {
+    if (isDirty(current)) (nextCtx || current.ctx).toast('Your unsaved mapping edits were discarded: the mapping view was closed.', 'warn');
+  }
+
   DBM.views = DBM.views || {};
-  DBM.views.mapping = { title: 'Mapping', render: render, onEvent: onEvent, holdRender: holdRender };
+  DBM.views.mapping = { title: 'Mapping', render: render, onEvent: onEvent, holdRender: holdRender, leave: leave };
 })(window.DBM = window.DBM || {});
