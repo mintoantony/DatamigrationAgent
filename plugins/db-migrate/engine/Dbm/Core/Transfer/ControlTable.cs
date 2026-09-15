@@ -150,12 +150,58 @@ public static class ControlTable
 
     /// <summary>
     /// Runs <paramref name="body"/> in a client-side transaction holding the exclusive application lock, commits on success and
-    /// rolls back on any failure. No SET options are issued, so the caller's XACT_ABORT setting survives; with XACT_ABORT OFF a
-    /// statement error does not doom the transaction, which is why every failure path rolls back explicitly.
+    /// rolls back on any failure. No SET XACT_ABORT is issued, so the caller's setting survives; with XACT_ABORT OFF a statement
+    /// error does not doom the transaction, which is why every failure path rolls back explicitly.
+    /// BeginTransaction (even with IsolationLevel.Unspecified) resets the session isolation level to READ COMMITTED and SqlClient
+    /// leaves it there after commit, so the caller's level is read first and re-applied on every path, failures included (ruling 68).
     /// </summary>
     private static async Task UnderAppLockAsync(SqlConnection conn, Func<SqlTransaction, Task> body, CancellationToken ct)
     {
-        var tx = (SqlTransaction)await conn.BeginTransactionAsync(IsolationLevel.Unspecified, ct);
+        short callerLevel = await SessionIsolationLevelAsync(conn, ct);
+        bool failed = false;
+        try
+        {
+            var tx = (SqlTransaction)await conn.BeginTransactionAsync(IsolationLevel.Unspecified, ct);
+            await RunLockedAsync(conn, tx, body, ct);
+        }
+        catch
+        {
+            failed = true;
+            throw;
+        }
+        finally
+        {
+            // On a failure path the original exception is the one to report; on success a failed restore must not pass silently.
+            await RestoreIsolationLevelAsync(conn, callerLevel, swallowErrors: failed);
+        }
+    }
+
+    /// <summary>sys.dm_exec_sessions.transaction_isolation_level: 0 unspecified, 1 read uncommitted, 2 read committed,
+    /// 3 repeatable read, 4 serializable, 5 snapshot. A session can always read its own row.</summary>
+    private static async Task<short> SessionIsolationLevelAsync(SqlConnection conn, CancellationToken ct)
+    {
+        await using var cmd = new SqlCommand("SELECT transaction_isolation_level FROM sys.dm_exec_sessions WHERE session_id = @@SPID;", conn);
+        return Convert.ToInt16(await cmd.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
+    }
+
+    private static async Task RestoreIsolationLevelAsync(SqlConnection conn, short level, bool swallowErrors)
+    {
+        string? name = level switch
+        {
+            1 => "READ UNCOMMITTED", 2 => "READ COMMITTED", 3 => "REPEATABLE READ", 4 => "SERIALIZABLE", 5 => "SNAPSHOT",
+            _ => null,   // 0 "unspecified": nothing meaningful to re-apply
+        };
+        if (name is null || conn.State != ConnectionState.Open) return;
+        try
+        {
+            await using var cmd = new SqlCommand($"SET TRANSACTION ISOLATION LEVEL {name};", conn);
+            await cmd.ExecuteNonQueryAsync(CancellationToken.None);
+        }
+        catch (Exception) when (swallowErrors) { /* the original failure is the one worth reporting */ }
+    }
+
+    private static async Task RunLockedAsync(SqlConnection conn, SqlTransaction tx, Func<SqlTransaction, Task> body, CancellationToken ct)
+    {
         try
         {
             await ExecAsync(conn, tx, $"""

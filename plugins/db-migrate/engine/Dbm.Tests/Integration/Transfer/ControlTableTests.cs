@@ -359,6 +359,51 @@ public sealed class ControlTableTests
     }
 
     [Fact]
+    public async Task Ensure_and_drop_leave_the_callers_session_isolation_level_as_they_found_it()
+    {
+        await using var db = await TempDatabase.CreateAsync("dbm_ctliso");
+        await using var conn = new SqlConnection(db.ConnectionString);
+        await conn.OpenAsync();
+
+        async Task<string> Level()
+        {
+            await using var c = new SqlCommand("SELECT transaction_isolation_level FROM sys.dm_exec_sessions WHERE session_id = @@SPID", conn);
+            return Convert.ToInt16(await c.ExecuteScalarAsync()) switch
+            {
+                1 => "READ UNCOMMITTED", 2 => "READ COMMITTED", 3 => "REPEATABLE READ", 4 => "SERIALIZABLE", 5 => "SNAPSHOT", var n => n.ToString(),
+            };
+        }
+
+        // Ends on a non-default level too, so the last step cannot pass merely by landing on READ COMMITTED.
+        foreach (var level in new[] { "READ UNCOMMITTED", "SERIALIZABLE", "REPEATABLE READ" })
+        {
+            await using (var s = new SqlCommand($"SET TRANSACTION ISOLATION LEVEL {level};", conn)) await s.ExecuteNonQueryAsync();
+            Assert.Equal(level, await Level());
+
+            await ControlTable.EnsureAsync(conn, default);                                   // ensure-create
+            Assert.Equal(level, await Level());
+            await ControlTable.EnsureAsync(conn, default);                                   // ensure-existing
+            Assert.Equal(level, await Level());
+            await ControlTable.UpsertAsync(conn, null, 1, "T01", Checkpoint.Start, default);
+            await ControlTable.DropAsync(conn, default);                                     // drop ours
+            Assert.Equal(level, await Level());
+            await ControlTable.DropAsync(conn, default);                                     // drop absent
+            Assert.Equal(level, await Level());
+
+            await db.ExecAsync("CREATE TABLE dbo.__dbm_checkpoint (x int NOT NULL);");
+            await Assert.ThrowsAsync<TransferException>(() => ControlTable.EnsureAsync(conn, default));   // ensure-mismatch (failure path)
+            Assert.Equal(level, await Level());
+            await Assert.ThrowsAsync<TransferException>(() => ControlTable.DropAsync(conn, default));     // drop-mismatch (failure path)
+            Assert.Equal(level, await Level());
+            await db.ExecAsync("DROP TABLE dbo.__dbm_checkpoint;");
+            await db.ExecAsync("CREATE VIEW dbo.__dbm_checkpoint AS SELECT 1 AS x;");
+            await Assert.ThrowsAsync<SqlException>(() => ControlTable.EnsureAsync(conn, default));       // server error after the lock
+            Assert.Equal(level, await Level());
+            await db.ExecAsync("DROP VIEW dbo.__dbm_checkpoint;");
+        }
+    }
+
+    [Fact]
     public async Task A_create_or_drop_that_fails_after_taking_the_lock_leaves_nothing_behind()
     {
         await using var db = await TempDatabase.CreateAsync("dbm_ctlfail");
