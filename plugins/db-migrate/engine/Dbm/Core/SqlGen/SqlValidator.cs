@@ -8,42 +8,59 @@ using Microsoft.Data.SqlClient;
 
 namespace Dbm.Core.SqlGen;
 
-/// <summary>Validates a plan against the live databases without changing either of them.
-/// Source: <c>sp_describe_first_result_set</c> (parameterised) for every SourceQuery.
-/// Target: catalog checks plus a syntax check of every target-side statement with SET PARSEONLY sent as three
-/// separate batches (ON / statement / OFF). Verified on SQL Server 2025 LocalDB: a single batch
-/// "SET PARSEONLY ON; stmt; SET PARSEONLY OFF;" EXECUTES stmt (both SETs act at parse time), so never combine them.</summary>
+/// <summary>Validates a plan against the live databases.
+/// <para><b>Safety claim:</b> no plan SQL — generated or agent-written — is ever executed. Validation may create an engine-authored,
+/// session-local temp table (<c>#stg</c>) in tempdb, dropped at connection close.</para>
+/// <para>Every plan statement, on either side, is only ever sent as the <c>@tsql</c> string argument of
+/// <c>sp_describe_first_result_set</c>, which compiles without executing. A plan statement is never sent as a batch. The only
+/// batches this class sends are the engine-built scaffold <c>CREATE TABLE #stg</c> (<see cref="SqlGenerator.StagingDdl"/>) and its
+/// <c>DROP</c>. (The previous SET PARSEONLY sandbox was void: a statement can switch PARSEONLY off with a spelling a text filter
+/// cannot recognise, and the rest of its batch executed.)</para>
+/// <para>Each statement is checked on its own, never batched with another: sp_describe reports errors in later statements of a
+/// batch inconsistently. Limits (reported, not hidden): a statement that depends on an object an earlier statement creates cannot be
+/// server-checked without executing the creator, and a single stored field holding several statements gets sp_describe's
+/// inconsistent later-statement checking.</para></summary>
 public static class SqlValidator
 {
     /// <summary>Prefix of validator warnings stored in TaskPlan.Warnings (lets a re-validation replace them).</summary>
     public const string WarningPrefix = "validate: ";
 
-    /// <summary>SET PARSEONLY takes effect while the batch is parsed, so a statement containing "SET PARSEONLY OFF" would switch
-    /// the check off and the rest of its batch would EXECUTE (verified on LocalDB). Any mention of PARSEONLY - comments
-    /// included, deliberately - is refused without being sent.</summary>
-    static readonly Regex ParseOnlyWord = new(@"\bPARSEONLY\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    /// <summary>Middle of a "not checked" warning: "&lt;field&gt;: not checked: &lt;reason&gt;".</summary>
+    public const string NotCheckedMarker = ": not checked: ";
 
-    const string ParseOnlyError = "SET PARSEONLY is not allowed";
-
-    /// <summary>The one PARSEONLY test, shared by CheckShape (offline report) and ParseCheckAsync (refuses to send).</summary>
-    static bool MentionsParseOnly(string? sql) => sql is not null && ParseOnlyWord.IsMatch(sql);
+    /// <summary>The GlobalWarnings line of a single-task run: the global statements were not checked. Report/CLI only, never stored.</summary>
+    public const string SingleTaskGlobalWarning = "global preSql/postSql" + NotCheckedMarker + "single-task validation";
 
     static readonly Regex GoLine = new(@"^\s*GO\s*(\d+\s*)?$", RegexOptions.Multiline | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
+    const int InvalidObjectName = 208;
+    const int InvalidColumnName = 207;
+
     public sealed record ResultColumn(string Name, string SystemTypeName, bool IsNullable, int Precision, int Scale);
 
-    public static async Task<ValidationReport> ValidateAsync(SqlPlanPayload plan, string sourceCs, string targetCs, CatalogSnapshot tgt,
-        string? onlyTaskId, CancellationToken ct)
+    /// <summary>Outcome of checking one target statement: <see cref="Error"/> = a real error; <see cref="NotChecked"/> = the server
+    /// could not check it and why; both null = it compiled. <see cref="Errors"/> are the underlying server errors (wrappers removed).</summary>
+    public sealed record TargetCheck(string? Error, string? NotChecked, IReadOnlyList<SqlError> Errors);
+
+    public static Task<ValidationReport> ValidateAsync(SqlPlanPayload plan, string sourceCs, string targetCs, CatalogSnapshot tgt,
+        string? onlyTaskId, CancellationToken ct) =>
+        ValidateAsync(plan, sourceCs, targetCs, tgt, onlyTaskId, SqlConnect.OpenAsync, ct);
+
+    /// <param name="open">Opens a connection; tests substitute a failing opener to pin the secret scrubbing of connection errors.</param>
+    internal static async Task<ValidationReport> ValidateAsync(SqlPlanPayload plan, string sourceCs, string targetCs, CatalogSnapshot tgt,
+        string? onlyTaskId, Func<string, CancellationToken, Task<SqlConnection>> open, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(sourceCs);
         ArgumentNullException.ThrowIfNull(targetCs);
         ArgumentNullException.ThrowIfNull(tgt);
+        ArgumentNullException.ThrowIfNull(open);
         var taskErrors = new Dictionary<string, List<string>>(StringComparer.Ordinal);
         var taskWarnings = new Dictionary<string, List<string>>(StringComparer.Ordinal);
         var global = new List<string>();
+        var globalWarnings = new List<string>();
         if (onlyTaskId is not null && !plan.Tasks.ContainsKey(onlyTaskId))
-            return new ValidationReport(false, taskErrors, taskWarnings, [$"unknown task {onlyTaskId}"]);
+            return new ValidationReport(false, taskErrors, taskWarnings, [$"unknown task {onlyTaskId}"], [SingleTaskGlobalWarning]);
 
         var ids = onlyTaskId is not null ? [onlyTaskId]
             : plan.Order.Where(plan.Tasks.ContainsKey).Concat(plan.Tasks.Keys.Where(k => !plan.Order.Contains(k)).OrderBy(k => k, StringComparer.Ordinal)).Distinct().ToList();
@@ -54,10 +71,11 @@ public static class SqlValidator
         SqlConnection? source = null, target = null;
         try
         {
-            try { source = await SqlConnect.OpenAsync(sourceCs, ct); }
+            try { source = await open(sourceCs, ct); }
             catch (Exception ex) when (ex is SqlException or InvalidOperationException or ArgumentException)
             { global.Add("source connection failed: " + Scrub(ex.Message)); }
-            try { target = await SqlConnect.OpenAsync(WithoutPooling(targetCs), ct); }
+            // Not pooled: the session, and with it the #stg scaffold, ends when this connection closes.
+            try { target = await open(WithoutPooling(targetCs), ct); }
             catch (Exception ex) when (ex is SqlException or InvalidOperationException or ArgumentException)
             { global.Add("target connection failed: " + Scrub(ex.Message)); }
 
@@ -66,16 +84,12 @@ public static class SqlValidator
 
             if (onlyTaskId is null)
             {
-                CheckGlobal("preSql", plan.PreSql);
-                CheckGlobal("postSql", plan.PostSql);
+                var statements = plan.PreSql.Select((sql, i) => ($"preSql[{i}]", sql))
+                    .Concat(plan.PostSql.Select((sql, i) => ($"postSql[{i}]", sql))).ToList();
+                foreach (var (field, sql) in statements)
+                    if (GoLine.IsMatch(sql)) global.Add($"{field}: GO batch separators are not allowed");
                 if (target is not null)
-                {
-                    // Statements naming PARSEONLY were reported by CheckGlobal; ParseCheckAsync would refuse them anyway.
-                    for (var i = 0; i < plan.PreSql.Count; i++)
-                        if (!MentionsParseOnly(plan.PreSql[i]) && await ParseCheckAsync(target, plan.PreSql[i], ct) is { } e) global.Add($"preSql[{i}]: {Scrub(e)}");
-                    for (var i = 0; i < plan.PostSql.Count; i++)
-                        if (!MentionsParseOnly(plan.PostSql[i]) && await ParseCheckAsync(target, plan.PostSql[i], ct) is { } e) global.Add($"postSql[{i}]: {Scrub(e)}");
-                }
+                    await CheckSequenceAsync(target, statements, customMerge: false, global, globalWarnings, Scrub, ct);
             }
         }
         finally
@@ -84,20 +98,13 @@ public static class SqlValidator
             if (target is not null) await target.DisposeAsync();
         }
         var ok = global.Count == 0 && taskErrors.Values.All(l => l.Count == 0);
-        return new ValidationReport(ok, taskErrors, taskWarnings, global);
-
-        void CheckGlobal(string field, List<string> statements)
-        {
-            for (var i = 0; i < statements.Count; i++)
-            {
-                if (GoLine.IsMatch(statements[i])) global.Add($"{field}[{i}]: GO batch separators are not allowed");
-                if (MentionsParseOnly(statements[i])) global.Add($"{field}[{i}]: {ParseOnlyError}");
-            }
-        }
+        return new ValidationReport(ok, taskErrors, taskWarnings, global, onlyTaskId is null ? globalWarnings : [SingleTaskGlobalWarning]);
     }
 
     /// <summary>Copies a report into the plan: task Errors are replaced, validator warnings (prefixed) replace the previous
-    /// validator warnings; generator warnings stay. <paramref name="full"/> = the report covers the whole plan (sets plan.Errors).</summary>
+    /// validator warnings; generator warnings stay. <paramref name="full"/> = the report covers the whole plan: only then are
+    /// plan.Errors and the prefixed lines of plan.Warnings replaced. A partial run checked no global statement, so it leaves both
+    /// alone. Lines of plan.Warnings that do not START with the prefix (generator notices, e.g. discarded custom SQL) always survive.</summary>
     public static void Apply(SqlPlanPayload plan, ValidationReport report, bool full = true)
     {
         ArgumentNullException.ThrowIfNull(plan);
@@ -105,11 +112,14 @@ public static class SqlValidator
         foreach (var (id, errors) in report.TaskErrors)
             if (plan.Tasks.TryGetValue(id, out var task)) task.Errors = errors.ToList();
         foreach (var (id, warnings) in report.TaskWarnings)
-            if (plan.Tasks.TryGetValue(id, out var task))
-                task.Warnings = task.Warnings.Where(w => !w.StartsWith(WarningPrefix, StringComparison.Ordinal))
-                    .Concat(warnings.Select(w => WarningPrefix + w)).ToList();
-        if (full) plan.Errors = report.GlobalErrors.ToList();
+            if (plan.Tasks.TryGetValue(id, out var task)) task.Warnings = ReplacePrefixed(task.Warnings, warnings);
+        if (!full) return;
+        plan.Errors = report.GlobalErrors.ToList();
+        plan.Warnings = ReplacePrefixed(plan.Warnings, report.GlobalWarnings ?? []);
     }
+
+    static List<string> ReplacePrefixed(List<string> existing, IEnumerable<string> validatorLines) =>
+        existing.Where(w => !w.StartsWith(WarningPrefix, StringComparison.Ordinal)).Concat(validatorLines.Select(w => WarningPrefix + w)).ToList();
 
     /// <summary>Offline checks of one task (no database needed): mode, required fields, bindings, GO separators.</summary>
     public static List<string> CheckShape(TaskPlan task)
@@ -128,8 +138,6 @@ public static class SqlValidator
             errors.Add($"{dup.Key}: bound more than once");
         foreach (var (field, sql) in AllFields(task))
             if (GoLine.IsMatch(sql)) errors.Add($"{field}: GO batch separators are not allowed");
-        foreach (var (field, sql) in TargetFields(task))
-            if (MentionsParseOnly(sql)) errors.Add($"{field}: {ParseOnlyError}");
         return errors;
     }
 
@@ -190,69 +198,210 @@ public static class SqlValidator
             }
         }
 
-        // Target-side statements: syntax only.
-        if (target is not null)
-            foreach (var (field, sql) in TargetFields(task))
-                if (!MentionsParseOnly(sql) && await ParseCheckAsync(target, sql, ct) is { } e) errors.Add($"{field}: {scrub(e)}");   // PARSEONLY: reported by CheckShape
+        // Target statements, one at a time, in execution order. mergeSql is checked against the engine-built #stg scaffold.
+        if (target is null) return;
+        var fields = TargetFields(task).ToList();
+        try
+        {
+            // Drop at every task start too: otherwise a stale #stg from an earlier staging task would let this task's own statements
+            // (a custom direct task may name #stg) bind against someone else's scaffold.
+            await DropScaffoldAsync(target);
+            var beforeMerge = fields.TakeWhile(f => f.Field != "mergeSql").ToList();
+            await CheckSequenceAsync(target, beforeMerge, task.Custom, errors, warnings, scrub, ct);
+            if (fields.Count == beforeMerge.Count) return;
+
+            // Rule 10: drop-then-create IMMEDIATELY before this mergeSql check. The connection is shared by every task and #stg is a
+            // fixed name, so a wider scaffold left by an earlier task would let a narrower task's merge bind and false-pass.
+            await DropScaffoldAsync(target);
+            string? scaffoldFailure = null;
+            if (table is not null)
+            {
+                var columns = task.Columns.Select(b => targetCols.GetValueOrDefault(b.Target)).OfType<ColumnInfo>()
+                    .DistinctBy(c => c.Name, StringComparer.OrdinalIgnoreCase);
+                var keys = task.KeyColumns.Select(k => (k, (ColumnInfo?)null));   // key types live in the source catalog: sql_variant
+                try { await ExecAsync(target, SqlGenerator.StagingDdl(columns, keys), ct); }
+                catch (SqlException ex) { scaffoldFailure = Messages(ex); }
+            }
+            if (scaffoldFailure is not null)
+                warnings.Add($"mergeSql{NotCheckedMarker}the staging scaffold could not be created ({scrub(scaffoldFailure)})");
+            else
+                await CheckSequenceAsync(target, fields, task.Custom, errors, warnings, scrub, ct, skip: beforeMerge.Count);
+        }
+        finally
+        {
+            await DropScaffoldAsync(target);
+        }
     }
 
-    /// <summary>Result columns of the first result set, or the compile error message(s).</summary>
+    /// <summary>Checks <paramref name="statements"/>[skip..] one by one; earlier statements (all of them) feed the rule-8 lookup.</summary>
+    static async Task CheckSequenceAsync(SqlConnection target, List<(string Field, string Sql)> statements, bool customMerge,
+        List<string> errors, List<string> warnings, Func<string, string> scrub, CancellationToken ct, int skip = 0)
+    {
+        for (var i = skip; i < statements.Count; i++)
+        {
+            var (field, sql) = statements[i];
+            if (string.IsNullOrWhiteSpace(sql)) continue;
+            var check = await CheckTargetStatementAsync(target, sql, ct);
+            if (check.NotChecked is not null) { warnings.Add(field + NotCheckedMarker + scrub(check.NotChecked)); continue; }
+            if (MayHoldSeveralStatements(sql)) warnings.Add(field + NotCheckedMarker + MultipleStatementsReason);   // plus any error below
+            if (check.Error is null) continue;
+            if (Unverifiable(check.Errors, field, customMerge, statements.Take(i)) is { } reason)
+                warnings.Add(field + NotCheckedMarker + scrub(reason));
+            else
+                errors.Add($"{field}: {scrub(check.Error)}");
+        }
+    }
+
+    // Rules 6-8 classify a SERVER-AUTHORED error message to choose a report label ("error" or "not checked"). This is not the text
+    // filter that was voided as a security boundary: nothing here decides what is sent or executed — every statement is only ever
+    // described, never run — so gaming these rules can only hide the author's own broken SQL from themselves (it then fails at the
+    // real migration). They carry no security load. Rule 8 is an acknowledged heuristic: worst case a false positive or a missed typo.
+    static string? Unverifiable(IReadOnlyList<SqlError> serverErrors, string field, bool customTask, IEnumerable<(string Field, string Sql)> earlier)
+    {
+        var earlierList = earlier.ToList();
+        var reasons = new List<string>();
+        foreach (var e in serverErrors)
+        {
+            if (e.Number == InvalidObjectName && QuotedName(e.Message) is { } name)
+            {
+                // Rule 6: a '#' name is provably a temp object (a permanent table cannot be named with a leading '#').
+                if (name.StartsWith('#')) { reasons.Add($"temp table '{name}' does not exist during validation"); continue; }
+                // Rule 8: created by an earlier statement of the same sequence, which validation never executes.
+                if (earlierList.FirstOrDefault(s => Creates(s.Sql, name)) is { Field: not null } creator)
+                { reasons.Add($"'{name}' is created by {creator.Field}, which validation does not execute"); continue; }
+            }
+            // Rule 7: [207] never names its object. Only a generated task's mergeSql is known to match the scaffold exactly.
+            if (e.Number == InvalidColumnName && field == "mergeSql" && customTask)
+            { reasons.Add($"custom staging columns are unknown to validation ({e.Message})"); continue; }
+            return null;   // at least one real error: report the statement as an error
+        }
+        return reasons.Count == 0 ? null : string.Join("; ", reasons.Distinct(StringComparer.Ordinal));
+    }
+
+    const string MultipleStatementsReason = "binding not verified: the field may hold multiple statements, and later statements are not reliably checked";
+
+    // Heuristic with NO security load, same class as rules 6-8: it only chooses to ADD a disclosure. sp_describe reports parse errors
+    // for the whole string but may silently skip binding errors in a later statement, so a field that may hold several statements
+    // gets any server error reported AND a visible "binding not verified" line. Conservative on purpose: a ';' inside a literal or
+    // comment over-flags, which only adds an honest warning, never an error. Generated SQL is always one statement.
+    static bool MayHoldSeveralStatements(string sql)
+    {
+        var trimmed = sql.TrimEnd();
+        if (trimmed.EndsWith(';')) trimmed = trimmed[..^1];
+        return trimmed.Contains(';', StringComparison.Ordinal);
+    }
+
+    static string? QuotedName(string message)
+    {
+        var first = message.IndexOf('\'');
+        var last = message.LastIndexOf('\'');
+        return first >= 0 && last > first ? message[(first + 1)..last] : null;
+    }
+
+    /// <summary>Heuristic (rule 8): does <paramref name="sql"/> textually create <paramref name="name"/> ("schema.table" or "table")?</summary>
+    static bool Creates(string sql, string name)
+    {
+        var target = SplitName(name);
+        foreach (Match m in CreatesObject.Matches(sql.Replace("[", "", StringComparison.Ordinal).Replace("]", "", StringComparison.Ordinal).Replace("\"", "", StringComparison.Ordinal)))
+        {
+            var created = SplitName(m.Groups["name"].Value);
+            if (!string.Equals(created.Name, target.Name, StringComparison.OrdinalIgnoreCase)) continue;
+            if (created.Schema is null || target.Schema is null || string.Equals(created.Schema, target.Schema, StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        return false;
+    }
+
+    static readonly Regex CreatesObject = new(@"\b(?:CREATE\s+(?:TABLE|VIEW|SYNONYM)|INTO)\s+(?<name>[^\s(;,]+)",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    static (string? Schema, string Name) SplitName(string qualified)
+    {
+        var parts = qualified.Split('.');
+        return parts.Length == 1 ? (null, parts[0]) : (parts[^2], parts[^1]);
+    }
+
+    /// <summary>Result columns of the first result set, or the compile error message(s). Never executes <paramref name="sql"/>:
+    /// it is passed only as the <c>@tsql</c> argument of <c>sp_describe_first_result_set</c>.</summary>
     public static async Task<(List<ResultColumn>? Columns, string? Error)> DescribeAsync(SqlConnection conn, string sql, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(conn);
         ArgumentNullException.ThrowIfNull(sql);
-        await using var cmd = new SqlCommand("EXEC sp_describe_first_result_set @tsql = @q;", conn) { CommandTimeout = 60 };
-        cmd.Parameters.Add(new SqlParameter("@q", SqlDbType.NVarChar, -1) { Value = sql });
         try
         {
-            await using var r = await cmd.ExecuteReaderAsync(ct);
-            int oHidden = r.GetOrdinal("is_hidden"), oName = r.GetOrdinal("name"), oNull = r.GetOrdinal("is_nullable"),
-                oType = r.GetOrdinal("system_type_name"), oPrec = r.GetOrdinal("precision"), oScale = r.GetOrdinal("scale");
-            var list = new List<ResultColumn>();
-            while (await r.ReadAsync(ct))
-            {
-                if (!r.IsDBNull(oHidden) && r.GetBoolean(oHidden)) continue;
-                list.Add(new ResultColumn(
-                    r.IsDBNull(oName) ? "" : r.GetString(oName),
-                    r.IsDBNull(oType) ? "sql_variant" : r.GetString(oType),
-                    !r.IsDBNull(oNull) && r.GetBoolean(oNull),
-                    r.IsDBNull(oPrec) ? 0 : Convert.ToInt32(r.GetValue(oPrec), CultureInfo.InvariantCulture),
-                    r.IsDBNull(oScale) ? 0 : Convert.ToInt32(r.GetValue(oScale), CultureInfo.InvariantCulture)));
-            }
-            return (list, null);
+            return (await DescribeColumnsAsync(conn, sql, ct), null);
         }
         catch (SqlException ex) { return (null, Messages(ex)); }
     }
 
-    /// <summary>Syntax check on the target: SET PARSEONLY ON / statement / SET PARSEONLY OFF as three batches. Nothing executes.
-    /// A statement mentioning PARSEONLY is never sent, whether or not CheckShape ran first (see <see cref="ParseOnlyWord"/>).</summary>
-    public static async Task<string?> ParseCheckAsync(SqlConnection conn, string sql, CancellationToken ct)
+    /// <summary>Checks one target statement without executing it, via <c>sp_describe_first_result_set</c>. For a target statement an
+    /// empty result set means VALID (DML and DDL return none) — unlike a source query. When the server gives only a "could not be
+    /// analyzed / determined" wrapper with no underlying error (e.g. dynamic SQL), the statement is reported as not checked, never
+    /// as passing or failing. Context-free: the task-level rules (temp tables, earlier creators, custom staging) are applied by
+    /// ValidateAsync, which is the entry point to use for a plan.</summary>
+    public static async Task<TargetCheck> CheckTargetStatementAsync(SqlConnection conn, string sql, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(conn);
-        if (string.IsNullOrWhiteSpace(sql)) return null;
-        if (MentionsParseOnly(sql)) return ParseOnlyError;   // security boundary: must not depend on any earlier check
-        await ExecAsync(conn, "SET PARSEONLY ON;", ct);
+        ArgumentNullException.ThrowIfNull(sql);
+        if (string.IsNullOrWhiteSpace(sql)) return new TargetCheck(null, null, []);
         try
         {
-            await ExecAsync(conn, sql, ct);
-            return null;
+            await DescribeColumnsAsync(conn, sql, ct);
+            return new TargetCheck(null, null, []);
         }
-        catch (SqlException ex) { return Messages(ex); }
-        finally { await ExecAsync(conn, "SET PARSEONLY OFF;", CancellationToken.None); }
+        catch (SqlException ex)
+        {
+            var real = RealErrors(ex);
+            return real.Count == 0
+                ? new TargetCheck(null, ex.Message, [])
+                : new TargetCheck(string.Join(" ", real.Select(e => e.Message).Distinct(StringComparer.Ordinal)), null, real);
+        }
     }
 
+    static async Task<List<ResultColumn>> DescribeColumnsAsync(SqlConnection conn, string sql, CancellationToken ct)
+    {
+        await using var cmd = new SqlCommand("EXEC sp_describe_first_result_set @tsql = @q;", conn) { CommandTimeout = 60 };
+        cmd.Parameters.Add(new SqlParameter("@q", SqlDbType.NVarChar, -1) { Value = sql });
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        int oHidden = r.GetOrdinal("is_hidden"), oName = r.GetOrdinal("name"), oNull = r.GetOrdinal("is_nullable"),
+            oType = r.GetOrdinal("system_type_name"), oPrec = r.GetOrdinal("precision"), oScale = r.GetOrdinal("scale");
+        var list = new List<ResultColumn>();
+        while (await r.ReadAsync(ct))
+        {
+            if (!r.IsDBNull(oHidden) && r.GetBoolean(oHidden)) continue;
+            list.Add(new ResultColumn(
+                r.IsDBNull(oName) ? "" : r.GetString(oName),
+                r.IsDBNull(oType) ? "sql_variant" : r.GetString(oType),
+                !r.IsDBNull(oNull) && r.GetBoolean(oNull),
+                r.IsDBNull(oPrec) ? 0 : Convert.ToInt32(r.GetValue(oPrec), CultureInfo.InvariantCulture),
+                r.IsDBNull(oScale) ? 0 : Convert.ToInt32(r.GetValue(oScale), CultureInfo.InvariantCulture)));
+        }
+        return list;
+    }
+
+    /// <summary>Engine-authored batches only (the scaffold and its drop). Never called with plan SQL.</summary>
     static async Task ExecAsync(SqlConnection conn, string sql, CancellationToken ct)
     {
-        await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = 60 };   // no parameters => sent as a plain SQL batch
+        await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = 60 };
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
+    /// <summary>Best effort and never masks an earlier error: a failure here leaves at most a session-local temp table that the
+    /// non-pooled connection drops on close.</summary>
+    static async Task DropScaffoldAsync(SqlConnection conn)
+    {
+        try { await ExecAsync(conn, "IF OBJECT_ID('tempdb..#stg') IS NOT NULL DROP TABLE #stg;", CancellationToken.None); }
+        catch (Exception ex) when (ex is SqlException or InvalidOperationException) { /* see summary */ }
+    }
+
+    static List<SqlError> RealErrors(SqlException ex) =>
+        ex.Errors.Cast<SqlError>()
+            .Where(e => !e.Message.StartsWith("The batch could not be analyzed", StringComparison.Ordinal)
+                     && !e.Message.StartsWith("The metadata could not be determined", StringComparison.Ordinal))
+            .ToList();
+
     static string Messages(SqlException ex)
     {
-        var parts = ex.Errors.Cast<SqlError>().Select(e => e.Message)
-            .Where(m => !m.StartsWith("The batch could not be analyzed", StringComparison.Ordinal)
-                     && !m.StartsWith("The metadata could not be determined", StringComparison.Ordinal))
-            .Distinct().ToList();
+        var parts = RealErrors(ex).Select(e => e.Message).Distinct().ToList();
         return parts.Count > 0 ? string.Join(" ", parts) : ex.Message;
     }
 

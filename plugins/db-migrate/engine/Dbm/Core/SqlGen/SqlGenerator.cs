@@ -172,14 +172,13 @@ public static class SqlGenerator
         if (map.Sources.Count > 0 && primary is null) notes.Add($"primary source {map.Sources[0]} not found in the source catalog");
         var keyColumns = primary?.BestKey() ?? [];
         var keyLines = new List<string>();
-        var keyDdl = new List<string>();
+        var keys = new List<(string Alias, ColumnInfo? Column)>();
         for (var i = 0; i < keyColumns.Count; i++)
         {
             var alias = "__k" + i.ToString(CultureInfo.InvariantCulture);
             keyLines.Add($"s.{SqlQuote.Ident(keyColumns[i])} AS {SqlQuote.Ident(alias)}");
             task.KeyColumns.Add(alias);
-            var keyCol = primary!.FindColumn(keyColumns[i]);
-            keyDdl.Add($"    {SqlQuote.Ident(alias)} {(keyCol is null ? "sql_variant" : TypeWithCollation(keyCol))} NULL");
+            keys.Add((alias, primary!.FindColumn(keyColumns[i])));
         }
 
         var from = !string.IsNullOrWhiteSpace(map.From) ? map.From.Trim()
@@ -201,12 +200,24 @@ public static class SqlGenerator
 
         if (task.Mode == "staging_merge")
         {
-            var ddl = bound.Select(c => $"    {SqlQuote.Ident(c.Name)} {TypeWithCollation(c)} NULL").Concat(keyDdl);
-            task.StagingDdl = "CREATE TABLE #stg (\n" + string.Join(",\n", ddl) + "\n);";
+            task.StagingDdl = StagingDdl(bound, keys);
             var cols = string.Join(", ", bound.Select(c => SqlQuote.Ident(c.Name)));
             task.MergeSql = $"INSERT INTO {SqlQuote.Table(table.Schema, table.Name)} ({cols})\nSELECT {cols}\nFROM #stg;";
         }
         return task;
+    }
+
+    /// <summary>THE staging table definition: <c>CREATE TABLE #stg (...)</c> with every bound target column, then every key alias
+    /// (<c>sql_variant</c> when the key column's type is unknown), all NULL. One definition, two callers: the generator emits it as
+    /// <c>stagingDdl</c>, and SqlValidator executes it as the scaffold <c>mergeSql</c> is checked against. Never copy it.
+    /// Identifiers are quoted with <see cref="SqlQuote.Ident"/>; names and types come from catalog data, never from plan text.</summary>
+    public static string StagingDdl(IEnumerable<ColumnInfo> columns, IEnumerable<(string Alias, ColumnInfo? Column)> keys)
+    {
+        ArgumentNullException.ThrowIfNull(columns);
+        ArgumentNullException.ThrowIfNull(keys);
+        var ddl = columns.Select(c => $"    {SqlQuote.Ident(c.Name)} {TypeWithCollation(c)} NULL")
+            .Concat(keys.Select(k => $"    {SqlQuote.Ident(k.Alias)} {(k.Column is null ? "sql_variant" : TypeWithCollation(k.Column))} NULL"));
+        return "CREATE TABLE #stg (\n" + string.Join(",\n", ddl) + "\n);";
     }
 
     static void CarryOver(TaskPlan task, TaskPlan old)

@@ -607,4 +607,40 @@ public class SqlGeneratorTests
         Assert.Throws<ArgumentNullException>("map", () => SqlGenerator.MappingHash(null!));
         Assert.Throws<ArgumentNullException>("sourceQuery", () => SqlGenerator.CountSql(null!));
     }
+
+    /// <summary>Byte-for-byte the stagingDdl the generator emitted BEFORE StagingDdl was extracted (captured from commit 56f821c's
+    /// generator). The shared builder has two callers — the generator and SqlValidator's scaffold — and must not drift.</summary>
+    const string AddressesStagingDdl =
+        "CREATE TABLE #stg (\n    [AddressId] int NULL,\n    [CustomerId] int NULL,\n" +
+        "    [Line1] nvarchar(200) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,\n    [City] nvarchar(80) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,\n" +
+        "    [PostalCode] nvarchar(12) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,\n    [CountryCode] char(2) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,\n" +
+        "    [__k0] int NULL\n);";
+
+    const string ProductsStagingDdl =
+        "CREATE TABLE #stg (\n    [ProductId] int NULL,\n    [Name] nvarchar(150) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,\n" +
+        "    [Description] nvarchar(500) COLLATE SQL_Latin1_General_CP1_CI_AS NULL,\n    [UnitPrice] decimal(19,4) NULL,\n    [IsActive] bit NULL,\n" +
+        "    [__k0] int NULL\n);";
+
+    [Fact]
+    public void Staging_ddl_is_byte_identical_through_the_shared_builder()
+    {
+        var mapping = SampleMappings.Approved();
+        mapping.Tables["app.Addresses"].Kind = "lookup";
+        mapping.Tables["app.Products"].Kind = "lookup";
+        var src = SampleCatalogs.Source();
+        var tgt = SampleCatalogs.Target();
+        var plan = SqlGenerator.Generate(mapping, src, tgt);
+
+        foreach (var (target, expected) in new[] { ("app.Addresses", AddressesStagingDdl), ("app.Products", ProductsStagingDdl) })
+        {
+            var task = Task(plan, target);
+            Assert.Equal(expected, task.StagingDdl);
+
+            // The builder called directly, with the same typed inputs the generator uses, yields the same bytes.
+            var table = tgt.FindTable(target)!;
+            var primary = src.FindTable(mapping.Tables[target].Sources[0])!;
+            var keys = primary.BestKey()!.Select((k, i) => ("__k" + i, primary.FindColumn(k)));
+            Assert.Equal(expected, SqlGenerator.StagingDdl(task.Columns.Select(b => table.FindColumn(b.Target)!), keys));
+        }
+    }
 }

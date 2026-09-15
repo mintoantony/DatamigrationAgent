@@ -5,6 +5,7 @@ using Dbm.Core.Jobs;
 using Dbm.Core.Patching;
 using Dbm.Core.SqlGen;
 using Dbm.Core.State;
+using Dbm.Core.Workflow;
 
 namespace Dbm.Cli.Commands;
 
@@ -66,6 +67,9 @@ public sealed class SqlValidateCommand : ICommand
             try
             {
                 var patch = Patch.Parse(File.ReadAllText(patchPath));
+                // Same rule and wording as the web endpoint (CoreEndpoints human edit): a patch is only checked against its own phase.
+                if (!Phases.TryParse(patch.Phase, out var patchPhase) || patchPhase != PhaseName.Sql)
+                    throw new CliFailure("invalid_patch", $"patch.phase must be '{PhaseName.Sql.Text()}'.");
                 if (patch.BaseVersion != row.Version)
                     throw new CliFailure("stale_patch", $"The patch is based on v{patch.BaseVersion} but the current version is v{row.Version}.");
                 node = JsonPatch.Apply(node, patch.Ops);
@@ -98,6 +102,7 @@ public sealed class SqlValidateCommand : ICommand
             taskErrors = report.TaskErrors,
             taskWarnings = report.TaskWarnings,
             globalErrors = report.GlobalErrors,
+            globalWarnings = report.GlobalWarnings,
         }, report.Ok ? 0 : 1);
     }
 }
