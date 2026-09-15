@@ -14,7 +14,9 @@ namespace Dbm.Core.SqlGen;
 public static class ScriptPack
 {
     const string Rule = "-- =====================================================================";
-    const string MismatchTitle = "WARNING: this pack does not match the plan's execution order";
+    /// <summary>Heading over the plan's stored <see cref="SqlPlanSource.SkippedPrefix"/> line(s), which follow verbatim.</summary>
+    const string NotValidatedTitle = "WARNING: NOT VALIDATED - no database checked this plan";
+    const string MismatchTitle ="WARNING: this pack does not match the plan's execution order";
 
     public static byte[] BuildZip(SqlPlanPayload plan, string projectName)
     {
@@ -40,6 +42,7 @@ public static class ScriptPack
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(projectName);
         var problems = plan.OrderProblems();
+        var notValidated = plan.Warnings.Where(w => w.StartsWith(SqlPlanSource.SkippedPrefix, StringComparison.Ordinal)).ToList();
         var ordered = plan.Order.Select(id => (Id: id, Known: plan.Tasks.ContainsKey(id))).ToList();
         var listed = new HashSet<string>(plan.Order, StringComparer.Ordinal);
         var slots = ordered.Concat(plan.Tasks.Keys.Where(k => !listed.Contains(k)).OrderBy(k => k, StringComparer.Ordinal).Select(k => (Id: k, Known: true))).ToList();
@@ -47,7 +50,7 @@ public static class ScriptPack
         var width = Math.Max(2, (slots.Count + 1).ToString(CultureInfo.InvariantCulture).Length);
         var preName = new string('0', width) + "_pre.sql";
         var postName = new string('9', width) + "_post.sql";
-        var files = new List<(string, string)> { (preName, GlobalFile(projectName, preName, "pre-load", "before the first task", plan.PreSql, problems)) };
+        var files = new List<(string, string)> { (preName, GlobalFile(projectName, preName, "pre-load", "before the first task", plan.PreSql, problems, notValidated)) };
         var index = new List<(string File, string Id, TaskPlan Task)>();
         for (var i = 0; i < slots.Count; i++)
         {
@@ -58,8 +61,8 @@ public static class ScriptPack
             files.Add((name, TaskFile(projectName, id, task)));
             index.Add((name, id, task));
         }
-        files.Add((postName, GlobalFile(projectName, postName, "post-load", "after the last task", plan.PostSql, [])));
-        files.Add(("README.md", Readme(projectName, preName, postName, index, problems)));
+        files.Add((postName, GlobalFile(projectName, postName, "post-load", "after the last task", plan.PostSql, [], [])));
+        files.Add(("README.md", Readme(projectName, preName, postName, index, problems, notValidated)));
         return files;
     }
 
@@ -76,12 +79,18 @@ public static class ScriptPack
     /// <summary>The ONLY way an interpolated value reaches a <c>--</c> comment line.</summary>
     static StringBuilder Comment(StringBuilder sb, string text) => sb.Append("-- ").Append(OneLine(text)).Append('\n');
 
-    static string GlobalFile(string project, string name, string what, string when, List<string> statements, List<string> problems)
+    static string GlobalFile(string project, string name, string what, string when, List<string> statements, List<string> problems,
+        List<string> notValidated)
     {
         var sb = new StringBuilder();
         sb.Append(Rule).Append('\n');
         Comment(sb, $"{project}: {name} - global {what} statements");
         Comment(sb, $"runs on TARGET, {when}");
+        if (notValidated.Count > 0)
+        {
+            Comment(sb, NotValidatedTitle);
+            foreach (var line in notValidated) Comment(sb, line);   // the stored line verbatim, flattened
+        }
         if (problems.Count > 0)
         {
             Comment(sb, $"{MismatchTitle} (see README.md)");
@@ -154,10 +163,17 @@ public static class ScriptPack
         foreach (var i in items) Comment(sb, "  - " + i);
     }
 
-    static string Readme(string project, string preName, string postName, List<(string File, string Id, TaskPlan Task)> index, List<string> problems)
+    static string Readme(string project, string preName, string postName, List<(string File, string Id, TaskPlan Task)> index, List<string> problems,
+        List<string> notValidated)
     {
         var sb = new StringBuilder();
         sb.Append($"# {OneLine(project)} - migration script pack\n\n");
+        if (notValidated.Count > 0)
+        {
+            sb.Append($"## {NotValidatedTitle}\n\n");
+            foreach (var line in notValidated) sb.Append(OneLine(line)).Append('\n');
+            sb.Append('\n');
+        }
         if (problems.Count > 0)
         {
             sb.Append($"## {MismatchTitle}\n\n")

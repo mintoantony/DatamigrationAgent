@@ -140,7 +140,33 @@ public class ScriptPackTests
         Assert.Contains("--   - T03: task is missing from order\n", pre);
     }
 
-    const string Hostile = "x\nCANARY_LF;\rCANARY_CR;\r\nCANARY_CRLF;\u2028CANARY_LS;\u2029CANARY_PS;\u0085CANARY_NEL;\vCANARY_VT;\fCANARY_FF;";
+    /// <summary>Fix round 2 (concern 3): the DBA never sees ApprovalBlockers. A pack of a plan nothing validated says so, with the stored
+    /// line verbatim; a validated plan's pack says nothing of the kind.</summary>
+    [Fact]
+    public void A_never_validated_plan_says_so_in_the_pack_and_a_validated_one_does_not()
+    {
+        const string marker = SqlPlanSource.SkippedPrefix + "source connection, target connection missing";
+        var plan = Plan();
+        plan.Warnings.Add(marker);
+
+        var files = ScriptPack.BuildFiles(plan, "demo");
+
+        Assert.Contains("-- WARNING: NOT VALIDATED - no database checked this plan\n-- " + marker + "\n", files[0].Content);
+        var readme = files.Single(f => f.Name == "README.md").Content;
+        Assert.Contains("## WARNING: NOT VALIDATED - no database checked this plan\n\n" + marker + "\n", readme);
+
+        foreach (var (name, content) in ScriptPack.BuildFiles(Plan(), "demo"))
+            Assert.DoesNotContain("NOT VALIDATED", content, StringComparison.Ordinal);
+        Assert.DoesNotContain(SqlPlanSource.SkippedPrefix, string.Concat(ScriptPack.BuildFiles(Plan(), "demo").Select(f => f.Content)), StringComparison.Ordinal);
+
+        // The stored line is untrusted text like any other: it cannot start a line of its own.
+        var hostile = Plan();
+        hostile.Warnings.Add(marker + "\nDROP TABLE [app].[Orders];");
+        foreach (var (name, content) in ScriptPack.BuildFiles(hostile, "demo"))
+            Assert.DoesNotContain("\nDROP TABLE", content, StringComparison.Ordinal);
+    }
+
+    const string Hostile ="x\nCANARY_LF;\rCANARY_CR;\r\nCANARY_CRLF;\u2028CANARY_LS;\u2029CANARY_PS;\u0085CANARY_NEL;\vCANARY_VT;\fCANARY_FF;";
 
     /// <summary>The SQL bodies ARE executable by design; every other value that reaches the pack is text.</summary>
     static readonly HashSet<string> SqlBodies = [nameof(TaskPlan.SourceQuery), nameof(TaskPlan.StagingDdl), nameof(TaskPlan.MergeSql),
