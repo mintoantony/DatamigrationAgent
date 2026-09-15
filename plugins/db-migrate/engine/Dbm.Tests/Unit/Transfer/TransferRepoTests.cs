@@ -283,6 +283,70 @@ public sealed class TransferRepoTests : IDisposable
         Assert.Equal(id, _repo.Latest()!.Id);   // rejected runs left nothing behind
     }
 
+    // ---- fix round 1 (M3, L2) ----
+
+    [Fact]
+    public void Tasks_come_back_in_creation_ordinal_not_task_id_order()
+    {
+        // Creation order deliberately differs from ordinal string order and from the (run_id, task_id) key order.
+        long id = _repo.CreateRun(1, new TransferOptions(), [("T02", "app.B"), ("T01", "app.A"), ("T10", "app.C"), ("T03", "app.D")]);
+        var tasks = _repo.Tasks(id);
+        Assert.Equal(new[] { "T02", "T01", "T10", "T03" }, tasks.Select(t => t.TaskId));
+        Assert.Equal(new[] { 0, 1, 2, 3 }, tasks.Select(t => t.Ordinal));
+    }
+
+    [Fact]
+    public void ErrorRows_come_back_in_insertion_order_across_and_within_tasks()
+    {
+        long id = _repo.CreateRun(1, new TransferOptions(), [("T02", "app.B"), ("T01", "app.A")]);
+        _repo.AddErrorRow(id, "T02", null, "{}", "e0 T02");
+        _repo.AddErrorRow(id, "T01", null, "{}", "e1 T01");
+        _repo.AddErrorRow(id, "T02", null, "{}", "e2 T02");
+        _repo.AddErrorRow(id, "T01", null, "{}", "e3 T01");
+        Assert.Equal(new[] { "e0 T02", "e1 T01", "e2 T02", "e3 T01" }, _repo.ErrorRows(id).Select(e => e.Error));
+        Assert.Equal(new[] { "e1 T01", "e3 T01" }, _repo.ErrorRows(id, "T01").Select(e => e.Error));
+        var ids = _repo.ErrorRows(id).Select(e => e.Id).ToList();
+        Assert.Equal(ids.OrderBy(x => x), ids);
+    }
+
+    [Fact]
+    public void ErrorRowCount_for_an_unknown_run_or_task_throws_instead_of_reading_as_clean()
+    {
+        long id = NewRun();
+        Assert.Equal(0, _repo.ErrorRowCount(id, "T01"));   // a real task with no errors
+        Assert.Equal("unknown_task", Assert.Throws<TransferException>(() => _repo.ErrorRowCount(id, "T99")).Code);
+        Assert.Equal("unknown_task", Assert.Throws<TransferException>(() => _repo.ErrorRowCount(id + 1, "T01")).Code);
+    }
+
+    [Fact]
+    public void CreateRun_refuses_an_empty_task_list_that_would_read_as_all_done()
+    {
+        long before = NewRun();
+        long? id = null;
+        bool guarded = false;
+        try { id = _repo.CreateRun(1, new TransferOptions(), []); }
+        catch (ArgumentException) { guarded = true; }
+
+        if (!guarded)
+        {
+            // The harm: a run with no tasks satisfies "every task is done", so 5.3 completes it having copied nothing.
+            Assert.False(_repo.Tasks(id!.Value).All(t => t.Status == TransferTaskStatus.Done),
+                "an empty run reads as all tasks done: it would complete as a successful migration of nothing");
+        }
+        Assert.True(guarded);
+        Assert.Equal(before, _repo.Latest()!.Id);
+    }
+
+    [Fact]
+    public void CreateRun_applies_the_checkpoint_task_id_length_limit()
+    {
+        string id64 = new('a', 64);
+        long ok = _repo.CreateRun(1, new TransferOptions(), [(id64, "a.b")]);
+        Assert.Equal(id64, _repo.Tasks(ok).Single().TaskId);
+        Assert.Throws<ArgumentException>(() => _repo.CreateRun(1, new TransferOptions(), [("T01", "a.b"), (id64 + "b", "c.d")]));
+        Assert.Equal(ok, _repo.Latest()!.Id);
+    }
+
     [Fact]
     public void CreateRun_task_identity_is_ordinal_with_no_surrounding_whitespace()
     {

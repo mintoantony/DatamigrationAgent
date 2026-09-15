@@ -238,23 +238,28 @@ public sealed class ControlTableTests
         await using var conn = new SqlConnection(db.ConnectionString);
         await conn.OpenAsync();
 
-        // The harm, shown with the planner's own SQL and no guard: TOP (0) returns an empty chunk from a 3-row source, and an empty
-        // chunk is exactly how the engine recognises a completed task — nothing copied, reported as done.
-        foreach (long n in new long[] { 0, -1 })
+        // Product path. With the guard, Command refuses 0. Without it, the command it builds is run exactly as the engine
+        // would run a chunk, and the harm assertion is what fails: TOP (0) yields an empty chunk from a 3-row source, and an
+        // empty chunk is how the engine recognises a finished task (nothing copied, reported done).
+        bool guarded = false;
+        SqlCommand? cmd = null;
+        try { cmd = ChunkPlanner.Command(conn, task, null, 0); }
+        catch (ArgumentOutOfRangeException) { guarded = true; }
+        if (cmd is not null)
         {
-            await using var raw = new SqlCommand(ChunkPlanner.Sql(task, afterKey: false), conn);
-            raw.Parameters.Add(new SqlParameter("@__n", System.Data.SqlDbType.BigInt) { Value = n });
-            try
+            await using (cmd)
             {
-                await using var r = await raw.ExecuteReaderAsync();
-                Assert.False(await r.ReadAsync());
+                int rowsRead = 0;
+                await using (var r = await cmd.ExecuteReaderAsync())
+                    while (await r.ReadAsync()) rowsRead++;
+                Assert.True(rowsRead > 0,
+                    $"chunk size 0 returned {rowsRead} rows from a 3-row source: the engine would mark the task done having copied nothing");
             }
-            catch (SqlException) when (n < 0) { /* a negative TOP errors instead; still not a copy */ }
         }
+        Assert.True(guarded);
         Assert.Equal(3L, await db.CountAsync("dbo.S"));
 
-        // The guard: Command refuses it before any query runs, and a real chunk size reads the rows.
-        Assert.Throws<ArgumentOutOfRangeException>(() => ChunkPlanner.Command(conn, task, null, 0));
+        // A real chunk size reads the rows through the same path.
         await using var ok = ChunkPlanner.Command(conn, task, null, 1);
         await using var rows = await ok.ExecuteReaderAsync();
         Assert.True(await rows.ReadAsync());
@@ -268,32 +273,203 @@ public sealed class ControlTableTests
         await conn.OpenAsync();
         await ControlTable.EnsureAsync(conn, default);
 
+        // Two distinct 65-character ids sharing a 64-character prefix, written and read through the product path.
         string prefix = new('x', 64);
-        string orders = prefix + "_orders", customers = prefix + "_customers";
-
-        // The harm, shown with the same nvarchar(64) parameter the control table binds and no length guard:
-        // SqlClient truncates silently, so two distinct tasks write one row and each reads the other's resume position.
-        async Task RawUpsert(string taskId, int chunkNo, string lastKey)
+        string orders = prefix + "o", customers = prefix + "c";
+        bool guarded = false;
+        try
         {
-            await using var cmd = new SqlCommand($"""
-                UPDATE {ControlTable.Name} SET chunk_no = @c, last_key = @k WHERE run_id = 1 AND task_id = @t;
-                IF @@ROWCOUNT = 0 INSERT {ControlTable.Name} VALUES (1, @t, @c, @k, 0, 0, 0, SYSUTCDATETIME());
-                """, conn);
-            cmd.Parameters.Add(new SqlParameter("@t", System.Data.SqlDbType.NVarChar, 64) { Value = taskId });
-            cmd.Parameters.Add(new SqlParameter("@c", System.Data.SqlDbType.Int) { Value = chunkNo });
-            cmd.Parameters.Add(new SqlParameter("@k", System.Data.SqlDbType.NVarChar, -1) { Value = lastKey });
-            await cmd.ExecuteNonQueryAsync();
+            await ControlTable.UpsertAsync(conn, null, 1, orders, new Checkpoint(7, "orders-key", 700, 0, false), default);
+            await ControlTable.UpsertAsync(conn, null, 1, customers, new Checkpoint(2, "customers-key", 200, 0, false), default);
         }
-        await RawUpsert(orders, 7, "orders-key");
-        await RawUpsert(customers, 2, "customers-key");
-        Assert.Equal(1L, await db.CountAsync(ControlTable.Name));
-        Assert.Equal("customers-key", await db.ScalarAsync<string>($"SELECT last_key FROM {ControlTable.Name}"));   // orders' position is gone
-        await db.ExecAsync($"DELETE FROM {ControlTable.Name}");
+        catch (ArgumentException) { guarded = true; }
 
-        // The guard: both ids are refused at the boundary, before any statement runs.
-        await Assert.ThrowsAsync<ArgumentException>(() => ControlTable.UpsertAsync(conn, null, 1, orders, Checkpoint.Start, default));
+        if (!guarded)
+        {
+            // Without the guard the nvarchar(64) parameter truncates silently: both tasks land on one row, and each would
+            // resume from the other's position.
+            Assert.Equal(2L, await db.CountAsync(ControlTable.Name));
+            Assert.Equal("orders-key", (await ControlTable.ReadAsync(conn, 1, orders, default))!.LastKeyJson);
+        }
+        Assert.True(guarded);
         await Assert.ThrowsAsync<ArgumentException>(() => ControlTable.ReadAsync(conn, 1, customers, default));
         Assert.Equal(0L, await db.CountAsync(ControlTable.Name));
+    }
+
+    // ---- fix round 1 (H1, M1, L1) ----
+
+    [Fact]
+    public async Task DropAsync_refuses_a_foreign_table_of_the_same_name_and_leaves_it_and_its_rows_intact()
+    {
+        await using var db = await TempDatabase.CreateAsync("dbm_ctldrop");
+        await db.ExecAsync("CREATE TABLE dbo.__dbm_checkpoint (run_id bigint NOT NULL, note nvarchar(20) NULL); INSERT dbo.__dbm_checkpoint VALUES (1, N'mine'), (2, N'also mine');");
+        await using var conn = new SqlConnection(db.ConnectionString);
+        await conn.OpenAsync();
+
+        var ex = await Record.ExceptionAsync(() => ControlTable.DropAsync(conn, default));
+
+        // The harm first, so a removed check fails here, on the missing table, not on the missing exception.
+        Assert.True(await ControlTable.ExistsAsync(conn, default), "DropAsync dropped a customer's table that is not a db-migrate checkpoint table");
+        Assert.Equal(2L, await db.CountAsync("dbo.__dbm_checkpoint"));
+        Assert.Equal("mine", await db.ScalarAsync<string>("SELECT note FROM dbo.__dbm_checkpoint WHERE run_id = 1"));
+
+        var te = Assert.IsType<TransferException>(ex);
+        Assert.Equal("control_table_mismatch", te.Code);
+        Assert.Equal(0, await db.ScalarAsync<int>("SELECT COUNT(*) FROM sys.dm_tran_locks WHERE resource_type = 'APPLICATION' AND resource_database_id = DB_ID()"));
+    }
+
+    [Fact]
+    public async Task Ensure_and_drop_leave_the_callers_xact_abort_setting_as_they_found_it()
+    {
+        await using var db = await TempDatabase.CreateAsync("dbm_ctlxact");
+        await using var conn = new SqlConnection(db.ConnectionString);
+        await conn.OpenAsync();
+
+        async Task<bool> XactAbort()
+        {
+            await using var c = new SqlCommand("SELECT CAST(@@OPTIONS & 16384 AS int)", conn);
+            return (int)(await c.ExecuteScalarAsync())! != 0;
+        }
+        async Task Set(bool on)
+        {
+            await using var c = new SqlCommand(on ? "SET XACT_ABORT ON;" : "SET XACT_ABORT OFF;", conn);
+            await c.ExecuteNonQueryAsync();
+        }
+
+        foreach (bool on in new[] { false, true, false })
+        {
+            await Set(on);
+            Assert.Equal(on, await XactAbort());
+            await ControlTable.EnsureAsync(conn, default);     // creates
+            Assert.Equal(on, await XactAbort());
+            await ControlTable.EnsureAsync(conn, default);     // already exists
+            Assert.Equal(on, await XactAbort());
+            await ControlTable.DropAsync(conn, default);       // drops ours
+            Assert.Equal(on, await XactAbort());
+            await ControlTable.DropAsync(conn, default);       // absent: no-op
+            Assert.Equal(on, await XactAbort());
+
+            await db.ExecAsync("CREATE TABLE dbo.__dbm_checkpoint (x int NOT NULL);");
+            await Assert.ThrowsAsync<TransferException>(() => ControlTable.EnsureAsync(conn, default));   // mismatch path
+            Assert.Equal(on, await XactAbort());
+            await Assert.ThrowsAsync<TransferException>(() => ControlTable.DropAsync(conn, default));
+            Assert.Equal(on, await XactAbort());
+            await db.ExecAsync("DROP TABLE dbo.__dbm_checkpoint;");
+        }
+    }
+
+    [Fact]
+    public async Task A_create_or_drop_that_fails_after_taking_the_lock_leaves_nothing_behind()
+    {
+        await using var db = await TempDatabase.CreateAsync("dbm_ctlfail");
+        await using var conn = new SqlConnection(db.ConnectionString);
+        await conn.OpenAsync();
+        await using var other = new SqlConnection(db.ConnectionString);
+        await other.OpenAsync();
+
+        async Task<int> TranCount()
+        {
+            await using var c = new SqlCommand("SELECT @@TRANCOUNT", conn);
+            return (int)(await c.ExecuteScalarAsync())!;
+        }
+        async Task<int> LockFromOtherConnection()
+        {
+            // 0 = granted immediately; negative = still held by the failed call.
+            await using var c = new SqlCommand($"""
+                BEGIN TRANSACTION;
+                DECLARE @rc int;
+                EXEC @rc = sp_getapplock @Resource = N'dbm:{ControlTable.Name}', @LockMode = N'Exclusive', @LockOwner = N'Transaction', @LockTimeout = 0;
+                ROLLBACK TRANSACTION;
+                SELECT @rc;
+                """, other);
+            return (int)(await c.ExecuteScalarAsync())!;
+        }
+
+        foreach (bool xactAbort in new[] { false, true })
+        {
+            await using (var s = new SqlCommand(xactAbort ? "SET XACT_ABORT ON;" : "SET XACT_ABORT OFF;", conn)) await s.ExecuteNonQueryAsync();
+
+            // Create fails after the table exists inside our transaction: a DDL trigger throws once CREATE TABLE has run.
+            await db.ExecAsync("""
+                CREATE TRIGGER probe_create ON DATABASE FOR CREATE_TABLE AS
+                  IF EVENTDATA().value('(/EVENT_INSTANCE/ObjectName)[1]', 'sysname') = N'__dbm_checkpoint' THROW 50001, N'probe: create refused', 1;
+                """);
+            await Assert.ThrowsAnyAsync<Exception>(() => ControlTable.EnsureAsync(conn, default));
+            Assert.Equal(0, await TranCount());
+            Assert.False(await ControlTable.ExistsAsync(conn, default));
+            Assert.Equal(0, await LockFromOtherConnection());
+            await db.ExecAsync("DROP TRIGGER probe_create ON DATABASE;");
+
+            // Drop fails after the shape check passed: our table and its rows must survive, with no transaction left open.
+            await ControlTable.EnsureAsync(conn, default);
+            await ControlTable.UpsertAsync(conn, null, 9, "T01", new Checkpoint(3, "k", 30, 0, false), default);
+            await db.ExecAsync("""
+                CREATE TRIGGER probe_drop ON DATABASE FOR DROP_TABLE AS
+                  IF EVENTDATA().value('(/EVENT_INSTANCE/ObjectName)[1]', 'sysname') = N'__dbm_checkpoint' THROW 50002, N'probe: drop refused', 1;
+                """);
+            await Assert.ThrowsAnyAsync<Exception>(() => ControlTable.DropAsync(conn, default));
+            Assert.Equal(0, await TranCount());
+            Assert.True(await ControlTable.ExistsAsync(conn, default));
+            Assert.Equal(new Checkpoint(3, "k", 30, 0, false), await ControlTable.ReadAsync(conn, 9, "T01", default));
+            Assert.Equal(0, await LockFromOtherConnection());
+            await db.ExecAsync("DROP TRIGGER probe_drop ON DATABASE;");
+
+            // Statement-level failures. A trigger error ends the transaction server-side; these do not. With XACT_ABORT OFF the
+            // transaction (and the application lock it owns) stays open after the error unless ControlTable rolls it back.
+            // Drop: a schema-bound view makes DROP TABLE fail (error 3729) after the shape check passed.
+            await db.ExecAsync("CREATE VIEW dbo.probe_bound WITH SCHEMABINDING AS SELECT run_id FROM dbo.__dbm_checkpoint;");
+            await Assert.ThrowsAsync<SqlException>(() => ControlTable.DropAsync(conn, default));
+            Assert.Equal(0, await TranCount());
+            Assert.Equal(0, await LockFromOtherConnection());
+            Assert.Equal(new Checkpoint(3, "k", 30, 0, false), await ControlTable.ReadAsync(conn, 9, "T01", default));
+            await db.ExecAsync("DROP VIEW dbo.probe_bound;");
+            await ControlTable.DropAsync(conn, default);
+
+            // Create: a non-table object of the name makes CREATE TABLE fail (error 2714) after the lock was taken.
+            await db.ExecAsync("CREATE VIEW dbo.__dbm_checkpoint AS SELECT 1 AS x;");
+            await Assert.ThrowsAsync<SqlException>(() => ControlTable.EnsureAsync(conn, default));
+            Assert.Equal(0, await TranCount());
+            Assert.Equal(0, await LockFromOtherConnection());
+            Assert.False(await ControlTable.ExistsAsync(conn, default));
+            Assert.Equal(1, await db.ScalarAsync<int>("SELECT COUNT(*) FROM sys.views WHERE name = N'__dbm_checkpoint'"));
+            await db.ExecAsync("DROP VIEW dbo.__dbm_checkpoint;");
+
+            // Client-side failure after the lock: the shape check throws control_table_mismatch while the transaction and its
+            // application lock are still open on the server. Only ControlTable's rollback ends them.
+            await db.ExecAsync("CREATE TABLE dbo.__dbm_checkpoint (x int NOT NULL); INSERT dbo.__dbm_checkpoint VALUES (5);");
+            await Assert.ThrowsAsync<TransferException>(() => ControlTable.EnsureAsync(conn, default));
+            Assert.Equal(0, await LockFromOtherConnection());
+            Assert.Equal(0, await TranCount());
+            await Assert.ThrowsAsync<TransferException>(() => ControlTable.DropAsync(conn, default));
+            Assert.Equal(0, await LockFromOtherConnection());
+            Assert.Equal(0, await TranCount());
+            Assert.Equal(1L, await db.CountAsync("dbo.__dbm_checkpoint"));
+            await db.ExecAsync("DROP TABLE dbo.__dbm_checkpoint;");
+        }
+    }
+
+    [Fact]
+    public async Task An_open_checkpoint_upsert_does_not_block_a_different_tasks_first_upsert()
+    {
+        await using var db = await TempDatabase.CreateAsync("dbm_ctlblock");
+        await using var a = new SqlConnection(db.ConnectionString);
+        await a.OpenAsync();
+        await using var b = new SqlConnection(db.ConnectionString);
+        await b.OpenAsync();
+        await ControlTable.EnsureAsync(a, default);
+
+        await using var txA = (SqlTransaction)await a.BeginTransactionAsync();
+        await ControlTable.UpsertAsync(a, txA, 1, "T01", new Checkpoint(1, "a", 10, 0, false), default);   // left open, as mid-chunk
+
+        await using var txB = (SqlTransaction)await b.BeginTransactionAsync();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var blocked = await Record.ExceptionAsync(() => ControlTable.UpsertAsync(b, txB, 1, "T02", new Checkpoint(1, "b", 10, 0, false), timeout.Token));
+        sw.Stop();
+        Assert.True(blocked is null, $"T02's first upsert was blocked by T01's open upsert for {sw.ElapsedMilliseconds} ms ({blocked?.GetType().Name}); parallel tasks would serialise on the checkpoint table");
+        await txB.CommitAsync();
+        await txA.CommitAsync();
+        Assert.Equal(2L, await db.CountAsync(ControlTable.Name));
     }
 
     [Fact]

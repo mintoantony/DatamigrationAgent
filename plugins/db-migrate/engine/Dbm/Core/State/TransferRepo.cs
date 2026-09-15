@@ -31,14 +31,15 @@ public sealed class TransferRepo(StateDb db)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(tasks);
+        // A run with no tasks satisfies "every task is done" and would complete as a successful migration of nothing (ruling L2).
+        if (tasks.Count == 0) throw new ArgumentException("A transfer run needs at least one task.", nameof(tasks));
         var normalized = options.Normalized();
         var ids = new HashSet<string>(StringComparer.Ordinal);
         foreach (var (taskId, target) in tasks)
         {
             if (string.IsNullOrWhiteSpace(taskId)) throw new ArgumentException("Every task needs a non-blank task id.", nameof(tasks));
-            // One identity rule shared with the checkpoint table (ruling Q5): ordinal, no surrounding whitespace.
-            if (char.IsWhiteSpace(taskId[0]) || char.IsWhiteSpace(taskId[^1]))
-                throw new ArgumentException($"Task id \"{taskId}\" has leading or trailing whitespace.", nameof(tasks));
+            // One identity rule shared with the checkpoint table (rulings Q5, L2): 1-64 characters, ordinal, no surrounding whitespace.
+            ControlTable.CheckTaskId(taskId);
             if (string.IsNullOrWhiteSpace(target)) throw new ArgumentException($"Task {taskId} has a blank target.", nameof(tasks));
             if (!ids.Add(taskId)) throw new ArgumentException($"Task id {taskId} appears more than once.", nameof(tasks));
         }
@@ -150,10 +151,16 @@ public sealed class TransferRepo(StateDb db)
             r => new ErrorRowEntry(r.GetInt64(0), r.GetInt64(1), r.GetString(2), Str(r, 3), Str(r, 4), r.GetString(5), Ts(r, 6)!.Value),
             new { RunId = runId, TaskId = taskId, Limit = Math.Clamp(limit, 1, 10_000) });
 
+    /// <summary>Rejected rows recorded for an existing task; an unknown run or task throws "unknown_task" rather than reading as 0 (ruling L2).</summary>
     public long ErrorRowCount(long runId, string taskId)
     {
         ArgumentNullException.ThrowIfNull(taskId);
-        return _db.Scalar<long>("SELECT COUNT(*) FROM error_row WHERE run_id = $RunId AND task_id = $TaskId", new { RunId = runId, TaskId = taskId });
+        long n = _db.Scalar<long>(
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM transfer_task WHERE run_id = $RunId AND task_id = $TaskId) " +
+            "THEN (SELECT COUNT(*) FROM error_row WHERE run_id = $RunId AND task_id = $TaskId) ELSE -1 END",
+            new { RunId = runId, TaskId = taskId });
+        if (n < 0) throw new TransferException("unknown_task", $"Transfer task {taskId} of run {runId} does not exist.");
+        return n;
     }
 
     /// <summary>

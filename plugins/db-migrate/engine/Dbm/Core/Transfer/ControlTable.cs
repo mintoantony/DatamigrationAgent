@@ -11,7 +11,8 @@ public sealed record Checkpoint(int ChunkNo, string? LastKeyJson, long RowsDone,
 
 /// <summary>
 /// dbo.__dbm_checkpoint in the TARGET: written in the same transaction as each chunk (exactly-once).
-/// This is the one persistent object the engine creates in a customer database; nothing here touches any other object.
+/// This is the one persistent object the engine creates in a customer database. Nothing here touches any other object, and
+/// nothing here writes into or drops a table of that name whose shape has not been verified as ours.
 /// </summary>
 public static class ControlTable
 {
@@ -33,38 +34,31 @@ public static class ControlTable
         "run_id|bigint|8|0|0|,task_id|nvarchar|128|0|0|" + Collation + ",chunk_no|int|4|0|0|,last_key|nvarchar|-1|0|1|" + Collation + "," +
         "rows_done|bigint|8|0|0|,rows_error|bigint|8|0|0|,done|bit|1|0|0|,updated_at|datetime2|7|3|0|;pk=run_id,task_id";
 
+    private const string MissingShape = "(table missing)";
+
     /// <summary>
     /// Creates the table if absent, then verifies an existing table has exactly the expected shape (else "control_table_mismatch",
-    /// leaving that table untouched). Safe to call repeatedly and concurrently: creation is serialised with a database-scoped
-    /// application lock held by a transaction, so a racing caller waits and then finds the table.
+    /// leaving that table untouched). Safe to call repeatedly and concurrently: creation and the check run under a database-scoped
+    /// application lock owned by a transaction, so a racing caller waits and then finds the table.
+    /// The caller's session settings (XACT_ABORT, isolation level) are left as they were.
     /// </summary>
     public static async Task EnsureAsync(SqlConnection conn, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(conn);
-        await ExecAsync(conn, $"""
-            SET XACT_ABORT ON;
-            BEGIN TRANSACTION;
-            DECLARE @rc int;
-            EXEC @rc = sp_getapplock @Resource = N'{AppLock}', @LockMode = N'Exclusive', @LockOwner = N'Transaction', @LockTimeout = 60000;
-            IF @rc < 0
-            BEGIN
-              ROLLBACK TRANSACTION;
-              THROW 50000, N'Timed out waiting to create {Name}.', 1;
-            END;
-            IF OBJECT_ID(N'{Name}', N'U') IS NULL
-              CREATE TABLE {Name} (
-                run_id bigint NOT NULL, task_id nvarchar(64) COLLATE {Collation} NOT NULL, chunk_no int NOT NULL,
-                last_key nvarchar(max) COLLATE {Collation} NULL,
-                rows_done bigint NOT NULL, rows_error bigint NOT NULL, done bit NOT NULL, updated_at datetime2(3) NOT NULL,
-                PRIMARY KEY (run_id, task_id));
-            COMMIT TRANSACTION;
-            """, ct);
-
-        string shape = await ShapeAsync(conn, ct);
-        if (!string.Equals(shape, ExpectedShape, StringComparison.Ordinal))
-            throw new TransferException("control_table_mismatch",
-                $"{Name} already exists in the target but is not a db-migrate checkpoint table; it was left untouched. Rename or drop it and retry.",
-                [$"expected: {ExpectedShape}", $"found: {shape}"]);
+        await UnderAppLockAsync(conn, async tx =>
+        {
+            await ExecAsync(conn, tx, $"""
+                IF OBJECT_ID(N'{Name}', N'U') IS NULL
+                  CREATE TABLE {Name} (
+                    run_id bigint NOT NULL, task_id nvarchar(64) COLLATE {Collation} NOT NULL, chunk_no int NOT NULL,
+                    last_key nvarchar(max) COLLATE {Collation} NULL,
+                    rows_done bigint NOT NULL, rows_error bigint NOT NULL, done bit NOT NULL, updated_at datetime2(3) NOT NULL,
+                    PRIMARY KEY (run_id, task_id));
+                """, ct);
+            string shape = await ShapeAsync(conn, tx, ct);
+            if (!string.Equals(shape, ExpectedShape, StringComparison.Ordinal))
+                throw Mismatch(shape, "it was left untouched. Rename or drop it and retry.");
+        }, ct);
     }
 
     public static async Task<bool> ExistsAsync(SqlConnection conn, CancellationToken ct)
@@ -90,7 +84,11 @@ public static class ControlTable
         return new Checkpoint(r.GetInt32(0), r.IsDBNull(1) ? null : r.GetString(1), r.GetInt64(2), r.GetInt64(3), r.GetBoolean(4));
     }
 
-    /// <summary>Insert-or-update of one task's checkpoint, inside <paramref name="tx"/> when given (commits and rolls back with the chunk).</summary>
+    /// <summary>
+    /// Insert-or-update of one task's checkpoint, inside <paramref name="tx"/> when given (commits and rolls back with the chunk).
+    /// No range-locking hints: one runner owns a (run, task) key, and hints would serialise different tasks' first upserts (ruling L1).
+    /// A same-key insert race, if it ever happened, fails loudly on the primary key rather than corrupting anything.
+    /// </summary>
     public static async Task UpsertAsync(SqlConnection conn, SqlTransaction? tx, long runId, string taskId, Checkpoint cp, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(conn);
@@ -101,7 +99,7 @@ public static class ControlTable
         ArgumentOutOfRangeException.ThrowIfNegative(cp.RowsError, nameof(cp));
 
         await using var cmd = new SqlCommand($"""
-            UPDATE {Name} WITH (UPDLOCK, SERIALIZABLE)
+            UPDATE {Name}
               SET chunk_no = @c, last_key = @k, rows_done = @d, rows_error = @e, done = @f, updated_at = SYSUTCDATETIME()
             WHERE run_id = @r AND task_id = @t;
             IF @@ROWCOUNT = 0
@@ -117,14 +115,84 @@ public static class ControlTable
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
-    /// <summary>Drops the table if present; a no-op otherwise.</summary>
-    public static Task DropAsync(SqlConnection conn, CancellationToken ct)
+    /// <summary>
+    /// Drops the table if it is ours; a no-op when absent. A table of that name with any other shape is a customer's object:
+    /// "control_table_mismatch", and it is left untouched (ruling H1). Check and drop run under the same application lock.
+    /// </summary>
+    public static async Task DropAsync(SqlConnection conn, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(conn);
-        return ExecAsync(conn, $"IF OBJECT_ID(N'{Name}', N'U') IS NOT NULL DROP TABLE {Name};", ct);
+        await UnderAppLockAsync(conn, async tx =>
+        {
+            string shape = await ShapeAsync(conn, tx, ct);
+            if (shape == MissingShape) return;
+            if (!string.Equals(shape, ExpectedShape, StringComparison.Ordinal))
+                throw Mismatch(shape, "it was not dropped.");
+            await ExecAsync(conn, tx, $"DROP TABLE {Name};", ct);
+        }, ct);
     }
 
-    private static async Task<string> ShapeAsync(SqlConnection conn, CancellationToken ct)
+    /// <summary>Task-id identity shared with the run repo (Q5): 1-64 characters, no leading or trailing whitespace.</summary>
+    internal static void CheckTaskId(string taskId)
+    {
+        ArgumentNullException.ThrowIfNull(taskId);
+        if (taskId.Length is 0 or > MaxTaskIdLength)
+            throw new ArgumentException($"Task id must be 1-{MaxTaskIdLength} characters (got {taskId.Length}).", nameof(taskId));
+        // SQL Server ignores trailing spaces in comparisons under every collation, BIN2 included: "T01 " would share T01's row.
+        if (char.IsWhiteSpace(taskId[0]) || char.IsWhiteSpace(taskId[^1]))
+            throw new ArgumentException($"Task id \"{taskId}\" has leading or trailing whitespace.", nameof(taskId));
+    }
+
+    private static TransferException Mismatch(string shape, string outcome)
+        => new("control_table_mismatch",
+            $"{Name} already exists in the target but is not a db-migrate checkpoint table; {outcome}",
+            [$"expected: {ExpectedShape}", $"found: {shape}"]);
+
+    /// <summary>
+    /// Runs <paramref name="body"/> in a client-side transaction holding the exclusive application lock, commits on success and
+    /// rolls back on any failure. No SET options are issued, so the caller's XACT_ABORT setting survives; with XACT_ABORT OFF a
+    /// statement error does not doom the transaction, which is why every failure path rolls back explicitly.
+    /// </summary>
+    private static async Task UnderAppLockAsync(SqlConnection conn, Func<SqlTransaction, Task> body, CancellationToken ct)
+    {
+        var tx = (SqlTransaction)await conn.BeginTransactionAsync(IsolationLevel.Unspecified, ct);
+        try
+        {
+            await ExecAsync(conn, tx, $"""
+                DECLARE @rc int;
+                EXEC @rc = sp_getapplock @Resource = N'{AppLock}', @LockMode = N'Exclusive', @LockOwner = N'Transaction', @LockTimeout = 60000;
+                IF @rc < 0 THROW 50000, N'Timed out waiting for the lock on {Name}.', 1;
+                """, ct);
+            await body(tx);
+            await tx.CommitAsync(ct);
+        }
+        catch
+        {
+            await RollbackQuietlyAsync(conn, tx);
+            throw;
+        }
+        finally
+        {
+            await tx.DisposeAsync();
+        }
+    }
+
+    private static async Task RollbackQuietlyAsync(SqlConnection conn, SqlTransaction tx)
+    {
+        // Prefer the transaction object; if the server already ended it (e.g. an error inside a trigger) or a cancelled batch
+        // left SqlClient's view stale, fall back to a plain rollback so no transaction is ever left on the caller's connection.
+        try { if (tx.Connection is not null) await tx.RollbackAsync(CancellationToken.None); }
+        catch (Exception) { /* the original failure is the one worth reporting */ }
+        if (conn.State != ConnectionState.Open) return;
+        try
+        {
+            await using var rollback = new SqlCommand("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;", conn);
+            await rollback.ExecuteNonQueryAsync(CancellationToken.None);
+        }
+        catch (Exception) { /* as above */ }
+    }
+
+    private static async Task<string> ShapeAsync(SqlConnection conn, SqlTransaction tx, CancellationToken ct)
     {
         // Two plain result sets (no STRING_AGG, so it also runs on SQL Server 2016), joined client-side.
         await using var cmd = new SqlCommand($"""
@@ -135,7 +203,7 @@ public static class ControlTable
             JOIN sys.index_columns AS ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0
             JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
             WHERE i.object_id = OBJECT_ID(N'{Name}', N'U') AND i.is_primary_key = 1 ORDER BY ic.key_ordinal;
-            """, conn);
+            """, conn, tx);
         await using var r = await cmd.ExecuteReaderAsync(ct);
         var columns = new List<string>();
         while (await r.ReadAsync(ct))
@@ -144,17 +212,7 @@ public static class ControlTable
         var pk = new List<string>();
         if (await r.NextResultAsync(ct))
             while (await r.ReadAsync(ct)) pk.Add(r.GetString(0));
-        return columns.Count == 0 ? "(table missing)" : string.Join(',', columns) + ";pk=" + string.Join(',', pk);
-    }
-
-    private static void CheckTaskId(string taskId)
-    {
-        ArgumentNullException.ThrowIfNull(taskId);
-        if (taskId.Length is 0 or > MaxTaskIdLength)
-            throw new ArgumentException($"Task id must be 1-{MaxTaskIdLength} characters (got {taskId.Length}).", nameof(taskId));
-        // SQL Server ignores trailing spaces in comparisons under every collation, BIN2 included: "T01 " would share T01's row.
-        if (char.IsWhiteSpace(taskId[0]) || char.IsWhiteSpace(taskId[^1]))
-            throw new ArgumentException($"Task id \"{taskId}\" has leading or trailing whitespace.", nameof(taskId));
+        return columns.Count == 0 ? MissingShape : string.Join(',', columns) + ";pk=" + string.Join(',', pk);
     }
 
     private static void AddKey(SqlCommand cmd, long runId, string taskId)
@@ -163,23 +221,9 @@ public static class ControlTable
         cmd.Parameters.Add(new SqlParameter("@t", SqlDbType.NVarChar, MaxTaskIdLength) { Value = taskId });
     }
 
-    private static async Task ExecAsync(SqlConnection conn, string sql, CancellationToken ct)
+    private static async Task ExecAsync(SqlConnection conn, SqlTransaction tx, string sql, CancellationToken ct)
     {
-        await using var cmd = new SqlCommand(sql, conn);
-        try
-        {
-            await cmd.ExecuteNonQueryAsync(ct);
-        }
-        catch when (conn.State == ConnectionState.Open)
-        {
-            // A cancelled batch (attention) does not roll back a transaction the batch opened; never leave one on the caller's connection.
-            try
-            {
-                await using var rollback = new SqlCommand("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;", conn);
-                await rollback.ExecuteNonQueryAsync(CancellationToken.None);
-            }
-            catch (Exception) { /* the original failure is the one worth reporting */ }
-            throw;
-        }
+        await using var cmd = new SqlCommand(sql, conn, tx);
+        await cmd.ExecuteNonQueryAsync(ct);
     }
 }
