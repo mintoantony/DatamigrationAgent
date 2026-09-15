@@ -43,6 +43,25 @@ public sealed class SqlGenJobTests
         Assert.Contains(log, l => l.StartsWith("sqlgen: 6 task(s) generated", StringComparison.Ordinal));
     }
 
+    /// <summary>H1: an offline sqlgen draft records, in the stored plan, that nothing validated it — and that blocks approval.</summary>
+    [Fact]
+    public async Task Offline_job_stores_the_not_validated_marker()
+    {
+        using var project = TempProject.Create();
+        Prepare(project.Services);
+
+        var result = await new SqlGenJob().RunAsync(Ctx(project.Services, new List<string>()), CancellationToken.None);
+
+        const string marker = "live validation skipped: source connection, target connection missing";
+        Assert.Contains(marker, Json.FromNode<SqlPlanPayload>(result.DraftPayload!).Warnings);
+        var ctx = new Dbm.Core.Workflow.ModuleContext
+        {
+            Services = project.Services, OpenFeedback = [],
+            Current = project.Services.Artifacts.Add(PhaseName.Sql, 0, result.DraftPayload!.ToJsonString(), "script", "draft"),
+        };
+        Assert.Contains(SqlModule.NotValidatedBlocker + marker, new SqlModule().ApprovalBlockers(ctx, result.DraftPayload!));
+    }
+
     [Fact]
     public async Task Job_requires_an_approved_mapping()
     {

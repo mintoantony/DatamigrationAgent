@@ -12,6 +12,23 @@ public sealed class SqlPlanPayload
 
     public int ErrorCount() => Errors.Count + Tasks.Values.Sum(t => t.Errors.Count);
     public int WarningCount() => Warnings.Count + Tasks.Values.Sum(t => t.Warnings.Count);
+
+    /// <summary>Every way <see cref="Order"/> fails to list each task exactly once, in a stable order: "order[2]: T99 is not a task",
+    /// "order[6]: T01 is listed more than once", then (ordinal) "T03: task is missing from order". Empty = consistent.</summary>
+    public List<string> OrderProblems()
+    {
+        var problems = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = 0; i < Order.Count; i++)
+        {
+            var id = Order[i];
+            if (!Tasks.ContainsKey(id)) problems.Add(FormattableString.Invariant($"order[{i}]: {id} is not a task"));
+            else if (!seen.Add(id)) problems.Add(FormattableString.Invariant($"order[{i}]: {id} is listed more than once"));
+        }
+        foreach (var id in Tasks.Keys.Where(k => !seen.Contains(k)).OrderBy(k => k, StringComparer.Ordinal))
+            problems.Add($"{id}: task is missing from order");
+        return problems;
+    }
 }
 
 public sealed class TaskPlan
