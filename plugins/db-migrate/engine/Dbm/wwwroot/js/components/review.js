@@ -38,7 +38,11 @@
 
   /* ------------------------------------------------------------------ review bar */
 
-  C.reviewBar = function (ctx) {
+  /**
+   * opts.blocked: a reason string. The view on screen is known to be stale (a newer version exists that it has not shown), so
+   * Approve and Request changes — which act on the server's current version — are disabled and the reason is shown.
+   */
+  C.reviewBar = function (ctx, opts) {
     var row = ctx.phaseRow;
     var versions = ctx.versions || [];
     var shown = ctx.artifact;                 // {version, author, summary, createdAt, payload}
@@ -47,6 +51,7 @@
     var viewingOld = !!shown && latest != null && shown.version !== latest;
     var n = counts(ctx);
     var canReview = row.status === 'awaiting_review' && !viewingOld;
+    var blocked = (opts && opts.blocked) || null;
 
     var picker = h('select', {
       class: 'select',
@@ -58,13 +63,13 @@
       return h('option', { value: String(v.version), selected: shown && v.version === shown.version }, label);
     }));
 
-    var approveBtn = h('button', { type: 'button', class: 'btn btn-primary' }, C.icon('check'), 'Approve');
+    var approveBtn = h('button', { type: 'button', class: 'btn btn-primary', disabled: !!blocked, title: blocked }, C.icon('check'), 'Approve');
     approveBtn.addEventListener('click', function () { approve(ctx, approveBtn); });
     var changesBtn = h('button', {
       type: 'button',
       class: 'btn',
-      disabled: n.draft === 0,
-      title: n.draft === 0 ? 'Add at least one comment first' : 'Send your comments to Claude',
+      disabled: n.draft === 0 || !!blocked,
+      title: blocked || (n.draft === 0 ? 'Add at least one comment first' : 'Send your comments to Claude'),
     }, 'Request changes' + (n.draft ? ' (' + n.draft + ')' : ''));
     changesBtn.addEventListener('click', function () { requestChanges(ctx, changesBtn, n.draft); });
 
@@ -86,6 +91,7 @@
         reopenBtn,
         canReview ? changesBtn : null,
         canReview ? approveBtn : null),
+      blocked && canReview ? h('div', { class: 'review-blocked', style: { flexBasis: '100%' } }, C.notice('warn', blocked)) : null,
       viewingOld ? h('div', { style: { flexBasis: '100%' } }, C.notice('info', h('span', null,
         'You are viewing v' + shown.version + '. The current version is v' + latest + '. ',
         h('a', { href: '#', on: { click: function (e) { e.preventDefault(); ctx.setVersion(null); } } }, 'Show current')))) : null);

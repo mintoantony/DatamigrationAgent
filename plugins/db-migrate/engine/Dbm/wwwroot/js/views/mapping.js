@@ -433,7 +433,8 @@
     root.textContent = '';
     var page = el('div', { class: 'page map-page' });
     root.appendChild(page);
-    if (DBM.components.reviewBar && !window.DBM_EXPORT) page.appendChild(DBM.components.reviewBar(ctx));
+    view.page = page;
+    if (DBM.components.reviewBar && !window.DBM_EXPORT) view.review = page.appendChild(DBM.components.reviewBar(ctx));
     view.body = el('div', { class: 'stack' }, el('div', { class: 'empty is-loading' }, 'Loading mapping…'));
     page.appendChild(view.body);
     loadContext(ctx, payload).then(function (context) {
@@ -868,9 +869,11 @@
   function updateBar(view) {
     if (!view.bar) return;
     var n = changeCount(diff(view.before, view.work));
-    view.bar.status.textContent = n ? n + ' unsaved change' + (n === 1 ? '' : 's') : 'No unsaved changes';
+    view.bar.status.textContent = (n ? n + ' unsaved change' + (n === 1 ? '' : 's') : 'No unsaved changes') +
+      (n && view.held != null ? ' — cannot be saved: v' + view.held + ' is newer' : '');
     view.bar.status.classList.toggle('map-dirty', n > 0);
-    view.bar.save.disabled = n === 0 || view.saving;
+    view.bar.save.disabled = n === 0 || view.saving || view.held != null;   // held: the server would reject the stale baseVersion
+    view.bar.save.title = view.held != null ? 'A newer version (v' + view.held + ') exists; these edits cannot be saved against it.' : '';
     view.bar.discard.disabled = n === 0 || view.saving;
   }
 
@@ -925,6 +928,15 @@
     if (view.saving) return true;   // our own save produced the new version; its completion refreshes
     if (view.held !== next.version) {
       view.held = next.version;
+      // The controls must agree with the warning: nothing on this stale view may act on a version it has not shown.
+      updateBar(view);
+      if (view.review && view.review.parentNode === view.page && DBM.components.reviewBar) {
+        var blocked = 'A newer version (v' + next.version + ') exists. It must be loaded before this phase can be approved or ' +
+          'sent back: click Discard below to drop your unsaved edits and load it.';
+        var bar = DBM.components.reviewBar(view.ctx, { blocked: blocked });
+        view.page.replaceChild(bar, view.review);
+        view.review = bar;
+      }
       view.ctx.toast('A newer mapping version (v' + next.version + ') was created. Your unsaved edits to v' + view.ctx.version +
         ' are still on screen but cannot be saved against it. Click Discard to drop them and load v' + next.version + '.', 'warn');
     }

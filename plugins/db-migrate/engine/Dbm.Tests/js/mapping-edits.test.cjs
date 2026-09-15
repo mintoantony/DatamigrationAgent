@@ -28,6 +28,7 @@ class FakeNode {
     this.classList = { add() {}, remove() {}, toggle() {}, contains() { return false; } };
   }
   appendChild(c) { c.parentNode = this; this.children.push(c); return c; }
+  replaceChild(n, o) { const i = this.children.indexOf(o); this.children[i] = n; n.parentNode = this; o.parentNode = null; return o; }
   removeChild(c) { this.children.splice(this.children.indexOf(c), 1); c.parentNode = null; return c; }
   get firstChild() { return this.children[0] || null; }
   set textContent(v) { this.children = []; this.text = String(v); }
@@ -152,12 +153,14 @@ vm.runInThisContext(fs.readFileSync(path.join(JS, 'lib', 'dom.js'), 'utf8'), { f
 const stubComponents = {
   toast: (msg, kind) => { toasts.push({ msg, kind }); },
   errorText: (e) => String(e && e.message),
-  reviewBar: (ctx) => { lastCtx = ctx; return DBM.h('div'); },
+  notice: (kind, content) => DBM.h('div', { class: 'notice notice-' + kind }, content),
 };
 DBM.components = new Proxy(stubComponents, { get: (t, k) => (k in t ? t[k] : () => DBM.h('div')) });
-DBM.review = { refresh() {}, openFeedback() {}, openHistory() {} };
 DBM.phaseTitle = (n) => n;
-DBM.anchorLabel = (a) => String(a);
+// The real review bar (components/review.js), wrapped only to record the ctx each render hands it.
+vm.runInThisContext(fs.readFileSync(path.join(JS, 'components', 'review.js'), 'utf8'), { filename: 'review.js' });
+const realReviewBar = stubComponents.reviewBar;
+stubComponents.reviewBar = function (ctx) { lastCtx = ctx; return realReviewBar.apply(null, arguments); };
 DBM.api = { get, post, del: () => Promise.resolve({}), events: (onEvent) => { sse = onEvent; } };
 DBM.views = {
   setup: { render() {} },
@@ -252,7 +255,7 @@ test('2. dirty view: artifact_created keeps the unsaved edits (app.js respects t
   publish(4, other);
   sse({ type: 'artifact_created', data: { phase: 'mapping', version: 4 } });
   await settle(300);                            // past app.js's 150 ms scheduleRefresh
-  assert.equal(barStatus(), '1 unsaved change', 'edits survive the scheduled refresh');
+  assert.match(barStatus(), /^1 unsaved change/, 'edits survive the scheduled refresh');
   assert.equal(header().split(' · ')[0], 'v3', 'the view stays on the version the edits are based on');
   const warn = toasts.filter((t) => t.kind === 'warn');
   assert.equal(warn.length, 1, 'exactly one warning, not one per background refresh: ' + JSON.stringify(toasts));
@@ -262,7 +265,7 @@ test('2. dirty view: artifact_created keeps the unsaved edits (app.js respects t
   // Further background refreshes (e.g. agent presence) keep holding, without repeating the warning.
   sse({ type: 'agent_presence', data: {} });
   await settle(300);
-  assert.equal(barStatus(), '1 unsaved change');
+  assert.match(barStatus(), /^1 unsaved change/);
   assert.equal(toasts.filter((t) => t.kind === 'warn').length, 1);
 
   // Discard releases the hold and loads the new version.
@@ -324,6 +327,52 @@ test('7. a view without holdRender re-renders exactly as before on every view-ke
   assert.equal(analysisRenders.length, n + 2, 'same key: no render');
   DBM.app.select('mapping');
   await settle();
+});
+
+function reviewButton(prefix) { return find(view, (n) => n.tagName === 'button' && n.textContent.indexOf(prefix) === 0); }
+function isDisabled(btn) { return btn.disabled === true || 'disabled' in btn.attributes; }
+
+async function holdOnV4() {
+  await reset();
+  server.feedback.push({ id: 9, status: 'draft', anchor: null, text: 'please fix' });
+  await lastCtx.refresh();
+  await settle();
+  await editEmail('LOWER(s.[EMAIL_ADDR])');
+  assert.equal(isDisabled(reviewButton('Approve')), false, 'Approve is enabled before the hold');
+  assert.equal(isDisabled(reviewButton('Request changes')), false, 'Request changes is enabled before the hold (one draft)');
+  assert.equal(isDisabled(byText('button', 'Save as new version')), false, 'Save is enabled before the hold');
+  publish(4, payload());
+  sse({ type: 'artifact_created', data: { phase: 'mapping', version: 4 } });
+  await settle(300);
+  assert.equal(header().split(' · ')[0], 'v3', 'held');
+}
+
+test('8. held view: Approve and Request changes are disabled and the bar says why', async () => {
+  await holdOnV4();
+  const approve = reviewButton('Approve');
+  const changes = reviewButton('Request changes');
+  assert.ok(approve && changes, 'both actions are still shown');
+  assert.equal(isDisabled(approve), true, 'Approve would sign off v4, which this view never showed');
+  assert.equal(isDisabled(changes), true, 'Request changes would act on v4 too');
+  const reason = find(view, (n) => /review-blocked/.test(n.className));
+  assert.ok(reason, 'the reason is shown in the review bar');
+  assert.match(reason.textContent, /newer version \(v4\)/);
+  assert.match(approve.attributes.title, /v4/);
+});
+
+test('9. held view: Save is disabled, Discard stays enabled and loads the new version', async () => {
+  await holdOnV4();
+  const save = byText('button', 'Save as new version');
+  assert.equal(isDisabled(save), true, 'Save could only be rejected for a stale baseVersion');
+  assert.match(barStatus(), /cannot be saved: v4 is newer/);
+  const discard = byText('button', 'Discard');
+  assert.equal(isDisabled(discard), false, 'Discard is the way out');
+  discard.fire('click');
+  await settle(300);
+  assert.equal(header().split(' · ')[0], 'v4');
+  assert.equal(barStatus(), 'No unsaved changes');
+  assert.equal(isDisabled(reviewButton('Approve')), false, 'the fresh v4 view can be actioned');
+  assert.equal(find(view, (n) => /review-blocked/.test(n.className)), null);
 });
 
 test('3. clean view: artifact_created refreshes to the new version as before', async () => {
