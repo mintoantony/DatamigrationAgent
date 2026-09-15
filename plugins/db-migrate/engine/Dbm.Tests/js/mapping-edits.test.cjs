@@ -121,6 +121,7 @@ function artifact(v) { return { version: v, author: 'agent', summary: 's', creat
 
 function get(url) {
   let body;
+  if (url.indexOf('/api/mapping/context') === 0) server.contextGets = (server.contextGets || 0) + 1;
   if (url === '/api/state' && server.failStateOnce) { server.failStateOnce = false; return Promise.reject(new Error('network down')); }
   if (url.indexOf('/api/mapping/context') === 0 && server.contextDelay) {
     return new Promise((r) => setTimeout(() => r(context()), server.contextDelay));
@@ -579,6 +580,18 @@ test('7b. a view without leave() is navigated away from exactly as before', asyn
   assert.equal(analysisRenders.length, n, 'the old view was not rendered again');
   assert.equal(consoleErrors.length, errors, 'no error from a missing hook: ' + JSON.stringify(consoleErrors.slice(errors)));
   assert.equal(toasts.length, 0, 'and nothing was said');
+});
+
+test('16. a carried re-render reuses the context it carried: drawn at once, no refetch, no loading placeholder', async () => {
+  await reset();
+  await editEmail('LOWER(s.[EMAIL_ADDR])');
+  server.contextDelay = 300;
+  const gets = server.contextGets;
+  server.feedback.push({ id: 31, status: 'draft', anchor: null, text: 'a' });
+  await lastCtx.refresh();                      // resolves once the view is rendered, before any context GET could return
+  assert.equal(server.contextGets, gets, 'no context GET for a same-version carry');
+  assert.equal(find(view, (n) => /is-loading/.test(n.className)), null, 'no "Loading mapping…" flicker over the edits');
+  assert.equal(barStatus(), '1 unsaved change', 'the save bar is drawn immediately');
 });
 
 test('15. L1: the mapping view being replaced by another view (phase went stale) says the edits were discarded', async () => {

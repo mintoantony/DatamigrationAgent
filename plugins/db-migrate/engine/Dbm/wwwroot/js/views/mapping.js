@@ -938,7 +938,10 @@
     });
   }
 
-  function isDirty(view) { return !!view && !!view.context && diff(view.before, view.work).length > 0; }
+  // No context check: a view without context has before === work unless edits were carried, and carried edits bring their
+  // context. Requiring context here was the mechanism of finding H1 (a carried view looked clean while refetching); if the
+  // carry ever regresses, this stays true and the hold still protects the edits.
+  function isDirty(view) { return !!view && diff(view.before, view.work).length > 0; }
 
   /**
    * app.js asks before replacing this view. Declines (returns true) only when unsaved edits would be destroyed by moving to
