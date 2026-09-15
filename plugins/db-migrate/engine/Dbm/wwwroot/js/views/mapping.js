@@ -880,10 +880,23 @@
     view.bar.discard.disabled = n === 0 || view.saving;
     // A held view that has become clean — by Discard or by typing the edits back out — releases the hold itself instead of
     // waiting for an unrelated refresh: nothing is left to protect, and its disabled controls would otherwise strand the user.
-    if (n === 0 && view.held != null && !view.releasing && view === current) {
-      view.releasing = true;
-      Promise.resolve(view.ctx.refresh()).then(function () { view.releasing = false; }, function () { view.releasing = false; });
+    // Order matters: clear the hold, give the controls back (normal review bar, Save by the usual rule), then refresh — so
+    // the screen is usable even if that refresh fails. Should edits be made again on this stale view, the next refresh
+    // (or a rejected save, via failed()) re-engages the hold.
+    if (n === 0 && view.held != null && view === current) {
+      view.held = null;
+      setReviewBar(view, null);
+      updateBar(view);
+      view.ctx.refresh();
     }
+  }
+
+  /** Swap the page's review bar for one built with (blocked reason | null for the normal bar). */
+  function setReviewBar(view, blocked) {
+    if (!view.review || view.review.parentNode !== view.page || !DBM.components.reviewBar) return;
+    var bar = blocked ? DBM.components.reviewBar(view.ctx, { blocked: blocked }) : DBM.components.reviewBar(view.ctx);
+    view.page.replaceChild(bar, view.review);
+    view.review = bar;
   }
 
   function saveEdits(view) {
@@ -943,13 +956,8 @@
       view.held = next.version;
       // The controls must agree with the warning: nothing on this stale view may act on a version it has not shown.
       updateBar(view);
-      if (view.review && view.review.parentNode === view.page && DBM.components.reviewBar) {
-        var blocked = 'A newer version (v' + next.version + ') exists. It must be loaded before this phase can be approved or ' +
-          'sent back: click Discard below to drop your unsaved edits and load it.';
-        var bar = DBM.components.reviewBar(view.ctx, { blocked: blocked });
-        view.page.replaceChild(bar, view.review);
-        view.review = bar;
-      }
+      setReviewBar(view, 'A newer version (v' + next.version + ') exists. It must be loaded before this phase can be approved or ' +
+        'sent back: click Discard below to drop your unsaved edits and load it.');
       view.ctx.toast('A newer mapping version (v' + next.version + ') was created. Your unsaved edits to v' + view.ctx.version +
         ' are still on screen but cannot be saved against it. Click Discard to drop them and load v' + next.version + '.', 'warn');
     }

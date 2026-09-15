@@ -101,6 +101,8 @@ const server = { status: 'awaiting_review', version: 3, payloads: { 3: payload()
 let sse = null;
 let lastCtx = null;
 const toasts = [];
+const consoleErrors = [];
+console.error = (...a) => { consoleErrors.push(a.map(String).join(' ')); };   // app.js swallows hook errors into console.error
 const analysisRenders = [];   // a view without holdRender (stands in for analysis.js / setup.js / pending.js)
 
 function stateDoc() {
@@ -195,6 +197,7 @@ async function reset() {
   server.onEdit = null;
   server.contextDelay = 0;
   server.failStateOnce = false;
+  server.agentOnline = true;
   // Leave whatever view the previous test left behind, then come back: every test starts from a first render.
   DBM.app.select('analysis');
   await settle();
@@ -424,7 +427,27 @@ test('12. M1: a held view whose edits are reverted by hand releases itself and l
   assert.equal(header().split(' · ')[0], 'v4');
   assert.equal(barStatus(), 'No unsaved changes');
   assert.equal(isDisabled(reviewButton('Approve')), false);
+  assert.equal(isDisabled(reviewButton('Request changes')), false);
   assert.equal(find(view, (n) => /review-blocked/.test(n.className)), null);
+});
+
+test('11b. H1, real shape: slow context, presence flips offline, then the agent answers a comment inside the window', async () => {
+  await reset();
+  server.feedback.push({ id: 21, status: 'open', anchor: null, text: 'q' });
+  await lastCtx.refresh();
+  await settle();
+  await editEmail('LOWER(s.[EMAIL_ADDR])');
+  server.contextDelay = 400;                    // large catalog
+  server.agentOnline = false;
+  sse({ type: 'agent_presence', data: {} });    // key-changing event #1 → carried re-render, context GET (400 ms) starts
+  await settle(200);
+  server.feedback[0].status = 'addressed';
+  sse({ type: 'feedback_changed', data: {} });  // key-changing event #2 inside the window
+  await settle(700);
+  server.agentOnline = true;
+  assert.equal(lastCtx.feedback[0].status, 'addressed', 'both re-renders happened');
+  assert.equal(barStatus(), '1 unsaved change');
+  assert.equal(toasts.filter((t) => t.kind === 'warn').length, 0, 'same version: carried silently, nothing discarded');
 });
 
 test('13. M1/R2: if the release refresh fails, the next ordinary refresh still loads the new version (no latch in the shell)', async () => {
@@ -444,16 +467,39 @@ test('13b. a failed release does not use up the self-release: edit again, revert
   byText('button', 'Discard').fire('click');
   await settle(300);
   assert.equal(header().split(' · ')[0], 'v3', 'first release refresh failed');
+  // H2: even though the refresh failed, the screen is not stuck — the hold is cleared and the controls are given back.
+  assert.equal(find(view, (n) => /review-blocked/.test(n.className)), null, 'blocked notice gone');
+  assert.equal(isDisabled(reviewButton('Approve')), false, 'Approve usable');
+  assert.equal(isDisabled(reviewButton('Request changes')), false, 'Request changes usable');
+  assert.equal(barStatus(), 'No unsaved changes');
   const collapsed = byText('button', '▸');
   if (collapsed) collapsed.fire('click');
-  let ta = find(view, (n) => n.tagName === 'textarea' && n.attributes['aria-label'] === 'Expression for Email');
+  const ta = find(view, (n) => n.tagName === 'textarea' && n.attributes['aria-label'] === 'Expression for Email');
   ta.value = 'UPPER(s.[EMAIL_ADDR])';
   ta.fire('input');
-  assert.match(barStatus(), /^1 unsaved change — cannot be saved: v4 is newer/, 'still held while dirty again');
+  assert.equal(isDisabled(byText('button', 'Save as new version')), false, 'Save usable once there is something to save');
+  sse({ type: 'agent_presence', data: {} });    // the next refresh sees the newer version under the new edits: hold again
+  await settle(300);
+  assert.equal(header().split(' · ')[0], 'v3');
+  assert.match(barStatus(), /^1 unsaved change — cannot be saved: v4 is newer/, 'held again');
   ta.value = 's.[EMAIL_ADDR]';
   ta.fire('input');
-  await settle(300);                            // no SSE event
+  await settle(300);                            // no SSE event: the view releases itself again
   assert.equal(header().split(' · ')[0], 'v4');
+});
+
+test('13c. H2: revert by hand with the release refresh failing — every control is usable, nothing stays blocked', async () => {
+  await holdOnV4();
+  server.failStateOnce = true;
+  const ta = find(view, (n) => n.tagName === 'textarea' && n.attributes['aria-label'] === 'Expression for Email');
+  ta.value = 's.[EMAIL_ADDR]';
+  ta.fire('input');
+  await settle(300);
+  assert.equal(header().split(' · ')[0], 'v3', 'refresh failed, still showing v3');
+  assert.equal(find(view, (n) => /review-blocked/.test(n.className)), null, 'the blocked bar was swapped back');
+  assert.equal(isDisabled(reviewButton('Approve')), false);
+  assert.equal(isDisabled(reviewButton('Request changes')), false);
+  assert.doesNotMatch(barStatus(), /cannot be saved/);
 });
 
 test('14. M2/P3: a save rejected because an agent version landed first engages the hold at once', async () => {
@@ -474,6 +520,65 @@ test('14. M2/P3: a save rejected because an agent version landed first engages t
   assert.equal(isDisabled(byText('button', 'Save as new version')), true, 'Save is disabled');
   assert.equal(isDisabled(reviewButton('Approve')), true, 'Approve cannot sign off v4 from this view');
   assert.ok(toasts.some((t) => t.kind === 'warn' && /v4/.test(t.msg)), 'the newer-version warning is shown');
+});
+
+function exprShown() {
+  const collapsed = byText('button', '▸');
+  if (collapsed) collapsed.fire('click');
+  const ta = find(view, (n) => n.tagName === 'textarea' && n.attributes['aria-label'] === 'Expression for Email');
+  return ta && (ta.value !== '' ? ta.value : ta.textContent);   // typed value, else the value it was rendered with
+}
+
+test('14b. M2: after a save is rejected for a stale baseVersion, the edits are still on screen', async () => {
+  await reset();
+  await editEmail('LOWER(s.[EMAIL_ADDR])');
+  server.contextDelay = 300;                    // any re-render that did not carry would be context-less and lose the edits
+  server.onEdit = () => {
+    publish(4, payload());
+    sse({ type: 'artifact_created', data: { phase: 'mapping', version: 4 } });
+    return new Promise((r) => setTimeout(() => r({ ok: false, errors: ['baseVersion 3 does not match the current version 4'] }), 400));
+  };
+  byText('button', 'Save as new version').fire('click');
+  await settle(1000);
+  assert.equal(header().split(' · ')[0], 'v3', 'not replaced by v4');
+  assert.match(barStatus(), /^1 unsaved change/, 'the change count survived');
+  assert.equal(exprShown(), 'LOWER(s.[EMAIL_ADDR])', 'the edited expression is what the textarea shows');
+});
+
+test('14c. adversarial: a same-version rejection refreshes, context is slow, and a second event lands in the window', async () => {
+  await reset();
+  server.feedback.push({ id: 22, status: 'open', anchor: null, text: 'q' });
+  await lastCtx.refresh();
+  await settle();
+  await editEmail('LOWER(s.[EMAIL_ADDR])');
+  server.contextDelay = 400;
+  server.onEdit = () => Promise.resolve({ ok: false, errors: ['expression does not parse'] });   // validation, version unchanged
+  byText('button', 'Save as new version').fire('click');   // failed() → refresh → carried re-render
+  await settle(100);
+  server.feedback[0].status = 'addressed';
+  sse({ type: 'feedback_changed', data: {} });              // second key change while any context GET would be in flight
+  await settle(800);
+  assert.equal(lastCtx.feedback[0].status, 'addressed');
+  assert.equal(barStatus(), '1 unsaved change');
+  assert.equal(exprShown(), 'LOWER(s.[EMAIL_ADDR])');
+  server.onEdit = () => Promise.resolve({ ok: true, version: 4, warnings: [] });
+  const sent = await save();
+  assert.ok(sent.body.ops.some((o) => o.value === 'LOWER(s.[EMAIL_ADDR])'), 'and Save still sends it');
+});
+
+test('7b. a view without leave() is navigated away from exactly as before', async () => {
+  await reset();
+  DBM.app.select('analysis');
+  await settle();
+  const errors = consoleErrors.length;
+  const n = analysisRenders.length;
+  DBM.app.select('mapping');                    // leaving the analysis stub, which has no leave hook
+  await settle();
+  assert.equal(barStatus(), 'No unsaved changes', 'mapping rendered');
+  assert.equal(find(view, (x) => x.className === 'analysis'), null, 'analysis content cleared');
+  assert.equal(analysisRenders.length, n, 'the old view was not rendered again');
+  assert.equal(consoleErrors.length, errors, 'no error from a missing hook: ' + JSON.stringify(consoleErrors.slice(errors)));
+  assert.equal(toasts.length, 0, 'and nothing was said');
 });
 
 test('15. L1: the mapping view being replaced by another view (phase went stale) says the edits were discarded', async () => {
