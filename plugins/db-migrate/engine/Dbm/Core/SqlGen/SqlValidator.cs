@@ -203,8 +203,11 @@ public static class SqlValidator
         var fields = TargetFields(task).ToList();
         try
         {
-            // Drop at every task start too: otherwise a stale #stg from an earlier staging task would let this task's own statements
-            // (a custom direct task may name #stg) bind against someone else's scaffold.
+            // #stg drops: task start (here), immediately before the scaffold create, and in finally. In the happy path the three are
+            // MUTUALLY REDUNDANT: the previous task's finally drop already clears #stg before this one; removing any single drop
+            // breaks no test (analysed equivalent mutants). They are kept as defence in depth, because DropScaffoldAsync swallows its
+            // own exceptions, so each drop backstops another's SILENT failure. Together they guarantee this task's statements (a
+            // custom direct task may name #stg) never bind against an earlier task's scaffold.
             await DropScaffoldAsync(target);
             var beforeMerge = fields.TakeWhile(f => f.Field != "mergeSql").ToList();
             await CheckSequenceAsync(target, beforeMerge, task.Custom, errors, warnings, scrub, ct);
@@ -212,9 +215,9 @@ public static class SqlValidator
 
             // Rule 10: drop-then-create IMMEDIATELY before this mergeSql check. The connection is shared by every task and #stg is a
             // fixed name, so a wider scaffold left by an earlier task would let a narrower task's merge bind and false-pass.
-            // DELIBERATELY REDUNDANT today: nothing executes between the task-start drop and here (sp_describe executes nothing), so
-            // removing this line breaks no test (an analysed equivalent mutant). Keep it, so a future executing step added before the
-            // merge check cannot silently reintroduce the stale-scaffold false pass.
+            // DELIBERATELY REDUNDANT today (see the task-start comment): nothing executes between the task-start drop and here
+            // (sp_describe executes nothing). Keep it, so a future executing step added before the merge check, or a silently failed
+            // earlier drop, cannot reintroduce the stale-scaffold false pass.
             await DropScaffoldAsync(target);
             string? scaffoldFailure = null;
             if (table is not null)
@@ -232,7 +235,7 @@ public static class SqlValidator
         }
         finally
         {
-            await DropScaffoldAsync(target);
+            await DropScaffoldAsync(target);   // third of the mutually redundant #stg drops (see the task-start comment)
         }
     }
 
