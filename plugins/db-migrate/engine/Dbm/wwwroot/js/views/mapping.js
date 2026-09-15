@@ -397,7 +397,7 @@
     return cx.source && cx.source.length ? ops.blockers(cx, view.work) : (cx.blockers || []);
   }
 
-  function render(root, ctx) {
+  function render(root, ctx, opts) {
     var artifact = ctx.artifact || {};
     var payload = artifact.payload || { tables: {}, drops: {}, notes: [] };
     var phase = ((ctx.state && ctx.state.phases) || []).filter(function (p) { return p.name === 'mapping'; })[0] || {};
@@ -409,10 +409,26 @@
       expanded: {},
       filter: 'all',
       saving: false,
+      held: null,
       bar: null,
       body: null,
       editable: !ctx.readOnly && phase.status === 'awaiting_review' && ctx.version === phase.currentVersion
     };
+    // A re-render over this view (a comment posted, agent presence, any ctx.refresh) carries unsaved edits across, but only
+    // onto the same base version and only into a view that is still editable. A version change never reaches here while
+    // dirty: holdRender declines it. A first render (opts.rerender false) never inherits another instance's work.
+    var prev = opts && opts.rerender ? current : null;
+    if (isDirty(prev)) {
+      if (view.editable && prev.editable && ctx.version === prev.ctx.version) {
+        view.before = prev.before;
+        view.work = prev.work;
+        view.expanded = prev.expanded;
+        view.filter = prev.filter;
+        view.saving = prev.saving;
+      } else {
+        ctx.toast('Your unsaved mapping edits were discarded: this view is no longer editable.', 'warn');
+      }
+    }
     current = view;
     root.textContent = '';
     var page = el('div', { class: 'page map-page' });
@@ -834,7 +850,15 @@
 
   function saveBar(view) {
     var status = el('span', { class: 'small', 'aria-live': 'polite' });
-    var discard = el('button', { class: 'btn btn-ghost', on: { click: function () { view.work = clone(view.before); redraw(view); } } }, 'Discard');
+    var discard = el('button', {
+      class: 'btn btn-ghost', on: {
+        click: function () {
+          view.work = clone(view.before);
+          redraw(view);
+          if (view.held != null) view.ctx.refresh();   // a newer version was held back for these edits: load it now
+        }
+      }
+    }, 'Discard');
     var save = el('button', { class: 'btn btn-primary', on: { click: function () { saveEdits(view); } } }, 'Save as new version');
     view.bar = { status: status, discard: discard, save: save };
     updateBar(view);
@@ -857,18 +881,25 @@
     view.bar.save.classList.add('is-loading');
     updateBar(view);
     var n = changeCount(list);
+    var sent = clone(view.work);
     var patch = {
       phase: 'mapping', baseVersion: view.ctx.version, ops: list, responses: [],
       summary: 'Human edit: ' + n + ' change' + (n === 1 ? '' : 's') + ' in the mapping screen'
     };
+    // A re-render during the POST may have moved these edits into a new view instance (render carries `work` by reference).
+    function live() { return current && current !== view && current.work === view.work ? [view, current] : [view]; }
     function failed(message) {
-      view.saving = false;
-      if (view.bar) { view.bar.save.classList.remove('is-loading'); updateBar(view); }
+      live().forEach(function (v) {
+        v.saving = false;
+        if (v.bar) { v.bar.save.classList.remove('is-loading'); updateBar(v); }
+      });
       view.ctx.toast('Not saved: ' + message, 'err');
     }
     view.ctx.api.post('/api/edit/mapping', patch).then(function (res) {
       if (res && res.ok === false) { failed((res.errors || []).join('; ') || 'rejected'); return; }
-      view.saving = false;
+      // What was sent is now server state: it is no longer an unsaved edit, so the refresh below (and the artifact_created
+      // this save emits) must replace the view rather than be held for it. Edits typed during the POST stay dirty.
+      live().forEach(function (v) { v.saving = false; v.before = clone(sent); });
       var open = (res && res.warnings) || [];
       view.ctx.toast('Saved as v' + res.version + (open.length ? ' — ' + open.length + ' open item' + (open.length === 1 ? '' : 's') : ''), 'ok');
       view.ctx.refresh();
@@ -880,14 +911,34 @@
 
   function isDirty(view) { return !!view && !!view.context && diff(view.before, view.work).length > 0; }
 
+  /**
+   * app.js asks before replacing this view. Declines (returns true) only when unsaved edits would be destroyed by moving to
+   * a different base version while staying on the latest one — i.e. a new version arrived underneath the edits. Those edits
+   * cannot be carried onto it (the server rejects a stale baseVersion and replaying them could overwrite the newer version),
+   * so the view stays on its base until the user discards. Navigating to an older version, or a view that becomes read-only,
+   * is not held. Same-version re-renders are not held either: render() carries the edits across.
+   */
+  function holdRender(next) {
+    var view = current;
+    if (!isDirty(view) || !next || next.version === view.ctx.version || next.version !== next.latestVersion) return false;
+    if (next.readOnly || !next.phaseRow || next.phaseRow.status !== 'awaiting_review') return false;   // no longer editable at all
+    if (view.saving) return true;   // our own save produced the new version; its completion refreshes
+    if (view.held !== next.version) {
+      view.held = next.version;
+      view.ctx.toast('A newer mapping version (v' + next.version + ') was created. Your unsaved edits to v' + view.ctx.version +
+        ' are kept on screen but can no longer be saved; discard them to load v' + next.version + '.', 'warn');
+    }
+    return true;
+  }
+
   function onEvent(evt, ctx) {
     var type = evt && evt.type;
     var data = (evt && (evt.data || evt.payload)) || {};
     if (type !== 'artifact_created' || data.phase !== 'mapping') return;
-    if (isDirty(current)) ctx.toast('A new mapping version was created. Save or discard your edits, then reload the view.', 'warn');
-    else ctx.refresh();
+    // Dirty: nothing to do here. The shell's refresh for this event asks holdRender, which keeps the edits and warns once.
+    if (!isDirty(current)) ctx.refresh();
   }
 
   DBM.views = DBM.views || {};
-  DBM.views.mapping = { title: 'Mapping', render: render, onEvent: onEvent };
+  DBM.views.mapping = { title: 'Mapping', render: render, onEvent: onEvent, holdRender: holdRender };
 })(window.DBM = window.DBM || {});

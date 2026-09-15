@@ -115,8 +115,16 @@
         renderChrome();
         var key = viewKey(row);
         if (force === true || key !== S.viewKey) {
-          S.viewKey = key;
-          renderView(row);
+          var view = pickView(row);
+          var ctx = makeCtx(row);
+          if (view === S.view && view.holdRender && view.holdRender(ctx)) {
+            // The view holds unsaved state this render would destroy and declined it. Keep the view on screen; give the
+            // shell (and the review drawer) the fresh ctx; leave S.viewKey stale so every later refresh asks again.
+            S.ctx = ctx;
+          } else {
+            S.viewKey = key;
+            renderView(row, view, ctx);
+          }
         }
         DBM.review.refresh(S.ctx);
       });
@@ -241,13 +249,18 @@
     }
   }
 
-  function renderView(row) {
+  /**
+   * Views may implement holdRender(nextCtx) → true to decline a re-render that would destroy unsaved state (the shell then
+   * keeps them on screen), and receive render(root, ctx, {rerender}) where rerender says the same view is being redrawn
+   * over itself (as opposed to a first render after navigation), so it can carry in-flight state across.
+   */
+  function renderView(row, view, ctx) {
     var root = DBM.clear(document.getElementById('view'));
-    var view = pickView(row);
+    var rerender = view === S.view;
     S.view = view;
-    S.ctx = makeCtx(row);
+    S.ctx = ctx;
     try {
-      view.render(root, S.ctx);
+      view.render(root, S.ctx, { rerender: rerender });
     } catch (err) {
       root.appendChild(h('div', { class: 'page' }, C.notice('err', 'This screen failed to render: ' + (err && err.message))));
       if (window.console) console.error(err);
