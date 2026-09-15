@@ -16,6 +16,8 @@ public static class SqlGenerator
     public const string ReviewMergeWarning = "review merge SQL";
     public const string CarriedWarning = "custom SQL carried over from the previous plan";
     public const string DiscardedWarning = "custom SQL discarded: the mapping for this table changed";
+    /// <summary>Plan-level, rendered as "&lt;target&gt;: " + this, for a previous custom task whose target gets no task in the new plan.</summary>
+    public const string DiscardedNoTaskWarning = "custom SQL discarded: the table is no longer generated";
 
     /// <summary>Rendered as "&lt;Col&gt;: " + this for a column whose typeRisk is <see cref="TypeCompat.UnevaluatedRisk"/>: the conversion
     /// could not be evaluated, which is a different claim from a conversion evaluated and found lossy.</summary>
@@ -78,6 +80,15 @@ public static class SqlGenerator
             plan.Tasks[ids[target]] = task;
             plan.Order.Add(ids[target]);
         }
+
+        // 4b. Custom tasks whose target gets no task at all (skipped, unmapped, or gone from the target catalog) lose their
+        // hand-written SQL with no task to carry a warning, so report each one at plan level, ordinally by target.
+        if (carryOver is not null)
+            foreach (var lost in carryOver.Tasks.OrderBy(kv => kv.Key, StringComparer.Ordinal).Select(kv => kv.Value)
+                         .Where(p => p is not null && p.Custom && p.Target is not null
+                             && !maps.Keys.Any(k => string.Equals(k, p.Target, StringComparison.OrdinalIgnoreCase)))
+                         .OrderBy(p => p.Target, StringComparer.Ordinal))
+                plan.Warnings.Add($"{lost.Target}: {DiscardedNoTaskWarning}");
 
         // 5. FK cycles: disable the cut constraints for the load, re-enable WITH CHECK afterwards.
         foreach (var edge in topo.CycleEdges)

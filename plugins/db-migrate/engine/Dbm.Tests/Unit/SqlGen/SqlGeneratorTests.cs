@@ -399,6 +399,109 @@ public class SqlGeneratorTests
         Assert.DoesNotContain(second.Tasks.Values, t => t.Warnings.Contains(SqlGenerator.DiscardedWarning));
     }
 
+    // ---- Fix round 2: custom SQL for a table that gets no task at all is announced at plan level ----------------------
+
+    public static TheoryData<string> NoTaskRoutes() => new() { "skipped", "removed from the mapping", "absent from the target catalog" };
+
+    /// <summary>Regenerates against <paramref name="previous"/> with app.Addresses no longer producing a task by <paramref name="route"/>.</summary>
+    static SqlPlanPayload GenerateWithoutAddresses(string route, SqlPlanPayload previous)
+    {
+        var mapping = SampleMappings.Approved();
+        var tgt = SampleCatalogs.Target();
+        switch (route)
+        {
+            case "skipped": mapping.Tables["app.Addresses"].Kind = "skip"; break;
+            case "removed from the mapping": mapping.Tables.Remove("app.Addresses"); break;
+            case "absent from the target catalog": tgt = tgt with { Tables = tgt.Tables.Where(t => t.Key != "app.Addresses").ToList() }; break;
+            default: throw new ArgumentOutOfRangeException(nameof(route));
+        }
+        var plan = SqlGenerator.Generate(mapping, SampleCatalogs.Source(), tgt, previous);
+        Assert.DoesNotContain(plan.Tasks.Values, t => t.Target == "app.Addresses");
+        return plan;
+    }
+
+    static List<string> AllWarnings(SqlPlanPayload plan) => plan.Warnings.Concat(plan.Tasks.Values.SelectMany(t => t.Warnings)).ToList();
+
+    [Fact]
+    public void DiscardedNoTaskWarning_text_is_pinned()
+    {
+        Assert.Equal("custom SQL discarded: the table is no longer generated", SqlGenerator.DiscardedNoTaskWarning);
+    }
+
+    [Theory]
+    [MemberData(nameof(NoTaskRoutes))]
+    public void Custom_sql_for_a_table_that_gets_no_task_is_reported_at_plan_level(string route)
+    {
+        var first = Plan();
+        Task(first, "app.Addresses").SourceQuery = "SELECT 1 AS [AddressId]";
+        Task(first, "app.Addresses").Custom = true;
+
+        var plan = GenerateWithoutAddresses(route, first);
+        Assert.Equal(["app.Addresses: " + SqlGenerator.DiscardedNoTaskWarning],
+            plan.Warnings.Where(w => w.Contains(SqlGenerator.DiscardedNoTaskWarning, StringComparison.Ordinal)));
+        Assert.DoesNotContain(AllWarnings(plan), w => w.Contains(SqlGenerator.DiscardedWarning, StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [MemberData(nameof(NoTaskRoutes))]
+    public void A_non_custom_task_that_stops_being_generated_reports_nothing(string route)
+    {
+        var plan = GenerateWithoutAddresses(route, Plan());
+        Assert.DoesNotContain(AllWarnings(plan), w => w.Contains("custom SQL discarded", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Plan_level_discard_lines_are_one_per_lost_custom_task_ordered_by_target()
+    {
+        // Task ids deliberately sort the opposite way to the targets.
+        var previous = new SqlPlanPayload
+        {
+            Tasks =
+            {
+                ["T01"] = new TaskPlan { Target = "app.Orders", Custom = true, MappingHash = "x" },
+                ["T02"] = new TaskPlan { Target = "app.Addresses", Custom = true, MappingHash = "y" },
+                ["T03"] = new TaskPlan { Target = "app.AuditEvents", Custom = false },
+            },
+        };
+        var mapping = SampleMappings.Approved();
+        foreach (var key in new[] { "app.Orders", "app.Addresses", "app.AuditEvents" }) mapping.Tables[key].Kind = "skip";
+        var plan = SqlGenerator.Generate(mapping, SampleCatalogs.Source(), SampleCatalogs.Target(), previous);
+        Assert.Equal(["app.Addresses: " + SqlGenerator.DiscardedNoTaskWarning, "app.Orders: " + SqlGenerator.DiscardedNoTaskWarning],
+            plan.Warnings.Where(w => w.Contains(SqlGenerator.DiscardedNoTaskWarning, StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public void A_still_generated_or_carried_custom_task_never_produces_the_plan_level_line()
+    {
+        var first = Plan();
+        Task(first, "app.Addresses").Custom = true;
+        Task(first, "app.Orders").Custom = true;
+        var mapping = SampleMappings.Approved();
+        mapping.Tables["app.Orders"].Filter = "s.[TOTAL_AMT] > 0";   // Orders regenerates (task warning), Addresses carries over
+        var plan = SqlGenerator.Generate(mapping, SampleCatalogs.Source(), SampleCatalogs.Target(), first);
+        Assert.True(Task(plan, "app.Addresses").Custom);
+        Assert.Contains(SqlGenerator.DiscardedWarning, Task(plan, "app.Orders").Warnings);
+        Assert.DoesNotContain(AllWarnings(plan), w => w.Contains(SqlGenerator.DiscardedNoTaskWarning, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Discard_checks_match_the_previous_target_case_insensitively()
+    {
+        // The previous plan names the table in different case; it is the same SQL Server object under a default collation.
+        var first = Plan();
+        var addresses = Task(first, "app.Addresses");
+        addresses.Target = "APP.ADDRESSES";
+        addresses.SourceQuery = "SELECT 1 AS [AddressId]";
+        addresses.Custom = true;
+
+        var mapping = SampleMappings.Approved();
+        mapping.Tables["app.Addresses"].Columns["City"].Expr = "UPPER(s.[CITY])";
+        var plan = SqlGenerator.Generate(mapping, SampleCatalogs.Source(), SampleCatalogs.Target(), first);
+
+        Assert.Contains(SqlGenerator.DiscardedWarning, Task(plan, "app.Addresses").Warnings);
+        Assert.DoesNotContain(AllWarnings(plan), w => w.Contains(SqlGenerator.DiscardedNoTaskWarning, StringComparison.Ordinal));
+    }
+
     // ---- Fix round 1: a cycle is cut only on an edge whose EVERY child-side FK column is nullable ----------------------
 
     static TableMap EmptyMap() => new() { Kind = "direct" };
@@ -453,11 +556,12 @@ public class SqlGeneratorTests
 
     // ---- Fix round 1: task ids widen past 99 tasks, and every reference uses the widened ids -------------------------
 
-    [Fact]
-    public void Past_99_tasks_ids_widen_to_three_digits_and_every_reference_agrees()
+    [Theory]
+    [InlineData(100)]   // the exact boundary: width comes from the count itself, not count - 1
+    [InlineData(101)]
+    public void Past_99_tasks_ids_widen_to_three_digits_and_every_reference_agrees(int count)
     {
-        // 101 tables in a chain: app.t000 <- app.t001 <- ... <- app.t100, and app.t100 also references app.t000.
-        const int count = 101;
+        // count tables in a chain: app.t000 <- app.t001 <- ..., and the last table also references app.t000.
         string Key(int i) => "app.t" + i.ToString("D3", System.Globalization.CultureInfo.InvariantCulture);
         var tables = Enumerable.Range(0, count).Select(i =>
         {
@@ -477,7 +581,7 @@ public class SqlGeneratorTests
         Assert.Equal("T001", plan.Order[0]);
         Assert.Equal("T099", plan.Order[98]);
         Assert.Equal("T100", plan.Order[99]);
-        Assert.Equal("T101", plan.Order[100]);
+        if (count > 100) Assert.Equal("T101", plan.Order[100]);
         Assert.All(plan.Order, id => Assert.Matches("^T[0-9]{3}$", id));
         // Equal width is what keeps ordinal id order equal to execution order.
         Assert.Equal(plan.Order, plan.Order.OrderBy(x => x, StringComparer.Ordinal));
@@ -490,8 +594,8 @@ public class SqlGeneratorTests
             Assert.All(plan.Tasks[id].DependsOn, d => Assert.True(plan.Tasks.ContainsKey(d), $"{id} depends on unissued id {d}"));
         }
         Assert.Empty(plan.Tasks["T001"].DependsOn);
-        Assert.Equal(["T099"], plan.Tasks["T100"].DependsOn);
-        Assert.Equal(["T001", "T100"], plan.Tasks["T101"].DependsOn);
+        Assert.Equal(count == 100 ? new[] { "T001", "T099" } : new[] { "T099" }, plan.Tasks["T100"].DependsOn);
+        if (count > 100) Assert.Equal(["T001", "T100"], plan.Tasks["T101"].DependsOn);
     }
 
     [Fact]
