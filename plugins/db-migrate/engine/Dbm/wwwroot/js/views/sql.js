@@ -1,0 +1,595 @@
+/* views/sql.js — SQL phase: global pre/post, tasks in execution order, highlighted SQL with line anchors,
+   in-place editing, per-task version diff, live validation and the script-pack download.
+   Pure helpers are exposed as DBM.sqlView for node tests (no DOM access at load time). */
+(function (DBM) {
+  'use strict';
+
+  var SECTIONS = ['pre', 'source', 'staging', 'merge', 'post'];
+  var SECTION_TITLE = { pre: 'Task pre-load', source: 'Source query', staging: 'Staging table', merge: 'Merge into target', post: 'Task post-load' };
+  var SECTION_SIDE = { pre: 'target', source: 'source', staging: 'target', merge: 'target', post: 'target' };
+  var INT_MAX = 2147483647;
+
+  /* ---------- pure helpers ---------- */
+
+  /* "\r\n" → "\n" only: a lone "\r" is not a line break (TaskListing rule 3). */
+  function norm(s) { return String(s == null ? '' : s).replace(/\r\n/g, '\n'); }
+
+  /**
+   * MIRROR of Dbm.Core.SqlGen.TaskListing.Build — the meaning of a comment anchor sql:<taskId>:<line>. Its C# doc comment is the
+   * shared definition; js/fixtures/task-listing.json is asserted against both implementations. Do not change one side alone.
+   * Inputs in order: each task.preSql element → "pre", sourceQuery → "source", stagingDdl → "staging", mergeSql → "merge", each
+   * task.postSql element → "post". Skip only null/undefined/"" (a whitespace-only text IS numbered). Replace "\r\n" with "\n"
+   * (a lone "\r" stays), split on "\n" keeping empty pieces (a trailing newline numbers an empty last line), never trim.
+   * Numbers are 1-based and continuous across every section and statement.
+   */
+  function listing(task) {
+    var out = [];
+    eachText(task, function (section, text) {
+      norm(text).split('\n').forEach(function (line) { out.push({ no: out.length + 1, section: section, text: line }); });
+    });
+    return out;
+  }
+
+  /* The listing's inputs in order, skip rule applied: fn(section, rawText) for every text that contributes lines. */
+  function eachText(task, fn) {
+    function add(section, text) { if (text != null && text !== '') fn(section, text); }
+    (task.preSql || []).forEach(function (s) { add('pre', s); });
+    add('source', task.sourceQuery);
+    add('staging', task.stagingDdl);
+    add('merge', task.mergeSql);
+    (task.postSql || []).forEach(function (s) { add('post', s); });
+  }
+
+  function listingText(task) { return listing(task).map(function (l) { return l.text; }).join('\n'); }
+
+  /**
+   * MIRROR of Dbm.Core.SqlGen.SqlModule.ParseAnchor (same shared fixture). "task:<id>" → {task: id, line: null} (the rest verbatim);
+   * "sql:<id>:<line>" splits on the LAST ':' and needs a non-empty id and a line of plain ASCII digits only (no sign, spaces,
+   * separators or other digit forms — C# NumberStyles.None) whose value is 1..2147483647 (C# int). Anything else → nulls.
+   */
+  function parseAnchor(anchor) {
+    var none = { task: null, line: null };
+    if (typeof anchor !== 'string') return none;
+    if (anchor.indexOf('task:') === 0) return { task: anchor.slice(5), line: null };
+    if (anchor.indexOf('sql:') !== 0) return none;
+    var rest = anchor.slice(4);
+    var colon = rest.lastIndexOf(':');
+    var digits = rest.slice(colon + 1);
+    if (colon <= 0 || !/^[0-9]+$/.test(digits)) return none;
+    var value = Number(digits);
+    return value >= 1 && value <= INT_MAX ? { task: rest.slice(0, colon), line: value } : none;
+  }
+
+  /* The listing grouped by section, each line carrying its highlighted HTML. Each stored text (one statement, or one query) is
+     highlighted on its own, from the RAW text, so a comment or string spanning lines keeps its colour and sqlLines splits it by
+     the same rule as the listing: html[i] belongs to that text's line i. Highlighting the already-split lines re-joined with
+     "\n" would normalise twice ("x\r\r\ny" → "x\r\ny" → "x\ny") and drop a character the listing keeps. */
+  function sectionBlocks(task) {
+    var all = listing(task);
+    var htmls = [];
+    eachText(task, function (section, text) { htmls = htmls.concat(DBM.highlight.sqlLines(text)); });
+    return SECTIONS.map(function (sec) {
+      var lines = [];
+      all.forEach(function (l, i) { if (l.section === sec) lines.push({ no: l.no, text: l.text, html: htmls[i] || '' }); });
+      return lines.length ? { section: sec, lines: lines } : null;
+    }).filter(Boolean);
+  }
+
+  function splitStatements(text) {
+    return norm(text).split(/^[ \t]*GO[ \t]*$/im).map(function (s) { return s.trim(); }).filter(Boolean);
+  }
+
+  function joinStatements(list) { return (list || []).join('\nGO\n'); }
+
+  function trimEnd(s) { return s.replace(/\s+$/, ''); }
+
+  /* Patch ops (JSON pointers into the SQL artifact) for the fields the user changed. */
+  function editOps(id, task, edits) {
+    var ops = [];
+    var base = '/tasks/' + id + '/';
+    ['sourceQuery', 'stagingDdl', 'mergeSql'].forEach(function (f) {
+      if (!Object.prototype.hasOwnProperty.call(edits, f)) return;
+      var before = trimEnd(norm(task[f]));
+      var after = trimEnd(norm(edits[f]));
+      if (after === before) return;
+      if (!after && f !== 'sourceQuery') { if (task[f] != null) ops.push({ op: 'remove', path: base + f }); return; }
+      ops.push({ op: task[f] == null ? 'add' : 'replace', path: base + f, value: after });
+    });
+    ['preSql', 'postSql'].forEach(function (f) {
+      if (!Object.prototype.hasOwnProperty.call(edits, f)) return;
+      var after = splitStatements(edits[f]);
+      var before = (task[f] || []).map(function (s) { return norm(s).trim(); });
+      if (JSON.stringify(after) === JSON.stringify(before)) return;
+      ops.push({ op: task[f] == null ? 'add' : 'replace', path: base + f, value: after });
+    });
+    return ops;
+  }
+
+  function countLists(map) {
+    return Object.keys(map || {}).reduce(function (n, k) { return n + ((map[k] || []).length); }, 0);
+  }
+
+  /**
+   * Verdict of a POST /api/sql/validate report. globalWarnings is a T4.3 contract: [] means the global statements were checked
+   * and are clean; a missing (or null) list means nobody said, so it is 'unreported' and never 'clean'. Every warning line counts
+   * — "not checked" lines included — so a statement that could not be checked is never shown as a pass.
+   * → {state: 'errors'|'unreported'|'warnings'|'clean', errors, warnings, globalCoverage: 'checked'|'unreported'}
+   */
+  function reportSummary(r) {
+    var reported = Array.isArray(r.globalWarnings);
+    var errors = (r.globalErrors || []).length + countLists(r.taskErrors);
+    var warnings = (reported ? r.globalWarnings.length : 0) + countLists(r.taskWarnings);
+    var state = !r.ok || errors ? 'errors' : !reported ? 'unreported' : warnings ? 'warnings' : 'clean';
+    return { state: state, errors: errors, warnings: warnings, globalCoverage: reported ? 'checked' : 'unreported' };
+  }
+
+  /* {taskId: number of draft/open comments anchored on the task or one of its lines}, resolved with parseAnchor. */
+  function openCommentsByTask(feedback) {
+    var out = {};
+    (feedback || []).forEach(function (f) {
+      if (!f || (f.status !== 'draft' && f.status !== 'open')) return;
+      var a = parseAnchor(f.anchor);
+      if (a.task) out[a.task] = (out[a.task] || 0) + 1;
+    });
+    return out;
+  }
+
+  function findByTarget(plan, target) {
+    if (!plan || !plan.tasks) return null;
+    var ids = Object.keys(plan.tasks);
+    for (var i = 0; i < ids.length; i++) if (plan.tasks[ids[i]].target === target) return plan.tasks[ids[i]];
+    return null;
+  }
+
+  function plural(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); }
+
+  /* ---------- context helpers (ctx from app.js: artifact = the version being shown) ---------- */
+
+  function payloadOf(ctx) {
+    var a = ctx && ctx.artifact;
+    return a && a.payload && a.payload.tasks && a.payload.order ? a.payload : null;
+  }
+
+  function versionOf(ctx) {
+    if (!ctx) return null;
+    if (typeof ctx.version === 'number') return ctx.version;
+    if (ctx.artifact && typeof ctx.artifact.version === 'number') return ctx.artifact.version;
+    return typeof ctx.latestVersion === 'number' ? ctx.latestVersion : null;
+  }
+
+  function versionsOf(ctx) { return Array.isArray(ctx.versions) ? ctx.versions : []; }
+
+  function exported() { return !!globalThis.DBM_EXPORT; }
+
+  function live(ctx) { return !exported() && !!ctx.api; }
+
+  /* app.js sets readOnly unless the phase awaits review and the current version is shown. */
+  function canEdit(ctx) { return !ctx.readOnly && live(ctx); }
+
+  function errorText(e, fallback) {
+    if (DBM.components && DBM.components.errorText && e) return DBM.components.errorText(e);
+    return (e && e.message) || fallback;
+  }
+
+  /* ---------- DOM helpers ---------- */
+
+  function el(tag, attrs, kids) {
+    var args = [tag, attrs || {}];
+    (kids || []).forEach(function (k) {
+      if (k === null || k === undefined || k === false) return;
+      args.push(typeof k === 'number' ? String(k) : k);
+    });
+    return DBM.h.apply(null, args);
+  }
+
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+  function list(cls, items) {
+    return el('ul', { class: 'sql-msgs ' + cls }, items.map(function (m) { return el('li', {}, [m]); }));
+  }
+
+  function codeBlock(text) {
+    var lines = norm(text).split('\n');
+    var html = DBM.highlight.sqlLines(text);
+    return el('pre', { class: 'code sql-code' }, lines.map(function (_, i) {
+      return el('div', { class: 'line' }, [el('span', { class: 'ln' }, [String(i + 1)]), el('span', { html: html[i] || ' ' })]);
+    }));
+  }
+
+  /* ---------- view state ---------- */
+
+  // editor: {id, task, areas: {field: textarea}} while a task is being edited; drafts: {id, version, values} so a same-version
+  // re-render (a comment posted, agent presence) rebuilds the editor with what was typed rather than the stored SQL.
+  var ui = { selected: null, editing: null, editor: null, drafts: null, diff: null, report: null, busy: false, saving: false, forVersion: undefined, heldWarned: false };
+  var mounted = null;
+
+  function rerender() { if (mounted) render(mounted.root, mounted.ctx); }
+
+  function isDirty() {
+    var e = ui.editor;
+    if (!e || ui.editing !== e.id) return false;
+    var edits = {};
+    Object.keys(e.areas).forEach(function (k) { edits[k] = e.areas[k].value; });
+    return editOps(e.id, e.task, edits).length > 0;
+  }
+
+  function discard() { ui.editing = null; ui.editor = null; ui.drafts = null; ui.heldWarned = false; }
+
+  function selectedId(plan) {
+    if (ui.selected && plan.tasks[ui.selected]) return ui.selected;
+    for (var i = 0; i < plan.order.length; i++) {
+      var t = plan.tasks[plan.order[i]];
+      if (t && t.errors && t.errors.length) return plan.order[i];
+    }
+    return plan.order[0] || null;
+  }
+
+  function select(id) {
+    if (isDirty() && typeof globalThis.confirm === 'function' && !globalThis.confirm('Discard your unsaved SQL edits?')) return;
+    ui.selected = id; discard(); ui.diff = null; rerender();
+  }
+
+  /* ---------- sections ---------- */
+
+  function toolbar(ctx, plan) {
+    if (!plan || !live(ctx)) return null;
+    var attrs = { class: 'btn' + (ui.busy ? ' is-loading' : ''), type: 'button', disabled: ui.busy, on: { click: function () { runValidate(ctx); } } };
+    return el('div', { class: 'toolbar row' }, [
+      el('button', attrs, [ui.busy ? 'Validating…' : 'Validate live']),
+      el('a', { class: 'btn btn-ghost', href: ctx.api.url('/api/export/sqlpack'), download: true, title: 'Script pack of the current version' }, ['Download script pack']),
+    ]);
+  }
+
+  function runValidate(ctx) {
+    ui.busy = true;
+    rerender();
+    ctx.api.post('/api/sql/validate', {}).then(function (report) {
+      ui.busy = false;
+      ui.report = report;
+      rerender();
+      var s = reportSummary(report);
+      if (s.state === 'clean') ctx.toast('Validation passed', 'ok');
+      else if (s.state === 'warnings') ctx.toast('Validation passed with ' + plural(s.warnings, 'warning') + ' — read them before approving', 'warn');
+      else if (s.state === 'unreported') ctx.toast('Validation passed, but the server did not report whether the global statements were checked', 'warn');
+      else ctx.toast('Validation found ' + plural(s.errors, 'error'), 'err');
+    }).catch(function (e) {
+      ui.busy = false;
+      rerender();
+      ctx.toast(errorText(e, 'Validation failed'), 'err');
+    });
+  }
+
+  function kpis(plan) {
+    var tasks = plan.order.map(function (id) { return plan.tasks[id]; }).filter(Boolean);
+    var custom = tasks.filter(function (t) { return t.custom; }).length;
+    var warnings = (plan.warnings || []).length + tasks.reduce(function (n, t) { return n + (t.warnings || []).length; }, 0);
+    var errors = (plan.errors || []).length + tasks.reduce(function (n, t) { return n + (t.errors || []).length; }, 0);
+    return el('div', { class: 'grid-kpi' }, [
+      DBM.components.kpi('Tasks', DBM.fmt.num(tasks.length), 'in execution order'),
+      DBM.components.kpi('Custom SQL', DBM.fmt.num(custom), custom ? 'edited by agent or human' : 'all generated'),
+      DBM.components.kpi('Warnings', DBM.fmt.num(warnings), 'review before approval'),
+      DBM.components.kpi('Errors', DBM.fmt.num(errors), errors ? 'block approval' : 'none'),
+    ]);
+  }
+
+  var REPORT_BADGE = {
+    clean: ['st-approved', 'ok'], warnings: ['st-stale', 'ok · warnings'], unreported: ['st-stale', 'ok · coverage not reported'], errors: ['st-failed', 'errors'],
+  };
+
+  function reportCard(plan) {
+    var r = ui.report;
+    var s = reportSummary(r);
+    var rows = [];
+    (r.globalErrors || []).forEach(function (e) { rows.push(el('li', { class: 'sql-count-err' }, ['plan: ' + e])); });
+    if (Array.isArray(r.globalWarnings)) r.globalWarnings.forEach(function (w) { rows.push(el('li', { class: 'sql-report-warn' }, ['plan: ' + w])); });
+    else rows.push(el('li', { class: 'sql-report-warn' }, ['plan: the server did not report whether the global pre-load/post-load statements were checked']));
+    var ids = plan.order.slice();
+    Object.keys(r.taskErrors || {}).concat(Object.keys(r.taskWarnings || {})).forEach(function (id) { if (ids.indexOf(id) < 0) ids.push(id); });
+    ids.forEach(function (id) {
+      var errs = (r.taskErrors && r.taskErrors[id]) || [];
+      var warns = (r.taskWarnings && r.taskWarnings[id]) || [];
+      if (!errs.length && !warns.length) return;
+      rows.push(el('li', { class: 'sql-report-task' }, [
+        plan.tasks[id]
+          ? el('button', { class: 'chip sql-chip-btn', type: 'button', on: { click: function () { select(id); } } }, [id])
+          : el('span', { class: 'chip' }, [id]),
+        errs.length ? list('sql-msgs-err', errs) : null,
+        warns.length ? list('sql-msgs-warn', warns) : null,
+      ]));
+    });
+    var badge = REPORT_BADGE[s.state];
+    return el('section', { class: 'card sql-report is-' + s.state, 'aria-live': 'polite' }, [
+      el('div', { class: 'card-h row row-wrap' }, [
+        el('h3', { class: 'h3' }, ['Live validation' + (r.version != null ? ' · v' + r.version : '')]),
+        el('span', { class: 'badge ' + badge[0] }, [badge[1]]),
+        s.errors || s.warnings ? el('span', { class: 'small muted' }, [plural(s.errors, 'error') + ', ' + plural(s.warnings, 'warning')]) : null,
+        el('span', { class: 'spacer' }),
+        el('button', { class: 'btn btn-ghost btn-sm', type: 'button', on: { click: function () { ui.report = null; rerender(); } } }, ['Dismiss']),
+      ]),
+      el('div', { class: 'card-b' }, [s.state === 'clean'
+        ? el('p', { class: 'muted' }, ['Every task and the global statements were checked: no errors or warnings.'])
+        : el('ul', { class: 'sql-msgs sql-report-list' }, rows)]),
+    ]);
+  }
+
+  function globalCard(title, when, statements) {
+    var body = statements && statements.length
+      ? codeBlock(joinStatements(statements))
+      : el('p', { class: 'muted small' }, ['None.']);
+    return el('section', { class: 'card' }, [
+      el('div', { class: 'card-h row' }, [el('h3', { class: 'h3' }, [title]), el('span', { class: 'small muted' }, [when])]),
+      el('div', { class: 'card-b' }, [body]),
+    ]);
+  }
+
+  function taskList(plan, activeId, comments) {
+    return el('nav', { class: 'sql-tasks', 'aria-label': 'Tasks in execution order' }, plan.order.map(function (id) {
+      var t = plan.tasks[id];
+      if (!t) return null;
+      var errs = (t.errors || []).length;
+      var warns = (t.warnings || []).length;
+      var active = id === activeId;
+      return el('button', {
+        class: 'sql-task' + (active ? ' is-active' : ''), type: 'button', 'aria-current': active ? 'true' : null,
+        on: { click: function () { if (id !== activeId) select(id); } },
+      }, [
+        el('span', { class: 'sql-task-h' }, [el('span', { class: 'mono small' }, [id]), el('span', { class: 'ellipsis' }, [t.target])]),
+        el('span', { class: 'sql-task-meta' }, [
+          el('span', { class: 'tag' }, [t.mode === 'staging_merge' ? 'staging + merge' : 'direct']),
+          t.custom ? el('span', { class: 'chip' }, ['custom']) : null,
+          errs ? el('span', { class: 'pill sql-count-err' }, [plural(errs, 'error')]) : null,
+          warns ? el('span', { class: 'pill sql-count-warn' }, [plural(warns, 'warning')]) : null,
+          comments[id] ? el('span', { class: 'pill' }, [plural(comments[id], 'comment')]) : null,
+          (t.dependsOn || []).length ? el('span', { class: 'small muted' }, ['after ' + t.dependsOn.join(', ')]) : null,
+        ]),
+      ]);
+    }));
+  }
+
+  function taskDetail(ctx, plan, id, version) {
+    var t = plan.tasks[id];
+    var head = el('div', { class: 'card-h row row-wrap' }, [
+      el('h2', { class: 'h2' }, [el('span', { class: 'mono' }, [id]), ' ', t.target]),
+      el('span', { class: 'spacer' }),
+      diffPicker(ctx, id, t, version),
+      canEdit(ctx) && ui.editing !== id
+        ? el('button', { class: 'btn btn-sm', type: 'button', on: { click: function () { discard(); ui.editing = id; ui.diff = null; rerender(); } } }, ['Edit SQL'])
+        : null,
+    ]);
+    ctx.commentable(head, 'task:' + id, id + ' ' + t.target);
+
+    var meta = el('div', { class: 'row-wrap sql-meta' }, [
+      el('span', { class: 'tag' }, [t.mode === 'staging_merge' ? 'staging + merge' : 'direct']),
+      t.identityInsert ? el('span', { class: 'tag' }, ['identity insert']) : null,
+      el('span', { class: 'tag' }, [(t.keyColumns || []).length ? 'keys ' + t.keyColumns.join(', ') : 'no key · single transaction']),
+      t.chunkSize ? el('span', { class: 'tag' }, ['chunk ' + DBM.fmt.num(t.chunkSize)]) : null,
+      t.custom ? el('span', { class: 'chip' }, ['custom']) : null,
+      (t.dependsOn || []).length ? el('span', { class: 'small muted' }, ['depends on']) : null,
+    ].concat((t.dependsOn || []).map(function (dep) {
+      return plan.tasks[dep]
+        ? el('button', { class: 'chip sql-chip-btn', type: 'button', on: { click: function () { select(dep); } } }, [dep])
+        : el('span', { class: 'chip' }, [dep]);
+    })));
+
+    var body = [meta];
+    if ((t.errors || []).length) body.push(list('sql-msgs-err', t.errors));
+    if ((t.warnings || []).length) body.push(list('sql-msgs-warn', t.warnings));
+    body.push(bindings(t));
+    if (ui.editing === id && canEdit(ctx)) body.push(editor(ctx, id, t, version));
+    else if (ui.diff && ui.diff.id === id) body.push(diffView(version));
+    else body.push(sections(ctx, id, t));
+    body.push(el('details', { class: 'sql-count' }, [
+      el('summary', { class: 'small muted' }, ['Validation count query · runs on SOURCE']),
+      codeBlock(t.countSql || ''),
+    ]));
+    return el('section', { class: 'card sql-detail' }, [head, el('div', { class: 'card-b stack' }, body)]);
+  }
+
+  function bindings(t) {
+    var rows = (t.columns || []).map(function (c) {
+      return el('tr', {}, [el('td', { class: 'mono' }, [c.source]), el('td', { class: 'muted' }, ['→']), el('td', { class: 'mono' }, [c.target])]);
+    });
+    return el('details', {}, [
+      el('summary', { class: 'small muted' }, [(t.columns || []).length + ' column bindings (source alias → target column)']),
+      el('table', { class: 'tbl tbl-compact' }, [el('tbody', {}, rows)]),
+    ]);
+  }
+
+  function sections(ctx, id, t) {
+    var blocks = sectionBlocks(t);
+    if (!blocks.length) return el('p', { class: 'muted' }, ['This task has no SQL.']);
+    return el('div', { class: 'stack' }, blocks.map(function (b) {
+      var pre = el('pre', { class: 'code sql-code' }, b.lines.map(function (l) {
+        var row = el('div', { class: 'line', data: { line: String(l.no) } }, [
+          el('span', { class: 'ln' }, [String(l.no)]),
+          el('span', { html: l.html || ' ' }),
+        ]);
+        ctx.commentable(row, 'sql:' + id + ':' + l.no, id + ' line ' + l.no);
+        return row;
+      }));
+      var side = SECTION_SIDE[b.section];
+      return el('div', { class: 'sql-sec' }, [
+        el('div', { class: 'sql-sec-h' }, [
+          el('span', {}, [SECTION_TITLE[b.section]]),
+          el('span', { class: 'sql-side sql-side-' + (side === 'source' ? 'src' : 'tgt') }, ['runs on ' + side.toUpperCase()]),
+        ]),
+        pre,
+      ]);
+    }));
+  }
+
+  function diffPicker(ctx, id, t, version) {
+    var others = versionsOf(ctx).filter(function (v) { return v.version !== version; });
+    if (!others.length || !live(ctx) || ui.editing === id) return null;
+    var options = [el('option', { value: '' }, ['Compare with…'])].concat(others.slice().reverse().map(function (v) {
+      return el('option', { value: String(v.version), selected: !!(ui.diff && ui.diff.id === id && ui.diff.with === v.version) }, ['v' + v.version + (v.author ? ' · ' + v.author : '')]);
+    }));
+    return el('select', {
+      class: 'select btn-sm', 'aria-label': 'Compare this task with another version',
+      on: {
+        change: function (e) {
+          var v = parseInt(e.target.value, 10);
+          if (isNaN(v)) { ui.diff = null; rerender(); return; }
+          ctx.api.get('/api/artifact/sql/' + v).then(function (res) {
+            var old = findByTarget(res && res.payload, t.target);
+            ui.diff = { id: id, with: v, missing: !old, rows: DBM.diff.lines(old ? listingText(old) : '', listingText(t)) };
+            rerender();
+          }).catch(function (err) { ctx.toast(errorText(err, 'Could not load v' + v), 'err'); });
+        },
+      },
+    }, options);
+  }
+
+  function diffView(version) {
+    var d = ui.diff;
+    var changed = d.rows.some(function (r) { return r.op !== 'eq'; });
+    return el('div', { class: 'stack' }, [
+      el('div', { class: 'row' }, [
+        el('span', { class: 'small muted' }, [d.missing ? 'Task not present in v' + d.with + '; everything is new.' : 'Changes from v' + d.with + ' to v' + version]),
+        el('span', { class: 'spacer' }),
+        el('button', { class: 'btn btn-ghost btn-sm', type: 'button', on: { click: function () { ui.diff = null; rerender(); } } }, ['Close diff']),
+      ]),
+      changed
+        ? el('pre', { class: 'diff' }, d.rows.map(function (r) { return el('div', { class: 'diff-' + r.op }, [r.text]); }))
+        : el('p', { class: 'muted' }, ['No differences in this task.']),
+    ]);
+  }
+
+  function editor(ctx, id, t, version) {
+    var fields = [['preSql', 'Task pre-load · TARGET · separate statements with a line containing only GO', joinStatements(t.preSql)],
+      ['sourceQuery', 'Source query · runs on SOURCE · aliases = target columns, keys __k0…, no ORDER BY/TOP', t.sourceQuery || '']];
+    if (t.mode === 'staging_merge' || t.stagingDdl || t.mergeSql) {
+      fields.push(['stagingDdl', 'Staging table · TARGET · CREATE TABLE #stg (…)', t.stagingDdl || '']);
+      fields.push(['mergeSql', 'Merge into target · TARGET · end MERGE with ;', t.mergeSql || '']);
+    }
+    fields.push(['postSql', 'Task post-load · TARGET · separate statements with a line containing only GO', joinStatements(t.postSql)]);
+
+    var drafts = ui.drafts && ui.drafts.id === id && ui.drafts.version === version ? ui.drafts.values : null;
+    ui.drafts = { id: id, version: version, values: drafts || {} };
+    var areas = {};
+    ui.editor = { id: id, task: t, areas: areas };
+    var problems = el('div', { class: 'sql-edit-problems', 'aria-live': 'assertive' }, []);
+    var submit = el('button', { class: 'btn btn-primary', type: 'submit', disabled: ui.saving }, ['Save as new version']);
+
+    function save() {
+      if (ui.saving) return;
+      var edits = {};
+      Object.keys(areas).forEach(function (k) { edits[k] = areas[k].value; });
+      var ops = editOps(id, t, edits);
+      if (!ops.length) { ctx.toast('Nothing changed', 'info'); return; }
+      ui.saving = true;
+      submit.disabled = true;
+      clear(problems);
+      ctx.api.post('/api/edit/sql', { phase: 'sql', baseVersion: version, ops: ops, responses: [], summary: 'Edited ' + id + ' (' + t.target + ') in the UI' })
+        .then(function (res) {
+          ui.saving = false;
+          if (res && res.ok === false) { show((res.errors || []).concat(res.warnings || [])); return; }
+          discard();
+          ctx.toast('Saved as v' + (res && res.version), 'ok');
+          ctx.refresh();
+        })
+        .catch(function (e) {
+          ui.saving = false;
+          show(e && e.details && e.details.length ? e.details : [errorText(e, 'Save failed')]);
+        });
+    }
+
+    function show(messages) {
+      submit.disabled = false;
+      clear(problems);
+      problems.appendChild(list('sql-msgs-err', messages.length ? messages : ['The server rejected the edit.']));
+    }
+
+    var controls = fields.map(function (f) {
+      var initial = drafts && Object.prototype.hasOwnProperty.call(drafts, f[0]) ? drafts[f[0]] : f[2];
+      var lines = norm(initial).split('\n').length;
+      var ta = el('textarea', {
+        class: 'textarea sql-edit', spellcheck: 'false', rows: String(Math.min(24, Math.max(4, lines + 1))), 'aria-label': f[1],
+        on: {
+          input: function () { ui.drafts.values[f[0]] = ta.value; },
+          keydown: function (e) { if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) { e.preventDefault(); save(); } },
+        },
+      }, []);
+      ta.value = initial;
+      areas[f[0]] = ta;
+      return el('label', { class: 'stack sql-edit-field' }, [el('span', { class: 'small muted' }, [f[1]]), ta]);
+    });
+
+    return el('form', { class: 'stack sql-editor', on: { submit: function (e) { e.preventDefault(); save(); } } }, controls.concat([
+      problems,
+      el('div', { class: 'row row-wrap' }, [
+        submit,
+        el('button', { class: 'btn btn-ghost', type: 'button', on: { click: function () { discard(); rerender(); } } }, ['Cancel']),
+        el('span', { class: 'small muted' }, ['Ctrl+S saves · the server validates live before storing']),
+      ]),
+    ]));
+  }
+
+  /* ---------- view ---------- */
+
+  function render(root, ctx) {
+    mounted = { root: root, ctx: ctx };
+    var plan = payloadOf(ctx);
+    var version = versionOf(ctx);
+    if (ui.forVersion !== version) { discard(); ui.diff = null; ui.report = null; ui.forVersion = version; }
+    if (!canEdit(ctx)) discard();
+    clear(root);
+
+    var page = el('div', { class: 'page stack sql-page' }, [
+      el('div', { class: 'page-h row row-wrap' }, [el('h1', { class: 'h1' }, ['Migration SQL']), el('span', { class: 'spacer' }), toolbar(ctx, plan)]),
+    ]);
+    root.appendChild(page);
+    if (DBM.components.reviewBar) page.appendChild(DBM.components.reviewBar(ctx));
+    if (!plan) {
+      page.appendChild(DBM.components.emptyState('No SQL plan yet', 'The plan is generated as soon as the mapping is approved.'));
+      return;
+    }
+
+    page.appendChild(kpis(plan));
+    if (ui.report) page.appendChild(reportCard(plan));
+    if ((plan.errors || []).length || (plan.warnings || []).length) {
+      page.appendChild(el('section', { class: 'card' }, [
+        el('div', { class: 'card-h' }, [el('h3', { class: 'h3' }, ['Plan notes'])]),
+        el('div', { class: 'card-b' }, [
+          (plan.errors || []).length ? list('sql-msgs-err', plan.errors) : null,
+          (plan.warnings || []).length ? list('sql-msgs-warn', plan.warnings) : null,
+        ]),
+      ]));
+    }
+    page.appendChild(globalCard('Global pre-load', 'runs on TARGET before the first task', plan.preSql));
+    var id = selectedId(plan);
+    page.appendChild(el('div', { class: 'sql-layout' }, [
+      taskList(plan, id, openCommentsByTask(ctx.feedback)),
+      id ? taskDetail(ctx, plan, id, version) : DBM.components.emptyState('No tasks', 'Every target table is skipped in the mapping.'),
+    ]));
+    page.appendChild(globalCard('Global post-load', 'runs on TARGET after the last task', plan.postSql));
+  }
+
+  /* Decline a shell re-render onto a NEWER version while SQL edits are unsaved: the edits cannot be carried onto it (the server
+     rejects a stale baseVersion, and replaying them could overwrite the newer SQL). Same-version re-renders are not held — the
+     editor is rebuilt from the drafts. Our own save is not held either: its completion refreshes. */
+  function holdRender(next) {
+    if (!mounted || ui.saving || !isDirty() || !next) return false;
+    var v = versionOf(next);
+    if (v === ui.forVersion || v !== next.latestVersion) return false;   // same version, or the user navigated to an older one
+    if (!ui.heldWarned && mounted.ctx && mounted.ctx.toast) {
+      ui.heldWarned = true;
+      mounted.ctx.toast('A newer SQL version exists. Your unsaved edits are kept on screen, but saving them will be rejected — Cancel to load the new version.', 'info');
+    }
+    return true;
+  }
+
+  function leave(nextCtx) {
+    if (isDirty() && nextCtx && nextCtx.toast) nextCtx.toast('Your unsaved SQL edits were discarded: the SQL view was closed.', 'info');
+    discard();
+    ui.diff = null;
+    mounted = null;
+  }
+
+  DBM.sqlView = {
+    listing: listing, listingText: listingText, parseAnchor: parseAnchor, sectionBlocks: sectionBlocks, splitStatements: splitStatements,
+    joinStatements: joinStatements, editOps: editOps, reportSummary: reportSummary, openCommentsByTask: openCommentsByTask,
+  };
+  DBM.views = DBM.views || {};
+  DBM.views.sql = { title: 'SQL', render: render, holdRender: holdRender, leave: leave };
+})(globalThis.DBM = globalThis.DBM || {});
