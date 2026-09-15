@@ -57,7 +57,9 @@ given — never `state.db` — and never print or look for connection strings.
   `tableMap` asks for (lookups, de-duplication, `WHEN MATCHED` updates when the target may already hold the row).
 - No `GO` anywhere; each list element of `preSql`/`postSql` is one self-contained batch.
 - Change `mode`, `columns` and `keyColumns` only together and consistently. Never patch `errors`, `warnings`, `custom`,
-  `countSql` or `mappingHash` — the engine owns them. Warnings prefixed `validate:` are recomputed on every check.
+  `countSql` or `mappingHash` — the engine owns them, and a patch that changes `errors`, `warnings` or `custom` (plan or
+  task) is rejected. Warnings prefixed `validate:` are recomputed on every check.
+- `order` must list every task id exactly once; a patch that adds or removes a task updates `order` in the same patch.
 - Warnings are information, not failures. Do not twist SQL to silence a truncation or nullability warning — mention
   it in your summary unless the mapping or the reviewer asked for a transform.
 
@@ -93,6 +95,9 @@ are **not** a pass. Read them, and say in your summary which ones remain.
    checked, so finish with one run without `--task`. Fix and repeat until `"ok":true`.
 2. `dbm apply <patchPath> --dry-run` — must print `"ok":true` (it re-validates live and checks that every feedback id has
    a response). Fix and repeat until it does. Do **not** run `dbm apply` without `--dry-run`; the orchestrator applies.
+   Its `warnings` carry every `: not checked: ` line of that validation — global ones and `<taskId>: <field>: not checked: …`
+   ones about your SQL. A `live validation skipped: … missing` warning means nothing checked the plan at all: report it —
+   the plan cannot be approved until the connections and the target catalog exist.
 
 ## 6. Reply
 

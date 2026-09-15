@@ -95,4 +95,103 @@ public class ScriptPackTests
         Assert.Equal(first, second);
         Assert.Equal(ScriptPack.BuildFiles(Plan(), "demo"), Unzip(first));
     }
+
+    /// <summary>M5: every generated fixture inserts tasks in Order, so a pack iterating the dictionary would pass the test above.
+    /// Here the dictionary's insertion order is the reverse of Order; the pack must not change by a single byte.</summary>
+    [Fact]
+    public void Pack_follows_order_never_dictionary_insertion_order()
+    {
+        var plan = Plan();
+        var reversed = Plan();
+        reversed.Tasks = reversed.Tasks.Reverse().ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal);
+        Assert.NotEqual(reversed.Order, reversed.Tasks.Keys);   // fixture guard: the orders really differ
+
+        Assert.Equal(ScriptPack.BuildZip(plan, "demo"), ScriptPack.BuildZip(reversed, "demo"));
+        Assert.Equal(ScriptPack.BuildFiles(plan, "demo").Select(f => f.Name), ScriptPack.BuildFiles(reversed, "demo").Select(f => f.Name));
+    }
+
+    /// <summary>M5: two zips built within one 2-second DOS-time bucket cannot tell a fixed timestamp from "now"; the entry time can.</summary>
+    [Fact]
+    public void Zip_entries_carry_a_fixed_timestamp()
+    {
+        using var zip = new ZipArchive(new MemoryStream(ScriptPack.BuildZip(Plan(), "demo")), ZipArchiveMode.Read);
+        Assert.NotEmpty(zip.Entries);
+        Assert.All(zip.Entries, e => Assert.Equal(new DateTime(2000, 1, 1, 0, 0, 0), e.LastWriteTime.DateTime));
+    }
+
+    /// <summary>M2: the pack is handed to a DBA; a task missing from Order (or an Order id with no task) must never make it
+    /// silently incomplete.</summary>
+    [Fact]
+    public void A_pack_whose_order_does_not_match_its_tasks_says_so_and_omits_nothing()
+    {
+        var plan = Plan();
+        plan.Order.Remove("T03");
+        plan.Order.Insert(2, "T99");
+
+        var files = ScriptPack.BuildFiles(plan, "demo");
+
+        Assert.Contains(files, f => f.Content.Contains("-- demo: task T03  app.Products\n", StringComparison.Ordinal));
+        var readme = files.Single(f => f.Name == "README.md").Content;
+        Assert.Contains("## WARNING: this pack does not match the plan's execution order", readme);
+        Assert.Contains("- T03: task is missing from order", readme);
+        Assert.Contains("- order[2]: T99 is not a task", readme);
+        var pre = files[0].Content;
+        Assert.Contains("-- WARNING: this pack does not match the plan's execution order (see README.md)\n", pre);
+        Assert.Contains("--   - T03: task is missing from order\n", pre);
+    }
+
+    const string Hostile = "x\nCANARY_LF;\rCANARY_CR;\r\nCANARY_CRLF;\u2028CANARY_LS;\u2029CANARY_PS;\u0085CANARY_NEL;\vCANARY_VT;\fCANARY_FF;";
+
+    /// <summary>The SQL bodies ARE executable by design; every other value that reaches the pack is text.</summary>
+    static readonly HashSet<string> SqlBodies = [nameof(TaskPlan.SourceQuery), nameof(TaskPlan.StagingDdl), nameof(TaskPlan.MergeSql),
+        nameof(TaskPlan.PreSql), nameof(TaskPlan.PostSql), nameof(TaskPlan.CountSql)];
+
+    /// <summary>Poisons, by reflection, every string and string-list property of the plan and its tasks that is not a SQL body —
+    /// so a field added later is hostile here without anyone remembering to list it.</summary>
+    static SqlPlanPayload Poisoned(SqlPlanPayload plan, bool keepMode)
+    {
+        foreach (var p in typeof(SqlPlanPayload).GetProperties())
+            if (p.Name is not (nameof(SqlPlanPayload.PreSql) or nameof(SqlPlanPayload.PostSql) or nameof(SqlPlanPayload.Order) or nameof(SqlPlanPayload.Tasks)))
+                Poison(plan, p);
+        foreach (var task in plan.Tasks.Values)
+        {
+            foreach (var p in typeof(TaskPlan).GetProperties())
+                if (!SqlBodies.Contains(p.Name) && !(keepMode && p.Name == nameof(TaskPlan.Mode))) Poison(task, p);
+            task.Columns = task.Columns.Select(c => new ColumnBinding(c.Source + Hostile, c.Target + Hostile)).ToList();
+        }
+        var id = plan.Order[^1];
+        var hostileId = id + Hostile;
+        plan.Tasks = plan.Tasks.ToDictionary(kv => kv.Key == id ? hostileId : kv.Key, kv => kv.Value, StringComparer.Ordinal);
+        plan.Order[^1] = hostileId;
+        return plan;
+    }
+
+    static void Poison(object target, System.Reflection.PropertyInfo p)
+    {
+        if (p.PropertyType == typeof(string)) p.SetValue(target, (string?)p.GetValue(target) + Hostile);
+        else if (p.PropertyType == typeof(List<string>)) ((List<string>)p.GetValue(target)!).Add(Hostile);
+    }
+
+    /// <summary>H2: the pack is run by a DBA with production credentials. No interpolated value may end a `--` comment and start a
+    /// line of its own — for any line terminator a parser or editor honours.</summary>
+    [Fact]
+    public void Hostile_values_never_break_out_of_a_comment_line()
+    {
+        var mapping = SampleMappings.Approved();
+        mapping.Tables["app.Addresses"].Kind = "lookup";   // a staging_merge task exercises the staging header lines too
+        var packs = new[]
+        {
+            ScriptPack.BuildFiles(Poisoned(Plan(), keepMode: false), Hostile),
+            ScriptPack.BuildFiles(Poisoned(SqlGenerator.Generate(mapping, SampleCatalogs.Source(), SampleCatalogs.Target()), keepMode: true), Hostile),
+        };
+        Assert.Contains(packs[1], f => f.Content.Contains("-- Mode:            staging_merge\n", StringComparison.Ordinal));
+
+        var separators = new[] { "\r\n", "\n", "\r", "\u2028", "\u2029", "\u0085", "\v", "\f" };
+        foreach (var (name, content) in packs.SelectMany(p => p))
+        {
+            Assert.Contains("CANARY_LF", content);   // the values did reach the file
+            foreach (var line in content.Split(separators, StringSplitOptions.None))
+                Assert.False(line.TrimStart().StartsWith("CANARY", StringComparison.Ordinal), $"{name}: a value escaped its comment: [{line}]");
+        }
+    }
 }

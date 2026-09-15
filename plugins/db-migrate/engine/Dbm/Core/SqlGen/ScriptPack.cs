@@ -6,10 +6,15 @@ namespace Dbm.Core.SqlGen;
 
 /// <summary>DBA-readable export of a plan: 00_pre.sql, one NN_schema_table.sql per task (execution order), 99_post.sql, README.md.
 /// Deterministic: the same plan gives the same files in the same order and a byte-identical zip (fixed entry timestamps; nothing
-/// depends on dictionary enumeration order — files follow <see cref="SqlPlanPayload.Order"/>).</summary>
+/// depends on dictionary enumeration order — files follow <see cref="SqlPlanPayload.Order"/>, then any task Order misses, ordinal).
+/// <para><b>The pack is run by a DBA with production credentials.</b> Only the SQL bodies (source query, staging DDL, merge, pre/post
+/// statements, count query) are executable by design. Every other value — ids, target, mode, keys, dependencies, column map,
+/// warnings, errors, the project name, and any field added later — is untrusted text: it reaches a <c>--</c> comment only through
+/// <see cref="Comment"/>, and the README only through <see cref="OneLine"/>, so it can never end its line and start one of its own.</para></summary>
 public static class ScriptPack
 {
     const string Rule = "-- =====================================================================";
+    const string MismatchTitle = "WARNING: this pack does not match the plan's execution order";
 
     public static byte[] BuildZip(SqlPlanPayload plan, string projectName)
     {
@@ -28,36 +33,62 @@ public static class ScriptPack
         return ms.ToArray();
     }
 
-    /// <summary>File name → content, in zip order.</summary>
+    /// <summary>File name → content, in zip order. A plan whose Order does not list every task exactly once still exports every
+    /// task (the ones Order misses after the ordered ones) and says so, loudly, in 00_pre.sql and README.md.</summary>
     public static List<(string Name, string Content)> BuildFiles(SqlPlanPayload plan, string projectName)
     {
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(projectName);
-        var width = Math.Max(2, (plan.Order.Count + 1).ToString(CultureInfo.InvariantCulture).Length);
+        var problems = plan.OrderProblems();
+        var ordered = plan.Order.Select(id => (Id: id, Known: plan.Tasks.ContainsKey(id))).ToList();
+        var listed = new HashSet<string>(plan.Order, StringComparer.Ordinal);
+        var slots = ordered.Concat(plan.Tasks.Keys.Where(k => !listed.Contains(k)).OrderBy(k => k, StringComparer.Ordinal).Select(k => (Id: k, Known: true))).ToList();
+
+        var width = Math.Max(2, (slots.Count + 1).ToString(CultureInfo.InvariantCulture).Length);
         var preName = new string('0', width) + "_pre.sql";
         var postName = new string('9', width) + "_post.sql";
-        var files = new List<(string, string)> { (preName, GlobalFile(projectName, preName, "pre-load", "before the first task", plan.PreSql)) };
+        var files = new List<(string, string)> { (preName, GlobalFile(projectName, preName, "pre-load", "before the first task", plan.PreSql, problems)) };
         var index = new List<(string File, string Id, TaskPlan Task)>();
-        for (var i = 0; i < plan.Order.Count; i++)
+        for (var i = 0; i < slots.Count; i++)
         {
-            if (!plan.Tasks.TryGetValue(plan.Order[i], out var task)) continue;
+            if (!slots[i].Known) continue;
+            var id = slots[i].Id;
+            var task = plan.Tasks[id];
             var name = $"{(i + 1).ToString("D" + width.ToString(CultureInfo.InvariantCulture), CultureInfo.InvariantCulture)}_{FileSafe(task.Target.Replace('.', '_'))}.sql";
-            files.Add((name, TaskFile(projectName, plan.Order[i], task)));
-            index.Add((name, plan.Order[i], task));
+            files.Add((name, TaskFile(projectName, id, task)));
+            index.Add((name, id, task));
         }
-        files.Add((postName, GlobalFile(projectName, postName, "post-load", "after the last task", plan.PostSql)));
-        files.Add(("README.md", Readme(projectName, preName, postName, index)));
+        files.Add((postName, GlobalFile(projectName, postName, "post-load", "after the last task", plan.PostSql, [])));
+        files.Add(("README.md", Readme(projectName, preName, postName, index, problems)));
         return files;
     }
 
-    static string GlobalFile(string project, string name, string what, string when, List<string> statements)
+    /// <summary>Every line terminator a T-SQL parser or an editor may honour becomes a space.</summary>
+    public static string OneLine(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return text ?? "";
+        var chars = text.ToCharArray();
+        for (var i = 0; i < chars.Length; i++)
+            if (chars[i] is '\r' or '\n' or '\v' or '\f' or '\u0085' or '\u2028' or '\u2029') chars[i] = ' ';
+        return new string(chars);
+    }
+
+    /// <summary>The ONLY way an interpolated value reaches a <c>--</c> comment line.</summary>
+    static StringBuilder Comment(StringBuilder sb, string text) => sb.Append("-- ").Append(OneLine(text)).Append('\n');
+
+    static string GlobalFile(string project, string name, string what, string when, List<string> statements, List<string> problems)
     {
         var sb = new StringBuilder();
-        sb.Append(Rule).Append('\n')
-          .Append($"-- {project}: {name} - global {what} statements\n")
-          .Append($"-- runs on TARGET, {when}\n")
-          .Append(Rule).Append("\n\n");
-        if (statements.Count == 0) sb.Append($"-- (no global {what} statements)\n");
+        sb.Append(Rule).Append('\n');
+        Comment(sb, $"{project}: {name} - global {what} statements");
+        Comment(sb, $"runs on TARGET, {when}");
+        if (problems.Count > 0)
+        {
+            Comment(sb, $"{MismatchTitle} (see README.md)");
+            foreach (var p in problems) Comment(sb, "  - " + p);
+        }
+        sb.Append(Rule).Append("\n\n");
+        if (statements.Count == 0) Comment(sb, $"(no global {what} statements)");
         foreach (var s in statements) sb.Append(s.TrimEnd()).Append("\nGO\n\n");
         return sb.ToString();
     }
@@ -65,14 +96,14 @@ public static class ScriptPack
     static string TaskFile(string project, string id, TaskPlan t)
     {
         var sb = new StringBuilder();
-        sb.Append(Rule).Append('\n')
-          .Append($"-- {project}: task {id}  {t.Target}\n")
-          .Append($"-- Mode:            {t.Mode}\n")
-          .Append($"-- Keys:            {(t.KeyColumns.Count == 0 ? "(none - the table loads in a single transaction)" : string.Join(", ", t.KeyColumns))}\n")
-          .Append($"-- Depends on:      {(t.DependsOn.Count == 0 ? "(none)" : string.Join(", ", t.DependsOn))}\n")
-          .Append($"-- Identity insert: {(t.IdentityInsert ? "yes" : "no")}\n")
-          .Append($"-- Chunk size:      {(t.ChunkSize?.ToString(CultureInfo.InvariantCulture) ?? "run default")}\n")
-          .Append($"-- Custom SQL:      {(t.Custom ? "yes" : "no")}\n");
+        sb.Append(Rule).Append('\n');
+        Comment(sb, $"{project}: task {id}  {t.Target}");
+        Comment(sb, $"Mode:            {t.Mode}");
+        Comment(sb, $"Keys:            {(t.KeyColumns.Count == 0 ? "(none - the table loads in a single transaction)" : string.Join(", ", t.KeyColumns))}");
+        Comment(sb, $"Depends on:      {(t.DependsOn.Count == 0 ? "(none)" : string.Join(", ", t.DependsOn))}");
+        Comment(sb, $"Identity insert: {(t.IdentityInsert ? "yes" : "no")}");
+        Comment(sb, $"Chunk size:      {(t.ChunkSize?.ToString(CultureInfo.InvariantCulture) ?? "run default")}");
+        Comment(sb, $"Custom SQL:      {(t.Custom ? "yes" : "no")}");
         AppendList(sb, "Warnings", t.Warnings);
         AppendList(sb, "Errors (last validation)", t.Errors);
         sb.Append(Rule).Append("\n\n");
@@ -93,15 +124,15 @@ public static class ScriptPack
         var map = string.Join(", ", t.Columns.Select(c => c.Source == c.Target ? c.Target : $"{c.Source} -> {c.Target}"));
         if (t.Mode == "staging_merge")
         {
-            sb.Append("-- Each chunk is bulk-copied into #stg, then the merge statement runs in the same transaction.\n")
-              .Append($"-- Columns: {map}\n")
-              .Append((t.StagingDdl ?? "-- (missing staging DDL)").TrimEnd()).Append("\nGO\n")
+            sb.Append("-- Each chunk is bulk-copied into #stg, then the merge statement runs in the same transaction.\n");
+            Comment(sb, $"Columns: {map}");
+            sb.Append((t.StagingDdl ?? "-- (missing staging DDL)").TrimEnd()).Append("\nGO\n")
               .Append((t.MergeSql ?? "-- (missing merge SQL)").TrimEnd()).Append("\nGO\n\n");
         }
         else
         {
-            sb.Append($"-- Each chunk is bulk-copied straight into {t.Target}{(t.IdentityInsert ? " (KeepIdentity)" : "")}.\n")
-              .Append($"-- Columns: {map}\n\n");
+            Comment(sb, $"Each chunk is bulk-copied straight into {t.Target}{(t.IdentityInsert ? " (KeepIdentity)" : "")}.");
+            Comment(sb, $"Columns: {map}").Append('\n');
         }
 
         if (t.PostSql.Count > 0)
@@ -119,15 +150,23 @@ public static class ScriptPack
     static void AppendList(StringBuilder sb, string title, List<string> items)
     {
         if (items.Count == 0) return;
-        sb.Append($"-- {title}:\n");
-        foreach (var i in items) sb.Append("--   - ").Append(i.Replace("\r", " ", StringComparison.Ordinal).Replace("\n", " ", StringComparison.Ordinal)).Append('\n');
+        Comment(sb, $"{title}:");
+        foreach (var i in items) Comment(sb, "  - " + i);
     }
 
-    static string Readme(string project, string preName, string postName, List<(string File, string Id, TaskPlan Task)> index)
+    static string Readme(string project, string preName, string postName, List<(string File, string Id, TaskPlan Task)> index, List<string> problems)
     {
         var sb = new StringBuilder();
-        sb.Append($"# {project} - migration script pack\n\n")
-          .Append("Generated by **dbm** from the SQL plan. These files are for review, audit and rehearsal; the dbm engine runs the migration itself.\n\n")
+        sb.Append($"# {OneLine(project)} - migration script pack\n\n");
+        if (problems.Count > 0)
+        {
+            sb.Append($"## {MismatchTitle}\n\n")
+              .Append("The plan's order does not list every task exactly once. Every task is still exported: tasks missing from the order\n")
+              .Append("come after the ordered ones, in task-id order, and their real position in the run is unknown. Do not run this pack as-is.\n\n");
+            foreach (var p in problems) sb.Append("- ").Append(OneLine(p)).Append('\n');
+            sb.Append('\n');
+        }
+        sb.Append("Generated by **dbm** from the SQL plan. These files are for review, audit and rehearsal; the dbm engine runs the migration itself.\n\n")
           .Append("## How dbm moves the data\n\n")
           .Append("Source and target may be on different servers and **no linked server is used**. For every task dbm runs the *source query* on the\n")
           .Append("source server, streams the rows through its own process and writes them to the target with `SqlBulkCopy`. Scripts marked\n")
@@ -149,9 +188,11 @@ public static class ScriptPack
           .Append("## Files\n\n")
           .Append("| File | Task | Target | Mode | Depends on |\n|---|---|---|---|---|\n");
         foreach (var (file, id, t) in index)
-            sb.Append($"| `{file}` | {id} | {t.Target} | {t.Mode} | {(t.DependsOn.Count == 0 ? "-" : string.Join(", ", t.DependsOn))} |\n");
+            sb.Append($"| `{file}` | {Cell(id)} | {Cell(t.Target)} | {Cell(t.Mode)} | {(t.DependsOn.Count == 0 ? "-" : Cell(string.Join(", ", t.DependsOn)))} |\n");
         return sb.ToString();
     }
+
+    static string Cell(string text) => OneLine(text).Replace("|", "\\|", StringComparison.Ordinal);
 
     static string FileSafe(string s)
     {
