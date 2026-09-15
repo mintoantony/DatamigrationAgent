@@ -478,7 +478,8 @@ test('editor: a field holding a bare CR is read-only with a note; opening the ed
       openEditor(dom, s);
       assert.equal(areaFor(dom, 'Source query'), undefined, 'no textarea for the CR field');
       assert.ok(dom.text(dom.root).includes('contains a bare carriage return; edit it through the agent'));
-      assert.ok(areaFor(dom, 'Task pre-load') && areaFor(dom, 'Task post-load'), 'other fields stay editable');
+      assert.equal(areaFor(dom, 'Task pre-load'), undefined, 'the GO-in-comment list does not round-trip: read-only (N1)');
+      assert.ok(areaFor(dom, 'Task post-load'), 'a round-tripping list stays editable');
 
       const newer = sampleCtx({ version: 3, latestVersion: 3 }).ctx;
       assert.equal(globalThis.DBM.views.sql.holdRender(newer), false, 'an untouched editor is not dirty');
@@ -519,6 +520,100 @@ test('editor: Save sends only the field the user edited — no evidence fields, 
     const before = V.listing(t).filter(l => l.section !== 'source');
     const after = V.listing(applyOps(t, body.b.ops)).filter(l => l.section !== 'source');
     assert.deepEqual(after.map(l => [l.section, l.text]), before.map(l => [l.section, l.text]));
+  });
+});
+
+/* N1 (Ruling 70): edits are lossless. A list that does not survive splitStatements(joinStatements(list)) element for element is
+   read-only; a net no-op edit is not dirty and sends nothing; a real edit to one statement leaves its siblings byte-identical. */
+const LIST_NOTE = "this statement list can't be edited as one text without changing it; edit it through the agent";
+
+function editorFor(dom, s, id) {
+  globalThis.DBM.views.sql.render(dom.root, s.ctx);
+  if (id !== 'T01') click(dom, x => new RegExp(s.plan.tasks[id].target.replace('.', '\\.')).test(x));
+  click(dom, x => x === 'Edit SQL');
+}
+
+const type = (area, value) => { area.value = value; area.attrs.on.input(); };
+const submit = dom => dom.all(dom.root, n => n.tag === 'form')[0].attrs.on.submit({ preventDefault() {} });
+
+test('listRoundTrips: only a list that splitStatements(joinStatements(list)) gives back exactly', () => {
+  assert.equal(V.listRoundTrips([]), true);
+  assert.equal(V.listRoundTrips(undefined), true);
+  assert.equal(V.listRoundTrips(['A;', 'UPDATE STATISTICS [a].[b];']), true);
+  assert.equal(V.listRoundTrips(['/* keep\nGO\n*/ ALTER X;']), false, 'GO line inside a comment');
+  assert.equal(V.listRoundTrips(['A;', ' ']), false, 'whitespace-only statement');
+  assert.equal(V.listRoundTrips(['A;\n']), false, 'padded statement');
+  assert.equal(V.listRoundTrips(['SET A\r\n  ON;']), false, 'CRLF');
+  assert.equal(V.listRoundTrips(['']), false, 'empty statement');
+});
+
+test('N1: the re-reviewer\'s list (GO inside a comment, a whitespace statement) is read-only and a save sends no op for it', async () => {
+  await withFakeDom(async dom => {
+    const s = sampleCtx();
+    const t = s.plan.tasks.T01;
+    t.preSql = ['/* keep\nGO\n*/ ALTER X;', ' '];
+    t.postSql = ['A;', 'B;'];
+    const posts = [];
+    const toasts = [];
+    s.ctx.toast = (m) => toasts.push(m);
+    s.ctx.api = Object.assign({}, s.ctx.api, { post: (url, b) => { posts.push(b); return new Promise(() => {}); } });
+    editorFor(dom, s, 'T01');
+
+    assert.equal(areaFor(dom, 'Task pre-load'), undefined, 'no textarea for a list that does not round-trip');
+    assert.ok(dom.text(dom.root).includes(LIST_NOTE));
+    assert.ok(dom.text(dom.root).includes('/* keep'), 'the list is still shown');
+
+    submit(dom);
+    assert.equal(posts.length, 0, 'an untouched form sends nothing');
+    type(areaFor(dom, 'Source query'), 'SELECT 1 AS [AddressId] FROM [dbo].[ADDR] AS s');
+    submit(dom);
+    assert.equal(posts.length, 1);
+    assert.deepEqual(posts[0].ops.map(o => o.path), ['/tasks/T01/sourceQuery'], 'no preSql op');
+  });
+});
+
+test('N1: typing x then Backspace in a round-tripping list is a no-op — not dirty, nothing sent', async () => {
+  await withFakeDom(async dom => {
+    const s = sampleCtx();
+    const t = s.plan.tasks.T01;
+    t.preSql = ['ALTER TABLE [a].[b] NOCHECK CONSTRAINT [c];', 'UPDATE STATISTICS [a].[b];'];
+    const posts = [];
+    let confirms = 0;
+    const savedConfirm = globalThis.confirm;
+    globalThis.confirm = () => { confirms++; return true; };
+    s.ctx.api = Object.assign({}, s.ctx.api, { post: (url, b) => { posts.push(b); return new Promise(() => {}); } });
+    try {
+      editorFor(dom, s, 'T01');
+      const pre = areaFor(dom, 'Task pre-load');
+      assert.ok(pre, 'a round-tripping list is editable');
+      const opened = pre.value;
+      type(pre, opened + 'x');
+      type(pre, opened);
+      assert.equal(globalThis.DBM.views.sql.holdRender(sampleCtx({ version: 3, latestVersion: 3 }).ctx), false, 'a net no-op is not dirty');
+      submit(dom);
+      assert.equal(posts.length, 0, 'a net no-op sends nothing');
+      click(dom, x => /app\.Orders/.test(x));
+      assert.equal(confirms, 0, 'no discard prompt after a net no-op');
+    } finally { globalThis.confirm = savedConfirm; }
+  });
+});
+
+test('N1: a real edit to one statement of a round-tripping list leaves its siblings byte-identical', async () => {
+  await withFakeDom(async dom => {
+    const s = sampleCtx();
+    const t = s.plan.tasks.T01;
+    t.preSql = ['ALTER TABLE [a].[b] NOCHECK CONSTRAINT [c];', 'SELECT 1 /* a comment */;', 'UPDATE STATISTICS [a].[b];'];
+    let body = null;
+    s.ctx.api = Object.assign({}, s.ctx.api, { post: (url, b) => { body = b; return new Promise(() => {}); } });
+    editorFor(dom, s, 'T01');
+    const pre = areaFor(dom, 'Task pre-load');
+    type(pre, pre.value.replace('SELECT 1 /* a comment */;', 'SELECT 2;'));
+    submit(dom);
+    assert.deepEqual(body.ops, [{ op: 'replace', path: '/tasks/T01/preSql', value: [t.preSql[0], 'SELECT 2;', t.preSql[2]] }]);
+    const before = V.listing(t);
+    const after = V.listing(applyOps(t, body.ops));
+    assert.deepEqual(after.filter(l => !/SELECT/.test(l.text)).map(l => l.text), before.filter(l => !/SELECT/.test(l.text)).map(l => l.text));
+    assert.equal(after.length, before.length, 'no line numbers shift');
   });
 });
 

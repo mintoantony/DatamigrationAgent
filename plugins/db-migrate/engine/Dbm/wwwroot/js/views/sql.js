@@ -81,6 +81,15 @@
 
   function joinStatements(list) { return (list || []).join('\nGO\n'); }
 
+  /* Ruling 70: a statement list is editable as one text only if splitting its joined text gives back exactly the stored list,
+     element for element. Otherwise (a GO line inside a comment or string, a whitespace-only or padded statement, CRLF) a save
+     would rewrite statements the user never touched and shift every later line number. */
+  function listRoundTrips(list) {
+    var stored = list || [];
+    var back = splitStatements(joinStatements(stored));
+    return back.length === stored.length && back.every(function (x, i) { return x === stored[i]; });
+  }
+
   function trimEnd(s) { return s.replace(/\s+$/, ''); }
 
   /* Patch ops (JSON pointers into the SQL artifact) for the fields the user changed. */
@@ -247,18 +256,19 @@
 
   function rerender() { if (mounted) render(mounted.root, mounted.ctx); }
 
-  /* The edits the user actually made: {field: textarea value} for touched, editable fields only. */
+  /* The edits the user actually made (Ruling 70): {field: textarea value} for editable fields whose value differs from the value
+     the textarea opened with. A net no-op (type, then undo) is not an edit, and an untouched field is never re-derived. */
   function touchedEdits() {
     var e = ui.editor;
     var edits = {};
-    if (!e || ui.editing !== e.id || !ui.drafts || ui.drafts.id !== e.id) return edits;
-    Object.keys(ui.drafts.values).forEach(function (k) { if (e.areas[k]) edits[k] = e.areas[k].value; });
+    if (!e || ui.editing !== e.id) return edits;
+    Object.keys(e.areas).forEach(function (k) { if (e.areas[k].value !== e.opened[k]) edits[k] = e.areas[k].value; });
     return edits;
   }
 
   function isDirty() {
     var e = ui.editor;
-    return !!e && ui.editing === e.id && editOps(e.id, e.task, touchedEdits()).length > 0;
+    return !!e && ui.editing === e.id && Object.keys(touchedEdits()).length > 0;
   }
 
   function discard() { ui.editing = null; ui.editor = null; ui.drafts = null; ui.heldWarned = false; }
@@ -539,7 +549,8 @@
     // ops for the five SQL fields below.
     ui.drafts = { id: id, version: version, values: drafts || {} };
     var areas = {};
-    ui.editor = { id: id, task: t, areas: areas };
+    var opened = {};
+    ui.editor = { id: id, task: t, areas: areas, opened: opened };
     var problems = el('div', { class: 'sql-edit-problems', 'aria-live': 'assertive' }, []);
     var submit = el('button', { class: 'btn btn-primary', type: 'submit', disabled: ui.saving }, ['Save as new version']);
 
@@ -579,6 +590,13 @@
           codeBlock(Array.isArray(t[f[0]]) ? joinStatements(t[f[0]]) : t[f[0]]),
         ]);
       }
+      if ((f[0] === 'preSql' || f[0] === 'postSql') && !listRoundTrips(t[f[0]])) {
+        return el('div', { class: 'stack sql-edit-field sql-edit-locked' }, [
+          el('span', { class: 'small muted' }, [f[1]]),
+          el('p', { class: 'small sql-count-warn' }, ["Read-only: this statement list can't be edited as one text without changing it; edit it through the agent."]),
+          codeBlock(joinStatements(t[f[0]])),
+        ]);
+      }
       var initial = drafts && Object.prototype.hasOwnProperty.call(drafts, f[0]) ? drafts[f[0]] : f[2];
       var lines = norm(initial).split('\n').length;
       var ta = el('textarea', {
@@ -588,6 +606,8 @@
           keydown: function (e) { if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) { e.preventDefault(); save(); } },
         },
       }, []);
+      ta.value = f[2];
+      opened[f[0]] = ta.value;   // what the textarea opened with, as the textarea itself reads it back
       ta.value = initial;
       areas[f[0]] = ta;
       return el('label', { class: 'stack sql-edit-field' }, [el('span', { class: 'small muted' }, [f[1]]), ta]);
@@ -666,7 +686,7 @@
 
   DBM.sqlView = {
     listing: listing, listingText: listingText, parseAnchor: parseAnchor, sectionBlocks: sectionBlocks, splitStatements: splitStatements,
-    joinStatements: joinStatements, editOps: editOps, reportSummary: reportSummary, openCommentsByTask: openCommentsByTask,
+    joinStatements: joinStatements, listRoundTrips: listRoundTrips, editOps: editOps, reportSummary: reportSummary, openCommentsByTask: openCommentsByTask,
     diffRows: diffRows,
   };
   DBM.views = DBM.views || {};

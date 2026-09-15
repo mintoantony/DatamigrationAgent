@@ -24,11 +24,20 @@ public sealed class TaskListingMirrorTests
         return doc.RootElement.Clone();
     }
 
+    /// <summary>The file this class asserts is byte-for-byte the fixture node reads (js/fixtures/task-listing.json of this project,
+    /// whose path the build records in assembly metadata). Fails if the copy is missing, stale, or another file.</summary>
     [Fact]
-    public void Fixture_is_read_from_the_output_copy_of_this_projects_file()
+    public void Fixture_is_a_byte_identical_output_copy_of_this_projects_source_fixture()
     {
-        Assert.Equal(Path.Combine(AppContext.BaseDirectory, "fixtures", "task-listing.json"), FixturePath);
-        Assert.True(File.Exists(FixturePath), $"missing: {FixturePath}");
+        var source = typeof(TaskListingMirrorTests).Assembly.GetCustomAttributes(typeof(System.Reflection.AssemblyMetadataAttribute), false)
+            .Cast<System.Reflection.AssemblyMetadataAttribute>()
+            .SingleOrDefault(a => string.Equals(a.Key, "SharedListingFixtureSource", StringComparison.Ordinal))?.Value;
+
+        Assert.False(string.IsNullOrEmpty(source), "the build did not record SharedListingFixtureSource");
+        Assert.True(File.Exists(source), $"source fixture missing: {source}");
+        Assert.True(File.Exists(FixturePath), $"output copy missing: {FixturePath}");
+        Assert.StartsWith(Path.GetFullPath(AppContext.BaseDirectory), Path.GetFullPath(FixturePath), StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(File.ReadAllBytes(source!), File.ReadAllBytes(FixturePath));
     }
 
     public static IEnumerable<object[]> ListingCases() =>
