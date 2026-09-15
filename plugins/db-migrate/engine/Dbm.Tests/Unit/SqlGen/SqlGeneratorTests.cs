@@ -1,4 +1,5 @@
 using Dbm.Core;
+using Dbm.Core.Catalog;
 using Dbm.Core.Mapping;
 using Dbm.Core.Matching;
 using Dbm.Core.SqlGen;
@@ -355,6 +356,142 @@ public class SqlGeneratorTests
         var carried = Task(SqlGenerator.Generate(mapping, SampleCatalogs.Source(), SampleCatalogs.Target(), first), "app.Addresses");
         Assert.True(carried.Custom);
         Assert.Equal("SELECT 1 AS [AddressId]", carried.SourceQuery);
+    }
+
+    // ---- Fix round 1: custom SQL dropped on regeneration is announced ------------------------------------------------
+
+    [Fact]
+    public void DiscardedWarning_text_is_pinned()
+    {
+        Assert.Equal("custom SQL discarded: the mapping for this table changed", SqlGenerator.DiscardedWarning);
+    }
+
+    [Fact]
+    public void Discarding_custom_sql_because_the_mapping_changed_warns_on_that_task_only()
+    {
+        var first = Plan();
+        var addresses = Task(first, "app.Addresses");
+        addresses.SourceQuery = "SELECT 1 AS [AddressId]";
+        addresses.Custom = true;
+
+        var mapping = SampleMappings.Approved();
+        mapping.Tables["app.Addresses"].Columns["City"].Expr = "UPPER(s.[CITY])";
+        mapping.Tables["app.Orders"].Filter = "s.[TOTAL_AMT] > 0";   // Orders was not custom: its mapping changes too, but no human SQL is lost
+        var second = SqlGenerator.Generate(mapping, SampleCatalogs.Source(), SampleCatalogs.Target(), first);
+
+        var regenerated = Task(second, "app.Addresses");
+        Assert.False(regenerated.Custom);
+        Assert.Contains(SqlGenerator.DiscardedWarning, regenerated.Warnings);
+        Assert.DoesNotContain(SqlGenerator.CarriedWarning, regenerated.Warnings);
+        // A non-custom task whose mapping changed lost nothing a human wrote.
+        Assert.DoesNotContain(second.Tasks.Values.Where(t => t.Target != "app.Addresses"), t => t.Warnings.Contains(SqlGenerator.DiscardedWarning));
+    }
+
+    [Fact]
+    public void Carried_custom_sql_and_a_first_generation_never_warn_of_a_discard()
+    {
+        Assert.DoesNotContain(Plan().Tasks.Values, t => t.Warnings.Contains(SqlGenerator.DiscardedWarning));
+
+        var first = Plan();
+        Task(first, "app.Addresses").Custom = true;
+        var second = SqlGenerator.Generate(SampleMappings.Approved(), SampleCatalogs.Source(), SampleCatalogs.Target(), first);
+        Assert.True(Task(second, "app.Addresses").Custom);
+        Assert.DoesNotContain(second.Tasks.Values, t => t.Warnings.Contains(SqlGenerator.DiscardedWarning));
+    }
+
+    // ---- Fix round 1: a cycle is cut only on an edge whose EVERY child-side FK column is nullable ----------------------
+
+    static TableMap EmptyMap() => new() { Kind = "direct" };
+
+    /// <summary>A two-table cycle app.A &lt;-&gt; app.B. The edge (app.A, app.B) sorts first ordinally and is always NOT NULL, so it is
+    /// cut unless (app.B, app.A) is preferred. <paramref name="bFks"/> are app.B's FKs to app.A, over columns B1..B3.</summary>
+    static SqlPlanPayload CyclePlan(bool b1Nullable, bool b2Nullable, params ForeignKeyInfo[] bFks)
+    {
+        var a = TestCatalogs.Table("app.A", 0,
+            [TestCatalogs.Col("Id", "int", nullable: false), TestCatalogs.Col("Id2", "int", nullable: false), TestCatalogs.Col("BId", "int", nullable: false)],
+            pk: ["Id", "Id2"], fks: [TestCatalogs.Fk("FK_A_B", "BId", "app.B", "Id")]);
+        var b = TestCatalogs.Table("app.B", 0,
+            [TestCatalogs.Col("Id", "int", nullable: false), TestCatalogs.Col("B1", "int", nullable: b1Nullable),
+             TestCatalogs.Col("B2", "int", nullable: b2Nullable), TestCatalogs.Col("B3", "int", nullable: true)],
+            pk: ["Id"], fks: bFks);
+        var tgt = TestCatalogs.Snapshot(TestCatalogs.Meta("T"), [a, b]);
+        var src = TestCatalogs.Snapshot(TestCatalogs.Meta("S"), []);
+        var mapping = new MappingPayload { Tables = { ["app.A"] = EmptyMap(), ["app.B"] = EmptyMap() } };
+        return SqlGenerator.Generate(mapping, src, tgt);
+    }
+
+    static ForeignKeyInfo CompositeFk(string name, params string[] columns) => new(name, columns.ToList(), "app", "A", ["Id", "Id2"], false, false);
+
+    [Fact]
+    public void Composite_fk_with_one_not_null_column_is_not_a_preferred_cut()
+    {
+        // FK_B_A (B1 NULL, B2 NOT NULL): child rows cannot be inserted with a NULL reference, so deferring it cannot work.
+        var plan = CyclePlan(b1Nullable: true, b2Nullable: false, CompositeFk("FK_B_A", "B1", "B2"));
+        Assert.Equal(["ALTER TABLE [app].[A] NOCHECK CONSTRAINT [FK_A_B];"], plan.PreSql);
+        Assert.Equal(["ALTER TABLE [app].[A] WITH CHECK CHECK CONSTRAINT [FK_A_B];"], plan.PostSql);
+    }
+
+    [Fact]
+    public void Composite_fk_with_every_column_nullable_is_the_preferred_cut()
+    {
+        var plan = CyclePlan(b1Nullable: true, b2Nullable: true, CompositeFk("FK_B_A", "B1", "B2"));
+        Assert.Equal(["ALTER TABLE [app].[B] NOCHECK CONSTRAINT [FK_B_A];"], plan.PreSql);
+        Assert.Equal(["ALTER TABLE [app].[B] WITH CHECK CHECK CONSTRAINT [FK_B_A];"], plan.PostSql);
+        Assert.Contains(plan.Warnings, w => w.StartsWith("FK cycle broken at app.B -> app.A", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Edge_with_several_fks_is_preferred_only_when_every_fk_is_nullable()
+    {
+        // Two FKs on the same edge (app.B -> app.A): FK_B_A_1 over nullable B3, FK_B_A_2 over NOT NULL B2.
+        var mixed = CyclePlan(b1Nullable: true, b2Nullable: false, CompositeFk("FK_B_A_1", "B3", "B1"), CompositeFk("FK_B_A_2", "B2", "B1"));
+        Assert.Equal(["ALTER TABLE [app].[A] NOCHECK CONSTRAINT [FK_A_B];"], mixed.PreSql);
+
+        var safe = CyclePlan(b1Nullable: true, b2Nullable: true, CompositeFk("FK_B_A_1", "B3", "B1"), CompositeFk("FK_B_A_2", "B2", "B1"));
+        Assert.Equal(["ALTER TABLE [app].[B] NOCHECK CONSTRAINT [FK_B_A_1];", "ALTER TABLE [app].[B] NOCHECK CONSTRAINT [FK_B_A_2];"], safe.PreSql);
+    }
+
+    // ---- Fix round 1: task ids widen past 99 tasks, and every reference uses the widened ids -------------------------
+
+    [Fact]
+    public void Past_99_tasks_ids_widen_to_three_digits_and_every_reference_agrees()
+    {
+        // 101 tables in a chain: app.t000 <- app.t001 <- ... <- app.t100, and app.t100 also references app.t000.
+        const int count = 101;
+        string Key(int i) => "app.t" + i.ToString("D3", System.Globalization.CultureInfo.InvariantCulture);
+        var tables = Enumerable.Range(0, count).Select(i =>
+        {
+            var fks = new List<ForeignKeyInfo>();
+            if (i > 0) fks.Add(TestCatalogs.Fk($"FK_{i}_prev", "Prev", Key(i - 1), "Id"));
+            if (i == count - 1) fks.Add(TestCatalogs.Fk($"FK_{i}_root", "Root", Key(0), "Id"));
+            return TestCatalogs.Table(Key(i), 0,
+                [TestCatalogs.Col("Id", "int", nullable: false), TestCatalogs.Col("Prev", "int"), TestCatalogs.Col("Root", "int")],
+                pk: ["Id"], fks: fks);
+        }).ToList();
+        var mapping = new MappingPayload();
+        for (var i = 0; i < count; i++) mapping.Tables[Key(i)] = EmptyMap();
+
+        var plan = SqlGenerator.Generate(mapping, TestCatalogs.Snapshot(TestCatalogs.Meta("S"), []), TestCatalogs.Snapshot(TestCatalogs.Meta("T"), tables));
+
+        Assert.Equal(count, plan.Order.Count);
+        Assert.Equal("T001", plan.Order[0]);
+        Assert.Equal("T099", plan.Order[98]);
+        Assert.Equal("T100", plan.Order[99]);
+        Assert.Equal("T101", plan.Order[100]);
+        Assert.All(plan.Order, id => Assert.Matches("^T[0-9]{3}$", id));
+        // Equal width is what keeps ordinal id order equal to execution order.
+        Assert.Equal(plan.Order, plan.Order.OrderBy(x => x, StringComparer.Ordinal));
+        Assert.Equal(plan.Order.OrderBy(x => x, StringComparer.Ordinal), plan.Tasks.Keys.OrderBy(x => x, StringComparer.Ordinal));
+
+        for (var i = 0; i < count; i++)
+        {
+            var id = plan.Order[i];
+            Assert.Equal(Key(i), plan.Tasks[id].Target);
+            Assert.All(plan.Tasks[id].DependsOn, d => Assert.True(plan.Tasks.ContainsKey(d), $"{id} depends on unissued id {d}"));
+        }
+        Assert.Empty(plan.Tasks["T001"].DependsOn);
+        Assert.Equal(["T099"], plan.Tasks["T100"].DependsOn);
+        Assert.Equal(["T001", "T100"], plan.Tasks["T101"].DependsOn);
     }
 
     [Fact]

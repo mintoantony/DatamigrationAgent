@@ -15,6 +15,7 @@ public static class SqlGenerator
     public const string NoKeyWarning = "no key: single-transaction load";
     public const string ReviewMergeWarning = "review merge SQL";
     public const string CarriedWarning = "custom SQL carried over from the previous plan";
+    public const string DiscardedWarning = "custom SQL discarded: the mapping for this table changed";
 
     /// <summary>Rendered as "&lt;Col&gt;: " + this for a column whose typeRisk is <see cref="TypeCompat.UnevaluatedRisk"/>: the conversion
     /// could not be evaluated, which is a different claim from a conversion evaluated and found lossy.</summary>
@@ -69,7 +70,11 @@ public static class SqlGenerator
                 && string.Equals(p.Target, task.Target, StringComparison.OrdinalIgnoreCase)
                 && p.MappingHash is not null && p.MappingHash == task.MappingHash);
             if (old is not null) CarryOver(task, old);
+            // A custom task for this target that was NOT carried over (its mapping hash differs) is hand-written SQL being dropped: say so.
+            var discarded = old is null && carryOver is not null && carryOver.Tasks.Values.Any(p => p is not null && p.Custom
+                && string.Equals(p.Target, task.Target, StringComparison.OrdinalIgnoreCase));
             task.Warnings = BuildWarnings(task, table, map, notes);
+            if (discarded) task.Warnings.Add(DiscardedWarning);
             plan.Tasks[ids[target]] = task;
             plan.Order.Add(ids[target]);
         }
