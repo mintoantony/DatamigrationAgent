@@ -96,11 +96,12 @@ public sealed class TxScope : IAsyncDisposable
         return Convert.ToInt16(await cmd.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
 
-    /// <summary>Queues a session SET for the moment this scope lets go of the transaction. While the scope still holds a transaction the
-    /// server has already destroyed there is nowhere to issue such a statement — a command carrying that transaction fails with "The server
-    /// failed to resume the transaction", and SqlClient refuses a command that carries none while the connection has a pending local
-    /// transaction (measured, both ways round). Once the scope releases it, in <see cref="RestoreSessionStateAsync"/>, the transaction
-    /// object has been disposed and the statement goes through on the bare connection.</summary>
+    /// <summary>Queues a session SET for the moment this scope lets go of the transaction. After a <c>SqlBulkCopy</c> whose transaction the
+    /// server destroyed under it — the state the loader queues from — there is nowhere to issue such a statement: a command carrying that
+    /// transaction fails with "The server failed to resume the transaction", and SqlClient refuses a command that carries none while the
+    /// connection still has a pending local transaction (both measured at that point; after a raw ROLLBACK or a plain batch abort the same
+    /// two commands go through). Once the scope releases it, in <see cref="RestoreSessionStateAsync"/>, the transaction object has been
+    /// disposed and the statement goes through on the bare connection.</summary>
     internal void RestoreWhenReleased(string setStatement) => _whenReleased.Add(setStatement);
 
     /// <summary>Why this scope's connection must not be handed to another load: session state a caller set on it could not be put back,

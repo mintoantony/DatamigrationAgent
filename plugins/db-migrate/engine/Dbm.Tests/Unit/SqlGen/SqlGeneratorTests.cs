@@ -149,8 +149,13 @@ public class SqlGeneratorTests
     {
         var mapping = SampleMappings.Approved();
         mapping.Tables["app.Addresses"].Kind = "lookup";
-        var task = Task(SqlGenerator.Generate(mapping, SampleCatalogs.Source(), SampleCatalogs.Target()), "app.Addresses");
+        var plan = SqlGenerator.Generate(mapping, SampleCatalogs.Source(), SampleCatalogs.Target());
+        var task = Task(plan, "app.Addresses");
         Assert.Equal("staging_merge", task.Mode);
+        // BulkLoader refuses a direct task that carries a MergeSql (ruling 111), so no generated task may carry one: the merge belongs
+        // to the staging mode that runs it. Every other task in this same plan is direct.
+        Assert.All(plan.Tasks.Values.Where(t => t.Mode != "staging_merge"), t => Assert.Null(t.MergeSql));
+        Assert.Contains(plan.Tasks.Values, t => t.Mode != "staging_merge");
         Assert.StartsWith("CREATE TABLE #stg (\n    [AddressId] int NULL,\n    [CustomerId] int NULL,\n    [Line1] nvarchar(200)", task.StagingDdl);
         Assert.Contains("\n    [__k0] int NULL\n);", task.StagingDdl);
         Assert.Equal(
