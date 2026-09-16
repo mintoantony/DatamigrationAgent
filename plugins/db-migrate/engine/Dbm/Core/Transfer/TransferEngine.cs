@@ -50,6 +50,11 @@ public sealed class TransferEngine
         var missing = tasks.Where(t => !_plan.Tasks.ContainsKey(t.TaskId)).Select(t => t.TaskId).ToList();
         if (missing.Count > 0) throw new TransferException("plan_mismatch", "The SQL plan has no task " + string.Join(", ", missing) + ".");
 
+        // Ruling 103. A "running" run must stay resumable - that is what a crash leaves behind - so status alone cannot say whether a
+        // runner is still alive. The lock can, and it is taken before anything is read or written, so a second runner is refused
+        // before it copies a row rather than after it has doubled the table.
+        await using var runLock = await RunLock.AcquireAsync(_targetCs, runId, ct);
+
         var rc = new RunContext
         {
             Services = _services, RunId = runId, Plan = _plan, SourceCs = _sourceCs, TargetCs = _targetCs,
@@ -70,16 +75,19 @@ public sealed class TransferEngine
             if (error is not null) return Finish(rc, RunStatus.Failed, error);
             bool allDone = repo.Tasks(runId).All(t => t.Status == TransferTaskStatus.Done);
             if (!allDone && control.Kind == StopKind.Cancel)
-                return Finish(rc, RunStatus.Cancelled, null, ControlTableSummary(await DropControlTableAsync(rc, ct)));
+            {
+                await DropControlTableAsync(rc, ct);
+                return Finish(rc, RunStatus.Cancelled, null);
+            }
             if (!allDone) return Finish(rc, RunStatus.Paused, null);
 
             await using (var tgt = await SqlConnect.OpenAsync(_targetCs, ct))
             {
                 await TargetOps.ExecAllAsync(tgt, _plan.PostSql, ct);
             }
-            string? note = await DropControlTableAsync(rc, ct);
+            await DropControlTableAsync(rc, ct);
             string? summary = await FinishCompletedAsync(rc, ct);
-            return Finish(rc, RunStatus.Completed, null, summary ?? ControlTableSummary(note));
+            return Finish(rc, RunStatus.Completed, null, summary);
         }
         catch (Exception) when (ct.IsCancellationRequested)
         {
@@ -106,7 +114,9 @@ public sealed class TransferEngine
         foreach (var t in tasks)
         {
             long before = await TargetOps.CountTargetAsync(tgt, t.Target, ct);
-            long source = await TargetOps.ScalarLongAsync(src, TargetOps.CountSqlOf(_plan.Tasks[t.TaskId]), ct);
+            // CountSql is an arbitrary plan field returned verbatim. One that yields NULL or no row leaves the source count unknown,
+            // and "unknown" must not be recorded as 0 - a 0 there silences the very warning that says an empty table is not expected.
+            long? source = await TargetOps.ScalarLongOrNullAsync(src, TargetOps.CountSqlOf(_plan.Tasks[t.TaskId]), ct);
             rc.Repo.SetTaskCounts(rc.RunId, t.TaskId, source, before);
         }
     }
@@ -162,27 +172,35 @@ public sealed class TransferEngine
     /// <summary>
     /// Drops our checkpoint table, or - when a table of that name in the target is not ours - says so and leaves it alone. ControlTable
     /// refuses to drop a foreign table (ruling H1) by throwing; uncaught here that would report a migration which loaded every row as a
-    /// failed run, and swallowed it would leave the table standing with nothing saying why. Returns the note, for the run's summary.
+    /// failed run, and swallowed it would leave the table standing with nothing saying why. The note goes into the run's summary.
     /// </summary>
-    private async Task<string?> DropControlTableAsync(RunContext rc, CancellationToken ct)
+    private async Task DropControlTableAsync(RunContext rc, CancellationToken ct)
     {
-        if (rc.Options.KeepControlTable) return null;
+        if (rc.Options.KeepControlTable) return;
         try
         {
             await using var tgt = await SqlConnect.OpenAsync(_targetCs, ct);
             await ControlTable.DropAsync(tgt, ct);
-            return null;
         }
         catch (TransferException ex) when (ex.Code == "control_table_mismatch")
         {
             string note = $"{ControlTable.Name} in the target is not ours; it was left untouched (control_table_mismatch).";
+            rc.AddNote(note);
             rc.Log("warn", $"{note} {ex.Message}");
-            return note;
         }
     }
 
-    private static string? ControlTableSummary(string? note)
-        => note is null ? null : Json.Serialize(new { controlTable = note });
+    /// <summary>
+    /// What the run carries out with it when nothing else will: the error, and the notes the run collected (a control table that was
+    /// not ours, rejected rows counted but never recorded). 5.4's own summary replaces this one, and must carry the notes forward.
+    /// </summary>
+    private static string? RunSummary(RunContext rc, string? error)
+    {
+        var notes = rc.Notes;
+        if (error is null && notes.Count == 0) return null;
+        List<string>? list = notes.Count == 0 ? null : notes.ToList();
+        return Json.Serialize(new { error, notes = list });
+    }
 
     /// <summary>Completion hook: Task 5.4 replaces this body with run validation + the final report. Returns summary_json.</summary>
     private Task<string?> FinishCompletedAsync(RunContext rc, CancellationToken ct) => Task.FromResult<string?>(null);
@@ -190,7 +208,7 @@ public sealed class TransferEngine
     private TransferOutcome Finish(RunContext rc, RunStatus status, string? error, string? summaryJson = null)
     {
         string text = EnumText.ToText(status);
-        rc.Repo.SetRunStatus(rc.RunId, status, summaryJson ?? (error is null ? null : Json.Serialize(new { error })));
+        rc.Repo.SetRunStatus(rc.RunId, status, summaryJson ?? RunSummary(rc, error));
         _services.Sink.Publish("transfer_run_changed", new { runId = rc.RunId, status = text });
         rc.Progress.RunStatus = text;
         rc.Progress.Publish(force: true);

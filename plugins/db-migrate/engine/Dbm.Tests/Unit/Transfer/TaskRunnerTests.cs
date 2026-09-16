@@ -117,12 +117,14 @@ public sealed class TaskRunnerTests
     }
 
     /// <summary>
-    /// Harm: in stop mode the bisector ends at the first failed row, so rows after it are in neither list - not loaded, not rejected,
-    /// in no error_row, not in the target. Committing that chunk and advancing the checkpoint past them drops them from the migration
-    /// with every counter still agreeing. The chunk must be refused instead, so the transaction rolls back.
+    /// NOT a harm test - a contract assertion (ruling 104). Rulings 73/74 say <c>Loaded + Failed</c> need not equal
+    /// <c>Attempted</c>, but no route reaches that state through today's loader: stop mode rolls back and throws before the check, and
+    /// skip mode attempts every row. The reviewer confirmed it by deleting both call sites, and nothing failed. This test therefore
+    /// pins only that the assertion says the right thing if a future 5.2 change ever makes the state reachable; it is not evidence of
+    /// a defect prevented, and the guard's call sites have no mutation behind them.
     /// </summary>
     [Fact]
-    public void A_chunk_whose_rows_are_not_all_accounted_for_is_refused_before_its_checkpoint_is_written()
+    public void The_accounting_contract_assertion_names_the_rows_that_are_in_neither_list()
     {
         var short_ = new ChunkOutcome(4, [new RowFailure(4, "bad")], 0) { Attempted = 20 };
         var ex = Assert.Throws<TransferException>(() => TaskRunner.CheckAccounted("T02", 7, short_));

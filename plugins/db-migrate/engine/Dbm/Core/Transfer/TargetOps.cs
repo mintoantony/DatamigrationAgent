@@ -21,14 +21,23 @@ public static class TargetOps
         }
     }
 
-    public static async Task<long> ScalarLongAsync(SqlConnection conn, string sql, CancellationToken ct, int timeoutSec = 0)
+    /// <summary>
+    /// The scalar as a number, or <c>null</c> when the query returned no row or a NULL. A caller that records this as a count must
+    /// keep the two apart: a 0 that means "nobody could count" reads exactly like one that means "there is nothing there".
+    /// </summary>
+    public static async Task<long?> ScalarLongOrNullAsync(SqlConnection conn, string sql, CancellationToken ct, int timeoutSec = 0)
     {
         ArgumentNullException.ThrowIfNull(conn);
         ArgumentNullException.ThrowIfNull(sql);
         await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = timeoutSec };
         var value = await cmd.ExecuteScalarAsync(ct);
-        return value is null or DBNull ? 0 : Convert.ToInt64(value, CultureInfo.InvariantCulture);
+        return value is null or DBNull ? null : Convert.ToInt64(value, CultureInfo.InvariantCulture);
     }
+
+    /// <summary>The scalar, with no result counted as 0. Only for queries that cannot fail to produce one, such as COUNT_BIG over a
+    /// table; anything a plan supplies goes through <see cref="ScalarLongOrNullAsync"/> instead.</summary>
+    public static async Task<long> ScalarLongAsync(SqlConnection conn, string sql, CancellationToken ct, int timeoutSec = 0)
+        => await ScalarLongOrNullAsync(conn, sql, ct, timeoutSec) ?? 0;
 
     public static Task<long> CountTargetAsync(SqlConnection conn, string targetKey, CancellationToken ct)
     {

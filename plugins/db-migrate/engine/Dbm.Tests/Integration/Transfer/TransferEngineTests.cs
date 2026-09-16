@@ -234,6 +234,55 @@ public sealed class TransferEngineTests(EngineSourceFixture fx) : IClassFixture<
         Assert.Contains("error", rig.Repo.GetRun(runId)!.SummaryJson);
     }
 
+    /// <summary>
+    /// Harm: the bad row is written to error_row before the throw, and the chunk then rolls back, so the checkpoint does not move.
+    /// Every retry of the failed run hits the same source row and records it again - the operator is shown one bad row N times and
+    /// cannot tell a repeat attempt from N genuinely bad rows.
+    /// </summary>
+    [Fact]
+    public async Task A_stop_mode_failure_records_its_bad_row_once_however_often_the_run_is_retried()
+    {
+        await using var rig = await RigAsync();
+        long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 500, Parallelism = 1, ErrorMode = "stop" });
+
+        Assert.Equal(RunStatus.Failed, (await rig.Engine.RunAsync(runId, new TransferControl(), default)).Status);
+        Assert.Single(rig.Repo.ErrorRows(runId, "T02"));
+
+        Assert.Equal(RunStatus.Failed, (await rig.Engine.RunAsync(runId, new TransferControl(), default)).Status);
+        Assert.Equal(500, await rig.Tgt.CountAsync("app.Child"));
+        Assert.Single(rig.Repo.ErrorRows(runId, "T02"));       // one bad row, not one copy per attempt
+    }
+
+    /// <summary>
+    /// Harm (ruling 105): a chunk's rows and checkpoint commit together, but its error rows are written to the mirror just after, and
+    /// the checkpoint already counts them. A crash in that window leaves the counts correct and no row duplicated or skipped - but the
+    /// run then tells the operator "2 rejected" and hands them one row, permanently, with nothing saying the other is missing. The
+    /// runner holds both numbers, so the runner is what must compare them.
+    /// </summary>
+    [Fact]
+    public async Task Rejected_rows_counted_but_never_recorded_are_declared_at_the_end_of_the_task()
+    {
+        await using var rig = await RigAsync();
+        long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 200, Parallelism = 1, ErrorMode = "skip" });
+        TaskRunner.AfterChunkTransaction = (taskId, chunkNo) =>
+        {
+            if (taskId == "T02" && chunkNo == 4)             // chunk 4 holds Id 777, the row the CHECK rejects
+                throw new InvalidOperationException("staged crash before the chunk's error rows were written");
+        };
+
+        Assert.Equal(RunStatus.Failed, (await rig.Engine.RunAsync(runId, new TransferControl(), default)).Status);
+        TaskRunner.AfterChunkTransaction = null;
+
+        Assert.Equal(RunStatus.Completed, (await rig.Engine.RunAsync(runId, new TransferControl(), default)).Status);
+        var child = rig.Repo.Task(runId, "T02")!;
+        Assert.Equal(1998, child.RowsDone);                                          // the data itself is correct
+        Assert.Equal(2, child.RowsError);
+        Assert.Single(rig.Repo.ErrorRows(runId, "T02"));                             // the other row is gone for good
+        Assert.Contains("were counted but never recorded", rig.Repo.GetRun(runId)!.SummaryJson);
+        Assert.Contains(rig.Svc.Sink.Events, e => e.Type == "log"
+            && (e.Payload?.ToString() ?? "").Contains("never recorded"));
+    }
+
     [Fact]
     public async Task Cancel_stops_after_the_current_chunk_and_drops_the_control_table()
     {
@@ -298,6 +347,6 @@ public sealed class TransferEngineTests(EngineSourceFixture fx) : IClassFixture<
         Assert.Equal(1, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(*) FROM dbo.__dbm_checkpoint WHERE note = N'customer data'"));
         Assert.Contains(rig.Svc.Sink.Events, e => e.Type == "log"
             && (e.Payload?.ToString() ?? "").Contains("control_table_mismatch"));           // and it says so, by name
-        Assert.Contains("controlTable", rig.Repo.GetRun(runId)!.SummaryJson);               // in the run's own outcome, not only a log line
+        Assert.Contains("control_table_mismatch", rig.Repo.GetRun(runId)!.SummaryJson);     // in the run's own outcome, not only a log line
     }
 }

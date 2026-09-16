@@ -45,7 +45,24 @@ internal sealed class RunContext
     public required TransferProgress Progress { get; init; }
     public required IReadOnlyList<string> Secrets { get; init; }
 
+    private readonly List<string> _notes = [];
+
     public TransferRepo Repo => Services.Transfers;
+
+    /// <summary>
+    /// What this run has to carry out with it because nothing else will: a control table that was not ours, rejected rows that were
+    /// counted but never recorded. They go into the run's summary_json as well as the log, so the absence says why it is absent.
+    /// </summary>
+    public IReadOnlyList<string> Notes
+    {
+        get { lock (_notes) return _notes.ToList(); }
+    }
+
+    public void AddNote(string note)
+    {
+        ArgumentNullException.ThrowIfNull(note);
+        lock (_notes) _notes.Add(note);
+    }
 
     public string Scrub(string text) => Redactor.Scrub(text, Secrets);
 
@@ -70,6 +87,21 @@ internal sealed class TaskRunner(RunContext rc)
 
     private const string NoKeyTypes = KeyFailedNote + ": the key column types were never read";
 
+    private static readonly AsyncLocal<Action<string, int>?> AfterChunkTransactionHook = new();
+
+    /// <summary>
+    /// Test seam. Invoked with (taskId, chunkNo) at the one instant that defines chunk atomicity: the chunk's rows and its checkpoint
+    /// have both just become durable, or neither has. A test throws here to stage a crash in exactly that window, so that a checkpoint
+    /// written outside the chunk transaction shows up as a chunk loaded twice on resume. <b>Nothing may be inserted between
+    /// <c>scope.CommitAsync</c> and the call to this hook</b> - that gap is the thing being pinned. Null in production, and held in an
+    /// <see cref="AsyncLocal{T}"/> so one test's seam cannot reach another test's run.
+    /// </summary>
+    internal static Action<string, int>? AfterChunkTransaction
+    {
+        get => AfterChunkTransactionHook.Value;
+        set => AfterChunkTransactionHook.Value = value;
+    }
+
     internal sealed record ErrorRecord(string? Key, string Row, string Error);
 
     private sealed record Pass(TransferTaskStatus Status, Checkpoint Checkpoint);
@@ -83,14 +115,19 @@ internal sealed class TaskRunner(RunContext rc)
         try
         {
             await using var tgt = await SqlConnect.OpenAsync(rc.TargetCs, ct);
-            var cp = ResumePoint(row, await ControlTable.ReadAsync(tgt, rc.RunId, id, ct));
+            var stored = await ControlTable.ReadAsync(tgt, rc.RunId, id, ct);
+            var cp = ResumePoint(row, stored);
             if (cp.Done)
             {
                 Mirror(id, cp);   // committed before a crash; only the mirror and PostSql may be missing
             }
             else
             {
-                await TargetOps.ExecAllAsync(tgt, task.PreSql, ct);
+                // Ruling 106, which overrides the brief's ordering: task PreSql runs on the segment that STARTS the task, never on a
+                // resume. It is operator-authored text carried verbatim by the generator, so a DELETE there - the natural thing for a
+                // human to write - would wipe what the previous segment loaded, and the run would still report completed. A task with
+                // no checkpoint row has committed nothing, so re-running it there is safe; with one, it is not.
+                if (stored is null) await TargetOps.ExecAllAsync(tgt, task.PreSql, ct);
                 var shape = await TargetShape.LoadAsync(tgt, task.Target, ct);
                 // Ruling 73: the loader has to know the target it is loading into, or a binding to a missing column and a binding to an
                 // identity column become a chunk of rejected rows and a table of silently renumbered ids respectively.
@@ -184,7 +221,10 @@ internal sealed class TaskRunner(RunContext rc)
                 {
                     await scope.RollbackAsync();
                     var first = Capture(task, table, [outcome.Failed[0]], types);
-                    Write(id, first);
+                    // This chunk rolls back and the checkpoint does not move, so every retry of the failed run reaches this same source
+                    // row again. Error rows beyond the checkpoint's own count are that row from an earlier attempt: record it once, or
+                    // the operator is shown one bad row N times and cannot tell a retry from N bad rows.
+                    if (rc.Repo.ErrorRowCount(rc.RunId, id) <= cp.RowsError) Write(id, first);
                     throw new TransferException("row_rejected", $"Row {first[0].Key ?? "(key unknown)"} rejected: {first[0].Error}");
                 }
                 CheckAccounted(id, cp.ChunkNo + 1, outcome);
@@ -192,6 +232,9 @@ internal sealed class TaskRunner(RunContext rc)
                     cp.RowsError + outcome.Failed.Count, lastChunk);
                 await ControlTable.UpsertAsync(scope.Connection, scope.Tx, rc.RunId, id, next, ct);
                 await scope.CommitAsync(ct);
+                // The chunk's rows and its checkpoint are now both durable, or neither is. See AfterChunkTransaction: nothing may go
+                // between the commit above and this line, because that gap is exactly what the seam exists to pin.
+                AfterChunkTransaction?.Invoke(id, next.ChunkNo);
             }
 
             cp = next;
@@ -237,7 +280,9 @@ internal sealed class TaskRunner(RunContext rc)
             {
                 await scope.RollbackAsync();
                 var first = Capture(task, table, [outcome.Failed[0]], null);
-                Write(id, first);
+                // A keyless task commits nothing until it finishes, so it always restarts from zero: any error row already recorded
+                // for it is this same row from an earlier attempt.
+                if (rc.Repo.ErrorRowCount(rc.RunId, id) == 0) Write(id, first);
                 throw new TransferException("row_rejected", $"A row was rejected: {first[0].Error}");
             }
             CheckAccounted(id, chunks + 1, outcome);
@@ -275,9 +320,12 @@ internal sealed class TaskRunner(RunContext rc)
             : ", the merge reported no row count";
 
     /// <summary>
-    /// In stop mode the bisector ends at the first failed row, so the rows after it are in neither list: not loaded, not rejected, in no
-    /// error_row and not in the target (<see cref="ChunkOutcome.Attempted"/> is what was handed over). Committing such a chunk and moving
-    /// the checkpoint past those rows drops them from the migration with every counter still agreeing. Refuse the chunk so it rolls back.
+    /// A contract assertion, not a guard with a route behind it (ruling 104). Rulings 73/74 state that
+    /// <see cref="ChunkOutcome.Loaded"/> + <see cref="ChunkOutcome.Failed"/> need not equal <see cref="ChunkOutcome.Attempted"/>, and if
+    /// that ever became reachable, committing such a chunk would advance the checkpoint past rows in neither list - not loaded, not
+    /// rejected, in no error_row, not in the target - with every counter still agreeing. Today no route reaches it: stop mode rolls back
+    /// and throws above, skip mode attempts every row. Deleting both call sites fails no test, and that is expected; this exists so that
+    /// a future loader change cannot make the state reachable silently. It costs three lines inside the transaction, so it fails safe.
     /// </summary>
     internal static void CheckAccounted(string taskId, int chunkNo, ChunkOutcome outcome)
     {
@@ -296,6 +344,21 @@ internal sealed class TaskRunner(RunContext rc)
         string source = rowsSource is null ? "the source count is unknown" : $"the source count said {rowsSource.Value:N0}";
         if (cp.RowsDone + cp.RowsError == 0 && rowsSource > 0)
             rc.Log("warn", $"{id} {task.Target}: finished with no rows loaded and no rows rejected, although {source}.");
+
+        // Ruling 105. A chunk's rows and its checkpoint commit together, but the error rows go to the mirror just after, while the
+        // checkpoint already counts them. A crash in that window costs no data - the counts stay right and nothing is duplicated or
+        // skipped - but the run would otherwise tell the operator "N rejected" and hand them fewer than N rows, permanently and
+        // silently. This runner is the one component holding both numbers, so this is where they get compared.
+        long recorded = rc.Repo.ErrorRowCount(rc.RunId, id);
+        if (cp.RowsError > recorded)
+        {
+            string note = $"{id} {task.Target}: {cp.RowsError - recorded:N0} of {cp.RowsError:N0} rejected rows were counted but never "
+                + "recorded - the run was interrupted between a chunk committing and its rejected rows being written down. The rows "
+                + "themselves loaded correctly; what is lost is which rows were rejected, and it cannot be recovered by resuming.";
+            rc.AddNote(note);
+            rc.Log("warn", note);
+        }
+
         rc.Log("info", $"{id} {task.Target}: done - {cp.RowsDone:N0} loaded, {cp.RowsError:N0} rejected ({source}).");
     }
 
