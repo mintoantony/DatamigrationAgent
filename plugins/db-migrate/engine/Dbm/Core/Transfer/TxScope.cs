@@ -51,6 +51,11 @@ public sealed class TxScope : IAsyncDisposable
         await SafeRollbackAsync();
         Tx = (SqlTransaction)await Connection.BeginTransactionAsync(ct);
         Restarts++;
+        // A new transaction resets the session isolation level again, so the restore is re-armed: a scope that is restarted
+        // after it has already finished would otherwise leave the caller's connection at READ COMMITTED with nothing left to
+        // put it back (ruling 87). The scope is unfinished again too — this transaction is live and nobody has ended it.
+        _finished = false;
+        _restored = false;
     }
 
     public async Task CommitAsync(CancellationToken ct)
@@ -91,10 +96,20 @@ public sealed class TxScope : IAsyncDisposable
         return Convert.ToInt16(await cmd.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture);
     }
 
-    /// <summary>Queues a session SET for the moment this scope lets go of the transaction. A transaction the server has already destroyed
-    /// cannot carry a command, and SqlClient refuses a command without one while the connection still has a pending local transaction — so
-    /// a caller that has to give the session a setting back on that path hands the statement here instead of losing it.</summary>
+    /// <summary>Queues a session SET for the moment this scope lets go of the transaction. While the scope still holds a transaction the
+    /// server has already destroyed there is nowhere to issue such a statement — a command carrying that transaction fails with "The server
+    /// failed to resume the transaction", and SqlClient refuses a command that carries none while the connection has a pending local
+    /// transaction (measured, both ways round). Once the scope releases it, in <see cref="RestoreSessionStateAsync"/>, the transaction
+    /// object has been disposed and the statement goes through on the bare connection.</summary>
     internal void RestoreWhenReleased(string setStatement) => _whenReleased.Add(setStatement);
+
+    /// <summary>Why this scope's connection must not be handed to another load: session state a caller set on it could not be put back,
+    /// so anything that ran on it next would silently inherit settings its owner never chose. Null while the scope is sound.</summary>
+    internal Exception? PoisonedBy { get; private set; }
+
+    /// <summary>Marks the scope unusable for further loads, keeping the first cause. The transaction itself is untouched: work already
+    /// in it is still the caller's to commit or roll back (ruling 93).</summary>
+    internal void Poison(Exception cause) => PoisonedBy ??= cause;
 
     /// <summary>Re-applies the level the caller's session had before the first transaction, plus anything queued by
     /// <see cref="RestoreWhenReleased"/>. Runs once, on whichever path ends the scope, with the transaction already released. A failure

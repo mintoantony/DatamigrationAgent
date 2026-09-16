@@ -14,9 +14,9 @@ public sealed class TxScopeTests
         await cmd.ExecuteNonQueryAsync();
     }
 
-    private static async Task<short> LevelAsync(SqlConnection conn)
+    private static async Task<short> LevelAsync(SqlConnection conn, SqlTransaction? tx = null)
     {
-        await using var cmd = new SqlCommand("SELECT transaction_isolation_level FROM sys.dm_exec_sessions WHERE session_id = @@SPID;", conn);
+        await using var cmd = new SqlCommand("SELECT transaction_isolation_level FROM sys.dm_exec_sessions WHERE session_id = @@SPID;", conn, tx);
         return Convert.ToInt16((await cmd.ExecuteScalarAsync())!, System.Globalization.CultureInfo.InvariantCulture);
     }
 
@@ -67,5 +67,32 @@ public sealed class TxScopeTests
         var wrong = seen.Where(x => x.Level != level).Select(x => $"{x.Path} -> {x.Level}").ToList();
         Assert.True(wrong.Count == 0, $"the caller set {name} ({level}); TxScope left the session at: {string.Join("; ", wrong)}");
         Assert.Equal(0L, await db.CountAsync("dbo.T"));
+    }
+
+    [Fact]
+    public async Task A_scope_restarted_after_it_has_finished_still_gives_the_isolation_level_back()
+    {
+        await using var db = await TempDatabase.CreateAsync("dbm_txscope");
+        await db.ExecAsync("CREATE TABLE dbo.T (id int NOT NULL PRIMARY KEY);");
+        await using var conn = new SqlConnection(db.ConnectionString);
+        await conn.OpenAsync();
+        await ExecAsync(conn, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;");
+
+        short afterFirst, afterRestart, afterSecond;
+        await using (var s = await TxScope.BeginAsync(conn, default))
+        {
+            await s.CommitAsync(default);
+            afterFirst = await LevelAsync(conn);
+            await s.RestartAsync(default);      // a second transaction on a scope that has already finished
+            afterRestart = await LevelAsync(conn, s.Tx);
+            await s.CommitAsync(default);
+            afterSecond = await LevelAsync(conn);
+        }
+        // Harm: the restore is spent after the first finish, so the second BeginTransaction leaves the caller's own
+        // long-lived connection at READ COMMITTED for the rest of its life, with nothing left to put it back.
+        Assert.Equal((short)4, afterFirst);
+        Assert.Equal((short)2, afterRestart);   // the new transaction did reset the session, so there is something to restore
+        Assert.Equal((short)4, afterSecond);
+        Assert.Equal((short)4, await LevelAsync(conn));
     }
 }
