@@ -44,9 +44,36 @@ test('listing order is pre, source, staging, merge, post; empty sections skipped
 const MIN_LISTING_CASES = 11;
 const MIN_ANCHOR_CASES = 31;
 
+/* ---- the OTHER numbering rule: the global pre/post card (Ruling 80) ----
+   A task listing numbers task fields; the global card is one codeBlock over the statements joined by a GO line, so nothing above
+   pins it. The engine (SqlValidator.FindBareCarriageReturns) reports a bare CR at a line of THIS card, and a reviewer reads that
+   number off the screen. Both halves assert the same fixture: here over the shipped joinStatements/cardLines, in C# over
+   TaskListing.Build of the joined text and FindBareCarriageReturns. */
+const MIN_GLOBAL_CARD_CASES = 6;
+assert.ok(Array.isArray(FIXTURE.globalCard) && FIXTURE.globalCard.length >= MIN_GLOBAL_CARD_CASES,
+  'fixture globalCard cases missing: the mirror tests below would not register');
+
+for (const c of FIXTURE.globalCard) {
+  test('global card numbering mirrors the engine (shared fixture): ' + c.name, () => {
+    const joined = V.joinStatements(c.statements);
+    const lines = V.cardLines(joined);
+    assert.equal(lines.length, c.lineCount, 'card line count');
+    assert.deepEqual(lines.map((t, i) => (/\r/.test(t) ? i + 1 : 0)).filter(Boolean), c.crLines, 'card lines holding a bare CR');
+    // codeBlock puts sqlLines(text)[i] beside card line i+1, so the two must split the joined text identically.
+    assert.equal(globalThis.DBM.highlight.sqlLines(joined).length, c.lineCount, 'sqlLines split differently from cardLines');
+    // 'reported' is the engine's answer, asserted for real on the C# side. Here it is held to the card it must point into:
+    // one entry per lone CR in the statements, every entry a real card line, and every CR the card SHOWS reported.
+    const loneCrs = c.statements.reduce((n, s) => n + (String(s).match(/\r(?!\n)/g) || []).length, 0);
+    assert.equal(c.reported.length, loneCrs, 'one reported line per lone CR in the statements');
+    for (const n of c.reported) assert.ok(n >= 1 && n <= c.lineCount, 'reported line ' + n + ' is not a card line');
+    for (const n of c.crLines) assert.ok(c.reported.indexOf(n) >= 0, 'a CR visible on card line ' + n + ' must be reported');
+  });
+}
+
 test('the shared fixture holds at least the expected number of cases', () => {
   assert.ok(Array.isArray(FIXTURE.listing) && FIXTURE.listing.length >= MIN_LISTING_CASES, 'listing cases: ' + (FIXTURE.listing || []).length);
   assert.ok(Array.isArray(FIXTURE.anchors) && FIXTURE.anchors.length >= MIN_ANCHOR_CASES, 'anchor cases: ' + (FIXTURE.anchors || []).length);
+  assert.ok(Array.isArray(FIXTURE.globalCard) && FIXTURE.globalCard.length >= MIN_GLOBAL_CARD_CASES, 'global card cases: ' + (FIXTURE.globalCard || []).length);
   const names = FIXTURE.listing.map(c => c.name);
   assert.ok(names.some(n => /lone CR/.test(n)), 'a lone-CR case');
   assert.ok(names.some(n => /CRLF/.test(n)), 'a CRLF case');

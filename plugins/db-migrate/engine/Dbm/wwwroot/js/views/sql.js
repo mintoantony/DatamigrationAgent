@@ -234,8 +234,14 @@
     return el('ul', { class: 'sql-msgs ' + cls }, items.map(function (m) { return el('li', {}, [m]); }));
   }
 
+  /* The lines a code block numbers: CRLF normalised, split on \n, a lone \r left inside its line (never a break). This is the
+     whole numbering rule of the GLOBAL pre/post card, which is codeBlock(joinStatements(list)) — the engine's
+     SqlValidator.FindBareCarriageReturns reports bare carriage returns at these numbers. Exported for the shared fixture
+     (Dbm.Tests/js/fixtures/task-listing.json, "globalCard"), which asserts it against the engine; nothing else calls it. */
+  function cardLines(text) { return norm(text).split('\n'); }
+
   function codeBlock(text) {
-    var lines = norm(text).split('\n');
+    var lines = cardLines(text);
     var html = DBM.highlight.sqlLines(text);
     return el('pre', { class: 'code sql-code' }, lines.map(function (_, i) {
       return el('div', { class: 'line' }, [el('span', { class: 'ln' }, [String(i + 1)]), el('span', { html: html[i] || ' ' })]);
@@ -686,7 +692,8 @@
 
   DBM.sqlView = {
     listing: listing, listingText: listingText, parseAnchor: parseAnchor, sectionBlocks: sectionBlocks, splitStatements: splitStatements,
-    joinStatements: joinStatements, listRoundTrips: listRoundTrips, editOps: editOps, reportSummary: reportSummary, openCommentsByTask: openCommentsByTask,
+    joinStatements: joinStatements, cardLines: cardLines, listRoundTrips: listRoundTrips, editOps: editOps, reportSummary: reportSummary,
+    openCommentsByTask: openCommentsByTask,
     diffRows: diffRows,
   };
   DBM.views = DBM.views || {};
