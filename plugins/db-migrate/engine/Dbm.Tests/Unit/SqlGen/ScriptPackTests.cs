@@ -47,6 +47,59 @@ public class ScriptPackTests
         Assert.Contains("-- Keys:            (none - the table loads in a single transaction)\n", files["01_app_AuditEvents.sql"]);
     }
 
+    /// <summary>Ruling 57: a bare-CR error is flagged in the pack exactly as any other stored task error — in the task file's
+    /// "Errors (last validation)" header.</summary>
+    [Fact]
+    public void A_bare_carriage_return_error_is_listed_like_any_other_task_error()
+    {
+        var plan = Plan();
+        plan.Tasks["T05"].PreSql.Insert(0, "-- note\rDELETE FROM app.Customers");
+        SqlValidator.RecordBareCarriageReturns(plan);
+        plan.Tasks["T04"].Errors.Add("sourceQuery: Invalid column name 'X'.");
+
+        var files = ScriptPack.BuildFiles(plan, "demo").ToDictionary(f => f.Name, f => f.Content);
+
+        Assert.Contains("-- Errors (last validation):\n--   - sourceQuery: Invalid column name 'X'.\n", files["04_app_Addresses.sql"]);
+        Assert.Contains("-- Errors (last validation):\n--   - preSql[0]: bare carriage return at line 1 (SQL Server treats it as a line break; use CRLF or LF)\n",
+            files["05_app_Orders.sql"]);
+    }
+
+    /// <summary>Ruling 96: the pack DERIVES bare carriage returns from the SQL, exactly as <see cref="SqlModule.ApprovalBlockers"/>
+    /// does, instead of trusting stored evidence. Nothing on the export path checks approval, so a version stored without the scan —
+    /// written before the rule, or by any writer that skips it — would otherwise hand a DBA a pack that says nothing at all: no
+    /// PLAN HAS ERRORS, no TASK(S) HAVE ERRORS, no error line anywhere, while shipping the hidden statement verbatim in the same
+    /// file. An absence the approval gate refuses to trust is not an absence the pack may turn into a positive claim.</summary>
+    [Fact]
+    public void A_pack_derives_bare_carriage_returns_that_no_stored_error_records()
+    {
+        var plan = Plan();
+        plan.PreSql.Add("-- disable the audit trigger\rDELETE FROM app.Customers");
+        plan.Tasks["T05"].PreSql.Insert(0, "-- note\rDROP TABLE app.Orders");
+        Assert.Empty(plan.Errors);                                    // nothing ever scanned this plan:
+        Assert.All(plan.Tasks.Values, t => Assert.Empty(t.Errors));   // neither carriage return has any stored evidence
+
+        var files = ScriptPack.BuildFiles(plan, "demo");
+
+        const string advice = " (SQL Server treats it as a line break; use CRLF or LF)";
+        Assert.Contains("-- WARNING: PLAN HAS ERRORS (see README.md)\n--   - preSql[1]: bare carriage return at line 3" + advice + "\n", files[0].Content);
+        Assert.Contains("-- WARNING: 1 TASK(S) HAVE ERRORS (see each task file's header)\n--   - T05 (app.Orders): 1 error(s)\n", files[0].Content);
+        Assert.Contains("-- Errors (last validation):\n--   - preSql[0]: bare carriage return at line 1" + advice + "\n",
+            files.Single(f => f.Name == "05_app_Orders.sql").Content);
+        var readme = files.Single(f => f.Name == "README.md").Content;
+        Assert.Contains("## WARNING: PLAN HAS ERRORS\n\n", readme);
+        Assert.Contains("## WARNING: 1 TASK(S) HAVE ERRORS\n\n", readme);
+        // The executable carriage return still ships in the same file as its warning: the pack warns, it does not withhold.
+        Assert.Contains(files, f => f.Content.Contains("\rDROP TABLE app.Orders", StringComparison.Ordinal));
+
+        // A stored line is not printed twice: the same plan, scanned, gives byte-identical files.
+        var scanned = Plan();
+        scanned.PreSql.Add("-- disable the audit trigger\rDELETE FROM app.Customers");
+        scanned.Tasks["T05"].PreSql.Insert(0, "-- note\rDROP TABLE app.Orders");
+        SqlValidator.RecordBareCarriageReturns(scanned);
+        Assert.NotEmpty(scanned.Errors);
+        Assert.Equal(ScriptPack.BuildFiles(scanned, "demo"), files);
+    }
+
     [Fact]
     public void Global_files_hold_the_cycle_statements()
     {
@@ -182,7 +235,116 @@ public class ScriptPackTests
             Assert.DoesNotContain("\nDROP TABLE", content, StringComparison.Ordinal);
     }
 
+    /// <summary>Ruling 71: the DBA never sees ApprovalBlockers, and a bare carriage return in a global pre/post statement is a
+    /// plan-level error, not a task one. The pack lists the plan's stored errors verbatim; a plan without them says nothing of the
+    /// kind, so "no block" means "no plan-level errors", not "the pack never prints them". Whether an errored plan may be exported
+    /// at all is unchanged: both packs are built.</summary>
+    [Fact]
+    public void A_plan_with_plan_level_errors_says_so_in_the_pack_and_a_clean_one_does_not()
+    {
+        var plan = Plan();
+        plan.PreSql.Add("-- disable the audit trigger\rDELETE FROM app.Customers");
+        SqlValidator.RecordBareCarriageReturns(plan);
+        var cr = Assert.Single(plan.Errors);   // stored without the scope prefix
+        Assert.Contains(SqlValidator.BareCarriageReturnMarker, cr, StringComparison.Ordinal);
+        plan.Errors.Add("target connection failed: timeout");
+
+        var files = ScriptPack.BuildFiles(plan, "demo");
+
+        Assert.Contains("-- WARNING: PLAN HAS ERRORS (see README.md)\n--   - " + cr + "\n--   - target connection failed: timeout\n", files[0].Content);
+        var readme = files.Single(f => f.Name == "README.md").Content;
+        Assert.Contains("## WARNING: PLAN HAS ERRORS\n\n", readme);
+        Assert.Contains("\n- " + cr + "\n- target connection failed: timeout\n", readme);
+
+        Assert.Empty(Plan().Errors);   // fixture guard: the generated plan really has no plan-level errors
+        foreach (var (name, content) in ScriptPack.BuildFiles(Plan(), "demo"))
+            Assert.DoesNotContain("PLAN HAS ERRORS", content, StringComparison.Ordinal);
+    }
+
+    /// <summary>Ruling 71, H2: a stored plan-level error is untrusted text like every other value. It reaches the pre file and the
+    /// README only through the neutraliser, so it can never end its line and start one of its own.</summary>
+    [Fact]
+    public void A_hostile_plan_level_error_cannot_start_a_line_of_its_own()
+    {
+        var plan = Plan();
+        plan.Errors.Add("target connection failed: " + Hostile);
+
+        var files = ScriptPack.BuildFiles(plan, "demo");
+
+        Assert.Contains("CANARY_LF", files[0].Content, StringComparison.Ordinal);   // the error did reach both files
+        Assert.Contains("CANARY_LF", files.Single(f => f.Name == "README.md").Content, StringComparison.Ordinal);
+        foreach (var (name, content) in files)
+            foreach (var line in content.Split(LineBreaks, StringSplitOptions.None))
+                Assert.False(line.TrimStart().StartsWith("CANARY", StringComparison.Ordinal), $"{name}: a value escaped its comment: [{line}]");
+    }
+
+    /// <summary>Ruling 77: 00_pre.sql carries the plan-level errors, but a task's errors live in its own file's header. Without a
+    /// roll-up the DBA who opens 00_pre.sql cannot tell "no task has errors" from "this pack never says". The ids are named, with a
+    /// count each so one error reads differently from nine, and the error text is not repeated. Exporting an errored plan stays
+    /// allowed.
+    /// <para>Ruling 95: the roll-up follows the pack's own file order, which is every task — those Order lists, then those it misses.
+    /// T06 here is errored and missing from Order: a roll-up restricted to ordered tasks would under-count in exactly the plan shape
+    /// that makes an inconsistent Order likely, while T06's file still ships with its errors.</para></summary>
+    [Fact]
+    public void The_pack_says_which_tasks_have_errors_and_says_nothing_when_none_do()
+    {
+        var plan = Plan();
+        plan.Tasks["T05"].Errors.Add("sourceQuery: Invalid column name 'X'.");
+        plan.Tasks["T05"].Errors.Add("preSql[0]: GO batch separators are not allowed");
+        plan.Tasks["T02"].Errors.Add("target table app.Customers not found in the target catalog");
+        plan.Tasks["T06"].Errors.Add("mergeSql: Invalid object name 'app.OrderLines_stg'.");
+        plan.Order.Remove("T06");
+        Assert.DoesNotContain("T06", plan.Order);              // fixture guard: the third errored task really is unordered
+        Assert.True(plan.Tasks.ContainsKey("T06"));            // and it is still a task, so its file still ships
+
+        var files = ScriptPack.BuildFiles(plan, "demo");
+
+        Assert.Contains("-- WARNING: 3 TASK(S) HAVE ERRORS (see each task file's header)\n--   - T02 (app.Customers): 1 error(s)\n--   - T05 (app.Orders): 2 error(s)\n--   - T06 (app.OrderLines): 1 error(s)\n",
+            files[0].Content);
+        var readme = files.Single(f => f.Name == "README.md").Content;
+        Assert.Contains("## WARNING: 3 TASK(S) HAVE ERRORS\n\n", readme);
+        Assert.Contains("\n- T02 (app.Customers): 1 error(s)\n- T05 (app.Orders): 2 error(s)\n- T06 (app.OrderLines): 1 error(s)\n", readme);
+        Assert.Equal(1, files.Count(f => f.Content.Contains("Invalid column name 'X'.", StringComparison.Ordinal)));   // the text stays in the task file
+        Assert.Single(files, f => f.Content.Contains("Invalid object name 'app.OrderLines_stg'.", StringComparison.Ordinal));
+
+        Assert.All(Plan().Tasks.Values, t => Assert.Empty(t.Errors));   // fixture guard: the generated tasks really have no errors
+        foreach (var (name, content) in ScriptPack.BuildFiles(Plan(), "demo"))
+            Assert.DoesNotContain("TASK(S) HAVE ERRORS", content, StringComparison.Ordinal);
+    }
+
+    /// <summary>Ruling 97, which makes Ruling 79's condition mechanical instead of remembered. Four warning lists have four heading
+    /// tests today only because someone recalls the rule; nothing makes a fifth list arrive with one. This pins the list-typed
+    /// properties of <c>PackNotes</c> against a literal map to the test that asserts each one's heading, so a list added without a
+    /// heading test fails here with the name of the list. The map's values are <c>nameof</c>, so renaming a heading test is a compile
+    /// error rather than a silent gap, and the attribute check catches a heading test that quietly stops being a test.</summary>
+    [Fact]
+    public void Every_PackNotes_warning_list_has_a_heading_test()
+    {
+        var headingTest = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["Problems"] = nameof(A_pack_whose_order_does_not_match_its_tasks_says_so_and_omits_nothing),
+            ["NotValidated"] = nameof(A_never_validated_plan_says_so_in_the_pack_and_a_validated_one_does_not),
+            ["PlanErrors"] = nameof(A_plan_with_plan_level_errors_says_so_in_the_pack_and_a_clean_one_does_not),
+            ["TaskErrors"] = nameof(The_pack_says_which_tasks_have_errors_and_says_nothing_when_none_do),
+        };
+
+        var notes = typeof(ScriptPack).GetNestedType("PackNotes", System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("ScriptPack.PackNotes is gone: the pack's warning lists moved, and this guard no longer guards anything.");
+        var lists = notes.GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)
+            .Where(p => p.PropertyType != typeof(string) && typeof(System.Collections.IEnumerable).IsAssignableFrom(p.PropertyType))
+            .Select(p => p.Name).OrderBy(n => n, StringComparer.Ordinal).ToList();
+
+        Assert.Equal(headingTest.Keys.OrderBy(n => n, StringComparer.Ordinal), lists);
+        foreach (var (list, test) in headingTest)
+            Assert.True(typeof(ScriptPackTests).GetMethod(test)!.GetCustomAttributes(typeof(FactAttribute), false).Length == 1,
+                $"{list}: its heading test {test} is not a [Fact]");
+    }
+
     const string Hostile ="x\nCANARY_LF;\rCANARY_CR;\r\nCANARY_CRLF;\u2028CANARY_LS;\u2029CANARY_PS;\u0085CANARY_NEL;\vCANARY_VT;\fCANARY_FF;";
+
+    /// <summary>Every line terminator a T-SQL parser or an editor may honour - the ones <see cref="ScriptPack.OneLine"/> neutralises,
+    /// and so the ones after which a hostile value must never be found.</summary>
+    static readonly string[] LineBreaks = ["\r\n", "\n", "\r", "\u2028", "\u2029", "\u0085", "\v", "\f"];
 
     /// <summary>Plan properties the poisoning skips: the global SQL bodies (executable by design) and Order (its ids are poisoned by
     /// renaming one task, below, so Order and Tasks keep matching). Pinned by <see cref="Poison_exclusions_are_exactly_the_sql_bodies_and_order"/>.</summary>
@@ -288,11 +450,10 @@ public class ScriptPackTests
         };
         Assert.Contains(packs[1], f => f.Content.Contains("-- Mode:            staging_merge\n", StringComparison.Ordinal));
 
-        var separators = new[] { "\r\n", "\n", "\r", "\u2028", "\u2029", "\u0085", "\v", "\f" };
         foreach (var (name, content) in packs.SelectMany(p => p))
         {
             Assert.Contains("CANARY_LF", content);   // the values did reach the file
-            foreach (var line in content.Split(separators, StringSplitOptions.None))
+            foreach (var line in content.Split(LineBreaks, StringSplitOptions.None))
                 Assert.False(line.TrimStart().StartsWith("CANARY", StringComparison.Ordinal), $"{name}: a value escaped its comment: [{line}]");
         }
     }

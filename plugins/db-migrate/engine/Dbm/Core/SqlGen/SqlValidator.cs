@@ -141,6 +141,92 @@ public static class SqlValidator
         return errors;
     }
 
+    /// <summary>Middle of a bare-CR error: "&lt;field&gt;: bare carriage return at line &lt;N&gt; (…)".</summary>
+    public const string BareCarriageReturnMarker = ": bare carriage return at line ";
+
+    const string BareCarriageReturnAdvice = " (SQL Server treats it as a line break; use CRLF or LF)";
+
+    static readonly Regex BareCarriageReturnLine = new(
+        @"^(?:preSql\[\d+\]|postSql\[\d+\]|sourceQuery|stagingDdl|mergeSql): bare carriage return at line \d+ \(SQL Server treats it as a line break; use CRLF or LF\)$",
+        RegexOptions.CultureInvariant);
+
+    /// <summary>Every lone <c>\r</c> (a CR not followed by LF) in every SQL body of the plan, one line per occurrence, offline. SQL Server
+    /// ends a <c>--</c> comment at a lone CR while <see cref="TaskListing"/> keeps it inside one line, so one listed line can hold two
+    /// executable lines. Scope "plan" (global preSql then postSql) first, then each task in <see cref="SqlPlanPayload.Order"/>, then any
+    /// task Order misses (ordinal). Line = "&lt;field&gt;: bare carriage return at line &lt;N&gt; (…)".
+    /// <para>N for a task field is its <see cref="TaskListing"/> number. N for a global statement is its number in the screen's global
+    /// card, which lists the statements joined by a <c>GO</c> line and numbers them by the same rules; the field names the statement.</para></summary>
+    public static List<(string Scope, string Line)> FindBareCarriageReturns(SqlPlanPayload plan)
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        var found = new List<(string, string)>();
+        foreach (var (name, statements) in new[] { ("preSql", plan.PreSql), ("postSql", plan.PostSql) })
+        {
+            var offset = 0;
+            var list = statements ?? [];
+            for (var i = 0; i < list.Count; i++)
+            {
+                var own = OwnListing(list[i]);
+                foreach (var l in own) AddOccurrences("plan", $"{name}[{i}]", offset + l.No, l.Text);
+                offset += Math.Max(own.Count, 1) + 1;   // an empty statement is still one card line; "GO" separates statements
+            }
+        }
+        var tasks = plan.Tasks ?? [];
+        var ids = (plan.Order ?? []).Where(tasks.ContainsKey)
+            .Concat(tasks.Keys.OrderBy(k => k, StringComparer.Ordinal)).Distinct(StringComparer.Ordinal);
+        foreach (var id in ids)
+        {
+            var task = tasks[id];
+            if (task is null) continue;
+            var offset = 0;
+            foreach (var (field, text) in ListingFields(task))
+            {
+                var own = OwnListing(text);
+                foreach (var l in own) AddOccurrences(id, field, offset + l.No, l.Text);
+                offset += own.Count;
+            }
+            if (offset != TaskListing.Build(task).Count)
+                throw new InvalidOperationException("bare carriage return check: the field walk no longer matches TaskListing");
+        }
+        return found;
+
+        void AddOccurrences(string scope, string field, int line, string text)
+        {
+            foreach (var c in text)
+                if (c == '\r') found.Add((scope, FormattableString.Invariant($"{field}{BareCarriageReturnMarker}{line}{BareCarriageReturnAdvice}")));
+        }
+    }
+
+    /// <summary>Replaces the bare-CR lines stored in plan.Errors and each task's Errors with the current ones (re-derived on every run:
+    /// a fixed CR clears) and returns them as "&lt;scope&gt;: &lt;line&gt;". Other stored errors are left alone.</summary>
+    public static List<string> RecordBareCarriageReturns(SqlPlanPayload plan)
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        var found = FindBareCarriageReturns(plan);
+        plan.Errors = [.. (plan.Errors ?? []).Where(e => !IsBareCarriageReturnLine(e)), .. found.Where(f => f.Scope == "plan").Select(f => f.Line)];
+        foreach (var (id, task) in plan.Tasks ?? [])
+            if (task is not null)
+                task.Errors = [.. (task.Errors ?? []).Where(e => !IsBareCarriageReturnLine(e)), .. found.Where(f => f.Scope == id).Select(f => f.Line)];
+        return found.Select(f => $"{f.Scope}: {f.Line}").ToList();
+    }
+
+    static bool IsBareCarriageReturnLine(string? error) => error is not null && BareCarriageReturnLine.IsMatch(error);
+
+    /// <summary>One text numbered on its own by <see cref="TaskListing"/>'s rules (the skip rule included).</summary>
+    static List<ListingLine> OwnListing(string? text) => TaskListing.Build(new TaskPlan { SourceQuery = text ?? "" });
+
+    /// <summary>The task's SQL fields in <see cref="TaskListing"/> input order.</summary>
+    static IEnumerable<(string Field, string? Text)> ListingFields(TaskPlan task)
+    {
+        var pre = task.PreSql ?? [];
+        for (var i = 0; i < pre.Count; i++) yield return ($"preSql[{i}]", pre[i]);
+        yield return ("sourceQuery", task.SourceQuery);
+        yield return ("stagingDdl", task.StagingDdl);
+        yield return ("mergeSql", task.MergeSql);
+        var post = task.PostSql ?? [];
+        for (var i = 0; i < post.Count; i++) yield return ($"postSql[{i}]", post[i]);
+    }
+
     static async Task ValidateTaskAsync(TaskPlan task, SqlConnection? source, SqlConnection? target, CatalogSnapshot tgt,
         List<string> errors, List<string> warnings, Func<string, string> scrub, CancellationToken ct)
     {

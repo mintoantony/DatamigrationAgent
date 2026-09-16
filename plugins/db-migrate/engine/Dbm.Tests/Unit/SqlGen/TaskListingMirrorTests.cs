@@ -8,7 +8,10 @@ namespace Dbm.Tests.Unit.SqlGen;
 /// and anchors with the exact parse results; this class asserts them against <see cref="TaskListing.Build"/> and
 /// <see cref="SqlModule.ParseAnchor"/>, and <c>js/sql-view.test.cjs</c> asserts the SAME file against <c>DBM.sqlView.listing</c> and
 /// <c>DBM.sqlView.parseAnchor</c>. A comment anchor <c>sql:&lt;taskId&gt;:&lt;line&gt;</c> is created by the browser and resolved by
-/// the engine, so either implementation drifting would land a reviewer's comment on the wrong line without any error.</summary>
+/// the engine, so either implementation drifting would land a reviewer's comment on the wrong line without any error.
+/// <para>The same file's "globalCard" array pins the OTHER numbering rule — the global pre/post card, which is one code block over
+/// the statements joined by a GO line — against the engine's bare-carriage-return line numbers. See
+/// <see cref="Global_card_numbering_matches_the_shared_fixture"/>.</para></summary>
 public sealed class TaskListingMirrorTests
 {
     /// <summary>Exactly one location: the build copies <c>js/fixtures/task-listing.json</c> of THIS project to
@@ -38,6 +41,16 @@ public sealed class TaskListingMirrorTests
         Assert.True(File.Exists(FixturePath), $"output copy missing: {FixturePath}");
         Assert.StartsWith(Path.GetFullPath(AppContext.BaseDirectory), Path.GetFullPath(FixturePath), StringComparison.OrdinalIgnoreCase);
         Assert.Equal(File.ReadAllBytes(source!), File.ReadAllBytes(FixturePath));
+    }
+
+    /// <summary>Ruling 94. Both parsers skip leading whitespace, so editing damage at the head of this file — 46 blank lines were
+    /// prepended once, by a shell, and neither suite noticed — changes the authority two implementations read while every test
+    /// stays green. Its first byte is <c>{</c>: no BOM, no blank lines, nothing before the object.</summary>
+    [Fact]
+    public void Fixture_starts_with_its_opening_brace()
+    {
+        var bytes = File.ReadAllBytes(FixturePath);
+        Assert.Equal((byte)'{', Assert.Single(bytes.Take(1)));
     }
 
     public static IEnumerable<object[]> ListingCases() =>
@@ -82,12 +95,15 @@ public sealed class TaskListingMirrorTests
     {
         const int minListingCases = 11;
         const int minAnchorCases = 31;
+        const int minGlobalCardCases = 6;
         var fixture = Fixture();
 
         Assert.True(fixture.GetProperty("listing").GetArrayLength() >= minListingCases, $"listing cases: {fixture.GetProperty("listing").GetArrayLength()}");
         Assert.True(fixture.GetProperty("anchors").GetArrayLength() >= minAnchorCases, $"anchor cases: {fixture.GetProperty("anchors").GetArrayLength()}");
         Assert.True(ListingCases().Count() >= minListingCases);
         Assert.True(AnchorCases().Count() >= minAnchorCases);
+        Assert.True(fixture.GetProperty("globalCard").GetArrayLength() >= minGlobalCardCases, $"global card cases: {fixture.GetProperty("globalCard").GetArrayLength()}");
+        Assert.True(GlobalCardCases().Count() >= minGlobalCardCases);
     }
 
     [Fact]
@@ -97,4 +113,42 @@ public sealed class TaskListingMirrorTests
         Assert.True(anchors.Count(a => a.GetProperty("task").ValueKind == JsonValueKind.Null) >= 15);
         Assert.Contains(anchors, a => a.GetProperty("anchor").GetString() == "sql:T04:2147483648");
     }
+
+    public static IEnumerable<object[]> GlobalCardCases() =>
+        Fixture().GetProperty("globalCard").EnumerateArray().Select(c => new object[] { c.GetProperty("name").GetString()! });
+
+    /// <summary>Ruling 80. The GLOBAL pre/post card is numbered by a different path than a task listing: the screen renders
+    /// <c>codeBlock(joinStatements(list))</c>, so the card is ONE block whose line N is the Nth line of the statements joined by a
+    /// GO line. <see cref="SqlValidator.FindBareCarriageReturns"/> reports a bare carriage return at a line of THAT card and a
+    /// reviewer reads the number off the screen, so the two must agree. Here the card is modelled by <see cref="TaskListing.Build"/>
+    /// of the joined text (same rule: CRLF normalised, split on \n, a lone CR never a break); js/sql-view.test.cjs asserts the SAME
+    /// fixture over the shipped <c>joinStatements</c> and <c>cardLines</c>. "crLines" are the card lines whose text holds a lone CR
+    /// and "reported" the lines the engine reports; they differ only in the swallowed-CR case the fixture names.</summary>
+    [Theory]
+    [MemberData(nameof(GlobalCardCases))]
+    public void Global_card_numbering_matches_the_shared_fixture(string name)
+    {
+        var item = Fixture().GetProperty("globalCard").EnumerateArray().Single(c => c.GetProperty("name").GetString() == name);
+        var statements = item.GetProperty("statements").EnumerateArray().Select(s => s.GetString()!).ToList();
+        var crLines = item.GetProperty("crLines").EnumerateArray().Select(n => n.GetInt32()).ToList();
+        var reported = item.GetProperty("reported").EnumerateArray().Select(n => n.GetInt32()).ToList();
+
+        var card = TaskListing.Build(new TaskPlan { SourceQuery = string.Join("\nGO\n", statements) });
+
+        Assert.Equal(item.GetProperty("lineCount").GetInt32(), card.Count);
+        Assert.Equal(crLines, card.Where(l => l.Text.Contains('\r', StringComparison.Ordinal)).Select(l => l.No).ToList());
+        // The pre card and the post card are numbered independently, each from its own first line.
+        Assert.Equal(reported, ReportedLines(new SqlPlanPayload { PreSql = statements }, "preSql"));
+        Assert.Equal(reported, ReportedLines(new SqlPlanPayload { PostSql = statements }, "postSql"));
+    }
+
+    /// <summary>The card line number of every bare carriage return the engine reports for one global card, in report order.</summary>
+    private static List<int> ReportedLines(SqlPlanPayload plan, string field) =>
+        SqlValidator.FindBareCarriageReturns(plan).Select(f =>
+        {
+            Assert.Equal("plan", f.Scope);
+            Assert.StartsWith(field + "[", f.Line, StringComparison.Ordinal);
+            var at = f.Line.IndexOf(SqlValidator.BareCarriageReturnMarker, StringComparison.Ordinal) + SqlValidator.BareCarriageReturnMarker.Length;
+            return int.Parse(f.Line[at..f.Line.IndexOf(' ', at)], System.Globalization.CultureInfo.InvariantCulture);
+        }).ToList();
 }

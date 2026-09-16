@@ -1,5 +1,5 @@
 {
-  "about": "Shared by Unit/SqlGen/TaskListingMirrorTests.cs (C# TaskListing.Build, SqlModule.ParseAnchor) and js/sql-view.test.cjs (DBM.sqlView.listing, parseAnchor). Each side asserts the SAME expected values, so a drift in either implementation fails that side's suite. Add a case here, never to one side only.",
+  "about": "Shared by Unit/SqlGen/TaskListingMirrorTests.cs (C# TaskListing.Build, SqlModule.ParseAnchor) and js/sql-view.test.cjs (DBM.sqlView.listing, parseAnchor). Each side asserts the SAME expected values, so a drift in either implementation fails that side's suite. Add a case here, never to one side only. The 'globalCard' array pins the OTHER numbering rule (the global pre/post card); see 'globalCardAbout'.",
   "listing": [
     {
       "name": "sample Addresses task: line 9 is FROM",
@@ -160,5 +160,51 @@
     { "anchor": "SQL:T04:1", "task": null, "line": null },
     { "anchor": "Task:T04", "task": null, "line": null },
     { "anchor": "tablemap:app.Orders", "task": null, "line": null }
+  ]
+  ,
+  "globalCardAbout": "The GLOBAL pre/post card is numbered by a different path than a task listing: views/sql.js globalCard renders codeBlock(joinStatements(list)), so the card is ONE block whose line N is the Nth line of the statements joined by a line containing GO. js/sql-view.test.cjs asserts lineCount and crLines against the shipped joinStatements and cardLines; Unit/SqlGen/TaskListingMirrorTests.cs asserts the same two against TaskListing.Build of the joined text, and 'reported' against SqlValidator.FindBareCarriageReturns. crLines = card lines whose text holds a lone CR; reported = the lines the engine reports, one per lone CR in the statements. They differ only where a case says so. NOTE: 'reported' is asserted against the engine on the C# side ONLY — the JS half cannot compute the engine's answer, so it holds 'reported' to an envelope (one entry per lone CR, every entry a real card line, every CR the card SHOWS reported) and a wrong 'reported' that stays inside that envelope reddens C# alone.",
+  "globalCard": [
+    {
+      "name": "five edges in one card: a bare CR, an empty statement, CRLF before a bare CR, a trailing newline, a trailing CR last",
+      "statements": ["-- a\rDELETE FROM t", "", "SELECT 1\r\nSELECT 2\rSELECT 3", "A\n", "B\r"],
+      "lineCount": 11,
+      "crLines": [1, 6, 11],
+      "reported": [1, 6, 11]
+    },
+    {
+      "name": "an empty statement is still one card line",
+      "statements": ["A", "", "B"],
+      "lineCount": 5,
+      "crLines": [],
+      "reported": []
+    },
+    {
+      "name": "a CRLF line before a bare-CR line: the CR stays inside line 2",
+      "statements": ["SELECT 1\r\nSELECT 2\rSELECT 3"],
+      "lineCount": 2,
+      "crLines": [2],
+      "reported": [2]
+    },
+    {
+      "name": "a trailing newline yields a final empty card line before the GO",
+      "statements": ["A\n", "B"],
+      "lineCount": 4,
+      "crLines": [],
+      "reported": []
+    },
+    {
+      "name": "a trailing bare CR on the LAST statement stays in its line",
+      "statements": ["A", "B\r"],
+      "lineCount": 3,
+      "crLines": [3],
+      "reported": [3]
+    },
+    {
+      "name": "known limit: a bare CR ending a non-last statement is swallowed by the join, so the card cannot show it although the engine still reports its line",
+      "statements": ["B\r", "C"],
+      "lineCount": 3,
+      "crLines": [],
+      "reported": [1]
+    }
   ]
 }
