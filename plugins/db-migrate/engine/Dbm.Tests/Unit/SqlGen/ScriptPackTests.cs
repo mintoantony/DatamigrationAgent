@@ -243,22 +243,24 @@ public class ScriptPackTests
     }
 
     /// <summary>Ruling 77: 00_pre.sql carries the plan-level errors, but a task's errors live in its own file's header. Without a
-    /// roll-up the DBA who opens 00_pre.sql cannot tell "no task has errors" from "this pack never says". The ids are named and the
-    /// error text is not repeated. Exporting an errored plan stays allowed.</summary>
+    /// roll-up the DBA who opens 00_pre.sql cannot tell "no task has errors" from "this pack never says". The ids are named, with a
+    /// count each so one error reads differently from nine, and the error text is not repeated. Exporting an errored plan stays
+    /// allowed.</summary>
     [Fact]
     public void The_pack_says_which_tasks_have_errors_and_says_nothing_when_none_do()
     {
         var plan = Plan();
         plan.Tasks["T05"].Errors.Add("sourceQuery: Invalid column name 'X'.");
+        plan.Tasks["T05"].Errors.Add("preSql[0]: GO batch separators are not allowed");
         plan.Tasks["T02"].Errors.Add("target table app.Customers not found in the target catalog");
 
         var files = ScriptPack.BuildFiles(plan, "demo");
 
-        Assert.Contains("-- WARNING: 2 TASK(S) HAVE ERRORS (see each task file's header)\n--   - T02 (app.Customers)\n--   - T05 (app.Orders)\n",
+        Assert.Contains("-- WARNING: 2 TASK(S) HAVE ERRORS (see each task file's header)\n--   - T02 (app.Customers): 1 error(s)\n--   - T05 (app.Orders): 2 error(s)\n",
             files[0].Content);
         var readme = files.Single(f => f.Name == "README.md").Content;
         Assert.Contains("## WARNING: 2 TASK(S) HAVE ERRORS\n\n", readme);
-        Assert.Contains("\n- T02 (app.Customers)\n- T05 (app.Orders)\n", readme);
+        Assert.Contains("\n- T02 (app.Customers): 1 error(s)\n- T05 (app.Orders): 2 error(s)\n", readme);
         Assert.Equal(1, files.Count(f => f.Content.Contains("Invalid column name 'X'.", StringComparison.Ordinal)));   // the text stays in the task file
 
         Assert.All(Plan().Tasks.Values, t => Assert.Empty(t.Errors));   // fixture guard: the generated tasks really have no errors

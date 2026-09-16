@@ -26,6 +26,23 @@ public static class ScriptPack
     /// at all, and a DBA who opens it alone would read that silence as "none".</summary>
     static string TaskErrorsTitle(int count) => FormattableString.Invariant($"WARNING: {count} TASK(S) HAVE ERRORS");
 
+    /// <summary>The warning lists 00_pre.sql and README.md print, ahead of anything else, in this order. They travel together and in
+    /// named fields on purpose: four <c>List&lt;string&gt;</c> parameters in a row is a transposition no compiler can catch, and a
+    /// swapped pair would quietly file one warning under another's heading. <see cref="None"/> is "nothing to say".</summary>
+    sealed record PackNotes
+    {
+        /// <summary>Every way <see cref="SqlPlanPayload.Order"/> fails to list each task exactly once.</summary>
+        public required List<string> Problems { get; init; }
+        /// <summary>The plan's stored <see cref="SqlPlanSource.SkippedPrefix"/> line(s).</summary>
+        public required List<string> NotValidated { get; init; }
+        /// <summary>The plan's stored plan-level <see cref="SqlPlanPayload.Errors"/>.</summary>
+        public required List<string> PlanErrors { get; init; }
+        /// <summary>"T04 (app.Addresses): 9 error(s)" per errored task; the error text itself stays in the task file.</summary>
+        public required List<string> TaskErrors { get; init; }
+
+        public static PackNotes None => new() { Problems = [], NotValidated = [], PlanErrors = [], TaskErrors = [] };
+    }
+
     public static byte[] BuildZip(SqlPlanPayload plan, string projectName)
     {
         var files = BuildFiles(plan, projectName);
@@ -59,10 +76,12 @@ public static class ScriptPack
         var width = Math.Max(2, (slots.Count + 1).ToString(CultureInfo.InvariantCulture).Length);
         var preName = new string('0', width) + "_pre.sql";
         var postName = new string('9', width) + "_post.sql";
-        // "T04 (app.Addresses)" per errored task, in pack-file order. The ids only: the error text is in the task file.
+        // "T04 (app.Addresses): 9 error(s)" per errored task, in pack-file order: enough to triage, while the error text itself
+        // stays in the task file.
         var taskErrors = slots.Where(s => s.Known && plan.Tasks[s.Id].Errors.Count > 0)
-            .Select(s => $"{s.Id} ({plan.Tasks[s.Id].Target})").ToList();
-        var files = new List<(string, string)> { (preName, GlobalFile(projectName, preName, "pre-load", "before the first task", plan.PreSql, problems, notValidated, plan.Errors, taskErrors)) };
+            .Select(s => FormattableString.Invariant($"{s.Id} ({plan.Tasks[s.Id].Target}): {plan.Tasks[s.Id].Errors.Count} error(s)")).ToList();
+        var notes = new PackNotes { Problems = problems, NotValidated = notValidated, PlanErrors = plan.Errors, TaskErrors = taskErrors };
+        var files = new List<(string, string)> { (preName, GlobalFile(projectName, preName, "pre-load", "before the first task", plan.PreSql, notes)) };
         var index = new List<(string File, string Id, TaskPlan Task)>();
         for (var i = 0; i < slots.Count; i++)
         {
@@ -73,8 +92,8 @@ public static class ScriptPack
             files.Add((name, TaskFile(projectName, id, task)));
             index.Add((name, id, task));
         }
-        files.Add((postName, GlobalFile(projectName, postName, "post-load", "after the last task", plan.PostSql, [], [], [], [])));
-        files.Add(("README.md", Readme(projectName, preName, postName, index, problems, notValidated, plan.Errors, taskErrors)));
+        files.Add((postName, GlobalFile(projectName, postName, "post-load", "after the last task", plan.PostSql, PackNotes.None)));
+        files.Add(("README.md", Readme(projectName, preName, postName, index, notes)));
         return files;
     }
 
@@ -91,32 +110,31 @@ public static class ScriptPack
     /// <summary>The ONLY way an interpolated value reaches a <c>--</c> comment line.</summary>
     static StringBuilder Comment(StringBuilder sb, string text) => sb.Append("-- ").Append(OneLine(text)).Append('\n');
 
-    static string GlobalFile(string project, string name, string what, string when, List<string> statements, List<string> problems,
-        List<string> notValidated, List<string> planErrors, List<string> taskErrors)
+    static string GlobalFile(string project, string name, string what, string when, List<string> statements, PackNotes notes)
     {
         var sb = new StringBuilder();
         sb.Append(Rule).Append('\n');
         Comment(sb, $"{project}: {name} - global {what} statements");
         Comment(sb, $"runs on TARGET, {when}");
-        if (notValidated.Count > 0)
+        if (notes.NotValidated.Count > 0)
         {
             Comment(sb, NotValidatedTitle);
-            foreach (var line in notValidated) Comment(sb, line);   // the stored line verbatim, flattened
+            foreach (var line in notes.NotValidated) Comment(sb, line);   // the stored line verbatim, flattened
         }
-        if (planErrors.Count > 0)
+        if (notes.PlanErrors.Count > 0)
         {
             Comment(sb, $"{PlanErrorsTitle} (see README.md)");
-            foreach (var e in planErrors) Comment(sb, "  - " + e);   // the stored line verbatim, flattened
+            foreach (var e in notes.PlanErrors) Comment(sb, "  - " + e);   // the stored line verbatim, flattened
         }
-        if (taskErrors.Count > 0)
+        if (notes.TaskErrors.Count > 0)
         {
-            Comment(sb, $"{TaskErrorsTitle(taskErrors.Count)} (see each task file's header)");
-            foreach (var t in taskErrors) Comment(sb, "  - " + t);
+            Comment(sb, $"{TaskErrorsTitle(notes.TaskErrors.Count)} (see each task file's header)");
+            foreach (var t in notes.TaskErrors) Comment(sb, "  - " + t);
         }
-        if (problems.Count > 0)
+        if (notes.Problems.Count > 0)
         {
             Comment(sb, $"{MismatchTitle} (see README.md)");
-            foreach (var p in problems) Comment(sb, "  - " + p);
+            foreach (var p in notes.Problems) Comment(sb, "  - " + p);
         }
         sb.Append(Rule).Append("\n\n");
         if (statements.Count == 0) Comment(sb, $"(no global {what} statements)");
@@ -185,39 +203,38 @@ public static class ScriptPack
         foreach (var i in items) Comment(sb, "  - " + i);
     }
 
-    static string Readme(string project, string preName, string postName, List<(string File, string Id, TaskPlan Task)> index, List<string> problems,
-        List<string> notValidated, List<string> planErrors, List<string> taskErrors)
+    static string Readme(string project, string preName, string postName, List<(string File, string Id, TaskPlan Task)> index, PackNotes notes)
     {
         var sb = new StringBuilder();
         sb.Append($"# {OneLine(project)} - migration script pack\n\n");
-        if (notValidated.Count > 0)
+        if (notes.NotValidated.Count > 0)
         {
             sb.Append($"## {NotValidatedTitle}\n\n");
-            foreach (var line in notValidated) sb.Append(OneLine(line)).Append('\n');
+            foreach (var line in notes.NotValidated) sb.Append(OneLine(line)).Append('\n');
             sb.Append('\n');
         }
-        if (planErrors.Count > 0)
+        if (notes.PlanErrors.Count > 0)
         {
             sb.Append($"## {PlanErrorsTitle}\n\n")
               .Append("The last validation recorded these plan-level errors - in the global statements, or in reaching the databases at all.\n")
               .Append("They are listed here because no task file holds them. Do not run this pack as-is.\n\n");
-            foreach (var e in planErrors) sb.Append("- ").Append(OneLine(e)).Append('\n');
+            foreach (var e in notes.PlanErrors) sb.Append("- ").Append(OneLine(e)).Append('\n');
             sb.Append('\n');
         }
-        if (taskErrors.Count > 0)
+        if (notes.TaskErrors.Count > 0)
         {
-            sb.Append($"## {TaskErrorsTitle(taskErrors.Count)}\n\n")
+            sb.Append($"## {TaskErrorsTitle(notes.TaskErrors.Count)}\n\n")
               .Append("These tasks carry errors from the last validation. Each error is listed in that task's own file, under\n")
               .Append("*Errors (last validation)* in its header. Do not run this pack as-is.\n\n");
-            foreach (var t in taskErrors) sb.Append("- ").Append(OneLine(t)).Append('\n');
+            foreach (var t in notes.TaskErrors) sb.Append("- ").Append(OneLine(t)).Append('\n');
             sb.Append('\n');
         }
-        if (problems.Count > 0)
+        if (notes.Problems.Count > 0)
         {
             sb.Append($"## {MismatchTitle}\n\n")
               .Append("The plan's order does not list every task exactly once. Every task is still exported: tasks missing from the order\n")
               .Append("come after the ordered ones, in task-id order, and their real position in the run is unknown. Do not run this pack as-is.\n\n");
-            foreach (var p in problems) sb.Append("- ").Append(OneLine(p)).Append('\n');
+            foreach (var p in notes.Problems) sb.Append("- ").Append(OneLine(p)).Append('\n');
             sb.Append('\n');
         }
         sb.Append("Generated by **dbm** from the SQL plan. These files are for review, audit and rehearsal; the dbm engine runs the migration itself.\n\n")
