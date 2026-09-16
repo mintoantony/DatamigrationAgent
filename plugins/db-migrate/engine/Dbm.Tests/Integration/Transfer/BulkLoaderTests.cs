@@ -887,4 +887,40 @@ public sealed class BulkLoaderTests
         Assert.Contains("the restore failed", refused!.Message, StringComparison.Ordinal);
         Assert.Equal(4L, await db.CountAsync("dbo.C"));
     }
+
+    [Fact]
+    public async Task Two_staging_bindings_on_one_target_are_refused_instead_of_one_being_dropped()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        var task = TaskFor("staging_merge");
+        task.Columns = [.. task.Columns, new ColumnBinding("Note2", "note")];   // a second source for the same target column
+        var table = Rows(4);
+        table.Columns.Add("Note2", typeof(string));
+        foreach (DataRow r in table.Rows)
+        {
+            r["Note"] = "first";
+            r["Note2"] = "second";
+        }
+        var loader = new BulkLoader(task, new TransferOptions { ErrorMode = "skip" });
+        ChunkOutcome? outcome = null;
+        TransferException? refused = null;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            try
+            {
+                outcome = await loader.LoadAsync(scope, table, true, null, default);
+                await scope.CommitAsync(default);
+            }
+            catch (TransferException ex) { refused = ex; }
+        }
+        // Harm: both bindings want the one #stg column, so one of them is dropped and the value a human wrote into the task
+        // never reaches the target -- the chunk reports a clean success and nothing says a mapping was not applied.
+        Assert.True(outcome is null, $"a binding was dropped and the chunk still reported Loaded={outcome?.Loaded}");
+        Assert.Equal(0L, await db.CountAsync("dbo.C"));
+        Assert.Equal("bad_task", refused?.Code);
+        Assert.Contains("Note2", refused!.Details);   // the second source, which would have been the silent casualty
+        Assert.Contains("Note", refused.Details);     // the first, and the #stg column both of them wanted
+    }
 }

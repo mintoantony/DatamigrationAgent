@@ -21,7 +21,7 @@ public sealed class StagingMappingTests
         table.Columns.Add("__k0", typeof(int));
         var staging = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["At"] = "At", ["__k0"] = "__k0" };
 
-        var (mappings, unmapped) = BulkLoader.StagingMappings(table, [binding], staging);
+        var (mappings, unmapped) = BulkLoader.StagingMappings("dbo.T", table, [binding], staging);
 
         Assert.Empty(unmapped);
         var twice = mappings.GroupBy(m => m.DestinationColumn, StringComparer.OrdinalIgnoreCase).Where(g => g.Count() > 1)

@@ -182,16 +182,19 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options, TargetSha
 
     /// <summary>The #stg column mappings for one chunk: every binding, from its normalised column when it has one, plus any remaining
     /// table column (the key aliases) whose name matches a #stg column. Extracted only so that "each destination is mapped once" can be
-    /// asserted — SqlBulkCopy accepts two mappings to one destination and silently keeps one of them.</summary>
+    /// asserted — SqlBulkCopy accepts two mappings to one destination and silently keeps one of them. Two bindings that want the same #stg
+    /// column are refused rather than one of them dropped: only one could ever be loaded, and a mapping a human wrote must not vanish
+    /// without saying so (ruling 100).</summary>
     internal static (List<SqlBulkCopyColumnMapping> Mappings, List<string> Unmapped) StagingMappings(
-        DataTable table, IReadOnlyList<ColumnBinding> bindings, IReadOnlyDictionary<string, string> staging)
+        string target, DataTable table, IReadOnlyList<ColumnBinding> bindings, IReadOnlyDictionary<string, string> staging)
     {
+        ArgumentNullException.ThrowIfNull(target);
         ArgumentNullException.ThrowIfNull(table);
         ArgumentNullException.ThrowIfNull(bindings);
         ArgumentNullException.ThrowIfNull(staging);
         var mappings = new List<SqlBulkCopyColumnMapping>();
         var mapped = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // #stg columns already spoken for
+        var taken = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);   // #stg column -> the source already going there
         var unmapped = new List<string>();
         foreach (var b in bindings)
         {
@@ -199,19 +202,27 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options, TargetSha
             if (mapped.Contains(source)) continue;
             if (staging.TryGetValue(b.Target, out var dest) || staging.TryGetValue(b.Source, out dest))
             {
+                if (taken.TryGetValue(dest, out var first))
+                    throw new TransferException("bad_task",
+                        $"Task for {target} binds two source columns to the one #stg column {dest}: {first} and {b.Source}. Only one of " +
+                        "them can be loaded, so the task is refused rather than dropping the other without saying so.",
+                        [dest, first, b.Source]);
                 mapped.Add(source);
-                if (!taken.Add(dest)) continue;
+                taken[dest] = b.Source;
                 mappings.Add(new SqlBulkCopyColumnMapping(source, dest));
             }
             else unmapped.Add(b.Target);
         }
         // Whatever is left that #stg has a column for: the key aliases. A table column whose #stg destination a binding has already
-        // claimed is skipped -- for a binding read from its normalised column that is the raw source column, and mapping it as well
-        // would point two mappings at one destination (ruling 92).
+        // claimed is skipped, not refused -- for a binding read from its normalised column that column is its own raw source, which
+        // nobody wrote as a mapping, and mapping it as well would point two mappings at one destination (ruling 92).
         foreach (DataColumn c in table.Columns)
-            if (!mapped.Contains(c.ColumnName) && staging.TryGetValue(c.ColumnName, out var dest) && mapped.Add(c.ColumnName)
-                && taken.Add(dest))
+            if (!mapped.Contains(c.ColumnName) && staging.TryGetValue(c.ColumnName, out var dest) && !taken.ContainsKey(dest)
+                && mapped.Add(c.ColumnName))
+            {
+                taken[dest] = c.ColumnName;
                 mappings.Add(new SqlBulkCopyColumnMapping(c.ColumnName, dest));
+            }
         return (mappings, unmapped);
     }
 
@@ -238,7 +249,7 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options, TargetSha
         var stg = await StagingColumnsAsync(scope, ct);
         using (var bc = NewCopy(scope, "#stg", SqlBulkCopyOptions.KeepNulls, progress))
         {
-            var (mappings, unmapped) = StagingMappings(table, _task.Columns, stg);
+            var (mappings, unmapped) = StagingMappings(_task.Target, table, _task.Columns, stg);
             // A bound value with nowhere to go in #stg would reach the target as NULL (or its default) without any error.
             if (unmapped.Count > 0)
                 throw new TransferException("bad_task",
