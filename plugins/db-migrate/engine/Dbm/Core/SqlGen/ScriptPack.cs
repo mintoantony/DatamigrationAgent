@@ -17,6 +17,10 @@ public static class ScriptPack
     /// <summary>Heading over the plan's stored <see cref="SqlPlanSource.SkippedPrefix"/> line(s), which follow verbatim.</summary>
     const string NotValidatedTitle = "WARNING: NOT VALIDATED - no database checked this plan";
     const string MismatchTitle ="WARNING: this pack does not match the plan's execution order";
+    /// <summary>Heading over the plan's stored plan-level <see cref="SqlPlanPayload.Errors"/>, which follow verbatim. Task-level errors
+    /// have their own place (the task file's "Errors (last validation)" header); without this block a plan-level error — a bare carriage
+    /// return in a global statement, a connection that failed — would reach the DBA nowhere at all.</summary>
+    const string PlanErrorsTitle = "WARNING: PLAN HAS ERRORS";
 
     public static byte[] BuildZip(SqlPlanPayload plan, string projectName)
     {
@@ -51,7 +55,7 @@ public static class ScriptPack
         var width = Math.Max(2, (slots.Count + 1).ToString(CultureInfo.InvariantCulture).Length);
         var preName = new string('0', width) + "_pre.sql";
         var postName = new string('9', width) + "_post.sql";
-        var files = new List<(string, string)> { (preName, GlobalFile(projectName, preName, "pre-load", "before the first task", plan.PreSql, problems, notValidated)) };
+        var files = new List<(string, string)> { (preName, GlobalFile(projectName, preName, "pre-load", "before the first task", plan.PreSql, problems, notValidated, plan.Errors)) };
         var index = new List<(string File, string Id, TaskPlan Task)>();
         for (var i = 0; i < slots.Count; i++)
         {
@@ -62,8 +66,8 @@ public static class ScriptPack
             files.Add((name, TaskFile(projectName, id, task)));
             index.Add((name, id, task));
         }
-        files.Add((postName, GlobalFile(projectName, postName, "post-load", "after the last task", plan.PostSql, [], [])));
-        files.Add(("README.md", Readme(projectName, preName, postName, index, problems, notValidated)));
+        files.Add((postName, GlobalFile(projectName, postName, "post-load", "after the last task", plan.PostSql, [], [], [])));
+        files.Add(("README.md", Readme(projectName, preName, postName, index, problems, notValidated, plan.Errors)));
         return files;
     }
 
@@ -81,7 +85,7 @@ public static class ScriptPack
     static StringBuilder Comment(StringBuilder sb, string text) => sb.Append("-- ").Append(OneLine(text)).Append('\n');
 
     static string GlobalFile(string project, string name, string what, string when, List<string> statements, List<string> problems,
-        List<string> notValidated)
+        List<string> notValidated, List<string> planErrors)
     {
         var sb = new StringBuilder();
         sb.Append(Rule).Append('\n');
@@ -91,6 +95,11 @@ public static class ScriptPack
         {
             Comment(sb, NotValidatedTitle);
             foreach (var line in notValidated) Comment(sb, line);   // the stored line verbatim, flattened
+        }
+        if (planErrors.Count > 0)
+        {
+            Comment(sb, $"{PlanErrorsTitle} (see README.md)");
+            foreach (var e in planErrors) Comment(sb, "  - " + e);   // the stored line verbatim, flattened
         }
         if (problems.Count > 0)
         {
@@ -165,7 +174,7 @@ public static class ScriptPack
     }
 
     static string Readme(string project, string preName, string postName, List<(string File, string Id, TaskPlan Task)> index, List<string> problems,
-        List<string> notValidated)
+        List<string> notValidated, List<string> planErrors)
     {
         var sb = new StringBuilder();
         sb.Append($"# {OneLine(project)} - migration script pack\n\n");
@@ -173,6 +182,14 @@ public static class ScriptPack
         {
             sb.Append($"## {NotValidatedTitle}\n\n");
             foreach (var line in notValidated) sb.Append(OneLine(line)).Append('\n');
+            sb.Append('\n');
+        }
+        if (planErrors.Count > 0)
+        {
+            sb.Append($"## {PlanErrorsTitle}\n\n")
+              .Append("The last validation recorded these plan-level errors - in the global statements, or in reaching the databases at all.\n")
+              .Append("They are listed here because no task file holds them. Do not run this pack as-is.\n\n");
+            foreach (var e in planErrors) sb.Append("- ").Append(OneLine(e)).Append('\n');
             sb.Append('\n');
         }
         if (problems.Count > 0)

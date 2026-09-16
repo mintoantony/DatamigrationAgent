@@ -199,7 +199,54 @@ public class ScriptPackTests
             Assert.DoesNotContain("\nDROP TABLE", content, StringComparison.Ordinal);
     }
 
+    /// <summary>Ruling 71: the DBA never sees ApprovalBlockers, and a bare carriage return in a global pre/post statement is a
+    /// plan-level error, not a task one. The pack lists the plan's stored errors verbatim; a plan without them says nothing of the
+    /// kind, so "no block" means "no plan-level errors", not "the pack never prints them". Whether an errored plan may be exported
+    /// at all is unchanged: both packs are built.</summary>
+    [Fact]
+    public void A_plan_with_plan_level_errors_says_so_in_the_pack_and_a_clean_one_does_not()
+    {
+        var plan = Plan();
+        plan.PreSql.Add("-- disable the audit trigger\rDELETE FROM app.Customers");
+        SqlValidator.RecordBareCarriageReturns(plan);
+        var cr = Assert.Single(plan.Errors);   // stored without the scope prefix
+        Assert.Contains(SqlValidator.BareCarriageReturnMarker, cr, StringComparison.Ordinal);
+        plan.Errors.Add("target connection failed: timeout");
+
+        var files = ScriptPack.BuildFiles(plan, "demo");
+
+        Assert.Contains("-- WARNING: PLAN HAS ERRORS (see README.md)\n--   - " + cr + "\n--   - target connection failed: timeout\n", files[0].Content);
+        var readme = files.Single(f => f.Name == "README.md").Content;
+        Assert.Contains("## WARNING: PLAN HAS ERRORS\n\n", readme);
+        Assert.Contains("\n- " + cr + "\n- target connection failed: timeout\n", readme);
+
+        Assert.Empty(Plan().Errors);   // fixture guard: the generated plan really has no plan-level errors
+        foreach (var (name, content) in ScriptPack.BuildFiles(Plan(), "demo"))
+            Assert.DoesNotContain("PLAN HAS ERRORS", content, StringComparison.Ordinal);
+    }
+
+    /// <summary>Ruling 71, H2: a stored plan-level error is untrusted text like every other value. It reaches the pre file and the
+    /// README only through the neutraliser, so it can never end its line and start one of its own.</summary>
+    [Fact]
+    public void A_hostile_plan_level_error_cannot_start_a_line_of_its_own()
+    {
+        var plan = Plan();
+        plan.Errors.Add("target connection failed: " + Hostile);
+
+        var files = ScriptPack.BuildFiles(plan, "demo");
+
+        Assert.Contains("CANARY_LF", files[0].Content, StringComparison.Ordinal);   // the error did reach both files
+        Assert.Contains("CANARY_LF", files.Single(f => f.Name == "README.md").Content, StringComparison.Ordinal);
+        foreach (var (name, content) in files)
+            foreach (var line in content.Split(LineBreaks, StringSplitOptions.None))
+                Assert.False(line.TrimStart().StartsWith("CANARY", StringComparison.Ordinal), $"{name}: a value escaped its comment: [{line}]");
+    }
+
     const string Hostile ="x\nCANARY_LF;\rCANARY_CR;\r\nCANARY_CRLF;\u2028CANARY_LS;\u2029CANARY_PS;\u0085CANARY_NEL;\vCANARY_VT;\fCANARY_FF;";
+
+    /// <summary>Every line terminator a T-SQL parser or an editor may honour - the ones <see cref="ScriptPack.OneLine"/> neutralises,
+    /// and so the ones after which a hostile value must never be found.</summary>
+    static readonly string[] LineBreaks = ["\r\n", "\n", "\r", "\u2028", "\u2029", "\u0085", "\v", "\f"];
 
     /// <summary>Plan properties the poisoning skips: the global SQL bodies (executable by design) and Order (its ids are poisoned by
     /// renaming one task, below, so Order and Tasks keep matching). Pinned by <see cref="Poison_exclusions_are_exactly_the_sql_bodies_and_order"/>.</summary>
@@ -305,11 +352,10 @@ public class ScriptPackTests
         };
         Assert.Contains(packs[1], f => f.Content.Contains("-- Mode:            staging_merge\n", StringComparison.Ordinal));
 
-        var separators = new[] { "\r\n", "\n", "\r", "\u2028", "\u2029", "\u0085", "\v", "\f" };
         foreach (var (name, content) in packs.SelectMany(p => p))
         {
             Assert.Contains("CANARY_LF", content);   // the values did reach the file
-            foreach (var line in content.Split(separators, StringSplitOptions.None))
+            foreach (var line in content.Split(LineBreaks, StringSplitOptions.None))
                 Assert.False(line.TrimStart().StartsWith("CANARY", StringComparison.Ordinal), $"{name}: a value escaped its comment: [{line}]");
         }
     }
