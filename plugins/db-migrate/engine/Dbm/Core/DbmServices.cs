@@ -40,6 +40,10 @@ public sealed class DbmServices : IDisposable
     private CatalogRepo? _catalog;
     public CatalogRepo Catalog => _catalog ??= new CatalogRepo(Db);
 
+    // T5.1: transfer runs, tasks and rejected rows (a stateless wrapper over Db, created on first use)
+    private TransferRepo? _transfers;
+    public TransferRepo Transfers => _transfers ??= new TransferRepo(Db);
+
     public IEventSink Sink { get; set; }
     public WorkflowEngine Workflow { get; }
     public IReadOnlyDictionary<PhaseName, IPhaseModule> Modules { get; private set; } = new Dictionary<PhaseName, IPhaseModule>();

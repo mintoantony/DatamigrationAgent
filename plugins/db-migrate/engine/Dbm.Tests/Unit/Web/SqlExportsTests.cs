@@ -70,18 +70,23 @@ public sealed class SqlExportsTests : IDisposable
         Assert.Equal("No SQL plan yet.", (string?)body["message"]);
     }
 
-    /// <summary>BY DESIGN until T4.5: the "sql" kind is registered, but the standalone HTML needs wwwroot/js/views/sql.js, which T4.5
-    /// creates. T4.5 replaces this test with one asserting the HTML export succeeds.</summary>
+    /// <summary>The "sql" kind answered 404 until T4.5 created wwwroot/js/views/sql.js; it now builds the standalone SQL screen and
+    /// saves a copy under exports (the GET form and the rendered content are covered by SqlEndpointsTests).</summary>
     [Fact]
-    public async Task Sql_html_export_answers_404_until_the_sql_view_exists()
+    public async Task Sql_html_export_is_saved_now_that_the_sql_view_exists()
     {
         WithPlan(_workspace);
         await using var server = await WebTestServer.StartAsync(_workspace.Ws, ws => DbmServices.Open(ws));
 
         var (status, body) = await server.SendAsync(HttpMethod.Post, "/api/export/sql");
 
-        Assert.Equal(HttpStatusCode.NotFound, status);
-        Assert.Equal("export_unavailable", (string?)body!["error"]);
-        Assert.Equal("View script js/views/sql.js not found.", (string?)body["message"]);
+        Assert.Equal(HttpStatusCode.OK, status);
+        Assert.True((bool)body!["ok"]!);
+        Assert.Equal("sql-v0.html", (string?)body["file"]);
+        var saved = Path.Combine(_workspace.Ws.ExportsDir, "sql-v0.html");
+        Assert.True(File.Exists(saved));
+        var html = File.ReadAllText(saved);
+        Assert.Contains("DBM.views.sql = ", html);
+        Assert.Contains("DBM.highlight = ", html);
     }
 }
