@@ -57,6 +57,7 @@ public sealed class BisectorTests
         Assert.Equal(37, r.Loaded.Count);
         Assert.Equal(Enumerable.Range(0, 40).Except(new[] { 3, 17, 39 }), t.Tx.Order());
         Assert.Equal(r.Loaded, t.Tx.Order());
+        Assert.Null(r.UniformError);   // rows loaded, so the load itself is not what is broken
     }
 
     [Fact]
@@ -104,6 +105,34 @@ public sealed class BisectorTests
         var r = await Bisector.RunAsync(2, new SilentTarget(error), false, default);
         Assert.Equal(new[] { 0, 1 }, r.Failed.Select(f => f.Row));
         Assert.All(r.Failed, f => Assert.False(string.IsNullOrWhiteSpace(f.Error)));
+    }
+
+    /// <summary>A plan defect: every attempt fails the same way, whichever rows it carries.</summary>
+    private sealed class HopelessTarget : IBisectTarget
+    {
+        public const string Error = "Invalid column name 'nope'.";
+        public int Attempts;
+
+        public Task<LoadAttempt> TryLoadAsync(IReadOnlyList<int> rows, CancellationToken ct)
+        {
+            Attempts++;
+            return Task.FromResult(new LoadAttempt(false, Error));
+        }
+
+        public Task RestartAsync(CancellationToken ct) => Task.CompletedTask;
+    }
+
+    [Fact]
+    public async Task A_chunk_where_every_attempt_fails_the_same_way_is_not_re_run_for_every_node()
+    {
+        var t = new HopelessTarget();
+        var r = await Bisector.RunAsync(64, t, false, default);
+        Assert.Equal(64, r.Failed.Count);
+        // Harm: the hopeless load is re-executed once per node of the bisection tree, 2N-1 = 127 times for 64 rows -- at the
+        // default chunk size, 200_000 re-runs of a broken merge. Once the whole chunk and two single rows have failed with one
+        // identical error and nothing has loaded, no multi-row attempt can succeed, so none is made.
+        Assert.Equal(64 + 6, t.Attempts);   // the rows, plus the whole chunk and the log2(64) halvings above the first row
+        Assert.Equal(HopelessTarget.Error, r.UniformError);
     }
 
     [Fact]

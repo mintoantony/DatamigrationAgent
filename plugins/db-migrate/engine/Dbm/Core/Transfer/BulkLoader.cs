@@ -6,10 +6,25 @@ using Microsoft.Data.SqlClient;
 
 namespace Dbm.Core.Transfer;
 
-public sealed record ChunkOutcome(long Loaded, IReadOnlyList<RowFailure> Failed, int Restarts);
+public sealed record ChunkOutcome(long Loaded, IReadOnlyList<RowFailure> Failed, int Restarts)
+{
+    /// <summary>The rows handed to <see cref="BulkLoader.LoadAsync"/>. <c>Loaded + Failed.Count == Attempted</c> only when the run is
+    /// complete; in stop mode it ends at the first failed row, so the difference is rows that were never attempted — in neither list,
+    /// in no error_row, and not in the target. A caller that commits such an outcome silently drops them.</summary>
+    public long Attempted { get; init; }
+
+    /// <summary>Rows the task's <c>MergeSql</c> reported affected, summed over the attempts that survived; null when the task has no
+    /// <c>MergeSql</c>, or when a merge reported no count at all (ruling 74). A merge that moved nothing shows as 0 beside a non-zero
+    /// <see cref="Loaded"/>. The loader does not judge it — a custom merge may legitimately filter, and T5.4's row-count/checksum
+    /// validation is the real net.</summary>
+    public long? MergeRowsAffected { get; init; }
+}
 
 /// <summary>Loads one DataTable into the target inside the caller's transaction, bisecting failures (V1–V5).</summary>
-public sealed class BulkLoader(TaskPlan task, TransferOptions options)
+/// <param name="shape">The target's live shape, when the caller has it (it does: T5.3 loads it two lines before constructing the
+/// loader). Optional only so that <c>new BulkLoader(task, options)</c> keeps working; without it the loader cannot tell a binding to a
+/// column the target does not have, or to an identity column, from bad data, and says so when a chunk fails as a whole.</param>
+public sealed class BulkLoader(TaskPlan task, TransferOptions options, TargetShape? shape = null)
 {
     public const string SavepointName = "dbm_b";
     private const int NotifyEvery = 5_000;
@@ -17,16 +32,22 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options)
 
     private readonly TaskPlan _task = task ?? throw new ArgumentNullException(nameof(task));
     private readonly TransferOptions _options = options ?? throw new ArgumentNullException(nameof(options));
+    private readonly TargetShape? _shape = shape;
 
-    /// <summary>Plan defects (no bindings, a binding whose source column is not in <paramref name="rows"/>, a staging binding with no #stg
-    /// column) throw <c>TransferException("bad_task")</c> instead of being reported as rejected rows. XACT_ABORT is OFF for the duration
-    /// of the load (a server-side row error must stay undoable by savepoint) and the connection's prior setting is restored.</summary>
+    /// <summary>Plan defects throw <c>TransferException("bad_task")</c> instead of being reported as rejected rows: no bindings, a binding
+    /// whose source column is not in <paramref name="rows"/>, a staging binding with no #stg column, and — when a shape was given — a
+    /// binding to a column the target does not have or to an identity column while <c>IdentityInsert</c> is off. So does a chunk in which
+    /// every row failed on its own with one identical error, which is a broken load rather than a chunk of individually bad rows (H2).
+    /// XACT_ABORT is OFF for the duration of the load (a server-side row error must stay undoable by savepoint) and the connection's prior
+    /// setting is restored. <see cref="ChunkOutcome.Attempted"/> is the row count handed over: in stop mode the run ends at the first
+    /// failed row, so <c>Loaded + Failed.Count</c> can be less than it and the difference is rows nothing knows about — the caller must
+    /// roll back rather than commit such an outcome.</summary>
     public async Task<ChunkOutcome> LoadAsync(TxScope scope, DataTable rows, bool allowRestart, Action<long>? progress, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(scope);
         ArgumentNullException.ThrowIfNull(rows);
         CheckBindings(rows);
-        if (rows.Rows.Count == 0) return new ChunkOutcome(0, [], 0);
+        if (rows.Rows.Count == 0) return new ChunkOutcome(0, [], 0) { Attempted = 0, MergeRowsAffected = null };
 
         bool xactAbortWasOn = await XactAbortIsOnAsync(scope, ct);
         if (xactAbortWasOn) await ExecAsync(scope, "SET XACT_ABORT OFF;", ct);
@@ -35,24 +56,34 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options)
         {
             var target = new Target(this, scope, rows, allowRestart, progress);
             var result = await Bisector.RunAsync(rows.Rows.Count, target, stopAtFirstFailure: !_options.SkipErrors, ct);
+            if (rows.Rows.Count > 1 && result.UniformError is not null) throw WholeChunkFailed(rows.Rows.Count, result.UniformError);
             completed = true;
-            return new ChunkOutcome(result.Loaded.Count, result.Failed, target.Restarts);
+            return new ChunkOutcome(result.Loaded.Count, result.Failed, target.Restarts)
+            {
+                Attempted = rows.Rows.Count,
+                MergeRowsAffected = target.MergeRowsAffected,
+            };
         }
         finally
         {
-            if (xactAbortWasOn)
-            {
-                try
-                {
-                    await using var cmd = new SqlCommand("SET XACT_ABORT ON;", scope.Connection, scope.Tx);
-                    await cmd.ExecuteNonQueryAsync(CancellationToken.None);
-                }
-                catch (Exception) when (!completed) { /* the load's own exception is the one to report */ }
-            }
+            if (xactAbortWasOn) await RestoreXactAbortAsync(scope, completed);
         }
     }
 
     private bool Staging => string.Equals(_task.Mode, "staging_merge", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>A whole chunk failing one identical way is a broken load, not N bad rows: fail the task, which is recoverable and says
+    /// why, rather than shredding a customer's table into error rows and reporting "completed with N rejected". A genuinely uniform data
+    /// fault fails the task too; the message says exactly what the rows failed on.</summary>
+    private TransferException WholeChunkFailed(int rowCount, string error)
+    {
+        string unbound = _shape is null
+            ? " No target shape was given to this loader, so a binding to a missing or identity target column could not be named."
+            : "";
+        return new TransferException("bad_task",
+            $"Every one of the {rowCount} rows in this chunk for {_task.Target} failed on its own with the same error, so the load is " +
+            $"broken rather than the rows.{unbound} The error was: {error}", [error]);
+    }
 
     private void CheckBindings(DataTable rows)
     {
@@ -64,10 +95,37 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options)
         if (missing.Count > 0)
             throw new TransferException("bad_task",
                 $"Task for {_task.Target} binds source columns the query does not return: {string.Join(", ", missing)}.", missing);
+        if (_shape is null) return;
+
+        // The target side of a binding, which only the shape can check. Both of these load silently and wrongly: a target column that
+        // does not exist makes SqlBulkCopy reject every row, and an identity column without KeepIdentity discards the bound values.
+        var unknown = _task.Columns.Where(b => _shape.Find(b.Target) is null).Select(b => b.Target)
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        if (unknown.Count > 0)
+            throw new TransferException("bad_task",
+                $"Task for {_task.Target} binds target columns that {_task.Target} does not have: {string.Join(", ", unknown)}.", unknown);
+        if (_task.IdentityInsert) return;
+        var identity = _task.Columns.Where(b => _shape.Find(b.Target)!.IsIdentity).Select(b => b.Target)
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        if (identity.Count > 0)
+            throw new TransferException("bad_task",
+                $"Task for {_task.Target} binds source values to identity column {string.Join(", ", identity)} while identityInsert is " +
+                "off, so the server would discard every bound value and assign its own. Either turn identityInsert on for this task, or " +
+                "drop the binding and let the server assign the value.", identity);
     }
 
-    private async Task WriteAsync(TxScope scope, DataRow[] rows, Action<long>? progress, CancellationToken ct)
+    /// <summary>The DataTable column a binding's values come from: <see cref="TargetShape.Normalize"/> writes each binding's rounded
+    /// values into a column of its own and never touches the source column, so that one wins when it is there.</summary>
+    private static string SourceColumn(DataTable table, ColumnBinding binding)
     {
+        string normalized = TargetShape.NormalizedColumn(binding);
+        return table.Columns.Contains(normalized) ? normalized : binding.Source;
+    }
+
+    /// <summary>Returns the rows the task's MergeSql reported affected, or null when there is no merge (ruling 74).</summary>
+    private async Task<long?> WriteAsync(TxScope scope, DataRow[] rows, Action<long>? progress, CancellationToken ct)
+    {
+        var table = rows[0].Table;
         if (!Staging)
         {
             var o = SqlBulkCopyOptions.CheckConstraints | SqlBulkCopyOptions.KeepNulls;
@@ -75,9 +133,9 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options)
             if (_options.TableLock) o |= SqlBulkCopyOptions.TableLock;
             if (_options.FireTriggers) o |= SqlBulkCopyOptions.FireTriggers;
             using var bc = NewCopy(scope, SqlQuote.TableKey(_task.Target), o, progress);
-            foreach (var b in _task.Columns) bc.ColumnMappings.Add(b.Source, b.Target);
+            foreach (var b in _task.Columns) bc.ColumnMappings.Add(SourceColumn(table, b), b.Target);
             await bc.WriteToServerAsync(rows, ct);
-            return;
+            return null;
         }
 
         if (string.IsNullOrWhiteSpace(_task.StagingDdl) || string.IsNullOrWhiteSpace(_task.MergeSql))
@@ -89,14 +147,14 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options)
         {
             var mapped = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var unmapped = new List<string>();
-            var table = rows[0].Table;
             foreach (var b in _task.Columns)
             {
-                if (mapped.Contains(b.Source)) continue;
+                string source = SourceColumn(table, b);
+                if (mapped.Contains(source)) continue;
                 if (stg.TryGetValue(b.Target, out var dest) || stg.TryGetValue(b.Source, out dest))
                 {
-                    bc.ColumnMappings.Add(b.Source, dest);
-                    mapped.Add(b.Source);
+                    bc.ColumnMappings.Add(source, dest);
+                    mapped.Add(source);
                 }
                 else unmapped.Add(b.Target);
             }
@@ -109,8 +167,9 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options)
                     bc.ColumnMappings.Add(c.ColumnName, dest);
             await bc.WriteToServerAsync(rows, ct);
         }
-        await ExecAsync(scope, _task.MergeSql, ct);
+        int affected = await ExecAsync(scope, _task.MergeSql, ct);
         await ExecAsync(scope, "DROP TABLE #stg;", ct);
+        return affected;   // negative when the merge counts nothing (SET NOCOUNT ON)
     }
 
     private static SqlBulkCopy NewCopy(TxScope scope, string destination, SqlBulkCopyOptions o, Action<long>? progress)
@@ -139,10 +198,29 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options)
         return Convert.ToInt32(await cmd.ExecuteScalarAsync(ct), System.Globalization.CultureInfo.InvariantCulture) != 0;
     }
 
-    private static async Task ExecAsync(TxScope scope, string sql, CancellationToken ct)
+    /// <summary>Gives the caller's connection its XACT_ABORT setting back. After a transaction-ending error there is nowhere to issue it
+    /// yet: the destroyed transaction refuses every command that carries it ("The server failed to resume the transaction"), and SqlClient
+    /// refuses a command that does not while the connection still holds the transaction object. Measured, both ways round. So on that path
+    /// the SET is handed to the scope, which issues it the moment it releases the transaction, and the load's own exception still surfaces.</summary>
+    private static async Task RestoreXactAbortAsync(TxScope scope, bool completed)
+    {
+        const string SetOn = "SET XACT_ABORT ON;";
+        if (await scope.XactStateAsync(CancellationToken.None) == 0) { scope.RestoreWhenReleased(SetOn); return; }
+        try
+        {
+            await using var cmd = new SqlCommand(SetOn, scope.Connection, scope.Tx);
+            await cmd.ExecuteNonQueryAsync(CancellationToken.None);
+        }
+        catch (Exception) when (!completed)
+        {
+            scope.RestoreWhenReleased(SetOn);   // the load is already failing; do not lose the setting over it
+        }
+    }
+
+    private static async Task<int> ExecAsync(TxScope scope, string sql, CancellationToken ct)
     {
         await using var cmd = new SqlCommand(sql, scope.Connection, scope.Tx) { CommandTimeout = 0 };
-        await cmd.ExecuteNonQueryAsync(ct);
+        return await cmd.ExecuteNonQueryAsync(ct);
     }
 
     /// <summary>The exception's message plus its inner messages (SqlBulkCopy puts the reason, e.g. the truncation, in the inner one);
@@ -162,26 +240,35 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options)
 
     private sealed class Target(BulkLoader loader, TxScope scope, DataTable table, bool allowRestart, Action<long>? progress) : IBisectTarget
     {
-        private bool _first = true;
+        private long _confirmed;                      // rows of this chunk that are in the transaction and have not been rolled back
+        private long? _merged = loader.Staging ? 0 : null;
+
         public int Restarts { get; private set; }
+        public long? MergeRowsAffected => _merged;
 
         public async Task<LoadAttempt> TryLoadAsync(IReadOnlyList<int> rows, CancellationToken ct)
         {
             var batch = new DataRow[rows.Count];
             for (int i = 0; i < rows.Count; i++) batch[i] = table.Rows[rows[i]];
-            var report = _first ? progress : null;   // live progress only for the first (whole-chunk) attempt
-            _first = false;
-            scope.Tx.Save(SavepointName);
+            bool saved = false;
             try
             {
-                await loader.WriteAsync(scope, batch, report, ct);
+                // Inside the try: a Save that cannot be taken (a doomed or distributed transaction) is a failed attempt for the
+                // bisector to recover from, not a raw SqlException out of LoadAsync.
+                scope.Tx.Save(SavepointName);
+                saved = true;
+                long? merged = await loader.WriteAsync(scope, batch, progress is null ? null : InFlight, ct);
+                _confirmed += batch.Length;
+                if (merged is long m) _merged = m < 0 || _merged is null ? null : _merged + m;
+                Report(_confirmed);
                 return LoadAttempt.Success;
             }
             catch (Exception ex) when ((ex is SqlException or InvalidOperationException) && !ct.IsCancellationRequested)
             {
-                if (await scope.XactStateAsync(ct) == 1)
+                if (saved && await scope.XactStateAsync(ct) == 1)
                 {
                     scope.Tx.Rollback(SavepointName);   // V1/V2
+                    Report(_confirmed);                 // the attempt's rows are gone again: never leave the caller counting them
                     return new LoadAttempt(false, Describe(ex));
                 }
                 return new LoadAttempt(false, Describe(ex), Doomed: true);   // V3
@@ -195,6 +282,15 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options)
                     "A row error ended the transaction of a single-transaction (keyless) task, so it cannot be bisected. Fix the data or give the task a key and retry.");
             await scope.RestartAsync(ct);
             Restarts++;
+            // The new transaction holds none of this chunk: the bisector reloads the confirmed rows next, which counts them again.
+            _confirmed = 0;
+            _merged = loader.Staging ? 0 : null;
+            Report(0);
         }
+
+        /// <summary>Live rows-copied inside one attempt, on top of what is already confirmed. Withdrawn if the attempt is rolled back.</summary>
+        private void InFlight(long copied) => Report(_confirmed + copied);
+
+        private void Report(long rows) => progress?.Invoke(rows);
     }
 }

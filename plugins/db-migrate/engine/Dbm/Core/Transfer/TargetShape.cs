@@ -44,9 +44,20 @@ public sealed class TargetShape(string target, IReadOnlyList<TargetColumn> colum
         return new TargetShape(targetKey, cols);
     }
 
+    /// <summary>The column <see cref="Normalize"/> writes one binding's rounded values into, and the column <c>BulkLoader</c> maps that
+    /// binding from when the table has it. One per binding, because one source column can be bound to two targets of different scale and
+    /// rounding it in place would give the finer target the coarser target's value.</summary>
+    public static string NormalizedColumn(ColumnBinding binding)
+    {
+        ArgumentNullException.ThrowIfNull(binding);
+        return $"__dbm_n_{binding.Source}->{binding.Target}";
+    }
+
     /// <summary>Rounds bound datetime2/datetimeoffset/time values to the target scale, and smalldatetime values to the minute, exactly like
     /// CAST (V8). Without it SqlBulkCopy truncates the fraction (datetime2(0) gets 10:00:00 for 10:00:00.997) and rounds smalldatetime on the
-    /// fractional second (10:01 for 10:00:29.999, where CAST gives 10:00).</summary>
+    /// fractional second (10:01 for 10:00:29.999, where CAST gives 10:00). Each binding's rounded values go into a column of its own
+    /// (<see cref="NormalizedColumn"/>); the source column is never written to, so a second binding on the same source — or a key column
+    /// the caller still has to read — keeps the value it needs.</summary>
     public void Normalize(DataTable table, IReadOnlyList<ColumnBinding> bindings)
     {
         ArgumentNullException.ThrowIfNull(table);
@@ -55,12 +66,14 @@ public sealed class TargetShape(string target, IReadOnlyList<TargetColumn> colum
         {
             var col = Find(b.Target);
             if (col is null || !Rounds(col.DataType, col.Scale)) continue;
-            int idx = table.Columns.IndexOf(b.Source);
-            if (idx < 0) continue;
+            int src = table.Columns.IndexOf(b.Source);
+            if (src < 0) continue;
+            string name = NormalizedColumn(b);
+            var dest = table.Columns[name] ?? table.Columns.Add(name, table.Columns[src]!.DataType);
             foreach (DataRow row in table.Rows)
             {
-                object v = row[idx];
-                if (v is not DBNull) row[idx] = RoundValue(v, col.DataType, col.Scale);
+                object v = row[src];
+                row[dest] = v is DBNull ? v : RoundValue(v, col.DataType, col.Scale);
             }
         }
     }

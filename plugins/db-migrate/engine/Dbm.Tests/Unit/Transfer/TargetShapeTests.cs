@@ -36,8 +36,10 @@ public sealed class TargetShapeTests
         var table = new DataTable();
         table.Columns.Add("S", typeof(DateTime));
         table.Rows.Add(At(input));
-        shape.Normalize(table, [new ColumnBinding("S", "S")]);
-        Assert.Equal(At(expected), table.Rows[0]["S"]);
+        var binding = new ColumnBinding("S", "S");
+        shape.Normalize(table, [binding]);
+        Assert.Equal(At(expected), table.Rows[0][TargetShape.NormalizedColumn(binding)]);
+        Assert.Equal(At(input), table.Rows[0]["S"]);   // the source column is never written to
     }
 
     [Fact]
@@ -77,10 +79,33 @@ public sealed class TargetShapeTests
         table.Columns.Add("Raw", typeof(DateTime));
         table.Rows.Add(At("2020-01-01T10:00:00.997"), At("2020-01-01T10:00:00.997"));
         table.Rows.Add(DBNull.Value, DBNull.Value);
-        shape.Normalize(table, [new ColumnBinding("CreatedAtSrc", "CreatedAt"), new ColumnBinding("Raw", "Raw")]);
-        Assert.Equal(At("2020-01-01T10:00:01"), table.Rows[0]["CreatedAtSrc"]);
+        var created = new ColumnBinding("CreatedAtSrc", "CreatedAt");
+        var raw = new ColumnBinding("Raw", "Raw");
+        shape.Normalize(table, [created, raw]);
+        Assert.Equal(At("2020-01-01T10:00:01"), table.Rows[0][TargetShape.NormalizedColumn(created)]);
+        Assert.Equal(DBNull.Value, table.Rows[1][TargetShape.NormalizedColumn(created)]);
+        Assert.Equal(At("2020-01-01T10:00:00.997"), table.Rows[0]["CreatedAtSrc"]);   // untouched
+        Assert.False(table.Columns.Contains(TargetShape.NormalizedColumn(raw)));      // scale 7: nothing to round
         Assert.Equal(At("2020-01-01T10:00:00.997"), table.Rows[0]["Raw"]);
-        Assert.Equal(DBNull.Value, table.Rows[1]["CreatedAtSrc"]);
+    }
+
+    [Fact]
+    public void Normalize_never_writes_to_a_column_another_binding_still_needs()
+    {
+        // Harm: rounding in place gives both targets whichever binding ran first, so the finer one silently loses its fraction.
+        var shape = new TargetShape("app.T", [
+            new TargetColumn("Coarse", "datetime2", 6, 19, 0, false, false),
+            new TargetColumn("Fine", "datetime2", 8, 27, 7, false, false),
+        ]);
+        var table = new DataTable();
+        table.Columns.Add("V", typeof(DateTime));
+        table.Rows.Add(At("2020-01-01T10:00:00.9974999"));
+        var coarse = new ColumnBinding("V", "Coarse");
+        var fine = new ColumnBinding("V", "Fine");
+        shape.Normalize(table, [coarse, fine]);
+        Assert.Equal(At("2020-01-01T10:00:01"), table.Rows[0][TargetShape.NormalizedColumn(coarse)]);
+        Assert.Equal(At("2020-01-01T10:00:00.9974999"), table.Rows[0]["V"]);
+        Assert.False(table.Columns.Contains(TargetShape.NormalizedColumn(fine)));
     }
 
     [Fact]
@@ -108,5 +133,33 @@ public sealed class TargetShapeTests
         string text = RowSnapshot.Text(value);
         Assert.DoesNotContain(text, c => char.IsSurrogate(c));
         Assert.Equal(new string('x', RowSnapshot.MaxValueLength - 1) + "…", text);
+    }
+
+    [Fact]
+    public void RowSnapshot_keeps_both_values_when_two_bindings_share_a_target()
+    {
+        var table = new DataTable();
+        table.Columns.Add("A", typeof(string));
+        table.Columns.Add("B", typeof(string));
+        table.Rows.Add("one", "two");
+        var o = JsonNode.Parse(RowSnapshot.Json(table.Rows[0], [new ColumnBinding("A", "X"), new ColumnBinding("B", "X")]))!.AsObject();
+        // Harm: o[b.Target] overwrites, so the human diagnosing the rejected row never sees what column A held.
+        var values = o.Select(p => p.Value?.GetValue<string>()).ToList();
+        Assert.Contains("one", values);
+        Assert.Contains("two", values);
+        Assert.Equal(2, o.Count);
+    }
+
+    [Fact]
+    public void RowSnapshot_says_so_when_a_bound_source_column_is_not_in_the_row()
+    {
+        var table = new DataTable();
+        table.Columns.Add("A", typeof(string));
+        table.Rows.Add("one");
+        var o = JsonNode.Parse(RowSnapshot.Json(table.Rows[0], [new ColumnBinding("A", "X"), new ColumnBinding("Gone", "Y")]))!.AsObject();
+        // Harm: the binding is skipped without a trace, so the snapshot looks like a complete row that simply has no Y.
+        Assert.True(o.ContainsKey("Y"), "the binding Gone -> Y vanished from the snapshot: " + o.ToJsonString());
+        Assert.Contains("Gone", o["Y"]!.ToJsonString(), StringComparison.Ordinal);
+        Assert.Equal("one", o["X"]!.GetValue<string>());
     }
 }

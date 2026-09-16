@@ -7,7 +7,13 @@ public sealed record LoadAttempt(bool Ok, string? Error = null, bool Doomed = fa
 
 public sealed record RowFailure(int Row, string Error);
 
-public sealed record BisectResult(IReadOnlyList<int> Loaded, IReadOnlyList<RowFailure> Failed);
+public sealed record BisectResult(IReadOnlyList<int> Loaded, IReadOnlyList<RowFailure> Failed)
+{
+    /// <summary>Set only when every row of the chunk was attempted on its own, every one of them failed, nothing loaded, and every
+    /// attempt carried this one error text. Data is not uniformly bad; a plan is — so the caller fails the task with this text rather
+    /// than reporting a whole chunk of rejected rows (H2). Null whenever a row loaded, a text differed, or rows went unattempted.</summary>
+    public string? UniformError { get; init; }
+}
 
 public interface IBisectTarget
 {
@@ -33,18 +39,37 @@ public static class Bisector
         var failed = new List<RowFailure>();
         if (rowCount == 0) return new BisectResult(loaded, failed);
 
+        string? uniformText = null;   // the error text every attempt so far has carried
+        bool uniform = true;          // ... and nothing at all has loaded
+        int failedRows = 0;
+
         var stack = new Stack<int[]>();
         stack.Push(Enumerable.Range(0, rowCount).ToArray());
         while (stack.Count > 0)
         {
             ct.ThrowIfCancellationRequested();
             int[] segment = stack.Pop();
+
+            // A multi-row attempt earns its cost only while a whole segment might still load. Once the whole chunk and two single rows
+            // have failed with one identical error and nothing has loaded, the load itself is what is broken, so every further multi-row
+            // attempt is a re-run of it: go straight to the rows (H2). 2N-1 attempts become N + log2(N) + 1.
+            if (segment.Length > 1 && uniform && failedRows >= 2)
+            {
+                Halve(stack, segment);
+                continue;
+            }
+
             var attempt = await target.TryLoadAsync(segment, ct);
             if (attempt.Ok)
             {
+                uniform = false;
                 loaded.AddRange(segment);
                 continue;
             }
+            string text = TextOf(attempt.Error);
+            if (uniformText is null) uniformText = text;
+            else if (!string.Equals(uniformText, text, StringComparison.Ordinal)) uniform = false;
+
             if (attempt.Doomed)
             {
                 await target.RestartAsync(ct);
@@ -58,16 +83,23 @@ public static class Bisector
             }
             if (segment.Length == 1)
             {
-                failed.Add(new RowFailure(segment[0], TextOf(attempt.Error)));
+                failedRows++;
+                failed.Add(new RowFailure(segment[0], text));
                 if (stopAtFirstFailure) break;
                 continue;
             }
-            int half = segment.Length / 2;
-            stack.Push(segment[half..]);
-            stack.Push(segment[..half]);
+            Halve(stack, segment);
         }
         loaded.Sort();
-        return new BisectResult(loaded, failed);
+        bool everyRowFailedAlike = uniform && uniformText is not null && loaded.Count == 0 && failed.Count == rowCount;
+        return new BisectResult(loaded, failed) { UniformError = everyRowFailedAlike ? uniformText : null };
+    }
+
+    private static void Halve(Stack<int[]> stack, int[] segment)
+    {
+        int half = segment.Length / 2;
+        stack.Push(segment[half..]);
+        stack.Push(segment[..half]);
     }
 
     private static string TextOf(string? error) => string.IsNullOrWhiteSpace(error) ? NoErrorText : error;

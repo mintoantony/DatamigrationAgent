@@ -161,6 +161,7 @@ public sealed class BulkLoaderTests
         Assert.Equal(9, outcome.Loaded);
         Assert.Equal(new[] { 4 }, outcome.Failed.Select(f => f.Row));
         Assert.Equal(9, await db.CountAsync("dbo.C"));
+        Assert.Equal(9L, outcome.MergeRowsAffected);   // summed over the attempts that survived (ruling 74)
     }
 
     [Fact]
@@ -466,5 +467,282 @@ public sealed class BulkLoaderTests
             """);
         Assert.True(diff.Length == 0, "bulk copy differs from INSERT ... SELECT: " + diff);
         Assert.Equal(4, await db.CountAsync("dbo.D1"));
+    }
+
+    // ---- fix round 1 ----
+
+    [Fact]
+    public async Task The_callers_XACT_ABORT_setting_survives_a_transaction_ending_load()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        await using (var set = new SqlCommand("SET XACT_ABORT ON;", conn)) await set.ExecuteNonQueryAsync();
+        var task = new TaskPlan { Target = "dbo.T", SourceQuery = "unused", Columns = [new("Id", "id"), new("V", "v")] };
+        var table = new DataTable();
+        table.Columns.Add("Id", typeof(int));
+        table.Columns.Add("V", typeof(int));
+        table.Rows.Add(1, 1);
+        table.Rows.Add(2, -1);   // the trigger rolls the transaction back: the server transaction is gone
+        var loader = new BulkLoader(task, new TransferOptions { ErrorMode = "skip", FireTriggers = true });
+        TransferException? failure = null;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            try { await loader.LoadAsync(scope, table, allowRestart: false, progress: null, default); }
+            catch (TransferException ex) { failure = ex; }
+        }
+        Assert.Equal("tx_ended", failure?.Code);
+        // Harm: the restore is issued on the transaction the server already destroyed, so it fails every time and the caller's
+        // own long-lived connection silently loses the XACT_ABORT it chose.
+        await using var probe = new SqlCommand("SELECT CAST(@@OPTIONS & 16384 AS int)", conn);
+        Assert.NotEqual(0, (int)(await probe.ExecuteScalarAsync())!);
+    }
+
+    [Fact]
+    public async Task A_chunk_whose_every_row_fails_with_the_same_error_fails_the_task_instead_of_rejecting_every_row()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        var loader = new BulkLoader(TaskFor(), new TransferOptions { ErrorMode = "skip" });
+        ChunkOutcome? outcome = null;
+        TransferException? failure = null;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            try { outcome = await loader.LoadAsync(scope, Rows(8, (i, v) => v[1] = 99), true, null, default); }
+            catch (TransferException ex) { failure = ex; }
+        }
+        // Harm: a customer's whole table shredded into error rows and the run reported as "completed with N rejected".
+        Assert.True(outcome is null, $"every row failed for the same reason, and the chunk still reported {outcome?.Failed.Count} rejected rows");
+        Assert.Equal("bad_task", failure?.Code);
+        Assert.Contains("FK_C_P", failure!.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_broken_MergeSql_fails_the_task_instead_of_rejecting_every_row()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        var task = TaskFor("staging_merge");
+        task.MergeSql = "INSERT dbo.C (pid, qty, note, at) SELECT Pid, Qty, Note, nonexistent_col FROM #stg;";
+        var loader = new BulkLoader(task, new TransferOptions { ErrorMode = "skip" });
+        ChunkOutcome? outcome = null;
+        TransferException? failure = null;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            try { outcome = await loader.LoadAsync(scope, Rows(8), true, null, default); }
+            catch (TransferException ex) { failure = ex; }
+        }
+        // Harm: the broken merge is re-run once per bisection node and every good row is reported rejected.
+        Assert.True(outcome is null, $"a broken MergeSql was reported as {outcome?.Failed.Count} rejected rows");
+        Assert.Equal("bad_task", failure?.Code);
+        Assert.Contains("nonexistent_col", failure!.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_chunk_whose_rows_fail_for_different_reasons_still_returns_rejected_rows()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        var loader = new BulkLoader(TaskFor(), new TransferOptions { ErrorMode = "skip" });
+        // Every row is bad, but two break the foreign key and two break the check constraint: that is data, not a plan defect.
+        var rows = Rows(4, (i, v) => { if (i < 2) v[1] = 99; else v[2] = 0; });
+        ChunkOutcome? outcome = null;
+        TransferException? failure = null;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            try { outcome = await loader.LoadAsync(scope, rows, true, null, default); }
+            catch (TransferException ex) { failure = ex; }
+        }
+        Assert.True(failure is null, $"rows failing for different reasons were reported as a task defect: {failure?.Message}");
+        Assert.Equal(4, outcome!.Failed.Count);
+        Assert.Equal(0, outcome.Loaded);
+    }
+
+    [Fact]
+    public async Task One_source_column_bound_to_two_target_scales_gives_each_target_its_own_CAST()
+    {
+        await using var db = await TempDatabase.CreateAsync("dbm_bulk");
+        await db.ExecAsync("""
+            CREATE TABLE dbo.S (k int NOT NULL PRIMARY KEY, v datetime2(7) NOT NULL);
+            INSERT dbo.S VALUES (1, '2020-01-01T10:00:00.9974999');
+            CREATE TABLE dbo.D (k int NOT NULL PRIMARY KEY, coarse datetime2(0) NULL, fine datetime2(7) NULL);
+            """);
+        await using var conn = new SqlConnection(db.ConnectionString);
+        await conn.OpenAsync();
+        foreach (var order in new[] { new[] { "coarse", "fine" }, new[] { "fine", "coarse" } })
+        {
+            await db.ExecAsync("DELETE dbo.D;");
+            var task = new TaskPlan
+            {
+                Target = "dbo.D", SourceQuery = "SELECT k, v FROM dbo.S", KeyColumns = ["k"],
+                Columns = [new("k", "k"), new("v", order[0]), new("v", order[1])],
+            };
+            var shape = await TargetShape.LoadAsync(conn, task.Target, default);
+            DataTable table;
+            await using (var cmd = new SqlCommand(task.SourceQuery, conn))
+            await using (var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SequentialAccess))
+            {
+                table = ChunkReader.NewTable(reader);
+                Assert.Equal(1, await ChunkReader.FillAsync(reader, table, 10, default));
+            }
+            shape.Normalize(table, task.Columns);
+            await using (var scope = await TxScope.BeginAsync(conn, default))
+            {
+                var outcome = await new BulkLoader(task, new TransferOptions { ErrorMode = "stop" }).LoadAsync(scope, table, true, null, default);
+                Assert.Empty(outcome.Failed);
+                await scope.CommitAsync(default);
+            }
+            // Harm: Normalize rounded the shared source column in place, so whichever binding ran first decided both targets
+            // and the finer one silently lost its fraction.
+            var diff = await db.ScalarAsync<string>("""
+                SELECT COALESCE(STRING_AGG(CONCAT('coarse=', CONVERT(varchar(30), d.coarse, 121), ' (CAST ', CONVERT(varchar(30), CAST(s.v AS datetime2(0)), 121),
+                  '), fine=', CONVERT(varchar(30), d.fine, 121), ' (CAST ', CONVERT(varchar(30), CAST(s.v AS datetime2(7)), 121), ')'), ' ; '), '')
+                FROM dbo.S AS s JOIN dbo.D AS d ON d.k = s.k
+                WHERE d.coarse <> CAST(s.v AS datetime2(0)) OR d.fine <> CAST(s.v AS datetime2(7))
+                """);
+            Assert.True(diff.Length == 0, $"bindings in order {order[0]}, {order[1]}: {diff}");
+            Assert.Equal(1L, await db.CountAsync("dbo.D"));
+        }
+    }
+
+    [Fact]
+    public async Task Progress_reports_only_rows_that_survived_the_attempt()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        const int N = 6000;   // more than NotifyAfter, so the whole-chunk attempt reports before it fails
+        var loader = new BulkLoader(TaskFor(), new TransferOptions { ErrorMode = "skip" });
+        var reported = new List<long>();
+        ChunkOutcome outcome;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            outcome = await loader.LoadAsync(scope, Rows(N, (i, v) => { if (i == N - 1) v[3] = "far too long!!"; }),
+                allowRestart: true, progress: v => { lock (reported) reported.Add(v); }, default);
+            await scope.CommitAsync(default);
+        }
+        long[] seen;
+        lock (reported) seen = [.. reported];
+        Assert.Equal(N - 1, outcome.Loaded);
+        Assert.Equal((long)(N - 1), await db.CountAsync("dbo.C"));
+        // Harm: the whole-chunk attempt notified 5000 rows copied and was then rolled back to the savepoint, leaving the caller
+        // believing rows were loaded that no longer exist -- and it was never told anything again.
+        Assert.True(seen.Length > 0, "the caller was told no progress at all");
+        Assert.True(seen.Contains(0L), "the rolled-back first attempt was never retracted: " + string.Join(",", seen));
+        Assert.True(seen[^1] == outcome.Loaded, $"the caller's last progress was {seen[^1]} while {outcome.Loaded} rows survived");
+        Assert.True(seen.All(v => v <= outcome.Loaded), $"progress reported {seen.Max()} rows while only {outcome.Loaded} survived");
+    }
+
+    [Fact]
+    public async Task Stop_mode_says_how_many_rows_it_was_handed_so_the_unaccounted_ones_are_visible()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        var loader = new BulkLoader(TaskFor(), new TransferOptions { ErrorMode = "stop" });
+        ChunkOutcome outcome;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            outcome = await loader.LoadAsync(scope, Rows(20, Spoil), true, null, default);
+            await scope.CommitAsync(default);   // the misuse the type has to make visible: 5.3 rolls back here, a later caller may not
+        }
+        // Harm: 20 rows handed over, Loaded=3 Failed=1, 16 rows in neither list, and the result looks successful.
+        Assert.Equal(3, outcome.Loaded);
+        Assert.Single(outcome.Failed);
+        Assert.Equal(20L, outcome.Attempted);
+        Assert.True(outcome.Loaded + outcome.Failed.Count < outcome.Attempted,
+            $"the outcome accounts for every one of the {outcome.Attempted} rows, so nothing is being lost here");
+        Assert.Equal(3L, await db.CountAsync("dbo.C"));
+    }
+
+    [Fact]
+    public async Task A_binding_to_a_column_the_target_does_not_have_is_refused_before_a_row_is_attempted()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        var task = TaskFor();
+        task.Columns = [.. task.Columns, new ColumnBinding("Note", "nonexistent_col")];
+        var loader = new BulkLoader(task, new TransferOptions { ErrorMode = "skip" }, await TargetShape.LoadAsync(conn, task.Target, default));
+        var touched = new List<long>();
+        ChunkOutcome? outcome = null;
+        TransferException? refused = null;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            try
+            {
+                outcome = await loader.LoadAsync(scope, Rows(8), true, v => { lock (touched) touched.Add(v); }, default);
+                await scope.CommitAsync(default);
+            }
+            catch (TransferException ex) { refused = ex; }
+        }
+        // Harm: SqlBulkCopy rejects every row on the mapping, so a one-character typo in a target column name turns a customer's
+        // table into error rows reported as "completed with 8 rejected".
+        Assert.True(outcome is null, $"a plan defect was reported as {outcome?.Failed.Count} rejected rows");
+        Assert.True(touched.Count == 0, $"the chunk was attempted {touched.Count} times before the binding was checked");
+        Assert.Equal("bad_task", refused?.Code);
+        Assert.Contains("nonexistent_col", refused!.Details);
+        Assert.Equal(0L, await db.CountAsync("dbo.C"));
+    }
+
+    [Fact]
+    public async Task A_binding_to_an_identity_column_without_identityInsert_is_refused_instead_of_renumbering_the_rows()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        var task = TaskFor();
+        task.IdentityInsert = false;
+        var loader = new BulkLoader(task, new TransferOptions { ErrorMode = "skip" }, await TargetShape.LoadAsync(conn, task.Target, default));
+        ChunkOutcome? outcome = null;
+        TransferException? refused = null;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            try
+            {
+                outcome = await loader.LoadAsync(scope, Rows(4), true, null, default);
+                await scope.CommitAsync(default);
+            }
+            catch (TransferException ex) { refused = ex; }
+        }
+        // Harm: source ids 100..103 land as 1, 2, 3, 4 with Loaded=4, Failed=0 and no warning; every foreign key pointing at
+        // those ids now points somewhere else.
+        Assert.Equal(0, await db.ScalarAsync<int>("SELECT COUNT(*) FROM dbo.C WHERE id BETWEEN 1 AND 4"));
+        Assert.True(outcome is null, $"the rows were renumbered and reported as {outcome?.Loaded} loaded");
+        Assert.Equal("bad_task", refused?.Code);
+        Assert.Contains("id", refused!.Details);
+        Assert.Contains("identityInsert", refused.Message, StringComparison.Ordinal);   // and the way out
+        Assert.Contains("drop the binding", refused.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_merge_that_moved_no_rows_can_be_seen_in_the_outcome()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        var task = TaskFor("staging_merge");
+        task.MergeSql = "SET IDENTITY_INSERT dbo.C ON; INSERT dbo.C (id, pid, qty, note, at) SELECT Id, Pid, Qty, Note, At FROM #stg WHERE 1 = 0; SET IDENTITY_INSERT dbo.C OFF;";
+        ChunkOutcome staged, direct;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            staged = await new BulkLoader(task, new TransferOptions { ErrorMode = "skip" }).LoadAsync(scope, Rows(4), true, null, default);
+            await scope.CommitAsync(default);
+        }
+        // Harm: ExecuteNonQuery's count was discarded, so a merge that moved nothing was indistinguishable from one that worked.
+        Assert.Equal(4, staged.Loaded);
+        Assert.Equal(0L, await db.CountAsync("dbo.C"));
+        Assert.Equal(0L, staged.MergeRowsAffected);
+
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            direct = await new BulkLoader(TaskFor(), new TransferOptions { ErrorMode = "skip" }).LoadAsync(scope, Rows(4), true, null, default);
+            await scope.CommitAsync(default);
+        }
+        Assert.Equal(4, direct.Loaded);
+        Assert.Null(direct.MergeRowsAffected);   // no MergeSql: nothing to report, not "moved nothing"
     }
 }
