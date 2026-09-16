@@ -92,14 +92,29 @@ internal sealed class TaskRunner(RunContext rc)
     /// <summary>
     /// Test seam. Invoked with (taskId, chunkNo) at the one instant that defines chunk atomicity: the chunk's rows and its checkpoint
     /// have both just become durable, or neither has. A test throws here to stage a crash in exactly that window, so that a checkpoint
-    /// written outside the chunk transaction shows up as a chunk loaded twice on resume. <b>Nothing may be inserted between
-    /// <c>scope.CommitAsync</c> and the call to this hook</b> - that gap is the thing being pinned. Null in production, and held in an
+    /// written outside the chunk transaction shows up as a chunk loaded twice on resume. Ruling 114: this is raised from inside
+    /// <see cref="TxScope.CommitAsync(CancellationToken, Func{CancellationToken, Task})"/>, on the statement after the COMMIT, so the
+    /// rule this used to state as a comment - that nothing may come between the commit and the seam - is now a property of the code
+    /// rather than a request to the next reader: the callback is the expression <c>_ =&gt; RaiseAfterChunk(id, next.ChunkNo)</c>, so
+    /// <c>RunKeyedAsync</c> has no statement position between the two at all. Null in production, and held in an
     /// <see cref="AsyncLocal{T}"/> so one test's seam cannot reach another test's run.
     /// </summary>
     internal static Action<string, int>? AfterChunkTransaction
     {
         get => AfterChunkTransactionHook.Value;
         set => AfterChunkTransactionHook.Value = value;
+    }
+
+    /// <summary>
+    /// The seam's whole body, so that the callback <c>RunKeyedAsync</c> hands to <c>CommitAsync</c> is a single expression and there is
+    /// no statement position anywhere in the chunk loop between the COMMIT and the raise (ruling 114). What is left of the gap is this
+    /// method's own body - and a write put here would have to be given the connection, the run id and the checkpoint as new parameters
+    /// first, which is a change to the seam's signature rather than a line moved past a comment.
+    /// </summary>
+    private static Task RaiseAfterChunk(string taskId, int chunkNo)
+    {
+        AfterChunkTransaction?.Invoke(taskId, chunkNo);
+        return Task.CompletedTask;
     }
 
     internal sealed record ErrorRecord(string? Key, string Row, string Error);
@@ -231,10 +246,11 @@ internal sealed class TaskRunner(RunContext rc)
                 next = new Checkpoint(cp.ChunkNo + 1, KeyCodec.Encode(newLast), cp.RowsDone + outcome.Loaded,
                     cp.RowsError + outcome.Failed.Count, lastChunk);
                 await ControlTable.UpsertAsync(scope.Connection, scope.Tx, rc.RunId, id, next, ct);
-                await scope.CommitAsync(ct);
-                // The chunk's rows and its checkpoint are now both durable, or neither is. See AfterChunkTransaction: nothing may go
-                // between the commit above and this line, because that gap is exactly what the seam exists to pin.
-                AfterChunkTransaction?.Invoke(id, next.ChunkNo);
+                // Ruling 114: the seam is raised from inside CommitAsync, on the statement after the COMMIT, rather than on the line
+                // after this one. The instant it fires is the instant the chunk's rows and its checkpoint are both durable or neither
+                // is. The callback is an expression, not a block, so this loop has no statement position between the two at all - the
+                // rule the old comment here asked the next reader to keep is now something the shape of the code keeps for them.
+                await scope.CommitAsync(ct, _ => RaiseAfterChunk(id, next.ChunkNo));
             }
 
             cp = next;
