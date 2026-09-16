@@ -136,4 +136,24 @@ public sealed class TaskRunnerTests
         TaskRunner.CheckAccounted("T02", 7, new ChunkOutcome(19, [new RowFailure(4, "bad")], 0)
             { Attempted = 20, MergeStatus = MergeStatus.NotApplicable });
     }
+
+    /// <summary>
+    /// Ruling 89 in the operator's log line: a null merge count means three different things and only <c>MergeStatus</c> says which.
+    /// The harm this pins is the sentence the runner used to write for a merge that never ran - "the merge reported no row count",
+    /// which reads as a merge that executed and stayed quiet - and, on the other side, the false "merge affected 0" a status-blind
+    /// reader produces for a task whose merge never ran at all.
+    /// </summary>
+    [Fact]
+    public void The_merge_note_is_chosen_by_the_status_not_by_the_count()
+    {
+        Assert.Equal("", TaskRunner.MergeNote(MergeStatus.NotApplicable, null));
+        Assert.Equal("", TaskRunner.MergeNote(MergeStatus.NotApplicable, 0L));       // a count beside "no merge" is still no sentence
+
+        Assert.Equal(", the merge did not run", TaskRunner.MergeNote(MergeStatus.DidNotRun, null));
+        Assert.Equal(", the merge did not run", TaskRunner.MergeNote(MergeStatus.DidNotRun, 0L));   // never "merge affected 0"
+
+        Assert.Equal(", merge affected 0", TaskRunner.MergeNote(MergeStatus.Ran, 0L));   // 0 from a merge that ran is a real count
+        Assert.Equal(", merge affected 1,234", TaskRunner.MergeNote(MergeStatus.Ran, 1234L));
+        Assert.Equal(", the merge ran and reported no row count", TaskRunner.MergeNote(MergeStatus.Ran, null));
+    }
 }

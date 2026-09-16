@@ -243,10 +243,11 @@ internal sealed class TaskRunner(RunContext rc)
             Mirror(id, cp);
             rc.Control.OnChunkCommitted(new ChunkCommit(id, task.Target, cp.ChunkNo, cp.RowsDone, cp.RowsError)
             {
+                MergeStatus = outcome.MergeStatus,      // ruling 89: the status the loader reported, not one inferred from the count
                 MergeRowsAffected = outcome.MergeRowsAffected,
             });
             rc.Log("info", $"{id} {task.Target}: chunk {cp.ChunkNo} committed ({cp.RowsDone:N0} rows, {cp.RowsError:N0} rejected"
-                + MergeNote(task, outcome.MergeRowsAffected) + ")", persist: false);
+                + MergeNote(outcome.MergeStatus, outcome.MergeRowsAffected) + ")", persist: false);
             if (lastChunk) return new Pass(TransferTaskStatus.Done, cp);
         }
     }
@@ -261,7 +262,12 @@ internal sealed class TaskRunner(RunContext rc)
         await using var scope = await TxScope.BeginAsync(tgt, ct);
         long loaded = 0, rejected = 0;
         int chunks = 0;
-        long? merged = string.IsNullOrWhiteSpace(task.MergeSql) ? null : 0L;
+        // Ruling 89: the status is the authority and the count is only ever read through it. Seeded from the task so that a keyless
+        // task whose source returned no rows at all - no chunk, so no outcome to read - reports "the merge did not run" instead of the
+        // false "merge affected 0" that an accumulator starting at zero used to produce.
+        var mergeStatus = string.IsNullOrWhiteSpace(task.MergeSql) ? MergeStatus.NotApplicable : MergeStatus.DidNotRun;
+        long mergedTotal = 0;
+        bool mergeCountUnknown = false;
         var errors = new List<ErrorRecord>();
         while (true)
         {
@@ -289,12 +295,18 @@ internal sealed class TaskRunner(RunContext rc)
             loaded += outcome.Loaded;
             rejected += outcome.Failed.Count;
             chunks++;
-            if (merged is not null || !string.IsNullOrWhiteSpace(task.MergeSql))
-                merged = merged is long s && outcome.MergeRowsAffected is long m ? s + m : null;
+            if (outcome.MergeStatus == MergeStatus.Ran)
+            {
+                // Sum only over the chunks whose merge actually ran. One that ran and reported no count makes the task's total unknown;
+                // a chunk whose merge did not run contributes nothing and must not be read as a zero.
+                mergeStatus = MergeStatus.Ran;
+                if (outcome.MergeRowsAffected is long m) mergedTotal += m; else mergeCountUnknown = true;
+            }
             errors.AddRange(Capture(task, table, outcome.Failed, null));
             rc.Progress.InFlight(id, loaded);
             if (n < chunkSize) break;
         }
+        long? merged = mergeStatus == MergeStatus.Ran && !mergeCountUnknown ? mergedTotal : null;
         var done = new Checkpoint(chunks, null, loaded, rejected, true);
         await ControlTable.UpsertAsync(scope.Connection, scope.Tx, rc.RunId, id, done, ct);
         await scope.CommitAsync(ct);
@@ -302,22 +314,26 @@ internal sealed class TaskRunner(RunContext rc)
         Mirror(id, done);
         rc.Control.OnChunkCommitted(new ChunkCommit(id, task.Target, done.ChunkNo, done.RowsDone, done.RowsError)
         {
+            MergeStatus = mergeStatus,
             MergeRowsAffected = merged,
         });
         rc.Log("info", $"{id} {task.Target}: committed in one transaction ({done.RowsDone:N0} rows, {done.RowsError:N0} rejected"
-            + MergeNote(task, merged) + ")", persist: false);
+            + MergeNote(mergeStatus, merged) + ")", persist: false);
         return new Pass(TransferTaskStatus.Done, done);
     }
 
     /// <summary>
     /// Ruling 73/74: the merge count is reported, never judged - a custom merge may legitimately filter, and T5.4's row-count and
-    /// checksum validation is the net. What it must not do is read as 0 when nobody counted: a task with no MergeSql says nothing, and
-    /// a merge that reported no count says that instead of a number.
+    /// checksum validation is the net. What it must not do is read as 0 when nobody counted, so per ruling 89 the sentence is chosen by
+    /// <see cref="ChunkOutcome.MergeStatus"/> and never inferred from the count: a null count means "no merge in this mode", "it never
+    /// ran" or "it ran and reported nothing", which are three different things, and only the status can tell them apart.
     /// </summary>
-    private static string MergeNote(TaskPlan task, long? mergeRows)
-        => string.IsNullOrWhiteSpace(task.MergeSql) ? ""
-            : mergeRows is long m ? $", merge affected {m:N0}"
-            : ", the merge reported no row count";
+    internal static string MergeNote(MergeStatus status, long? mergeRows) => status switch
+    {
+        MergeStatus.NotApplicable => "",
+        MergeStatus.DidNotRun => ", the merge did not run",
+        _ => mergeRows is long m ? $", merge affected {m:N0}" : ", the merge ran and reported no row count",
+    };
 
     /// <summary>
     /// A contract assertion, not a guard with a route behind it (ruling 104). Rulings 73/74 state that
