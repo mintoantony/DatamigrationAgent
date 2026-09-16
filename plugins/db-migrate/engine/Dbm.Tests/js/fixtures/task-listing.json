@@ -1,49 +1,3 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 {
   "about": "Shared by Unit/SqlGen/TaskListingMirrorTests.cs (C# TaskListing.Build, SqlModule.ParseAnchor) and js/sql-view.test.cjs (DBM.sqlView.listing, parseAnchor). Each side asserts the SAME expected values, so a drift in either implementation fails that side's suite. Add a case here, never to one side only. The 'globalCard' array pins the OTHER numbering rule (the global pre/post card); see 'globalCardAbout'.",
   "listing": [
@@ -208,7 +162,7 @@
     { "anchor": "tablemap:app.Orders", "task": null, "line": null }
   ]
   ,
-  "globalCardAbout": "The GLOBAL pre/post card is numbered by a different path than a task listing: views/sql.js globalCard renders codeBlock(joinStatements(list)), so the card is ONE block whose line N is the Nth line of the statements joined by a line containing GO. js/sql-view.test.cjs asserts lineCount and crLines against the shipped joinStatements and cardLines; Unit/SqlGen/TaskListingMirrorTests.cs asserts the same two against TaskListing.Build of the joined text, and 'reported' against SqlValidator.FindBareCarriageReturns. crLines = card lines whose text holds a lone CR; reported = the lines the engine reports, one per lone CR in the statements. They differ only where a case says so.",
+  "globalCardAbout": "The GLOBAL pre/post card is numbered by a different path than a task listing: views/sql.js globalCard renders codeBlock(joinStatements(list)), so the card is ONE block whose line N is the Nth line of the statements joined by a line containing GO. js/sql-view.test.cjs asserts lineCount and crLines against the shipped joinStatements and cardLines; Unit/SqlGen/TaskListingMirrorTests.cs asserts the same two against TaskListing.Build of the joined text, and 'reported' against SqlValidator.FindBareCarriageReturns. crLines = card lines whose text holds a lone CR; reported = the lines the engine reports, one per lone CR in the statements. They differ only where a case says so. NOTE: 'reported' is asserted against the engine on the C# side ONLY — the JS half cannot compute the engine's answer, so it holds 'reported' to an envelope (one entry per lone CR, every entry a real card line, every CR the card SHOWS reported) and a wrong 'reported' that stays inside that envelope reddens C# alone.",
   "globalCard": [
     {
       "name": "five edges in one card: a bare CR, an empty statement, CRLF before a bare CR, a trailing newline, a trailing CR last",

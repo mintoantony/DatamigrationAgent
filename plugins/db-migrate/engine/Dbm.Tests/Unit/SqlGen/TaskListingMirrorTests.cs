@@ -43,6 +43,16 @@ public sealed class TaskListingMirrorTests
         Assert.Equal(File.ReadAllBytes(source!), File.ReadAllBytes(FixturePath));
     }
 
+    /// <summary>Ruling 94. Both parsers skip leading whitespace, so editing damage at the head of this file — 46 blank lines were
+    /// prepended once, by a shell, and neither suite noticed — changes the authority two implementations read while every test
+    /// stays green. Its first byte is <c>{</c>: no BOM, no blank lines, nothing before the object.</summary>
+    [Fact]
+    public void Fixture_starts_with_its_opening_brace()
+    {
+        var bytes = File.ReadAllBytes(FixturePath);
+        Assert.Equal((byte)'{', Assert.Single(bytes.Take(1)));
+    }
+
     public static IEnumerable<object[]> ListingCases() =>
         Fixture().GetProperty("listing").EnumerateArray().Select(c => new object[] { c.GetProperty("name").GetString()! });
 

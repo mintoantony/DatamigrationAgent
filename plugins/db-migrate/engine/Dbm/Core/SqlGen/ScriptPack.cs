@@ -76,11 +76,18 @@ public static class ScriptPack
         var width = Math.Max(2, (slots.Count + 1).ToString(CultureInfo.InvariantCulture).Length);
         var preName = new string('0', width) + "_pre.sql";
         var postName = new string('9', width) + "_post.sql";
+        // Ruling 96: bare carriage returns are DERIVED here, exactly as SqlModule.ApprovalBlockers derives them, never read from
+        // stored evidence alone. Nothing on the export path checks approval, so a version stored without the scan would otherwise
+        // export a pack that says nothing at all while shipping the hidden statement verbatim. The scan is pure and offline.
+        var derived = SqlValidator.FindBareCarriageReturns(plan);
+        var planErrors = WithDerived(plan.Errors, derived, "plan");
+        var errorsOf = slots.Where(s => s.Known).ToDictionary(s => s.Id, s => WithDerived(plan.Tasks[s.Id].Errors, derived, s.Id), StringComparer.Ordinal);
+
         // "T04 (app.Addresses): 9 error(s)" per errored task, in pack-file order: enough to triage, while the error text itself
         // stays in the task file.
-        var taskErrors = slots.Where(s => s.Known && plan.Tasks[s.Id].Errors.Count > 0)
-            .Select(s => FormattableString.Invariant($"{s.Id} ({plan.Tasks[s.Id].Target}): {plan.Tasks[s.Id].Errors.Count} error(s)")).ToList();
-        var notes = new PackNotes { Problems = problems, NotValidated = notValidated, PlanErrors = plan.Errors, TaskErrors = taskErrors };
+        var taskErrors = slots.Where(s => s.Known && errorsOf[s.Id].Count > 0)
+            .Select(s => FormattableString.Invariant($"{s.Id} ({plan.Tasks[s.Id].Target}): {errorsOf[s.Id].Count} error(s)")).ToList();
+        var notes = new PackNotes { Problems = problems, NotValidated = notValidated, PlanErrors = planErrors, TaskErrors = taskErrors };
         var files = new List<(string, string)> { (preName, GlobalFile(projectName, preName, "pre-load", "before the first task", plan.PreSql, notes)) };
         var index = new List<(string File, string Id, TaskPlan Task)>();
         for (var i = 0; i < slots.Count; i++)
@@ -89,7 +96,7 @@ public static class ScriptPack
             var id = slots[i].Id;
             var task = plan.Tasks[id];
             var name = $"{(i + 1).ToString("D" + width.ToString(CultureInfo.InvariantCulture), CultureInfo.InvariantCulture)}_{FileSafe(task.Target.Replace('.', '_'))}.sql";
-            files.Add((name, TaskFile(projectName, id, task)));
+            files.Add((name, TaskFile(projectName, id, task, errorsOf[id])));
             index.Add((name, id, task));
         }
         files.Add((postName, GlobalFile(projectName, postName, "post-load", "after the last task", plan.PostSql, PackNotes.None)));
@@ -142,7 +149,16 @@ public static class ScriptPack
         return sb.ToString();
     }
 
-    static string TaskFile(string project, string id, TaskPlan t)
+    /// <summary>Stored lines, then every derived line of that scope the stored ones do not already record. Duplicates among the
+    /// derived lines are kept: two carriage returns on one line are two occurrences, and <see cref="SqlModule.ApprovalBlockers"/>
+    /// counts them the same way.</summary>
+    static List<string> WithDerived(List<string> stored, List<(string Scope, string Line)> derived, string scope)
+    {
+        var listed = new HashSet<string>(stored, StringComparer.Ordinal);
+        return [.. stored, .. derived.Where(f => f.Scope == scope && !listed.Contains(f.Line)).Select(f => f.Line)];
+    }
+
+    static string TaskFile(string project, string id, TaskPlan t, List<string> errors)
     {
         var sb = new StringBuilder();
         sb.Append(Rule).Append('\n');
@@ -154,7 +170,7 @@ public static class ScriptPack
         Comment(sb, $"Chunk size:      {(t.ChunkSize?.ToString(CultureInfo.InvariantCulture) ?? "run default")}");
         Comment(sb, $"Custom SQL:      {(t.Custom ? "yes" : "no")}");
         AppendList(sb, "Warnings", t.Warnings);
-        AppendList(sb, "Errors (last validation)", t.Errors);
+        AppendList(sb, "Errors (last validation)", errors);
         sb.Append(Rule).Append("\n\n");
 
         if (t.PreSql.Count > 0)
