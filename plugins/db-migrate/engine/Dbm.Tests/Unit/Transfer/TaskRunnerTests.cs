@@ -126,12 +126,14 @@ public sealed class TaskRunnerTests
     [Fact]
     public void The_accounting_contract_assertion_names_the_rows_that_are_in_neither_list()
     {
-        var short_ = new ChunkOutcome(4, [new RowFailure(4, "bad")], 0) { Attempted = 20 };
+        var short_ = new ChunkOutcome(4, [new RowFailure(4, "bad")], 0)
+            { Attempted = 20, MergeStatus = MergeStatus.NotApplicable };   // a direct task: there was never a merge to run
         var ex = Assert.Throws<TransferException>(() => TaskRunner.CheckAccounted("T02", 7, short_));
         Assert.Equal("rows_unaccounted", ex.Code);
         Assert.Contains("15", ex.Message);      // 20 handed over, 5 accounted for, 15 nobody knows about
         Assert.Contains("T02", ex.Message);
 
-        TaskRunner.CheckAccounted("T02", 7, new ChunkOutcome(19, [new RowFailure(4, "bad")], 0) { Attempted = 20 });
+        TaskRunner.CheckAccounted("T02", 7, new ChunkOutcome(19, [new RowFailure(4, "bad")], 0)
+            { Attempted = 20, MergeStatus = MergeStatus.NotApplicable });
     }
 }

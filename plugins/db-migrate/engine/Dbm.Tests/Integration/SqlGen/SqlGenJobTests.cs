@@ -43,6 +43,49 @@ public sealed class SqlGenJobTests
         Assert.Contains(log, l => l.StartsWith("sqlgen: 6 task(s) generated", StringComparison.Ordinal));
     }
 
+    /// <summary>H1: an offline sqlgen draft records, in the stored plan, that nothing validated it — and that blocks approval.</summary>
+    [Fact]
+    public async Task Offline_job_stores_the_not_validated_marker()
+    {
+        using var project = TempProject.Create();
+        Prepare(project.Services);
+
+        var result = await new SqlGenJob().RunAsync(Ctx(project.Services, new List<string>()), CancellationToken.None);
+
+        const string marker = "live validation skipped: source connection, target connection missing";
+        Assert.Contains(marker, Json.FromNode<SqlPlanPayload>(result.DraftPayload!).Warnings);
+        var ctx = new Dbm.Core.Workflow.ModuleContext
+        {
+            Services = project.Services, OpenFeedback = [],
+            Current = project.Services.Artifacts.Add(PhaseName.Sql, 0, result.DraftPayload!.ToJsonString(), "script", "draft"),
+        };
+        Assert.Contains(SqlModule.NotValidatedBlocker + marker, new SqlModule().ApprovalBlockers(ctx, result.DraftPayload!));
+    }
+
+    /// <summary>Ruling 57: generated output does not pass through SqlModule.Validate before it is stored, so the job records the
+    /// bare-CR check itself. Here the CR arrives through carried-over custom SQL.</summary>
+    [Fact]
+    public async Task Job_records_a_bare_carriage_return_in_carried_over_sql()
+    {
+        using var project = TempProject.Create();
+        var s = project.Services;
+        Prepare(s);
+        var previous = SqlGenerator.Generate(SampleMappings.Approved(), SampleCatalogs.Source(), SampleCatalogs.Target());
+        var orders = previous.Tasks.Single(kv => kv.Value.Target == "app.Orders").Key;
+        previous.Tasks[orders].Custom = true;
+        previous.Tasks[orders].PreSql.Insert(0, "-- note\rDELETE FROM app.Customers");
+        s.Artifacts.Add(PhaseName.Sql, s.Artifacts.NextVersion(PhaseName.Sql), Json.Serialize(previous), "agent", "custom");
+
+        var result = await new SqlGenJob().RunAsync(Ctx(s, new List<string>()), CancellationToken.None);
+
+        var plan = Json.FromNode<SqlPlanPayload>(result.DraftPayload!);
+        var task = plan.Tasks.Single(kv => kv.Value.Target == "app.Orders");
+        Assert.Equal("-- note\rDELETE FROM app.Customers", task.Value.PreSql[0]);
+        const string line = "preSql[0]: bare carriage return at line 1 (SQL Server treats it as a line break; use CRLF or LF)";
+        Assert.Equal([line], task.Value.Errors);
+        Assert.Contains(", 1 errors,", result.Summary);
+    }
+
     [Fact]
     public async Task Job_requires_an_approved_mapping()
     {

@@ -44,13 +44,20 @@ public sealed class TargetShape(string target, IReadOnlyList<TargetColumn> colum
         return new TargetShape(targetKey, cols);
     }
 
+    /// <summary>The namespace <see cref="Normalize"/> writes its own columns in. <c>BulkLoader</c> refuses a task that binds a column
+    /// here, because <see cref="Normalize"/> would overwrite it before the load.</summary>
+    public const string NormalizedPrefix = "__dbm_n_";
+
     /// <summary>The column <see cref="Normalize"/> writes one binding's rounded values into, and the column <c>BulkLoader</c> maps that
     /// binding from when the table has it. One per binding, because one source column can be bound to two targets of different scale and
     /// rounding it in place would give the finer target the coarser target's value.</summary>
+    /// <remarks>The source's length goes in front of it, so the name is unique for each binding: without it ("A", "X-&gt;Y") and
+    /// ("A-&gt;X", "Y") produce one column, and the two bindings overwrite each other's rounded values.</remarks>
     public static string NormalizedColumn(ColumnBinding binding)
     {
         ArgumentNullException.ThrowIfNull(binding);
-        return $"__dbm_n_{binding.Source}->{binding.Target}";
+        return string.Create(CultureInfo.InvariantCulture,
+            $"{NormalizedPrefix}{binding.Source.Length}_{binding.Source}->{binding.Target}");
     }
 
     /// <summary>Rounds bound datetime2/datetimeoffset/time values to the target scale, and smalldatetime values to the minute, exactly like

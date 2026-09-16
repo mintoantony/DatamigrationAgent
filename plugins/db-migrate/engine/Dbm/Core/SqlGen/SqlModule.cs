@@ -13,7 +13,9 @@ namespace Dbm.Core.SqlGen;
 public sealed class SqlModule : IPhaseModule
 {
     static readonly TimeSpan LiveTimeout = TimeSpan.FromMinutes(3);
-    public const string SkippedWarning = "live validation skipped: connections or target catalog missing";
+
+    /// <summary>ApprovalBlockers line for a plan whose stored warnings record that live validation did not run.</summary>
+    public const string NotValidatedBlocker = "plan is not validated: ";
 
     public PhaseName Phase => PhaseName.Sql;
     public string Agent => "sql-engineer";
@@ -102,7 +104,12 @@ public sealed class SqlModule : IPhaseModule
     }
 
     /// <summary>Normalises <paramref name="payload"/> IN PLACE (Custom flags, CountSql, validation results): WorkflowEngine.Apply
-    /// stores this same node, so a copy would silently lose the flags.</summary>
+    /// stores this same node, so a copy would silently lose the flags.
+    /// <para>The patch surface may write SQL, never validation evidence: a payload that changes <c>errors</c>, <c>warnings</c>
+    /// (plan or task) or <c>custom</c> against the base is rejected before anything is normalised. The engine then writes its own
+    /// lines — including, when live validation cannot run, the stored <see cref="SqlPlanSource.SkippedPrefix"/> marker that blocks
+    /// approval (re-derived on every run: added offline, removed live), and, on every run, the bare-CR errors
+    /// (<see cref="SqlValidator.RecordBareCarriageReturns"/>).</para></summary>
     public PayloadCheck Validate(ModuleContext ctx, JsonNode payload)
     {
         ArgumentNullException.ThrowIfNull(ctx);
@@ -114,35 +121,88 @@ public sealed class SqlModule : IPhaseModule
         if (StructureErrors(plan) is { Count: > 0 } structure) return new PayloadCheck(structure, []);
         SqlPlanPayload? basePlan = null;
         try { basePlan = Json.Deserialize<SqlPlanPayload>(ctx.Current.PayloadJson); } catch (JsonException) { }
+        if (EngineOwnedChanges(plan, basePlan) is { Count: > 0 } owned) return new PayloadCheck(owned, []);
 
         foreach (var (id, task) in plan.Tasks)
         {
             var before = basePlan?.Tasks.GetValueOrDefault(id);
-            if (before is null || SqlChanged(task, before)) task.Custom = true;
+            task.Custom = before is null || before.Custom || SqlChanged(task, before);
             task.CountSql = SqlGenerator.CountSql(task.SourceQuery);
         }
 
-        var errors = new List<string>();
-        var warnings = new List<string>();
-        if (SqlPlanSource.CanValidate(ctx.Services))
+        var errors = plan.OrderProblems();
+        // Ruling 63: a removed task's evidence does not vanish with it. Engine-authored, so written after the ownership check.
+        var warnings = RemovedTaskEvidence(plan, basePlan);
+        plan.Warnings.AddRange(warnings);
+        var skipped = SqlPlanSource.SkippedWarning(ctx.Services);
+        if (skipped is null)
         {
             using var cts = new CancellationTokenSource(LiveTimeout);
             var report = SqlPlanSource.ValidateLiveAsync(ctx.Services, plan, null, cts.Token).GetAwaiter().GetResult();
             SqlValidator.Apply(plan, report);
+            plan.Warnings = WithoutSkippedMarker(plan.Warnings);
             errors.AddRange(report.GlobalErrors);
-            foreach (var id in plan.Order.Concat(plan.Tasks.Keys.OrderBy(k => k, StringComparer.Ordinal)).Distinct(StringComparer.Ordinal))
+            var ids = plan.Order.Concat(plan.Tasks.Keys.OrderBy(k => k, StringComparer.Ordinal)).Distinct(StringComparer.Ordinal).ToList();
+            foreach (var id in ids)
                 if (report.TaskErrors.TryGetValue(id, out var list)) errors.AddRange(list.Select(e => $"{id}: {e}"));
+            // Dry-run is where an agent checks its own patch, and the plan it holds predates this validation: every "not checked"
+            // line of THIS run must reach it, global and task alike. Other task warnings stay in the stored plan.
             warnings.AddRange(report.GlobalWarnings);
+            foreach (var id in ids)
+                if (report.TaskWarnings.TryGetValue(id, out var list))
+                    warnings.AddRange(list.Where(w => w.Contains(SqlValidator.NotCheckedMarker, StringComparison.Ordinal)).Select(w => $"{id}: {w}"));
         }
         else
         {
-            warnings.Add(SkippedWarning);
+            plan.Warnings = [.. WithoutSkippedMarker(plan.Warnings), skipped];
+            warnings.Add(skipped);
             foreach (var (id, task) in plan.Tasks.OrderBy(kv => kv.Key, StringComparer.Ordinal))
                 errors.AddRange(SqlValidator.CheckShape(task).Select(e => $"{id}: {e}"));
         }
+        // Ruling 57: offline, live or not, every run re-derives the bare-CR errors into the stored errors (a fixed CR clears).
+        errors.AddRange(SqlValidator.RecordBareCarriageReturns(plan));
 
         ReplaceContent(payload.AsObject(), plan);
         return new PayloadCheck(errors, warnings);
+    }
+
+    /// <summary>For every task in the base that the payload no longer has (ordinal id order): one line per error, then per warning that
+    /// validation does not recompute (no <see cref="SqlValidator.WarningPrefix"/>) — "removed task &lt;id&gt; carried: &lt;original line&gt;",
+    /// the original flattened by <see cref="ScriptPack.OneLine"/> and never reworded.</summary>
+    static List<string> RemovedTaskEvidence(SqlPlanPayload plan, SqlPlanPayload? basePlan)
+    {
+        var carried = new List<string>();
+        if (basePlan is null) return carried;
+        foreach (var (id, gone) in basePlan.Tasks.Where(kv => !plan.Tasks.ContainsKey(kv.Key)).OrderBy(kv => kv.Key, StringComparer.Ordinal))
+            foreach (var line in gone.Errors.Concat(gone.Warnings.Where(w => !w.StartsWith(SqlValidator.WarningPrefix, StringComparison.Ordinal))))
+                carried.Add($"removed task {id} carried: {ScriptPack.OneLine(line)}");
+        return carried;
+    }
+
+    static List<string> WithoutSkippedMarker(List<string> warnings) =>
+        warnings.Where(w => !w.StartsWith(SqlPlanSource.SkippedPrefix, StringComparison.Ordinal)).ToList();
+
+    /// <summary>Errors, warnings and custom are engine-authored evidence. Compared exactly (ordinal, order-sensitive, whole list) against
+    /// the base, BEFORE Validate writes anything. Tasks only in the base were deleted (allowed; their lines go with them); tasks only in
+    /// the payload are new and must arrive with no errors and no warnings (their custom flag is set by the engine regardless).</summary>
+    static List<string> EngineOwnedChanges(SqlPlanPayload plan, SqlPlanPayload? basePlan)
+    {
+        const string ByValidation = "recorded by validation";
+        const string ByEngine = "recorded by the generator and validation";
+        static bool Same(List<string> a, List<string> b) => a.SequenceEqual(b, StringComparer.Ordinal);
+        static string Owned(string scope, string field, string owner) => $"{scope}: {field} is engine-owned ({owner}); a patch may not change it";
+
+        var errors = new List<string>();
+        if (!Same(plan.Errors, basePlan?.Errors ?? [])) errors.Add(Owned("plan", "errors", ByValidation));
+        if (!Same(plan.Warnings, basePlan?.Warnings ?? [])) errors.Add(Owned("plan", "warnings", ByEngine));
+        foreach (var (id, task) in plan.Tasks.OrderBy(kv => kv.Key, StringComparer.Ordinal))
+        {
+            var before = basePlan?.Tasks.GetValueOrDefault(id);
+            if (!Same(task.Errors, before?.Errors ?? [])) errors.Add(Owned(id, "errors", ByValidation));
+            if (!Same(task.Warnings, before?.Warnings ?? [])) errors.Add(Owned(id, "warnings", ByEngine));
+            if (before is not null && task.Custom != before.Custom) errors.Add(Owned(id, "custom", "set when the task's SQL changes"));
+        }
+        return errors;
     }
 
     public IReadOnlyList<string> ApprovalBlockers(ModuleContext ctx, JsonNode payload)
@@ -150,11 +210,17 @@ public sealed class SqlModule : IPhaseModule
         ArgumentNullException.ThrowIfNull(payload);
         var plan = Json.FromNode<SqlPlanPayload>(payload);
         var blockers = plan.Errors.Select(e => $"plan: {e}").ToList();
+        // Absence of errors is not evidence of validation: a plan nothing compiled cannot be approved.
+        blockers.AddRange(plan.Warnings.Where(w => w.StartsWith(SqlPlanSource.SkippedPrefix, StringComparison.Ordinal)).Select(w => NotValidatedBlocker + w));
         foreach (var id in plan.Order.Where(plan.Tasks.ContainsKey).Distinct(StringComparer.Ordinal))
             if (plan.Tasks[id].Errors.Count > 0) blockers.Add($"{id} ({plan.Tasks[id].Target}): {plan.Tasks[id].Errors.Count} validation error(s)");
         var orderSet = new HashSet<string>(plan.Order, StringComparer.Ordinal);
         if (plan.Order.Count != plan.Tasks.Count || !orderSet.SetEquals(plan.Tasks.Keys))
             blockers.Add("order must list every task id exactly once");
+        // Ruling 57: derived from the SQL itself, not only from stored errors, so a version stored before the rule is blocked too.
+        // A global line equals its stored "plan: " blocker, so only lines not already listed are added.
+        var listed = new HashSet<string>(blockers, StringComparer.Ordinal);
+        blockers.AddRange(SqlValidator.FindBareCarriageReturns(plan).Select(f => $"{f.Scope}: {f.Line}").Where(l => !listed.Contains(l)));
         return blockers;
     }
 
@@ -268,13 +334,17 @@ public sealed class SqlModule : IPhaseModule
         var errors = new List<string>();
         if (plan.PreSql is null || plan.PostSql is null || plan.Order is null || plan.Tasks is null || plan.Warnings is null || plan.Errors is null)
             errors.Add("preSql, postSql, order, tasks, warnings and errors must not be null");
+        else if (plan.Order.Any(s => s is null) || plan.Warnings.Any(s => s is null) || plan.Errors.Any(s => s is null)
+                 || plan.PreSql.Any(s => s is null) || plan.PostSql.Any(s => s is null))
+            errors.Add("preSql, postSql, order, warnings and errors must not contain null");
         foreach (var (id, t) in (plan.Tasks ?? []).OrderBy(kv => kv.Key, StringComparer.Ordinal))
         {
             if (t is null) { errors.Add($"{id}: task must not be null"); continue; }
             if (t.Target is null || t.Mode is null || t.SourceQuery is null || t.KeyColumns is null || t.Columns is null || t.PreSql is null
                 || t.PostSql is null || t.DependsOn is null || t.Warnings is null || t.Errors is null
                 || t.Columns.Any(c => c is null || c.Source is null || c.Target is null)
-                || t.PreSql.Any(s => s is null) || t.PostSql.Any(s => s is null) || t.KeyColumns.Any(s => s is null))
+                || t.PreSql.Any(s => s is null) || t.PostSql.Any(s => s is null) || t.KeyColumns.Any(s => s is null)
+                || t.DependsOn.Any(s => s is null) || t.Warnings.Any(s => s is null) || t.Errors.Any(s => s is null))
                 errors.Add($"{id}: only stagingDdl, mergeSql, chunkSize and mappingHash may be null");
         }
         return errors;

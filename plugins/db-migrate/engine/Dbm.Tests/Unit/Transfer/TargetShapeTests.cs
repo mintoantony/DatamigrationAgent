@@ -90,6 +90,17 @@ public sealed class TargetShapeTests
     }
 
     [Fact]
+    public void NormalizedColumn_gives_two_different_bindings_two_different_columns()
+    {
+        // Harm: ("A", "X->Y") and ("A->X", "Y") produced one name, so two bindings that need different rounding would share
+        // one column and the second would overwrite the first - the defect H3 fixed, back again under a new name.
+        var first = new ColumnBinding("A", "X->Y");
+        var second = new ColumnBinding("A->X", "Y");
+        Assert.NotEqual(TargetShape.NormalizedColumn(first), TargetShape.NormalizedColumn(second));
+        Assert.StartsWith(TargetShape.NormalizedPrefix, TargetShape.NormalizedColumn(first), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Normalize_never_writes_to_a_column_another_binding_still_needs()
     {
         // Harm: rounding in place gives both targets whichever binding ran first, so the finer one silently loses its fraction.

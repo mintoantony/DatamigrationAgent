@@ -21,13 +21,15 @@ public sealed class SqlGenJob : IJobHandler
         var plan = SqlGenerator.Generate(mapping, src, tgt, carryOver);
         ctx.Log($"sqlgen: {plan.Tasks.Count} task(s) generated{(carryOver is null ? "" : $", carry-over from v{latest!.Version}")}");
 
-        if (SqlPlanSource.CanValidate(s))
+        if (SqlPlanSource.SkippedWarning(s) is { } skipped) plan.Warnings.Add(skipped);   // stored: the plan is unvalidated
+        else
         {
             var report = await SqlPlanSource.ValidateLiveAsync(s, plan, null, ct);
             SqlValidator.Apply(plan, report);
             ctx.Log($"sqlgen: validation {(report.Ok ? "ok" : "found errors")}");
         }
-        else plan.Warnings.Add("live validation skipped: connections or target catalog missing");
+        // Ruling 57: this draft is stored without passing SqlModule.Validate, and carried-over or mapping-derived SQL can hold a lone CR.
+        SqlValidator.RecordBareCarriageReturns(plan);
 
         return new JobResult(Json.ToNode(plan), Summary(plan));
     }

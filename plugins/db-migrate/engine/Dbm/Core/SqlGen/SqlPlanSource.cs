@@ -25,9 +25,24 @@ public static class SqlPlanSource
         return version is null ? null : s.Artifacts.Get(PhaseName.Sql, version.Value);
     }
 
+    /// <summary>Start of the engine-authored plan warning recording that live validation did NOT run. A stored plan carrying it is
+    /// unvalidated: SqlModule.ApprovalBlockers blocks it, and SqlModule.Validate re-derives it on every run.</summary>
+    public const string SkippedPrefix = "live validation skipped: ";
+
+    /// <summary>"live validation skipped: source connection, target catalog missing" naming every missing input, or null when
+    /// live validation can run.</summary>
+    public static string? SkippedWarning(DbmServices s)
+    {
+        ArgumentNullException.ThrowIfNull(s);
+        var missing = new List<string>();
+        if (!s.Connections.Has(Side.Src)) missing.Add("source connection");
+        if (!s.Connections.Has(Side.Tgt)) missing.Add("target connection");
+        if (s.Catalog.Get(Side.Tgt) is null) missing.Add("target catalog");
+        return missing.Count == 0 ? null : SkippedPrefix + string.Join(", ", missing) + " missing";
+    }
+
     /// <summary>True when both connections and the target catalog are available.</summary>
-    public static bool CanValidate(DbmServices s) =>
-        (s ?? throw new ArgumentNullException(nameof(s))).Connections.Has(Side.Src) && s.Connections.Has(Side.Tgt) && s.Catalog.Get(Side.Tgt) is not null;
+    public static bool CanValidate(DbmServices s) => SkippedWarning(s) is null;
 
     /// <summary>Validates against the live databases. Throws InvalidOperationException when <see cref="CanValidate"/> is false.</summary>
     public static Task<ValidationReport> ValidateLiveAsync(DbmServices s, SqlPlanPayload plan, string? onlyTaskId, CancellationToken ct)

@@ -744,5 +744,326 @@ public sealed class BulkLoaderTests
         }
         Assert.Equal(4, direct.Loaded);
         Assert.Null(direct.MergeRowsAffected);   // no MergeSql: nothing to report, not "moved nothing"
+        Assert.Equal(MergeStatus.Ran, staged.MergeStatus);
+        Assert.Equal(MergeStatus.NotApplicable, direct.MergeStatus);
+    }
+
+    // ---- fix round 2 ----
+
+    [Fact]
+    public async Task A_scope_whose_transaction_is_already_gone_is_refused_instead_of_loading_into_a_new_one()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        var loader = new BulkLoader(TaskFor(), new TransferOptions { ErrorMode = "skip" });
+        ChunkOutcome? outcome = null;
+        TransferException? refused = null;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            await scope.CommitAsync(default);   // the caller's transaction is over; it hands the scope on anyway
+            try { outcome = await loader.LoadAsync(scope, Rows(4), allowRestart: true, progress: null, default); }
+            catch (TransferException ex) { refused = ex; }
+        }
+        // Harm: the savepoint fails, the bisector treats it as a doomed transaction, and RestartAsync opens a brand-new
+        // transaction on the caller's connection. The chunk loads into it and is reported as a success, while everything the
+        // caller did in the transaction it believed it was in has been discarded.
+        Assert.True(outcome is null, $"the chunk loaded into a new transaction: Loaded={outcome?.Loaded} Restarts={outcome?.Restarts}");
+        Assert.Equal("tx_ended", refused?.Code);
+        Assert.Equal(0L, await db.CountAsync("dbo.C"));
+    }
+
+    [Fact]
+    public async Task A_single_row_chunk_whose_one_row_is_bad_is_a_rejected_row_not_a_failed_task()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        var loader = new BulkLoader(TaskFor(), new TransferOptions { ErrorMode = "skip" });
+        ChunkOutcome? outcome = null;
+        TransferException? failure = null;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            try
+            {
+                outcome = await loader.LoadAsync(scope, Rows(1, (i, v) => v[1] = 99), true, null, default);
+                await scope.CommitAsync(default);
+            }
+            catch (TransferException ex) { failure = ex; }
+        }
+        // Harm: with one row there is nothing to tell a broken load from one bad row, so raising here would fail a whole
+        // keyed run in skip mode because its last chunk happened to hold a single rejectable row.
+        Assert.True(failure is null, $"a task was failed over one skippable row: {failure?.Code} {failure?.Message}");
+        Assert.Single(outcome!.Failed);
+        Assert.Equal(0, outcome.Loaded);
+        Assert.Equal(1L, outcome.Attempted);
+    }
+
+    [Fact]
+    public async Task A_merge_that_never_ran_is_not_reported_as_a_merge_that_moved_nothing()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        var loader = new BulkLoader(TaskFor("staging_merge"), new TransferOptions { ErrorMode = "skip" });
+        ChunkOutcome outcome;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            // every row rejected, for two different reasons, so no attempt survives and the merge never executes
+            outcome = await loader.LoadAsync(scope, Rows(4, (i, v) => { if (i < 2) v[1] = 99; else v[2] = 0; }), true, null, default);
+            await scope.CommitAsync(default);
+        }
+        Assert.Equal(0, outcome.Loaded);
+        Assert.Equal(4, outcome.Failed.Count);
+        // Harm: the running total starts at 0, so "the merge ran and moved nothing" and "no merge ever ran" were one number
+        // in the field ruling 74 added to make that very absence visible.
+        Assert.Equal(MergeStatus.DidNotRun, outcome.MergeStatus);
+        Assert.Null(outcome.MergeRowsAffected);
+    }
+
+    [Fact]
+    public async Task A_binding_whose_source_column_is_one_of_Normalizes_own_is_refused()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        string reserved = TargetShape.NormalizedColumn(new ColumnBinding("At", "at"));
+        var task = TaskFor();
+        task.Columns = [new("Id", "id"), new("Pid", "pid"), new("Qty", "qty"), new(reserved, "note"), new("At", "at")];
+        var table = Rows(4);
+        table.Columns.Add(reserved, typeof(string));
+        foreach (DataRow r in table.Rows) r[reserved] = "keepme";
+        var loader = new BulkLoader(task, new TransferOptions { ErrorMode = "skip" });
+        ChunkOutcome? outcome = null;
+        TransferException? refused = null;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            try
+            {
+                outcome = await loader.LoadAsync(scope, table, true, null, default);
+                await scope.CommitAsync(default);
+            }
+            catch (TransferException ex) { refused = ex; }
+        }
+        // Harm: TargetShape.Normalize writes its rounded values into columns of exactly this name, so a real source column
+        // there is overwritten before the load and the wrong value reaches the target with no error at all.
+        Assert.True(outcome is null, $"a column Normalize overwrites was loaded from: Loaded={outcome?.Loaded}, " +
+            $"rejected={string.Join(" | ", outcome?.Failed.Select(f => f.Error) ?? [])}");
+        Assert.Equal("bad_task", refused?.Code);
+        Assert.Contains(reserved, refused!.Details);
+        Assert.Equal(0L, await db.CountAsync("dbo.C"));
+    }
+
+    // Half 2 (the next load is refused) is a harm test: injecting the poison is a faithful stand-in for having been poisoned, and
+    // removing the entry check kills it. Half 1 (the poisoned chunk keeps its outcome) is NOT a harm test -- it is a contract
+    // assertion against a trigger no client can reach: BulkLoader.RestoreXactAbortAsync only runs the SET when XACT_STATE is not 0,
+    // and in every such state the SET succeeds, so `lost is null` here is asserting that an ordinary successful load does not throw.
+    // Three agents have failed to reach it; a mutation that deletes the production side of ruling 93 survives the suite by design
+    // (ruling 112). The same is true of poisoning on the failed-load path: same catch, same unreachable trigger.
+    [Fact]
+    public async Task A_scope_whose_session_state_could_not_be_restored_refuses_the_next_load_and_keeping_the_outcome_is_a_contract_assertion()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        var loader = new BulkLoader(TaskFor(), new TransferOptions { ErrorMode = "skip" });
+        ChunkOutcome? first = null;
+        ChunkOutcome? second = null;
+        TransferException? lost = null;
+        TransferException? refused = null;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            // the mark a failed XACT_ABORT restore leaves behind, put there from the caller's own progress callback
+            try
+            {
+                first = await loader.LoadAsync(scope, Rows(4), true,
+                    _ => scope.Poison(new InvalidOperationException("the restore failed")), default);
+            }
+            catch (TransferException ex) { lost = ex; }
+            try { second = await loader.LoadAsync(scope, Rows(4, (i, v) => v[0] = 200 + i), true, null, default); }
+            catch (TransferException ex) { refused = ex; }
+            await scope.CommitAsync(default);
+        }
+        // Half 1, contract only (see the note above the test): the chunk's rows are in the transaction, so throwing its outcome away
+        // would lose the only record of them -- but nothing reachable makes the restore fail, so this cannot go red on that harm.
+        Assert.True(lost is null, $"the chunk loaded but its outcome was thrown away: {lost?.Code} {lost?.Message}");
+        Assert.Equal(4, first!.Loaded);
+        // Half 2, harm: a connection whose session state could not be put back would otherwise be inherited in silence.
+        Assert.True(second is null, $"a second chunk loaded on a connection with unrestorable session state: Loaded={second?.Loaded}");
+        Assert.Equal("session_state", refused?.Code);
+        Assert.Contains("the restore failed", refused!.Message, StringComparison.Ordinal);
+        Assert.Equal(4L, await db.CountAsync("dbo.C"));
+    }
+
+    [Fact]
+    public async Task Two_staging_bindings_on_one_target_are_refused_instead_of_one_being_dropped()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        var task = TaskFor("staging_merge");
+        task.Columns = [.. task.Columns, new ColumnBinding("Note2", "note")];   // a second source for the same target column
+        var table = Rows(4);
+        table.Columns.Add("Note2", typeof(string));
+        foreach (DataRow r in table.Rows)
+        {
+            r["Note"] = "first";
+            r["Note2"] = "second";
+        }
+        var loader = new BulkLoader(task, new TransferOptions { ErrorMode = "skip" });
+        ChunkOutcome? outcome = null;
+        TransferException? refused = null;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            try
+            {
+                outcome = await loader.LoadAsync(scope, table, true, null, default);
+                await scope.CommitAsync(default);
+            }
+            catch (TransferException ex) { refused = ex; }
+        }
+        // Harm: both bindings want the one #stg column, so one of them is dropped and the value a human wrote into the task
+        // never reaches the target -- the chunk reports a clean success and nothing says a mapping was not applied.
+        Assert.True(outcome is null, $"a binding was dropped and the chunk still reported Loaded={outcome?.Loaded}");
+        Assert.Equal(0L, await db.CountAsync("dbo.C"));
+        Assert.Equal("bad_task", refused?.Code);
+        Assert.Contains("Note2", refused!.Details);   // the second source, which would have been the silent casualty
+        Assert.Contains("Note", refused.Details);     // the first, and the #stg column both of them wanted
+    }
+
+    // ---- fix round 3 ----
+
+    [Fact]
+    public async Task Staging_carries_a_second_binding_on_one_source_column_exactly_as_direct_mode_does()
+    {
+        await using var db = await TempDatabase.CreateAsync("dbm_bulk");
+        await db.ExecAsync("CREATE TABLE dbo.F (k int NOT NULL PRIMARY KEY, a nvarchar(10) NULL, b nvarchar(10) NULL);");
+        await using var conn = new SqlConnection(db.ConnectionString);
+        await conn.OpenAsync();
+        // One source column bound to two targets: the fan-out H3 and ruling 73 exist to support. Neither column rounds, so
+        // Normalize writes nothing and both bindings read the raw source column.
+        static TaskPlan Fanned(string mode) => new()
+        {
+            Target = "dbo.F",
+            Mode = mode,
+            SourceQuery = "unused",
+            KeyColumns = ["k"],
+            Columns = [new("k", "k"), new("A", "a"), new("A", "b")],
+            StagingDdl = mode == "staging_merge" ? "CREATE TABLE #stg (k int NULL, a nvarchar(10) NULL, b nvarchar(10) NULL)" : null,
+            MergeSql = mode == "staging_merge" ? "INSERT dbo.F (k, a, b) SELECT k, a, b FROM #stg;" : null,
+        };
+        var table = new DataTable();
+        table.Columns.Add("k", typeof(int));
+        table.Columns.Add("A", typeof(string));
+        for (int i = 0; i < 4; i++) table.Rows.Add(i + 1, "v" + i);
+        const string Readback = "SELECT COALESCE(STRING_AGG(CONCAT(k, ':', COALESCE(a, '<null>'), '/', COALESCE(b, '<null>')), ' ; ') WITHIN GROUP (ORDER BY k), '') FROM dbo.F";
+
+        ChunkOutcome staged, direct;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            staged = await new BulkLoader(Fanned("staging_merge"), new TransferOptions { ErrorMode = "skip" })
+                .LoadAsync(scope, table, true, null, default);
+            await scope.CommitAsync(default);
+        }
+        int stagedNulls = await db.ScalarAsync<int>("SELECT COUNT(*) FROM dbo.F WHERE b IS NULL");
+        string stagedRows = await db.ScalarAsync<string>(Readback);
+        await db.ExecAsync("DELETE dbo.F;");
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            direct = await new BulkLoader(Fanned("direct"), new TransferOptions { ErrorMode = "skip" })
+                .LoadAsync(scope, table, true, null, default);
+            await scope.CommitAsync(default);
+        }
+        string directRows = await db.ScalarAsync<string>(Readback);
+        // Harm: the second binding on the same source column is dropped on the way into #stg, so every row's b is NULL, the
+        // chunk reports a clean success, and the same task in direct mode applies both bindings (ruling 109).
+        Assert.True(stagedNulls == 0,
+            $"a human-written binding vanished in staging mode: {stagedNulls} of {staged.Attempted} rows have b IS NULL " +
+            $"while the chunk reported Loaded={staged.Loaded}");
+        Assert.Equal(directRows, stagedRows);
+        Assert.Equal(4, staged.Loaded);
+        Assert.Equal(4, direct.Loaded);
+    }
+
+    [Fact]
+    public async Task An_empty_chunk_on_a_scope_whose_transaction_is_gone_is_refused_like_any_other_chunk()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        await using (var set = new SqlCommand("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;", conn))
+            await set.ExecuteNonQueryAsync();
+        var loader = new BulkLoader(TaskFor(), new TransferOptions { ErrorMode = "skip" });
+        ChunkOutcome? outcome = null;
+        TransferException? refused = null;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            await scope.CommitAsync(default);   // the caller's transaction is over; it hands the scope on anyway
+            try { outcome = await loader.LoadAsync(scope, Rows(0), allowRestart: true, progress: null, default); }
+            catch (TransferException ex) { refused = ex; }
+        }
+        short level;
+        await using (var read = new SqlCommand("SELECT transaction_isolation_level FROM sys.dm_exec_sessions WHERE session_id = @@SPID;", conn))
+            level = Convert.ToInt16(await read.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture);
+        // Harm: the empty-chunk short-circuit ran before the entry guard, so a dead scope answered a clean outcome for an
+        // empty chunk and tx_ended for a non-empty one -- the refusal was row-conditional (ruling 110).
+        Assert.True(outcome is null,
+            $"an empty chunk on a dead scope returned a clean outcome: Loaded={outcome?.Loaded} Attempted={outcome?.Attempted} " +
+            $"MergeStatus={outcome?.MergeStatus}");
+        Assert.Equal("tx_ended", refused?.Code);
+        Assert.Equal(0L, await db.CountAsync("dbo.C"));
+        Assert.Equal(4, level);   // and the caller's connection is still the caller's
+    }
+
+    [Fact]
+    public async Task An_empty_chunks_outcome_says_which_of_the_three_things_happened_to_the_merge()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        ChunkOutcome direct, staged;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            direct = await new BulkLoader(TaskFor(), new TransferOptions { ErrorMode = "skip" }).LoadAsync(scope, Rows(0), true, null, default);
+            staged = await new BulkLoader(TaskFor("staging_merge"), new TransferOptions { ErrorMode = "skip" }).LoadAsync(scope, Rows(0), true, null, default);
+            await scope.CommitAsync(default);
+        }
+        // Harm: the empty chunk is the one outcome nothing pinned, and MergeStatus.Ran beside a null MergeRowsAffected is
+        // documented as "the merge ran and reported no count at all" -- for a chunk in which nothing was ever staged (ruling 111).
+        Assert.Equal(MergeStatus.NotApplicable, direct.MergeStatus);
+        Assert.Equal(MergeStatus.DidNotRun, staged.MergeStatus);
+        Assert.Null(direct.MergeRowsAffected);
+        Assert.Null(staged.MergeRowsAffected);
+        Assert.Equal(0L, staged.Attempted);
+        Assert.Equal(0L, await db.CountAsync("dbo.C"));
+    }
+
+    [Fact]
+    public async Task A_direct_task_that_carries_a_MergeSql_is_refused_instead_of_never_running_it()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        var task = TaskFor();
+        task.MergeSql = "UPDATE dbo.C SET note = 'merged';";   // a merge the direct path never runs
+        var loader = new BulkLoader(task, new TransferOptions { ErrorMode = "skip" });
+        ChunkOutcome? outcome = null;
+        TransferException? refused = null;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            try
+            {
+                outcome = await loader.LoadAsync(scope, Rows(4), true, null, default);
+                await scope.CommitAsync(default);
+            }
+            catch (TransferException ex) { refused = ex; }
+        }
+        // Harm: the rows load, the merge never runs, and the outcome reports NotApplicable -- the one value whose own
+        // documentation says the task has no MergeSql. A merge that cannot say why it did not run (ruling 111).
+        Assert.True(outcome is null,
+            $"a direct task's MergeSql never ran and the chunk reported MergeStatus={outcome?.MergeStatus} over {outcome?.Loaded} loaded rows");
+        Assert.Equal(0L, await db.CountAsync("dbo.C"));
+        Assert.Equal("bad_task", refused?.Code);
+        Assert.Contains("staging_merge", refused!.Message, StringComparison.Ordinal);   // and the way out
     }
 }

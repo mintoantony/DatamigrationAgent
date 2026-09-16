@@ -20,4 +20,14 @@
     <Using Include="Xunit" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Shared by js/sql-view.test.cjs and Unit/SqlGen/TaskListingMirrorTests.cs, which reads this output copy only. -->
+    <None Include="js\fixtures\task-listing.json" Link="fixtures\task-listing.json" CopyToOutputDirectory="PreserveNewest" />
+    <!-- The source path, fixed at build time, so a test can prove the output copy is byte-identical to it (no directory search). -->
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>SharedListingFixtureSource</_Parameter1>
+      <_Parameter2>$(MSBuildProjectDirectory)\js\fixtures\task-listing.json</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
 </Project>
