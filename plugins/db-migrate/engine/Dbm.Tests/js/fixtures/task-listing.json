@@ -1,0 +1,164 @@
+{
+  "about": "Shared by Unit/SqlGen/TaskListingMirrorTests.cs (C# TaskListing.Build, SqlModule.ParseAnchor) and js/sql-view.test.cjs (DBM.sqlView.listing, parseAnchor). Each side asserts the SAME expected values, so a drift in either implementation fails that side's suite. Add a case here, never to one side only.",
+  "listing": [
+    {
+      "name": "sample Addresses task: line 9 is FROM",
+      "task": {
+        "target": "app.Addresses",
+        "preSql": [],
+        "sourceQuery": "SELECT\n    s.[ADDR_ID] AS [AddressId],\n    s.[CUST_ID] AS [CustomerId],\n    s.[LINE1] AS [Line1],\n    s.[CITY] AS [City],\n    s.[ZIP] AS [PostalCode],\n    s.[CTRY_CD] AS [CountryCode],\n    s.[ADDR_ID] AS [__k0]\nFROM [dbo].[ADDR] AS s",
+        "postSql": []
+      },
+      "expected": [
+        { "no": 1, "section": "source", "text": "SELECT" },
+        { "no": 2, "section": "source", "text": "    s.[ADDR_ID] AS [AddressId]," },
+        { "no": 3, "section": "source", "text": "    s.[CUST_ID] AS [CustomerId]," },
+        { "no": 4, "section": "source", "text": "    s.[LINE1] AS [Line1]," },
+        { "no": 5, "section": "source", "text": "    s.[CITY] AS [City]," },
+        { "no": 6, "section": "source", "text": "    s.[ZIP] AS [PostalCode]," },
+        { "no": 7, "section": "source", "text": "    s.[CTRY_CD] AS [CountryCode]," },
+        { "no": 8, "section": "source", "text": "    s.[ADDR_ID] AS [__k0]" },
+        { "no": 9, "section": "source", "text": "FROM [dbo].[ADDR] AS s" }
+      ]
+    },
+    {
+      "name": "section order pre, source, staging, merge, post; numbering continuous across sections and statements",
+      "task": {
+        "preSql": ["P1;", "P2a\nP2b"],
+        "sourceQuery": "SELECT 1 AS [x]",
+        "stagingDdl": "CREATE TABLE #stg (\n  x int\n);",
+        "mergeSql": "INSERT INTO t SELECT x FROM #stg;",
+        "postSql": ["Q1;", "Q2;"]
+      },
+      "expected": [
+        { "no": 1, "section": "pre", "text": "P1;" },
+        { "no": 2, "section": "pre", "text": "P2a" },
+        { "no": 3, "section": "pre", "text": "P2b" },
+        { "no": 4, "section": "source", "text": "SELECT 1 AS [x]" },
+        { "no": 5, "section": "staging", "text": "CREATE TABLE #stg (" },
+        { "no": 6, "section": "staging", "text": "  x int" },
+        { "no": 7, "section": "staging", "text": ");" },
+        { "no": 8, "section": "merge", "text": "INSERT INTO t SELECT x FROM #stg;" },
+        { "no": 9, "section": "post", "text": "Q1;" },
+        { "no": 10, "section": "post", "text": "Q2;" }
+      ]
+    },
+    {
+      "name": "null and empty-string texts are skipped; CRLF normalised",
+      "task": { "preSql": ["ALTER A;"], "sourceQuery": "SELECT\r\n1 AS [x]", "stagingDdl": null, "mergeSql": "", "postSql": ["P1;", "P2a\nP2b"] },
+      "expected": [
+        { "no": 1, "section": "pre", "text": "ALTER A;" },
+        { "no": 2, "section": "source", "text": "SELECT" },
+        { "no": 3, "section": "source", "text": "1 AS [x]" },
+        { "no": 4, "section": "post", "text": "P1;" },
+        { "no": 5, "section": "post", "text": "P2a" },
+        { "no": 6, "section": "post", "text": "P2b" }
+      ]
+    },
+    {
+      "name": "an empty list element is skipped on its own, without affecting its neighbours",
+      "task": { "preSql": ["a", "", "b"], "sourceQuery": "", "postSql": ["", "c"] },
+      "expected": [
+        { "no": 1, "section": "pre", "text": "a" },
+        { "no": 2, "section": "pre", "text": "b" },
+        { "no": 3, "section": "post", "text": "c" }
+      ]
+    },
+    {
+      "name": "whitespace-only texts are NOT empty and are numbered (IsNullOrEmpty, not IsNullOrWhiteSpace)",
+      "task": { "preSql": [" ", ""], "sourceQuery": "\n", "stagingDdl": "\t", "mergeSql": " x", "postSql": ["  "] },
+      "expected": [
+        { "no": 1, "section": "pre", "text": " " },
+        { "no": 2, "section": "source", "text": "" },
+        { "no": 3, "section": "source", "text": "" },
+        { "no": 4, "section": "staging", "text": "\t" },
+        { "no": 5, "section": "merge", "text": " x" },
+        { "no": 6, "section": "post", "text": "  " }
+      ]
+    },
+    {
+      "name": "a lone CR is not a line break and stays in its line",
+      "task": { "preSql": [], "sourceQuery": "A\rB\r\nC\r", "postSql": ["\r"] },
+      "expected": [
+        { "no": 1, "section": "source", "text": "A\rB" },
+        { "no": 2, "section": "source", "text": "C\r" },
+        { "no": 3, "section": "post", "text": "\r" }
+      ]
+    },
+    {
+      "name": "CR CR LF normalises its last two characters only",
+      "task": { "preSql": [], "sourceQuery": "x\r\r\ny", "postSql": [] },
+      "expected": [
+        { "no": 1, "section": "source", "text": "x\r" },
+        { "no": 2, "section": "source", "text": "y" }
+      ]
+    },
+    {
+      "name": "a trailing newline yields a final empty numbered line; lines are never trimmed",
+      "task": { "preSql": ["X;\n"], "sourceQuery": "  S  \r\n", "postSql": ["\r\n", "\n\n"] },
+      "expected": [
+        { "no": 1, "section": "pre", "text": "X;" },
+        { "no": 2, "section": "pre", "text": "" },
+        { "no": 3, "section": "source", "text": "  S  " },
+        { "no": 4, "section": "source", "text": "" },
+        { "no": 5, "section": "post", "text": "" },
+        { "no": 6, "section": "post", "text": "" },
+        { "no": 7, "section": "post", "text": "" },
+        { "no": 8, "section": "post", "text": "" },
+        { "no": 9, "section": "post", "text": "" }
+      ]
+    },
+    {
+      "name": "Unicode line and paragraph separators, vertical tab and form feed are not line breaks",
+      "task": { "preSql": [], "sourceQuery": "a\u2028b\u2029c\u000Bd\u000Ce\u0085f", "postSql": [] },
+      "expected": [
+        { "no": 1, "section": "source", "text": "a\u2028b\u2029c\u000Bd\u000Ce\u0085f" }
+      ]
+    },
+    {
+      "name": "omitted lists and fields contribute nothing",
+      "task": { "sourceQuery": "q" },
+      "expected": [
+        { "no": 1, "section": "source", "text": "q" }
+      ]
+    },
+    {
+      "name": "nothing to number",
+      "task": { "preSql": [], "sourceQuery": "", "stagingDdl": null, "mergeSql": null, "postSql": [] },
+      "expected": []
+    }
+  ],
+  "anchors": [
+    { "anchor": "task:T04", "task": "T04", "line": null },
+    { "anchor": "task:", "task": "", "line": null },
+    { "anchor": "sql:T04:12", "task": "T04", "line": 12 },
+    { "anchor": "sql:T04:1", "task": "T04", "line": 1 },
+    { "anchor": "sql:T04:007", "task": "T04", "line": 7 },
+    { "anchor": "sql:a:b:3", "task": "a:b", "line": 3 },
+    { "anchor": "sql:T01:2147483647", "task": "T01", "line": 2147483647 },
+    { "anchor": null, "task": null, "line": null },
+    { "anchor": "", "task": null, "line": null },
+    { "anchor": "sql:T04:0", "task": null, "line": null },
+    { "anchor": "sql:T04:00", "task": null, "line": null },
+    { "anchor": "sql:T04:-1", "task": null, "line": null },
+    { "anchor": "sql:T04:+12", "task": null, "line": null },
+    { "anchor": "sql:T04: 12", "task": null, "line": null },
+    { "anchor": "sql:T04:12 ", "task": null, "line": null },
+    { "anchor": "sql:T04:12\n", "task": null, "line": null },
+    { "anchor": "sql:T04:12abc", "task": null, "line": null },
+    { "anchor": "sql:T04:1,000", "task": null, "line": null },
+    { "anchor": "sql:T04:1.0", "task": null, "line": null },
+    { "anchor": "sql:T04:1e3", "task": null, "line": null },
+    { "anchor": "sql:T04:0x1", "task": null, "line": null },
+    { "anchor": "sql:T04:\u0663", "task": null, "line": null },
+    { "anchor": "sql:T04:\uFF11\uFF12", "task": null, "line": null },
+    { "anchor": "sql:T04:2147483648", "task": null, "line": null },
+    { "anchor": "sql:T04:99999999999", "task": null, "line": null },
+    { "anchor": "sql:T04:", "task": null, "line": null },
+    { "anchor": "sql::5", "task": null, "line": null },
+    { "anchor": "sql:T04", "task": null, "line": null },
+    { "anchor": "SQL:T04:1", "task": null, "line": null },
+    { "anchor": "Task:T04", "task": null, "line": null },
+    { "anchor": "tablemap:app.Orders", "task": null, "line": null }
+  ]
+}
