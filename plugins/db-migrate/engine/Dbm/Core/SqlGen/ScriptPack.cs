@@ -21,6 +21,10 @@ public static class ScriptPack
     /// have their own place (the task file's "Errors (last validation)" header); without this block a plan-level error — a bare carriage
     /// return in a global statement, a connection that failed — would reach the DBA nowhere at all.</summary>
     const string PlanErrorsTitle = "WARNING: PLAN HAS ERRORS";
+    /// <summary>Heading over the ids of the tasks whose own files carry errors. The error text is not repeated here — it lives in each
+    /// task file's "Errors (last validation)" header — but without this line 00_pre.sql cannot say whether the task files hold errors
+    /// at all, and a DBA who opens it alone would read that silence as "none".</summary>
+    static string TaskErrorsTitle(int count) => FormattableString.Invariant($"WARNING: {count} TASK(S) HAVE ERRORS");
 
     public static byte[] BuildZip(SqlPlanPayload plan, string projectName)
     {
@@ -55,7 +59,10 @@ public static class ScriptPack
         var width = Math.Max(2, (slots.Count + 1).ToString(CultureInfo.InvariantCulture).Length);
         var preName = new string('0', width) + "_pre.sql";
         var postName = new string('9', width) + "_post.sql";
-        var files = new List<(string, string)> { (preName, GlobalFile(projectName, preName, "pre-load", "before the first task", plan.PreSql, problems, notValidated, plan.Errors)) };
+        // "T04 (app.Addresses)" per errored task, in pack-file order. The ids only: the error text is in the task file.
+        var taskErrors = slots.Where(s => s.Known && plan.Tasks[s.Id].Errors.Count > 0)
+            .Select(s => $"{s.Id} ({plan.Tasks[s.Id].Target})").ToList();
+        var files = new List<(string, string)> { (preName, GlobalFile(projectName, preName, "pre-load", "before the first task", plan.PreSql, problems, notValidated, plan.Errors, taskErrors)) };
         var index = new List<(string File, string Id, TaskPlan Task)>();
         for (var i = 0; i < slots.Count; i++)
         {
@@ -66,8 +73,8 @@ public static class ScriptPack
             files.Add((name, TaskFile(projectName, id, task)));
             index.Add((name, id, task));
         }
-        files.Add((postName, GlobalFile(projectName, postName, "post-load", "after the last task", plan.PostSql, [], [], [])));
-        files.Add(("README.md", Readme(projectName, preName, postName, index, problems, notValidated, plan.Errors)));
+        files.Add((postName, GlobalFile(projectName, postName, "post-load", "after the last task", plan.PostSql, [], [], [], [])));
+        files.Add(("README.md", Readme(projectName, preName, postName, index, problems, notValidated, plan.Errors, taskErrors)));
         return files;
     }
 
@@ -85,7 +92,7 @@ public static class ScriptPack
     static StringBuilder Comment(StringBuilder sb, string text) => sb.Append("-- ").Append(OneLine(text)).Append('\n');
 
     static string GlobalFile(string project, string name, string what, string when, List<string> statements, List<string> problems,
-        List<string> notValidated, List<string> planErrors)
+        List<string> notValidated, List<string> planErrors, List<string> taskErrors)
     {
         var sb = new StringBuilder();
         sb.Append(Rule).Append('\n');
@@ -100,6 +107,11 @@ public static class ScriptPack
         {
             Comment(sb, $"{PlanErrorsTitle} (see README.md)");
             foreach (var e in planErrors) Comment(sb, "  - " + e);   // the stored line verbatim, flattened
+        }
+        if (taskErrors.Count > 0)
+        {
+            Comment(sb, $"{TaskErrorsTitle(taskErrors.Count)} (see each task file's header)");
+            foreach (var t in taskErrors) Comment(sb, "  - " + t);
         }
         if (problems.Count > 0)
         {
@@ -174,7 +186,7 @@ public static class ScriptPack
     }
 
     static string Readme(string project, string preName, string postName, List<(string File, string Id, TaskPlan Task)> index, List<string> problems,
-        List<string> notValidated, List<string> planErrors)
+        List<string> notValidated, List<string> planErrors, List<string> taskErrors)
     {
         var sb = new StringBuilder();
         sb.Append($"# {OneLine(project)} - migration script pack\n\n");
@@ -190,6 +202,14 @@ public static class ScriptPack
               .Append("The last validation recorded these plan-level errors - in the global statements, or in reaching the databases at all.\n")
               .Append("They are listed here because no task file holds them. Do not run this pack as-is.\n\n");
             foreach (var e in planErrors) sb.Append("- ").Append(OneLine(e)).Append('\n');
+            sb.Append('\n');
+        }
+        if (taskErrors.Count > 0)
+        {
+            sb.Append($"## {TaskErrorsTitle(taskErrors.Count)}\n\n")
+              .Append("These tasks carry errors from the last validation. Each error is listed in that task's own file, under\n")
+              .Append("*Errors (last validation)* in its header. Do not run this pack as-is.\n\n");
+            foreach (var t in taskErrors) sb.Append("- ").Append(OneLine(t)).Append('\n');
             sb.Append('\n');
         }
         if (problems.Count > 0)

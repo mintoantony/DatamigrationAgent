@@ -242,6 +242,30 @@ public class ScriptPackTests
                 Assert.False(line.TrimStart().StartsWith("CANARY", StringComparison.Ordinal), $"{name}: a value escaped its comment: [{line}]");
     }
 
+    /// <summary>Ruling 77: 00_pre.sql carries the plan-level errors, but a task's errors live in its own file's header. Without a
+    /// roll-up the DBA who opens 00_pre.sql cannot tell "no task has errors" from "this pack never says". The ids are named and the
+    /// error text is not repeated. Exporting an errored plan stays allowed.</summary>
+    [Fact]
+    public void The_pack_says_which_tasks_have_errors_and_says_nothing_when_none_do()
+    {
+        var plan = Plan();
+        plan.Tasks["T05"].Errors.Add("sourceQuery: Invalid column name 'X'.");
+        plan.Tasks["T02"].Errors.Add("target table app.Customers not found in the target catalog");
+
+        var files = ScriptPack.BuildFiles(plan, "demo");
+
+        Assert.Contains("-- WARNING: 2 TASK(S) HAVE ERRORS (see each task file's header)\n--   - T02 (app.Customers)\n--   - T05 (app.Orders)\n",
+            files[0].Content);
+        var readme = files.Single(f => f.Name == "README.md").Content;
+        Assert.Contains("## WARNING: 2 TASK(S) HAVE ERRORS\n\n", readme);
+        Assert.Contains("\n- T02 (app.Customers)\n- T05 (app.Orders)\n", readme);
+        Assert.Equal(1, files.Count(f => f.Content.Contains("Invalid column name 'X'.", StringComparison.Ordinal)));   // the text stays in the task file
+
+        Assert.All(Plan().Tasks.Values, t => Assert.Empty(t.Errors));   // fixture guard: the generated tasks really have no errors
+        foreach (var (name, content) in ScriptPack.BuildFiles(Plan(), "demo"))
+            Assert.DoesNotContain("TASK(S) HAVE ERRORS", content, StringComparison.Ordinal);
+    }
+
     const string Hostile ="x\nCANARY_LF;\rCANARY_CR;\r\nCANARY_CRLF;\u2028CANARY_LS;\u2029CANARY_PS;\u0085CANARY_NEL;\vCANARY_VT;\fCANARY_FF;";
 
     /// <summary>Every line terminator a T-SQL parser or an editor may honour - the ones <see cref="ScriptPack.OneLine"/> neutralises,
