@@ -35,6 +35,8 @@ public static class CommandRegistry
         new TransferResumeCommand(),  // T5.5
         new TransferCancelCommand(),  // T5.5
         new TransferStatusCommand(),  // T5.5
+        new DemoCommand(),            // T6.1
+        new ExportCommand(),          // T6.1
         // Later milestones append their commands below this line.
     ];
 }
