@@ -863,3 +863,72 @@ dl.meta dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
   .sql-tasks { position: static; max-height: none; flex-direction: row; overflow-x: auto; padding-bottom: 4px; }
   .sql-task { min-width: 220px; }
 }
+
+/* ---------- Execute (T5.6) ---------- */
+.exe-page .exe-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.exe-page .exe-section-title { margin-top: 8px; }
+.exe-checks { list-style: none; margin: 0; padding: 0; }
+.exe-check { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+.exe-check:last-child { border-bottom: 0; }
+.exe-check-icon { width: 20px; height: 20px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700; color: var(--accent-contrast); }
+.exe-check-icon.is-ok { background: var(--ok); }
+.exe-check-icon.is-warn { background: var(--warn); }
+.exe-check-icon.is-err { background: var(--err); }
+/* A check that did not run is neither a tick nor a cross: it is the one shape on the checklist that means "unknown". */
+.exe-check-icon.is-notrun { background: var(--surface-2); color: var(--text-muted); border: 1px solid var(--border-strong); }
+.exe-check-name { font-weight: 600; }
+.exe-check-detail { color: var(--text-muted); font-size: 12px; overflow-wrap: anywhere; }
+.exe-note { font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere; }
+.exe-note.is-err { color: var(--err); }
+.exe-task-note { font-size: 11px; color: var(--text-muted); max-width: 280px; overflow-wrap: anywhere; }
+.exe-form { display: grid; gap: 16px; }
+.exe-field { display: grid; gap: 4px; }
+.exe-field label, .exe-legend { font-size: 12px; color: var(--text-muted); }
+.exe-fieldset { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px 12px; margin: 0; display: grid; gap: 8px; }
+.exe-choice { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
+.exe-choice input { margin-top: 3px; }
+.exe-danger-note { color: var(--err); }
+.exe-banner { padding: 12px 16px; border-radius: var(--radius); border: 1px solid var(--border); border-left-width: 4px; background: var(--surface-2); }
+.exe-banner.is-ok { border-left-color: var(--ok); }
+.exe-banner.is-warn { border-left-color: var(--warn); }
+.exe-banner.is-err { border-left-color: var(--err); }
+.exe-live-head { display: grid; grid-template-columns: minmax(0, 1fr) 160px; gap: 16px; align-items: center; }
+.exe-overall .bar { height: 12px; }
+.exe-spark { min-height: 32px; }
+.exe-table-wrap, .rep-table-wrap { overflow-x: auto; }
+.exe-tasks td, .rep-tasks td { vertical-align: middle; }
+.exe-task-progress { display: grid; grid-template-columns: minmax(80px, 1fr) auto; gap: 8px; align-items: center; min-width: 180px; }
+.exe-task-error { display: inline-block; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+.exe-tag { margin-left: 4px; }
+.exe-err-btn { color: var(--warn); font-variant-numeric: tabular-nums; }
+.exe-log { max-height: 240px; overflow: auto; margin: 0; font-size: 12px; }
+.exe-log .lvl-warn { color: var(--warn); }
+.exe-log .lvl-error { color: var(--err); }
+.exe-err-item { border-bottom: 1px solid var(--border); padding: 8px 0; }
+.exe-row-json { font-size: 12px; max-height: 200px; overflow: auto; margin: 0; }
+@media (max-width: 900px) {
+  .exe-page .exe-grid { grid-template-columns: 1fr; }
+  .exe-live-head { grid-template-columns: 1fr; }
+}
+
+/* ---------- Final report (T5.6) ---------- */
+.rep-match { color: var(--ok); }
+.rep-mismatch { color: var(--err); font-weight: 600; }
+/* "not compared" is its own colour: it is not a pass and it is not a failure. */
+.rep-unknown { color: var(--text-muted); font-style: italic; }
+.rep-flag { color: var(--warn); font-weight: 700; margin-left: 2px; }
+.rep-caveat { overflow-wrap: anywhere; }
+.rep-kpi-ok .kpi-v { color: var(--ok); }
+.rep-kpi-warn .kpi-v { color: var(--warn); }
+.rep-kpi-err .kpi-v { color: var(--err); }
+.rep-detail > td { background: var(--surface-2); }
+.rep-detail-body { padding: 8px 4px; }
+.rep-checksums { max-width: 720px; }
+.rep-samples { margin: 0; padding-left: 16px; display: grid; gap: 4px; }
+.rep-samples li { display: grid; grid-template-columns: minmax(120px, auto) minmax(0, 1fr); gap: 8px; }
+.rep-notes { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
+.rep-notes li { overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .rep-samples li { grid-template-columns: 1fr; }
+}
