@@ -202,8 +202,81 @@ public sealed class TransferEngine
         return Json.Serialize(new { error, notes = list });
     }
 
-    /// <summary>Completion hook: Task 5.4 replaces this body with run validation + the final report. Returns summary_json.</summary>
-    private Task<string?> FinishCompletedAsync(RunContext rc, CancellationToken ct) => Task.FromResult<string?>(null);
+    /// <summary>
+    /// Completion: validate every task (counts, and checksums where they can mean something), then build the final report, which is
+    /// what <c>summary_json</c> stores from here on.
+    /// <para><b>Nothing in here may fail the run.</b> Validation runs after the last row is loaded and after the run's own PostSql -
+    /// operator SQL that may well have dropped a table the plan loaded into - and an exception escaping this method is caught by
+    /// <see cref="RunAsync"/>'s general handler, which records the run as failed. A migration that moved every row would then be
+    /// reported as a failure because the thing meant to confirm it could not run, and an operator would go and re-run a migration that
+    /// was already correct. So every fault below becomes a note instead. "Never fails the run" is not permission to go quiet: the
+    /// report names what it could not check, and a task with no validation is listed as unvalidated rather than left looking clean.</para>
+    /// <para>This hook runs once, at run end, after the last task. It is deliberately nowhere near the per-chunk commit path: a write
+    /// between a chunk's COMMIT and its checkpoint upsert double-loads that chunk on resume (rulings 114/115), and nothing here touches
+    /// that seam.</para>
+    /// </summary>
+    private async Task<string?> FinishCompletedAsync(RunContext rc, CancellationToken ct)
+    {
+        await ValidateTasksAsync(rc, ct);
+        try
+        {
+            var run = rc.Repo.GetRun(rc.RunId)!;
+            // rc.Notes, verbatim: this report replaces RunSummary, which is the only thing that carried them into the run's outcome
+            // record (the control table that was not ours, rejected rows counted but never recorded). Without this they would survive
+            // only as log lines and the run's own outcome would stop telling the truth.
+            var report = FinalReportBuilder.Build(run, RunStatus.Completed, rc.Repo.Tasks(rc.RunId),
+                taskId => rc.Repo.ErrorRows(rc.RunId, taskId, FinalReportBuilder.MaxErrorSamples), Clock.Now(),
+                rc.Notes, taskId => rc.Repo.ErrorRowCount(rc.RunId, taskId));
+            return Json.Serialize(report);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            // Returning null falls back to RunSummary, which still carries the notes - a thinner outcome record, never a failed run.
+            rc.Log("warn", $"Transfer run {rc.RunId}: the final report could not be built: {rc.Describe(ex)}");
+            rc.AddNote($"The final report could not be built ({rc.Describe(ex)}); the run itself completed and its data is unaffected.");
+            return null;
+        }
+    }
+
+    private async Task ValidateTasksAsync(RunContext rc, CancellationToken ct)
+    {
+        try
+        {
+            await using var src = await SqlConnect.OpenAsync(_sourceCs, ct);
+            await using var tgt = await SqlConnect.OpenAsync(_targetCs, ct);
+            foreach (var row in rc.Repo.Tasks(rc.RunId))
+            {
+                try
+                {
+                    var v = await RunValidator.ValidateTaskAsync(src, tgt, _plan.Tasks[row.TaskId], row, rc.Options.ValidateChecksums, ct);
+                    rc.Repo.SetTaskValidation(rc.RunId, row.TaskId, Json.Serialize(v with
+                    {
+                        // The skip reason can quote a SQL error, so it is scrubbed - and scrubbing can empty a message whose whole
+                        // content was a secret. An empty string still serialises (only nulls vanish), but it would say nothing, and the
+                        // one thing this field exists for is to say why the checksum list is empty.
+                        ChecksumsSkipped = v.ChecksumsSkipped is null ? null
+                            : TransferFailure.NonBlank(rc.Scrub(v.ChecksumsSkipped), "the reason was removed because it held a secret"),
+                    }));
+                    if (!v.CountMatch)
+                        rc.Log("warn", $"{row.TaskId} {row.Target}: {v.CountNote ?? "the row counts were not confirmed"}.");
+                }
+                catch (Exception ex) when (!ct.IsCancellationRequested)
+                {
+                    string note = $"{row.TaskId} {row.Target}: could not be validated ({rc.Describe(ex)}). Its row counts and values "
+                                  + "are unconfirmed - the rows it loaded are unaffected.";
+                    rc.AddNote(note);
+                    rc.Log("warn", note);
+                }
+            }
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            string note = $"No task of run {rc.RunId} could be validated ({rc.Describe(ex)}); nothing in this report's row counts or "
+                          + "checksums was checked. The rows the run loaded are unaffected.";
+            rc.AddNote(note);
+            rc.Log("warn", note);
+        }
+    }
 
     private TransferOutcome Finish(RunContext rc, RunStatus status, string? error, string? summaryJson = null)
     {
