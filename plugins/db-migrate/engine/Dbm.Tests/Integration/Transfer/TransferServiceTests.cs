@@ -293,10 +293,13 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
         await using var rig = await RigAsync();
         string? stoppingDuring = null;
         RunStatus? statusDuring = null;
+        var eventsAtPause = new List<string>();
         rig.Service.ChunkCommitted += c =>
         {
             if (c.TaskId != "T01" || c.ChunkNo != 1) return;
+            int before = rig.Svc.Sink.Events.Count;
             rig.Service.Pause();
+            eventsAtPause.AddRange(rig.Svc.Sink.Events.Skip(before).Select(e => e.Type));
             var during = rig.Service.View();
             stoppingDuring = during.Stopping;
             statusDuring = during.Run!.Status;
@@ -307,6 +310,10 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
 
         Assert.Equal("pausing", stoppingDuring);
         Assert.Equal(RunStatus.Running, statusDuring);                                 // the run row cannot say it yet; the view can
+        // Ruling 140: and the screen has to be told, or none of the above reaches an operator who paused from the CLI, from an agent
+        // or from another tab - execute.js re-reads the view on transfer_run_changed/transfer_task_changed and on nothing else, so a
+        // pause announced only as a log line leaves the badge reading "Running" over an armed Pause button until the run ends.
+        Assert.Contains("transfer_run_changed", eventsAtPause);
         Assert.Null(rig.Service.View().Stopping);
         Assert.Equal(RunStatus.Paused, rig.Service.View().Run!.Status);
 

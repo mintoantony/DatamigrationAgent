@@ -100,6 +100,9 @@ public sealed class TransferService
     private readonly object _lock = new();
     private readonly CancellationTokenSource _lifetime = new();
     private bool _active, _starting;
+    /// <summary>The run <see cref="_control"/> belongs to, so a stop request can name it without re-reading the row it is stopping
+    /// (which is also the row that may not parse - ruling 142).</summary>
+    private long _activeRunId;
     private Task? _current;
     private TransferControl? _control;
     private TransferOptions? _preflightOptions;
@@ -201,7 +204,18 @@ public sealed class TransferService
         }
         try
         {
-            var latest = _services.Transfers.Latest();
+            TransferRunRow? latest;
+            try
+            {
+                latest = _services.Transfers.Latest();
+            }
+            catch (JsonException ex)
+            {
+                // Ruling 142, read one of three. Its own guard, not a shared one: each route has to refuse in its own words, and one
+                // catch-all would hide two of them the day a second thing throws.
+                throw UnreadableRun(ex, "No new run can start until that row is repaired or removed: it may still be loading into the "
+                                        + "same target, and this run would load into it too.");
+            }
             if (latest?.Status == RunStatus.Paused)
                 throw new TransferException("paused_run", $"Run {latest.Id} is paused; resume or cancel it first.");
             // A restart abandons a failed or cancelled run for a NEW run id: its checkpoint rows are ignored, and the __dbm_* tables
@@ -266,11 +280,30 @@ public sealed class TransferService
     public void Pause()
     {
         TransferControl? control;
-        lock (_lock) control = _active ? _control : null;
+        long runId;
+        lock (_lock)
+        {
+            control = _active ? _control : null;
+            runId = _activeRunId;
+        }
         if (control is null) throw new TransferException("not_running", "No transfer is running.");
         control.RequestPause();
         _services.Sink.Publish("log", new { level = "info", message = "Pause requested: running tasks stop after their current chunk." });
+        AnnounceStopping(runId, StopKind.Pause);
     }
+
+    /// <summary>
+    /// Ruling 140. A stop request changes what the execute screen must show - <see cref="TransferView.Stopping"/>, and with it a Pause
+    /// button that has already been spent - but it changes nothing in the run row, which still reads <c>running</c> until the last
+    /// keyless table finishes. Without an event the screen has no reason to re-read, so a pause pressed anywhere but in this tab (the
+    /// CLI, an agent in a terminal, a second browser) never reaches it: the operator watches a live "Running" with an armed Pause and
+    /// presses it again. The spec's requirement is that the screen shows the run's state whoever drove it, and that is this event.
+    /// <para>The payload carries the run's real status (still running) and what was asked for; the screen re-reads the view rather
+    /// than trusting the payload, so this only has to say "something changed" truthfully.</para>
+    /// </summary>
+    private void AnnounceStopping(long runId, StopKind kind) =>
+        _services.Sink.Publish("transfer_run_changed",
+            new { runId, status = EnumText.ToText(RunStatus.Running), stopping = StopText(kind) });
 
     /// <summary>
     /// Continues the latest paused or failed run from its checkpoints and returns its id.
@@ -291,7 +324,16 @@ public sealed class TransferService
         }
         try
         {
-            var run = _services.Transfers.Latest();
+            TransferRunRow? run;
+            try
+            {
+                run = _services.Transfers.Latest();
+            }
+            catch (JsonException ex)
+            {
+                // Ruling 142, read two of three.
+                throw UnreadableRun(ex, "It cannot be resumed: nothing is known about where it stopped or what it was loading.");
+            }
             if (run is null || run.Status is not (RunStatus.Paused or RunStatus.Failed))
                 throw new TransferException("not_resumable", "There is no paused or failed transfer run to resume.");
             EnsureTargetIsTheOneTheRunStartedIn(run);
@@ -314,14 +356,31 @@ public sealed class TransferService
     public async Task CancelAsync(CancellationToken ct)
     {
         TransferControl? control;
-        lock (_lock) control = _active ? _control : null;
+        long activeRunId;
+        lock (_lock)
+        {
+            control = _active ? _control : null;
+            activeRunId = _activeRunId;
+        }
         if (control is not null)
         {
             control.RequestCancel();
             _services.Sink.Publish("log", new { level = "warn", message = "Cancel requested: running tasks stop after their current chunk." });
+            // Ruling 140, the same door: a cancel asked for from the CLI moves the screen to "cancelling…" and disarms both buttons.
+            AnnounceStopping(activeRunId, StopKind.Cancel);
             return;
         }
-        var run = _services.Transfers.Latest();
+        TransferRunRow? run;
+        try
+        {
+            run = _services.Transfers.Latest();
+        }
+        catch (JsonException ex)
+        {
+            // Ruling 142, read three of three.
+            throw UnreadableRun(ex, "It cannot be cancelled: nothing is known about whether it is still running, or about what "
+                                    + "cancelling it would leave in the target.");
+        }
         if (run is null || run.Status is not (RunStatus.Paused or RunStatus.Failed))
             throw new TransferException("not_cancellable", "There is no running, paused or failed transfer to cancel.");
         if (!run.Options.KeepControlTable) await DropControlTableAsync(ConnectionStrings().Target, ct);
@@ -560,6 +619,7 @@ public sealed class TransferService
         lock (_lock)
         {
             _control = control;
+            _activeRunId = runId;
             _active = true;
             _current = Task.Run(() => RunBackgroundAsync(engine, runId, control, secrets, origin));
         }
@@ -953,6 +1013,21 @@ public sealed class TransferService
         return run.Status is RunStatus.Paused or RunStatus.Failed ? null
             : $"Run {run.Id} is {EnumText.ToText(run.Status)}; only a paused or failed run can be resumed.";
     }
+
+    /// <summary>
+    /// Ruling 142. <c>TransferRepo.MapRun</c> deserialises <c>options_json</c>, so a saved run that will not parse throws out of
+    /// <c>Latest()</c> - and out of <c>start</c>, <c>resume</c> and <c>cancel</c>, where 5.6's endpoint <c>Guard</c> mapped it to
+    /// <b>400 "Invalid JSON body"</b>. On those three routes the body really is fine: the unreadable thing is a record on disk, so the
+    /// operator was told to fix the one thing that was not broken, on the three buttons of a screen that was already saying the saved
+    /// run could not be read (ruling 132). A refusal by name with the record in the sentence is the same answer ruling 135 gave the
+    /// errors route.
+    /// <para>The code is new rather than borrowed: <c>not_resumable</c> and <c>not_cancellable</c> both claim to know the run's status,
+    /// and knowing it is exactly what failed here.</para>
+    /// </summary>
+    private static TransferException UnreadableRun(JsonException ex, string consequence) =>
+        new("unreadable_run",
+            "The latest transfer run could not be read: the options this workspace saved for it are not readable JSON ("
+            + Describe(ex) + "). " + consequence);
 
     private static string StopText(StopKind kind) => kind switch
     {

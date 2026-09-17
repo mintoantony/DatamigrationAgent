@@ -25,6 +25,9 @@ public static class TransferEndpoints
         ArgumentNullException.ThrowIfNull(app);
         ArgumentNullException.ThrowIfNull(state);
 
+        // T5.6: GET/POST /api/export/report through the T2.8 registry - no route of its own.
+        ExportEndpoints.Register("report", ReportExport.BuildAsync);
+
         app.MapGet("/api/transfer", () => Guard(() => Task.FromResult(ApiResults.Json(Service(state).View()))));
 
         app.MapPost("/api/transfer/preflight", (HttpRequest req, CancellationToken ct) => Guard(async () =>
@@ -57,7 +60,24 @@ public static class TransferEndpoints
 
         app.MapGet("/api/transfer/errors", (string? task, int? limit) => Guard(() =>
         {
-            var run = state.Services.Transfers.Latest();
+            TransferRunRow? run;
+            try
+            {
+                run = state.Services.Transfers.Latest();
+            }
+            catch (JsonException ex)
+            {
+                // Ruling 135. TransferRepo.MapRun deserialises options_json, so a saved run that will not parse throws here - and
+                // Guard would answer 400 "Invalid JSON body" to a GET that has no body, while GET /api/transfer beside it degrades
+                // with a sentence (ruling 132). The drawer must not contradict the screen it opens over: an empty list, 200, and the
+                // sentence saying which saved record is at fault, so the panel cannot be read as "no rejected rows".
+                return Task.FromResult(ApiResults.Json(new
+                {
+                    rows = Array.Empty<ErrorRowEntry>(),
+                    note = "The latest transfer run could not be read: the options this workspace saved for it are not readable JSON ("
+                           + TransferFailure.Describe(ex, t => t) + "). No rejected rows can be listed for it.",
+                }));
+            }
             IReadOnlyList<ErrorRowEntry> rows = run is null
                 ? []
                 : state.Services.Transfers.ErrorRows(run.Id, string.IsNullOrWhiteSpace(task) ? null : task, limit ?? 100);

@@ -182,6 +182,58 @@ public sealed class TransferEndpointsTests : IDisposable
         Assert.Contains("could not be read", (string?)body["cannotStart"] ?? "");
     }
 
+    /// <summary>
+    /// Ruling 135 (T5.6). The rejected-rows drawer reads the same workspace as the execute screen above it, so it has to degrade the
+    /// same way. Unguarded, this route reaches <c>TransferRepo.Latest()</c> directly: a saved run whose <c>options_json</c> will not
+    /// parse throws there, and <c>Guard</c> answers <b>400 "Invalid JSON body"</b> - to a GET that has no body - while the main view
+    /// beside it degrades with a sentence. The operator is then shown a screen that explains itself above a drawer that contradicts it.
+    /// </summary>
+    [Fact]
+    public async Task Errors_of_a_run_whose_saved_options_will_not_parse_are_an_empty_list_with_the_reason()
+    {
+        var s = _workspace.OpenServices();
+        long runId = s.Transfers.CreateRun(1, new TransferOptions(), [("T01", "app.A")]);
+        s.Db.Execute("UPDATE transfer_run SET options_json = '{not json' WHERE id = $Id", new { Id = runId });
+        await using var server = await WebTestServer.StartAsync(_workspace.Ws, ws => DbmServices.Open(ws));
+
+        var (status, body) = await server.SendAsync(HttpMethod.Get, "/api/transfer/errors?task=T01&limit=10");
+
+        Assert.Equal(HttpStatusCode.OK, status);
+        Assert.Empty(body!["rows"]!.AsArray());
+        Assert.Contains("could not be read", (string?)body["note"] ?? "");
+        Assert.DoesNotContain("Invalid JSON body", body.ToJsonString());
+    }
+
+    /// <summary>
+    /// Ruling 142 (T5.6 fix round 1). The fifth, sixth and seventh reads of ruling 135's shape: start, resume and cancel each reach
+    /// <c>TransferRepo.Latest()</c>, which deserialises <c>options_json</c>, so a saved run that will not parse reached <c>Guard</c> and
+    /// came back as <b>400 "Invalid JSON body: …"</b>. These three POSTs have bodies, and the bodies are fine - the unreadable thing is
+    /// a record on disk. The operator was told to fix the one thing that was not broken, on the three buttons of a screen already
+    /// saying the saved run could not be read.
+    /// <para>Three guards, not one: each route refuses in its own words, and rethrowing any one of them leaves the other two passing.</para>
+    /// </summary>
+    [Theory]
+    [InlineData("start")]
+    [InlineData("resume")]
+    [InlineData("cancel")]
+    public async Task A_corrupt_saved_run_is_refused_by_name_not_as_an_invalid_body(string route)
+    {
+        var s = _workspace.OpenServices();
+        long runId = s.Transfers.CreateRun(1, new TransferOptions(), [("T01", "app.A")]);
+        s.Db.Execute("UPDATE transfer_run SET options_json = '{not json' WHERE id = $Id", new { Id = runId });
+        await using var server = await WebTestServer.StartAsync(_workspace.Ws, ws => DbmServices.Open(ws));
+
+        var (status, body) = await server.SendAsync(HttpMethod.Post, "/api/transfer/" + route,
+            route == "start" ? new { options = new { }, confirmTarget = "ShopV2" } : null);
+
+        Assert.Equal(HttpStatusCode.Conflict, status);
+        Assert.Equal("unreadable_run", (string?)body!["error"]);
+        string message = (string?)body["message"] ?? "";
+        Assert.Contains("could not be read", message);
+        Assert.Contains("options this workspace saved", message);         // which record, not just that something failed
+        Assert.DoesNotContain("Invalid JSON body", message);
+    }
+
     [Fact]
     public async Task A_malformed_body_is_a_bad_request_not_a_default_start()
     {
