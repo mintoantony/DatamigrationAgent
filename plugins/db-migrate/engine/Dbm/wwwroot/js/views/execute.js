@@ -161,11 +161,13 @@
     if (!S.ctx.export && d.canStart) {
       if (run) page.appendChild(h('div', { class: 'h2 exe-section-title' }, 'Start a new run'));
       page.appendChild(h('div', { class: 'exe-grid' }, preflightCard(), optionsCard()));
-    } else if (!S.ctx.export && !run && d.cannotStart) {
-      // No run, no start: the reason is the only thing on the screen that can be acted on.
+    } else if (!S.ctx.export && d.cannotStart) {
+      /* The reason goes where the button would have been, run or no run. With a run present this used to be skipped entirely, so a
+         target_changed or target_unknown refusal drew as a clean completed screen: no Execute button, and nothing saying the engine
+         was refusing rather than finished. A missing control that cannot say why it is missing is this project's defect exactly. */
       page.appendChild(h('section', { class: 'card' },
-        h('div', { class: 'card-h' }, h('div', { class: 'h3' }, 'Cannot start a transfer yet')),
-        h('div', { class: 'card-b' }, h('div', { class: 'wrap-anywhere' }, d.cannotStart))));
+        h('div', { class: 'card-h' }, h('div', { class: 'h3' }, run ? 'A new run cannot be started' : 'Cannot start a transfer yet')),
+        h('div', { class: 'card-b' }, h('div', { class: 'wrap-anywhere exe-cannot-start' }, d.cannotStart))));
     }
     if (!run) page.appendChild(tasksCard());
     clear(S.root);

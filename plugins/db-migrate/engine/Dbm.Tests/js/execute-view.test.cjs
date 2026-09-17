@@ -187,6 +187,28 @@ test('an unknown source count reads "unknown" and the totals say "at least"', as
   assert.equal(D.text(D.query(m.root, '.kpi .kpi-s')), 'of at least 100,000 · 72%');
 });
 
+/* ------------------------------------------------------------------ F4: a missing button that says why it is missing */
+
+test('the reason a new run cannot start is on screen even when the last run finished cleanly', async () => {
+  const why = 'The target database this plan was approved against is no longer the one configured on Setup, so a new run cannot start.';
+  const m = await mount(runningView({
+    active: false, canStart: false, cannotStart: why,
+    run: Object.assign(runningView().run, { status: 'completed', endedAt: '2026-09-17T09:12:30+00:00', notes: [] }),
+  }));
+  // target_changed and target_unknown are two of the service's own refusal codes, and both land here. Without this the screen is a
+  // green "Transfer completed" banner with no Execute button and nothing to act on.
+  assert.equal(D.text(D.query(m.root, '.exe-cannot-start')), why);
+  assert.equal(D.queryAll(m.root, 'button').filter((b) => D.text(b).indexOf('Execute') === 0).length, 0);
+});
+
+test('when a run can be started the button carries the reason instead, not a card', async () => {
+  const m = await mount(runningView({ active: false, canStart: true, run: null }));
+  assert.equal(D.query(m.root, '.exe-cannot-start'), null);
+  const exec = D.queryAll(m.root, 'button').filter((b) => D.text(b).indexOf('Execute') === 0)[0];
+  assert.equal(exec.disabled, true);
+  assert.equal(D.text(D.query(m.root, '.exe-form .toolbar .muted')), 'Run pre-flight first.');
+});
+
 /* ------------------------------------------------------------------ F2 / ruling 140: a pause this tab did not press */
 
 test('a pause driven from the CLI reaches the screen: the badge says pausing and Pause is spent', async () => {
