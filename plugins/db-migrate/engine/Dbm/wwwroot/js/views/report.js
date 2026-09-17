@@ -37,6 +37,12 @@
     return h('span', { class: cls, title: info.note || '' }, info.text);
   }
 
+  /**
+   * One column's verdict. The third branch is a **contract assertion against a trigger unreachable from here** (rulings 104, 112,
+   * 121): `ChecksumResult.Match` is a plain `bool`, so the engine cannot send a column with no verdict today. It is written and kept
+   * so that making `Match` nullable - the obvious fix for a column the validator could not read - cannot silently draw an uncompared
+   * column as a match or a mismatch. `X.reportChecksums` counts `differ` rather than subtracting for the same reason.
+   */
   function matchMark(v) {
     if (v === true) return h('span', { class: 'rep-match' }, '✓ match');
     if (v === false) return h('span', { class: 'rep-mismatch' }, '✕ mismatch');
@@ -46,7 +52,7 @@
   function checksumCell(t) {
     const list = t.checksums || [];
     const text = X.checksumDetail(t);
-    const bad = list.some(function (c) { return !c.match; });
+    const bad = list.some(function (c) { return c.match === false; });
     const missed = t.checksumColumnsNotCompared || 0;
     const cls = list.length ? (bad ? 'rep-mismatch' : (missed ? 'rep-unknown' : 'rep-match')) : 'rep-unknown';
     return h('span', { class: cls, title: t.checksumsSkipped || t.checksumColumnsNote || '' }, text);
@@ -83,9 +89,10 @@
           counts.notCompared ? counts.notCompared + ' of ' + counts.total + ' tasks were not compared'
             : (counts.mismatched ? counts.mismatched + ' mismatched' : 'every task matches'),
           counts.mismatched ? 'err' : (counts.notCompared ? 'warn' : 'ok')),
+        // "differ" is the counted number, never total - matched: a column nobody compared is a gap, not a difference.
         kpi('Checksums', X.checksumHeadline(sums),
-          sums.total ? (sums.matched === sums.total ? 'every column compared matches' : (sums.total - sums.matched) + ' differ') : 'not computed',
-          sums.total && sums.matched !== sums.total ? 'err' : (sums.notCompared ? 'warn' : (sums.total ? 'ok' : '')))),
+          sums.total ? (sums.differ ? sums.differ + ' differ' : 'every column compared matches') : 'not computed',
+          sums.differ ? 'err' : (sums.notCompared ? 'warn' : (sums.total ? 'ok' : '')))),
       // "of at least": while a task has no source count the total above it is a floor, not a total.
       missing ? DBM.components.notice('warn', missing + (missing === 1 ? ' task has' : ' tasks have')
         + ' no source row count, so the source total above is a floor and the percentages are priced from it.') : null,

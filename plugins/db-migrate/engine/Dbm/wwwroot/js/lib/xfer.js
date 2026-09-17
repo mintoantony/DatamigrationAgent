@@ -256,11 +256,22 @@
     return c;
   };
 
-  /** Across the report's tasks: checksum columns compared, matched, and the bound columns no checksum could cover. */
+  /**
+   * Across the report's tasks: checksum columns compared, matched, differing, and the bound columns no checksum could cover.
+   * <p><b>`differ` is counted, not subtracted.</b> `total - matched` is the same number today, because `ChecksumResult.Match` is a
+   * plain bool - but the day it becomes nullable (the obvious fix for a column the validator could not read) subtraction would report
+   * every uncompared column to the operator as a <i>difference</i>, which is a reason to halt a migration, while the row three lines
+   * below says "not compared". A gap must not turn into a finding by arithmetic.</p>
+   */
   X.reportChecksums = function (tasks) {
-    const c = { total: 0, matched: 0, notCompared: 0 };
+    const c = { total: 0, matched: 0, differ: 0, notCompared: 0 };
     (tasks || []).forEach(function (t) {
-      (t.checksums || []).forEach(function (s) { c.total += 1; if (s.match) c.matched += 1; });
+      (t.checksums || []).forEach(function (s) {
+        c.total += 1;
+        if (s.match === true) c.matched += 1;
+        else if (s.match === false) c.differ += 1;
+        else c.notCompared += 1;                 // in the list, with no verdict: unreachable today (see above), never a difference
+      });
       c.notCompared += t.checksumColumnsNotCompared || 0;
     });
     return c;

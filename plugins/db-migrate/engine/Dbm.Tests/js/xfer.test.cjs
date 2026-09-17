@@ -237,7 +237,7 @@ test('the report headline carries what was not compared', () => {
     { checksums: [{ match: true }, { match: true }], checksumColumnsNotCompared: 1 },
   ];
   assert.deepEqual(X.reportCounts(tasks), { total: 4, compared: 2, matched: 1, mismatched: 1, notCompared: 2 });
-  assert.deepEqual(X.reportChecksums(tasks), { total: 5, matched: 4, notCompared: 1 });
+  assert.deepEqual(X.reportChecksums(tasks), { total: 5, matched: 4, differ: 1, notCompared: 1 });
   assert.equal(X.checksumHeadline({ total: 5, matched: 5, notCompared: 1 }), '5/5 matched, 1 not compared');
   assert.equal(X.checksumHeadline({ total: 5, matched: 5, notCompared: 0 }), '5/5 matched');
   assert.equal(X.checksumHeadline({ total: 5, matched: 4, notCompared: 2 }), '4/5 matched, 2 not compared');
@@ -251,6 +251,17 @@ test('the report headline carries what was not compared', () => {
   assert.equal(X.checksumDetail({ checksums: [], checksumsSkipped: 'rows were rejected' }), 'skipped');
   assert.equal(X.checksumDetail({ checksums: [] }), '—');
   assert.equal(X.checksumDetail({ checksums: [{ match: true }], checksumColumnsNotCompared: 1 }), '1/1 match, 1 column not compared');
+});
+
+/* Rulings 104/112/121: a contract assertion whose trigger is UNREACHABLE from the engine today. ChecksumResult.Match is a plain
+   bool, so no column can arrive without a verdict. Both this and report.js's matchMark third branch exist so that making Match
+   nullable - the obvious fix for a column the validator could not read - cannot report a gap as a difference, which is a reason to
+   halt a migration. Delete them only together with that possibility. */
+test('CONTRACT (unreachable today): a checksum with no verdict is a gap, never a difference', () => {
+  const tasks = [{ checksums: [{ match: true }, { match: null }, { match: false }], checksumColumnsNotCompared: 0 }];
+  assert.deepEqual(X.reportChecksums(tasks), { total: 3, matched: 1, differ: 1, notCompared: 1 });
+  // The number the KPI shows as "N differ" is the counted one; total - matched would say 2 and send an operator to halt a migration.
+  assert.notEqual(X.reportChecksums(tasks).differ, 3 - 1);
 });
 
 test('the errors drawer reads both an array and a degraded answer', () => {
