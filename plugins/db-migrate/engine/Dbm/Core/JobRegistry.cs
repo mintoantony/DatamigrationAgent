@@ -16,5 +16,6 @@ public static class JobRegistry
         yield return new Dbm.Core.Catalog.DiscoverJob();   // T2.5
         yield return new Dbm.Core.Analysis.AnalyzeJob();   // T2.6
         yield return new Dbm.Core.Matching.AutomapJob();   // T3.3
+        yield return new Dbm.Core.SqlGen.SqlGenJob();    // T4.3
     }
 }

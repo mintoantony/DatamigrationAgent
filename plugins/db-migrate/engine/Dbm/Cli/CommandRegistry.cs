@@ -28,6 +28,8 @@ public static class CommandRegistry
         new SearchCommand(),     // T2.5
         new ShowCommand(),       // T2.5
         new MapAutoCommand(),    // T3.3
+        new SqlGenCommand(),     // T4.3
+        new SqlValidateCommand(), // T4.3
         // Later milestones append their commands below this line.
     ];
 }

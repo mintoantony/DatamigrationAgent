@@ -14,5 +14,6 @@ public static class ModuleRegistry
         // milestone registrations below
         yield return new Dbm.Core.Analysis.AnalysisModule();   // T2.7
         yield return new Dbm.Core.Mapping.MappingModule(s);    // T3.4
+        yield return new Dbm.Core.SqlGen.SqlModule();      // T4.4
     }
 }

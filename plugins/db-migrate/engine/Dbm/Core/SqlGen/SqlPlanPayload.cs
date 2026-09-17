@@ -12,6 +12,23 @@ public sealed class SqlPlanPayload
 
     public int ErrorCount() => Errors.Count + Tasks.Values.Sum(t => t.Errors.Count);
     public int WarningCount() => Warnings.Count + Tasks.Values.Sum(t => t.Warnings.Count);
+
+    /// <summary>Every way <see cref="Order"/> fails to list each task exactly once, in a stable order: "order[2]: T99 is not a task",
+    /// "order[6]: T01 is listed more than once", then (ordinal) "T03: task is missing from order". Empty = consistent.</summary>
+    public List<string> OrderProblems()
+    {
+        var problems = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        for (var i = 0; i < Order.Count; i++)
+        {
+            var id = Order[i];
+            if (!Tasks.ContainsKey(id)) problems.Add(FormattableString.Invariant($"order[{i}]: {id} is not a task"));
+            else if (!seen.Add(id)) problems.Add(FormattableString.Invariant($"order[{i}]: {id} is listed more than once"));
+        }
+        foreach (var id in Tasks.Keys.Where(k => !seen.Contains(k)).OrderBy(k => k, StringComparer.Ordinal))
+            problems.Add($"{id}: task is missing from order");
+        return problems;
+    }
 }
 
 public sealed class TaskPlan
@@ -38,5 +55,8 @@ public sealed class TaskPlan
 /// <summary>Source = alias in SourceQuery (equals the target column name for generated tasks); Target = target column name.</summary>
 public sealed record ColumnBinding(string Source, string Target);
 
-/// <summary>Result of SqlValidator.ValidateAsync (T4.3). Dictionaries contain an entry (possibly empty) for every validated task.</summary>
-public sealed record ValidationReport(bool Ok, Dictionary<string, List<string>> TaskErrors, Dictionary<string, List<string>> TaskWarnings, List<string> GlobalErrors);
+/// <summary>Result of SqlValidator.ValidateAsync (T4.3). Dictionaries contain an entry (possibly empty) for every validated task.
+/// <see cref="GlobalWarnings"/> is always present: "not checked" notices for global preSql/postSql, or, on a single-task run, the one
+/// line <c>SqlValidator.SingleTaskGlobalWarning</c> — so an empty list always means "checked, nothing to report".</summary>
+public sealed record ValidationReport(bool Ok, Dictionary<string, List<string>> TaskErrors, Dictionary<string, List<string>> TaskWarnings, List<string> GlobalErrors,
+    List<string> GlobalWarnings);

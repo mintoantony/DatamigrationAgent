@@ -1,5 +1,30 @@
 # Milestone 4 — SQL Generation
 
+> **AMENDMENT — READ THIS BEFORE ANY M4 TASK. The target-side validation design in this file is VOID.**
+>
+> Rulings 25, 26, 28 and 29 (see `.superpowers/sdd/00-overview/progress.md`). The `SET PARSEONLY` sandbox this file prescribes **does not work**, and was demonstrated executing `DELETE` on the target through `SqlValidator.ValidateAsync` while returning `ok=true, globalErrors=[], CheckShape=[]`.
+>
+> **Why:** SQL Server matches SET *option names* under collation rules, which ignore collation-ignorable characters. `SET PARSE<U+0640>ONLY OFF; DELETE …` is read by the server as `PARSEONLY OFF`, and no text filter over that token can be made reliable — the accepted set has ~10,400 members in the BMP alone and **varies with the customer's collation**, which this engine never inspects.
+>
+> **Void in this file — do not implement, do not copy:**
+> - `:5` "validated live against both databases **without changing them**" — replaced by the narrower claim below.
+> - `:10` the three-batch PARSEONLY "safe form" — void **as a security control**.
+> - `:1011` "…parse-checked with the three-batch PARSEONLY form… **Nothing is ever executed on either database.**" — the requirement sentence. Void.
+> - `:1380-1382` the `SqlValidator` doc comment prescribing the three-batch form.
+> - `:1569-1581` the `ParseCheckAsync` code block, doc comment included ("Nothing executes"). **`:3986` claims every code block here is byte-identical to the shipped files — so copying this one restores the vulnerability.**
+> - `:1617` the non-pooled-connection rationale — moot once PARSEONLY is gone.
+> - `:1854` the three-batch explanation.
+> - `:3985` "Deliberate deviations: three-batch PARSEONLY…" — superseded.
+> - `:3986` the verification note is **true about the tests passing and false about the design being sound**. The suite could not see this: deleting `SET PARSEONLY ON;` entirely still passed all 111 tests, because the fixture's `preSql` disables an FK that its `postSql` re-enables.
+>
+> **Still correct and load-bearing:** `:9`'s error numbers (207 + 11501 for an unknown column, 208 + 11529 for an unknown table) — the replacement design depends on them. `:3970`'s warning about the single-batch form remains true about SQL Server; it is simply no longer relevant here. `m1-core-platform.md:10480` ("PARSEONLY is not used anywhere in M0/M1") stays true.
+>
+> **What replaces it:** target statements are parse-checked with **`sp_describe_first_result_set`** — the same primitive the source side already uses, verified immune to all six bypass variants because it never honours `SET PARSEONLY`. A target statement is **never sent as a batch**; it is only ever a string argument to a metadata procedure. `ExecAsync`/`ExecuteNonQuery` is never called on plan SQL.
+>
+> **A capability increase you must plan for, not a regression.** `:10` records that under PARSEONLY "unknown objects/columns are **not** reported (parse only)". `sp_describe` *compiles*, so it reports them. That is strictly better — and it is why `mergeSql` (`INSERT … FROM #stg`, `:207` of `SqlGenerator.cs`) now returns `[208] Invalid object name '#stg'` unless the staging table exists. **Do not fix that by executing the stored `stagingDdl`** — it can be agent-written, and executing it re-opens the hole. Synthesize the scaffold from catalog types through one shared builder, execute only that engine-authored DDL, and report a `#`-prefixed `[208]`/`[207]` as "not checked".
+>
+> **The safety claim, corrected:** *"No plan SQL — generated or agent-written — is ever executed. Validation may create an engine-authored, session-local temp table in tempdb, dropped at connection close."*
+
 > Part of the db-migrate plan. Read 00-overview.md (Global Constraints + Shared contracts) before any task; every task implicitly includes the Global Constraints.
 
 **Goal:** turn the approved mapping (C12) into a reviewable, validated migration plan (C13): one task per mapped target table in FK-dependency order, with generated source queries, key aliases, identity/LOB handling and FK-cycle pre/post statements (T4.1–T4.2). The plan is validated live against both databases without changing them (T4.3), refined by the `sql-engineer` subagent through the standard review loop and exported as a DBA-readable script pack (T4.4), and reviewed in the SQL screen with highlighted, line-commentable code, direct editing and per-task version diffs (T4.5).
