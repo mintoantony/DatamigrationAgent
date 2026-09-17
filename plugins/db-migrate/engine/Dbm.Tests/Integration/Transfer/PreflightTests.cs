@@ -201,6 +201,10 @@ public sealed class PreflightTests(EngineSourceFixture fx) : IClassFixture<Engin
         Assert.False(drift.Ok);
         Assert.Equal("error", drift.Severity);                             // ruling 120: nothing else records this fault
         Assert.Contains("could not be verified", drift.Detail);
+        // N2: a JSON parser message about a file the operator never saw is a line they cannot act on. Name the thing that will not
+        // parse, and the remedy, the way the sql_plan route one screen up already does.
+        Assert.Contains("saved catalog metadata", drift.Detail);
+        Assert.Contains("re-run discovery", drift.Detail);
         Assert.False(result.Passed);
         Assert.True(Check(result.Checks, "source_connection").Ok);          // nothing else failed: this is the drift check alone
         Assert.True(Check(result.Checks, "target_connection").Ok);
@@ -234,5 +238,68 @@ public sealed class PreflightTests(EngineSourceFixture fx) : IClassFixture<Engin
         Assert.Contains("T01", estimate.Detail);
         Assert.Contains("***", estimate.Detail);
         Assert.All(result.Checks, c => Assert.DoesNotContain(secret, c.Detail, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Harm (N1, ruling 124): CountSql is a plan field the generator returns verbatim, so a human can put anything in it. One that
+    /// yields a non-number needs no server fault at all - Convert.ToInt64 raises FormatException, SourceEstimateAsync caught only
+    /// SqlException, and RunAsync called it from a try with a finally and no catch. The operator got an exception where the checklist
+    /// belongs and lost every line that had already succeeded: F1's harm, on the other half of the same method.
+    /// </summary>
+    [Fact]
+    public async Task A_source_count_that_is_not_a_number_is_reported_rather_than_thrown()
+    {
+        await using var tgt = await TempDatabase.CreateAsync("dbm_pre_nan");
+        await tgt.ExecAsync(TransferEngineTests.TargetSchema);
+        using var svc = new XferServices();
+        var s = svc.Services;
+        s.Connections.Save(Side.Src, fx.Src.ConnectionString, TestCatalogs.Meta(fx.Src.Name));
+        s.Connections.Save(Side.Tgt, tgt.ConnectionString, TestCatalogs.Meta(tgt.Name));
+        var plan = TransferEngineTests.Plan();
+        plan.Tasks["T01"].CountSql = "SELECT N'about a thousand';";
+        Approve(s, plan);
+
+        // First without the group wrap above it, so that what is being pinned is the per-task catch itself and not the wrapper that
+        // would otherwise hide its absence: the fault must not leave this method at all.
+        await using (var direct = new SqlConnection(fx.Src.ConnectionString))
+        {
+            await direct.OpenAsync();
+            var bare = await Preflight.SourceEstimateAsync(direct, plan, default);
+            Assert.Contains("was not a number", bare.Detail);
+            Assert.Contains("2,700 rows across 2 tasks", bare.Detail);
+        }
+
+        var result = await Preflight.RunAsync(s, new TransferOptions(), default);
+
+        var estimate = Check(result.Checks, "estimated_rows");
+        Assert.False(estimate.Ok);
+        Assert.Equal("error", estimate.Severity);
+        Assert.Contains("T01", estimate.Detail);
+        Assert.Contains("was not a number", estimate.Detail);
+        Assert.Contains("2,700 rows across 2 tasks", estimate.Detail);       // the other two tasks were still counted
+        Assert.False(result.Passed);
+        foreach (var name in new[] { "sql_plan", "plan_valid", "source_connection", "target_connection", "schema_drift",
+                                     "target_tables", "insert_permission", "control_table", "target_rows" })
+            Assert.Contains(result.Checks, c => c.Name == name);             // every line that ran before it is still here
+    }
+
+    /// <summary>
+    /// Harm (N1, ruling 124): a source connection that dies part-way through the estimate makes every remaining task's command throw
+    /// InvalidOperationException, which escaped the same way. A connection in that state is what the re-reviewer's PP3 produced by
+    /// KILLing the session mid-count; closing it reaches the identical arm with no server tricks and no timing.
+    /// </summary>
+    [Fact]
+    public async Task A_source_connection_that_cannot_be_used_yields_a_checklist_line_not_an_exception()
+    {
+        await using var conn = new SqlConnection(fx.Src.ConnectionString);
+        await conn.OpenAsync();
+        await conn.CloseAsync();
+
+        var check = await Preflight.SourceEstimateAsync(conn, TransferEngineTests.Plan(), default);
+
+        Assert.False(check.Ok);
+        Assert.Equal("error", check.Severity);
+        Assert.Contains("0 rows across 0 tasks", check.Detail);
+        foreach (var id in new[] { "T01", "T02", "T03" }) Assert.Contains(id, check.Detail);
     }
 }

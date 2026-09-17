@@ -65,6 +65,24 @@ public static class RunValidator
     /// query. Both run plan-supplied <c>CountSql</c>; this one runs inside the completion hook with the run lock held.</summary>
     public const int RecountTimeoutSec = 120;
 
+    private static readonly AsyncLocal<int?> RecountTimeoutOverride = new();
+
+    /// <summary>
+    /// Test seam for <see cref="RecountTimeoutSec"/>. A bound of 120 s cannot be witnessed in a test without waiting two minutes, so
+    /// without this the bound is a constant nobody can prove is applied - and dropping it restores an unbounded query inside the
+    /// completion hook while the note still tells the operator it failed within 120 s. Held in an <see cref="AsyncLocal{T}"/> so one
+    /// test's override cannot reach another test's run, and null in production.
+    /// </summary>
+    internal static int? RecountTimeoutSecOverride
+    {
+        get => RecountTimeoutOverride.Value;
+        set => RecountTimeoutOverride.Value = value;
+    }
+
+    /// <summary>The bound actually applied. The note's wording is derived from this same value, so the sentence cannot claim a bound
+    /// the query was not given.</summary>
+    private static int RecountTimeout => RecountTimeoutSecOverride ?? RecountTimeoutSec;
+
     /// <summary>
     /// System scalar types BINARY_CHECKSUM compares exactly after V8 normalisation. text/ntext/image/xml/spatial/hierarchyid/sql_variant/
     /// rowversion and UDTs are out because BINARY_CHECKSUM either refuses them or is documented not to be value-faithful for them.
@@ -106,7 +124,7 @@ public static class RunValidator
             {
                 // Bounded, like SourceEstimateAsync's identical query: this is plan-supplied SQL running inside the completion hook
                 // with the run lock held, and an unbounded wait there is a run nobody can finish and nobody can cancel softly.
-                source = await TargetOps.ScalarLongOrNullAsync(src, TargetOps.CountSqlOf(task), ct, timeoutSec: RecountTimeoutSec);
+                source = await TargetOps.ScalarLongOrNullAsync(src, TargetOps.CountSqlOf(task), ct, timeoutSec: RecountTimeout);
                 sourceNote = source is null
                     ? "the source row count is unknown: this run never recorded one, and counting the source now produced no number either"
                     : "counted after the run, not the snapshot this run takes when a task starts - the source may have changed in between";
@@ -115,8 +133,10 @@ public static class RunValidator
             {
                 // Reported, not thrown: the count is one input to the report, and losing it must not lose the rest of the validation.
                 source = null;
+                // The bound in this sentence is read from the same place the command was given it, so it cannot claim one the query
+                // never had.
                 sourceNote = $"the source row count is unknown: this run never recorded one, and counting it now failed within "
-                             + $"{RecountTimeoutSec} s ({TransferFailure.NonBlank(ex.Message, ex.GetType().Name)})";
+                             + $"{RecountTimeout} s ({TransferFailure.NonBlank(ex.Message, ex.GetType().Name)})";
             }
         }
 

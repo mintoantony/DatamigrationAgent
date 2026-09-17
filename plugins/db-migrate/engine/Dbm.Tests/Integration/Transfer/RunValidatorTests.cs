@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Dbm.Core;
 using Dbm.Core.SqlGen;
 using Dbm.Core.State;
@@ -129,6 +130,63 @@ public sealed class RunValidatorTests(EngineSourceFixture fx) : IClassFixture<En
         Assert.False(faulted.CountCompared);
         Assert.Contains("counting it now failed", faulted.RowsSourceNote);
         Assert.Contains("Divide by zero", faulted.RowsSourceNote);
+    }
+
+    /// <summary>
+    /// Harm (N3, F9): the recount runs plan-supplied CountSql inside the completion hook, on a connection the run holds, with the run
+    /// lock held. Unbounded (CommandTimeout = 0) a slow or blocked count hangs the hook for as long as the server takes, while the note
+    /// it writes still tells the operator the count "failed within 120 s". A bound of 120 s cannot be witnessed without waiting two
+    /// minutes, so the bound is injected here and the note's wording is derived from the same value: the sentence cannot claim a bound
+    /// the query was not given.
+    /// <para>The rig: PrepareAsync records rows_source as null (its CountSql yields NULL), the plan's CountSql is then swapped for a
+    /// three-second one as the last chunk commits, and the completion hook's recount is the only thing left that runs it.</para>
+    /// </summary>
+    [Fact]
+    public async Task The_in_hook_source_recount_is_bounded_and_a_timeout_becomes_a_note()
+    {
+        await using var tgt = await TempDatabase.CreateAsync("dbm_val_recount");
+        await tgt.ExecAsync(TransferEngineTests.TargetSchema);
+        using var svc = new XferServices();
+        var plan = TransferEngineTests.Plan();
+        foreach (var id in new[] { "T02", "T03" })
+        {
+            plan.Tasks.Remove(id);
+            plan.Order.Remove(id);
+        }
+        var task = plan.Tasks["T01"];
+        task.CountSql = "SELECT CAST(NULL AS bigint);";                     // no source count is ever recorded for this run
+        var engine = new TransferEngine(svc.Services, plan, fx.Src.ConnectionString, tgt.ConnectionString);
+        long runId = engine.CreateRun(1, new TransferOptions { ErrorMode = "skip" });
+
+        var afterLastChunk = new Stopwatch();
+        var control = new TransferControl();
+        control.ChunkCommitted += _ =>
+        {
+            task.CountSql = "WAITFOR DELAY '00:00:03'; SELECT CAST(1 AS bigint);";
+            afterLastChunk.Restart();
+        };
+
+        RunValidator.RecountTimeoutSecOverride = 1;
+        try
+        {
+            var outcome = await engine.RunAsync(runId, control, default);
+            afterLastChunk.Stop();
+
+            // The bound first, because it is the thing with no other witness: if it is not applied the recount simply succeeds after
+            // the full three seconds, and every assertion below would then be testing an unbounded query's happy path.
+            Assert.True(afterLastChunk.Elapsed < TimeSpan.FromSeconds(2.5),
+                $"the hook took {afterLastChunk.Elapsed.TotalSeconds:F1}s after the last chunk for a recount bounded at 1s, so the "
+                + "bound was not applied and the query ran to its full three-second delay");
+            Assert.Equal(RunStatus.Completed, outcome.Status);              // a bounded wait is a note, never a failed run
+            var v = Json.Deserialize<TaskValidation>(svc.Services.Transfers.Tasks(runId).Single().ValidationJson!);
+            Assert.Null(v.RowsSource);
+            Assert.False(v.CountCompared);
+            Assert.Contains("failed within 1 s", v.RowsSourceNote);
+        }
+        finally
+        {
+            RunValidator.RecountTimeoutSecOverride = null;
+        }
     }
 
     /// <summary>

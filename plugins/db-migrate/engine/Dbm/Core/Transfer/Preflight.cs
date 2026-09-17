@@ -94,9 +94,13 @@ public static class Preflight
                     // Ruling 120: both connections are open here, so nothing else in the list is an error. Drift DETECTED blocks the
                     // run; drift left UNVERIFIABLE must block it too, or the one-bit gate says "go" about the check that catches a
                     // schema changed since discovery.
-                    checks.Add(NotRun("schema_drift",
-                        "The schemas could not be verified against the discovered catalogs: " + Describe(ex),
-                        causeIsAlreadyAnError: false));
+                    // The JSON route names what would not parse and what to do about it: a parser message on its own blocks the
+                    // operator with a complaint about a file they have never seen, which is a line they cannot act on.
+                    string why = ex is JsonException
+                        ? "The schemas could not be verified because the saved catalog metadata from discovery could not be read; "
+                          + "re-run discovery. " + Describe(ex)
+                        : "The schemas could not be verified against the discovered catalogs: " + Describe(ex);
+                    checks.Add(NotRun("schema_drift", why, causeIsAlreadyAnError: false));
                 }
             }
             else
@@ -133,11 +137,30 @@ public static class Preflight
                     causeIsAlreadyAnError: true));
             }
 
-            checks.Add(src is not null
-                ? await SourceEstimateAsync(src, approved.Plan, ct)
-                : NotRun("estimated_rows",
+            if (src is not null)
+            {
+                try
+                {
+                    checks.Add(await SourceEstimateAsync(src, approved.Plan, ct));
+                }
+                catch (Exception ex) when (ex is SqlException or FormatException or InvalidCastException or InvalidOperationException
+                                              or TimeoutException)
+                {
+                    // Symmetric with the target group's wrap, and for the same reason. Every fault the per-task catch above can see is
+                    // already handled there, so nothing reachable today lands here: this is a contract assertion (rulings 104, 112) so
+                    // that a future probe added outside that loop cannot turn one fault back into a lost checklist.
+                    checks.Add(Err("source_probe", "The source estimate stopped part-way: " + Describe(ex)));
+                    checks.Add(NotRun("estimated_rows",
+                        "Not counted: the source estimate stopped before finishing, so the number of rows this run would move is unknown.",
+                        causeIsAlreadyAnError: true));
+                }
+            }
+            else
+            {
+                checks.Add(NotRun("estimated_rows",
                     "Not counted: the source connection could not be opened, so the number of rows this run would move is unknown.",
                     causeIsAlreadyAnError: true));
+            }
 
             var keyless = TransferEngine.PlanOrder(approved.Plan).Where(id => approved.Plan.Tasks[id].KeyColumns.Count == 0)
                 .Select(id => approved.Plan.Tasks[id].Target).ToList();
@@ -314,7 +337,8 @@ public static class Preflight
         long total = 0;
         int counted = 0;
         (string Target, long Rows) largest = ("", -1);
-        var couldNotCount = new List<string>();
+        var noNumber = new List<string>();      // the query answered, with something that is not a count
+        var faulted = new List<string>();       // the query could not be run at all
         foreach (var id in TransferEngine.PlanOrder(plan))
         {
             var task = plan.Tasks[id];
@@ -323,23 +347,30 @@ public static class Preflight
                 long? n = await TargetOps.ScalarLongOrNullAsync(src, TargetOps.CountSqlOf(task), ct, timeoutSec: 120);
                 if (n is null)
                 {
-                    couldNotCount.Add($"{id} (the query returned no number, so its rows are not in the total)");
+                    noNumber.Add($"{id} (the query returned no number, so its rows are not in the total)");
                     continue;
                 }
                 total += n.Value;
                 counted++;
                 if (n.Value > largest.Rows) largest = (task.Target, n.Value);
             }
-            catch (SqlException ex)
+            // Ruling 124. CountSql is a plan field the generator returns verbatim, so anything a human can write can come back from it:
+            // a non-number raises FormatException or InvalidCastException out of Convert.ToInt64 with no server fault at all, and a
+            // source connection that died part-way through raises InvalidOperationException from the next task's command. One task's
+            // fault must cost that task's line, never the checklist - which is what the operator is holding to find out what to fix.
+            catch (Exception ex) when (ex is SqlException or FormatException or InvalidCastException or InvalidOperationException
+                                          or TimeoutException)
             {
-                couldNotCount.Add($"{id} ({Describe(ex)})");
+                faulted.Add($"{id} ({(ex is FormatException or InvalidCastException ? "its count was not a number: " : "")}{Describe(ex)})");
             }
         }
         string detail = $"{total.ToString("N0", CultureInfo.InvariantCulture)} rows across {counted} tasks" +
                         (largest.Rows >= 0 ? $" (largest: {largest.Target} {largest.Rows.ToString("N0", CultureInfo.InvariantCulture)})" : "") + ".";
-        return couldNotCount.Count == 0
-            ? Ok("estimated_rows", detail)
-            : new PreflightCheck("estimated_rows", false, "warning", detail + " Could not count: " + string.Join("; ", couldNotCount) + ".");
+        if (noNumber.Count == 0 && faulted.Count == 0) return Ok("estimated_rows", detail);
+        // Ruling 120's rule applied here too: a task whose count could not be run at all is a fault nothing else in the list records,
+        // so it is an error. A query that answered with no number is the documented, non-fatal case and stays a warning.
+        return new PreflightCheck("estimated_rows", false, faulted.Count > 0 ? "error" : "warning",
+            detail + " Could not count: " + string.Join("; ", faulted.Concat(noNumber)) + ".");
     }
 
     private static async Task<SqlConnection?> TryOpenAsync(string name, string? cs, List<PreflightCheck> checks, IReadOnlyList<string> secrets,
