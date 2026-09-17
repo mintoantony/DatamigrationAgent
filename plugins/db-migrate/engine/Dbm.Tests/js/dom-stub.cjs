@@ -12,6 +12,9 @@
  * task's 690-line test file after review, for no coverage this round needs.
  */
 
+/** Boolean content attributes whose IDL property the browser keeps in step with the attribute. */
+const REFLECTED = ['disabled', 'hidden', 'checked', 'readonly', 'required'];
+
 class FakeNode {
   constructor(tag, ns) {
     this.tagName = tag;
@@ -57,9 +60,16 @@ class FakeNode {
   get textContent() { return this.text + this.children.map((c) => c.textContent).join(''); }
   set textContent(v) { this.children = []; this.text = String(v); }
 
-  setAttribute(k, v) { this.attributes[k] = String(v); if (k === 'value') this.value = String(v); }
+  /* The browser reflects the boolean content attributes onto the IDL properties, and DBM.h writes the attribute
+     (`disabled: true` -> setAttribute('disabled', '')). Without the reflection a test reads an armed button where the
+     browser shows a dead one - the drift Ruling 141 warns about, found by exactly that assertion. */
+  setAttribute(k, v) {
+    this.attributes[k] = String(v);
+    if (k === 'value') this.value = String(v);
+    if (REFLECTED.indexOf(k) >= 0) this[k] = true;
+  }
   getAttribute(k) { return this.attributes[k] === undefined ? null : this.attributes[k]; }
-  removeAttribute(k) { delete this.attributes[k]; }
+  removeAttribute(k) { delete this.attributes[k]; if (REFLECTED.indexOf(k) >= 0) this[k] = false; }
   addEventListener(ev, fn) { (this.listeners[ev] = this.listeners[ev] || []).push(fn); }
   removeEventListener(ev, fn) { this.listeners[ev] = (this.listeners[ev] || []).filter((f) => f !== fn); }
   querySelector(sel) { return query(this, sel); }

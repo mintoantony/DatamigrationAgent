@@ -187,6 +187,37 @@ test('an unknown source count reads "unknown" and the totals say "at least"', as
   assert.equal(D.text(D.query(m.root, '.kpi .kpi-s')), 'of at least 100,000 · 72%');
 });
 
+/* ------------------------------------------------------------------ F2 / ruling 140: a pause this tab did not press */
+
+test('a pause driven from the CLI reaches the screen: the badge says pausing and Pause is spent', async () => {
+  // The service announces the stop with transfer_run_changed; this tab pressed nothing, so the event is the only way it can know.
+  let stopping = null;
+  const m = await mount(null, { view: () => runningView({ stopping: stopping }) });
+  assert.equal(D.text(D.query(m.root, '.page-h .badge')), 'Running');
+  assert.deepEqual(D.queryAll(m.root, '.card .toolbar button').map((b) => D.text(b) + (b.disabled ? ' [disabled]' : '')),
+    ['Pause', 'Cancel run']);
+
+  stopping = 'pausing';
+  VIEW.onEvent({ type: 'transfer_run_changed', data: { runId: 9, status: 'running', stopping: 'pausing' } });
+  await D.settle(220);
+
+  assert.equal(D.text(D.query(m.root, '.page-h .badge')), 'pausing…');
+  assert.deepEqual(D.queryAll(m.root, '.card .toolbar button').map((b) => D.text(b) + (b.disabled ? ' [disabled]' : '')),
+    ['pausing… [disabled]', 'Cancel run'], 'Pause is spent; Cancel escalates and stays armed');
+  assert.ok(D.text(D.query(m.root, '.exe-banner')).indexOf('Pausing…') === 0);
+});
+
+test('a cancel driven from outside disarms both buttons', async () => {
+  let stopping = null;
+  const m = await mount(null, { view: () => runningView({ stopping: stopping }) });
+  stopping = 'cancelling';
+  VIEW.onEvent({ type: 'transfer_run_changed', data: { runId: 9, status: 'running', stopping: 'cancelling' } });
+  await D.settle(220);
+  assert.equal(D.text(D.query(m.root, '.page-h .badge')), 'cancelling…');
+  assert.deepEqual(D.queryAll(m.root, '.card .toolbar button').map((b) => D.text(b) + (b.disabled ? ' [disabled]' : '')),
+    ['cancelling… [disabled]']);
+});
+
 /* ------------------------------------------------------------------ F7 / ruling 139: the flag, not the wording */
 
 test('a check the engine ran and failed is drawn as failed, however its sentence reads', async () => {

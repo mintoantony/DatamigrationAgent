@@ -100,6 +100,9 @@ public sealed class TransferService
     private readonly object _lock = new();
     private readonly CancellationTokenSource _lifetime = new();
     private bool _active, _starting;
+    /// <summary>The run <see cref="_control"/> belongs to, so a stop request can name it without re-reading the row it is stopping
+    /// (which is also the row that may not parse - ruling 142).</summary>
+    private long _activeRunId;
     private Task? _current;
     private TransferControl? _control;
     private TransferOptions? _preflightOptions;
@@ -266,11 +269,30 @@ public sealed class TransferService
     public void Pause()
     {
         TransferControl? control;
-        lock (_lock) control = _active ? _control : null;
+        long runId;
+        lock (_lock)
+        {
+            control = _active ? _control : null;
+            runId = _activeRunId;
+        }
         if (control is null) throw new TransferException("not_running", "No transfer is running.");
         control.RequestPause();
         _services.Sink.Publish("log", new { level = "info", message = "Pause requested: running tasks stop after their current chunk." });
+        AnnounceStopping(runId, StopKind.Pause);
     }
+
+    /// <summary>
+    /// Ruling 140. A stop request changes what the execute screen must show - <see cref="TransferView.Stopping"/>, and with it a Pause
+    /// button that has already been spent - but it changes nothing in the run row, which still reads <c>running</c> until the last
+    /// keyless table finishes. Without an event the screen has no reason to re-read, so a pause pressed anywhere but in this tab (the
+    /// CLI, an agent in a terminal, a second browser) never reaches it: the operator watches a live "Running" with an armed Pause and
+    /// presses it again. The spec's requirement is that the screen shows the run's state whoever drove it, and that is this event.
+    /// <para>The payload carries the run's real status (still running) and what was asked for; the screen re-reads the view rather
+    /// than trusting the payload, so this only has to say "something changed" truthfully.</para>
+    /// </summary>
+    private void AnnounceStopping(long runId, StopKind kind) =>
+        _services.Sink.Publish("transfer_run_changed",
+            new { runId, status = EnumText.ToText(RunStatus.Running), stopping = StopText(kind) });
 
     /// <summary>
     /// Continues the latest paused or failed run from its checkpoints and returns its id.
@@ -314,11 +336,18 @@ public sealed class TransferService
     public async Task CancelAsync(CancellationToken ct)
     {
         TransferControl? control;
-        lock (_lock) control = _active ? _control : null;
+        long activeRunId;
+        lock (_lock)
+        {
+            control = _active ? _control : null;
+            activeRunId = _activeRunId;
+        }
         if (control is not null)
         {
             control.RequestCancel();
             _services.Sink.Publish("log", new { level = "warn", message = "Cancel requested: running tasks stop after their current chunk." });
+            // Ruling 140, the same door: a cancel asked for from the CLI moves the screen to "cancelling…" and disarms both buttons.
+            AnnounceStopping(activeRunId, StopKind.Cancel);
             return;
         }
         var run = _services.Transfers.Latest();
@@ -560,6 +589,7 @@ public sealed class TransferService
         lock (_lock)
         {
             _control = control;
+            _activeRunId = runId;
             _active = true;
             _current = Task.Run(() => RunBackgroundAsync(engine, runId, control, secrets, origin));
         }
