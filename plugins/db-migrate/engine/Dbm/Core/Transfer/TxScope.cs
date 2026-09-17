@@ -58,9 +58,16 @@ public sealed class TxScope : IAsyncDisposable
         _restored = false;
     }
 
-    public async Task CommitAsync(CancellationToken ct)
+    /// <param name="afterCommit">Ruling 114. Raised on the statement after the COMMIT, so a caller that has something to do at the
+    /// instant its transaction became durable has nowhere to put a line before it: the commit and the callback are one operation, and
+    /// there is no gap in the caller for a later edit to occupy. Optional, so every caller with nothing to raise keeps calling
+    /// <c>CommitAsync(ct)</c> unchanged. It runs after the transaction is durable, so throwing from it cannot undo the commit - the
+    /// scope is left to <see cref="DisposeAsync"/>, whose rollback of an already-committed transaction is swallowed and whose
+    /// <see cref="RestoreSessionStateAsync"/> still runs.</param>
+    public async Task CommitAsync(CancellationToken ct, Func<CancellationToken, Task>? afterCommit = null)
     {
         await Tx.CommitAsync(ct);
+        if (afterCommit is not null) await afterCommit(ct);
         _finished = true;
         await RestoreSessionStateAsync();
     }
