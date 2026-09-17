@@ -332,13 +332,17 @@
     const eta = X.etaInfo(agg.done + agg.errors, agg.total, rate, missing);
     const kDone = kpi('Rows loaded', X.num(agg.done), doneSub(agg, missing));
     const kRate = kpi('Throughput', d.active ? X.fmtRate(rate) : '—', d.active ? 'last 10 seconds' : 'the run is not moving');
-    const kEta = kpi('Time left', d.active ? eta.text : '—', d.active ? (eta.note || 'started ' + ts(run.startedAt)) : 'started ' + ts(run.startedAt));
+    /* The sub-label is rewritten on every update, never only when there is something to say: an explanation that outlives the
+       absence it explained is worse than none. A tab opened on a live transfer used to read "TIME LEFT 32s / waiting for the first
+       rows" while a quarter of a million rows a second were moving, and an operator then has to decide which half to believe. */
+    const startedAt = 'started ' + ts(run.startedAt);
+    const kEta = kpi('Time left', d.active ? eta.text : '—', d.active ? (eta.note || startedAt) : startedAt);
     const kErr = kpi('Rejected rows', X.num(agg.errors),
       run.options && run.options.errorMode === 'skip' ? 'skipped and logged' : 'stop on first error');
     const overall = bar(X.ratio(agg.done + agg.errors, agg.total), 'exe-bar-lg');
     const spark = h('div', { class: 'exe-spark', 'aria-label': 'Throughput over time' });
     if (S.rateHistory.length > 1) spark.appendChild(DBM.components.sparkline(S.rateHistory.map(function (s) { return s.v; })));
-    S.live = { done: kDone, rate: kRate, eta: kEta, err: kErr, bar: overall, spark: spark, missing: missing };
+    S.live = { done: kDone, rate: kRate, eta: kEta, err: kErr, bar: overall, spark: spark, missing: missing, startedAt: startedAt };
 
     wrap.appendChild(h('section', { class: 'card' },
       h('div', { class: 'card-b stack' },
@@ -583,7 +587,7 @@
     S.live.done.s.textContent = doneSub({ done: done, errors: errors, total: total }, missing);
     S.live.rate.v.textContent = X.fmtRate(rate);
     S.live.eta.v.textContent = eta.text;
-    if (eta.note) S.live.eta.s.textContent = eta.note;
+    S.live.eta.s.textContent = eta.note || S.live.startedAt;
     S.live.err.v.textContent = X.num(errors);
     setBar(S.live.bar, X.ratio(done + errors, total));
     if (Date.now() - S.sparkAt > 1000 && S.rateHistory.length > 1) {

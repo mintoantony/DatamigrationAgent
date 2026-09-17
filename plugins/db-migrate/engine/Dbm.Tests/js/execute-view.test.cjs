@@ -187,6 +187,48 @@ test('an unknown source count reads "unknown" and the totals say "at least"', as
   assert.equal(D.text(D.query(m.root, '.kpi .kpi-s')), 'of at least 100,000 · 72%');
 });
 
+/* ------------------------------------------------------------------ F5: an explanation must not outlive what it explained */
+
+test('the ETA\'s reason clears the moment there is an ETA', async () => {
+  // Every task counted, but no samples yet: the first paint has a number-less ETA and says why.
+  const counted = runningView({ totals: { rowsSource: 100000, rowsDone: 72000, rowsError: 3, tasksDone: 1, tasksTotal: 3, tasksWithoutSource: 0 } });
+  counted.tasks[2].rowsSource = 900000;
+  const m = await mount(counted);
+  const eta = D.queryAll(m.root, '.kpi')[2];
+  assert.equal(D.text(D.query(eta, '.kpi-v')), '—');
+  assert.equal(D.text(D.query(eta, '.kpi-s')), 'waiting for the first rows');
+
+  VIEW.onEvent({
+    type: 'transfer_progress',
+    data: {
+      runId: 9, status: 'running', tasks: [],
+      overall: { done: 500000, total: 1000000, rowsError: 0, rowsPerSec: 233400, etaSec: 32, tasksWithoutSource: 0 },
+    },
+  });
+  dom.flushFrames();
+
+  assert.equal(D.text(D.query(eta, '.kpi-v')), '32s');
+  // "TIME LEFT 32s / waiting for the first rows" over 233,400 rows a second is the inverse of this milestone's defect: not an
+  // absence that cannot explain itself, but an explanation that has outlived the absence and now contradicts the number above it.
+  assert.notEqual(D.text(D.query(eta, '.kpi-s')), 'waiting for the first rows');
+  assert.equal(D.text(D.query(eta, '.kpi-s')), 'started ' + globalThis.DBM.fmt.ts('2026-09-17T09:00:00+00:00'));
+});
+
+test('an ETA withheld because a table is uncounted keeps saying so', async () => {
+  const m = await mount(runningView());
+  VIEW.onEvent({
+    type: 'transfer_progress',
+    data: {
+      runId: 9, status: 'running', tasks: [],
+      overall: { done: 500000, total: 1000000, rowsError: 0, rowsPerSec: 233400, tasksWithoutSource: 1 },
+    },
+  });
+  dom.flushFrames();
+  const eta = D.queryAll(m.root, '.kpi')[2];
+  assert.equal(D.text(D.query(eta, '.kpi-v')), '—');
+  assert.equal(D.text(D.query(eta, '.kpi-s')), '1 table has not been counted yet, so the rows left are unknown');
+});
+
 /* ------------------------------------------------------------------ F4: a missing button that says why it is missing */
 
 test('the reason a new run cannot start is on screen even when the last run finished cleanly', async () => {
