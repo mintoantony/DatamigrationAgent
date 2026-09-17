@@ -10,7 +10,19 @@ using Microsoft.Data.SqlClient;
 namespace Dbm.Core.Transfer;
 
 /// <summary>One line of the execute-screen checklist. <see cref="Ok"/> false with severity "error" blocks the run; "warning" does not.</summary>
-public sealed record PreflightCheck(string Name, bool Ok, string Severity, string Detail);
+public sealed record PreflightCheck(string Name, bool Ok, string Severity, string Detail)
+{
+    /// <summary>
+    /// True for a check this run could not carry out, as opposed to one that ran and found a fault (ruling 139). The two are already
+    /// built apart here - <see cref="Preflight.NotRun"/> against <c>Err</c> - but nothing carried the difference over the wire, so the
+    /// screen had to guess it from the wording, and the engine's own <c>target_probe</c> error ("Some target tables could not be
+    /// checked: …") reads exactly like one. Guessed wrong it draws a failure as "not run", which tells an operator the opposite of
+    /// what the engine found.
+    /// <para>Not nullable, so it is always serialised: a reader sees the <c>false</c> rather than inferring it from a key that is not
+    /// there, which is the same rule <see cref="TransferTotals.TasksWithoutSource"/> follows and the reason nulls are omitted at all.</para>
+    /// </summary>
+    public bool NotRun { get; init; }
+}
 
 public sealed record PreflightResult(int SqlVersion, DateTimeOffset At, List<PreflightCheck> Checks)
 {
@@ -412,5 +424,5 @@ public static class Preflight
     /// catch a changed schema and never ran must not leave that bit saying "go".</para>
     /// </summary>
     private static PreflightCheck NotRun(string name, string detail, bool causeIsAlreadyAnError) =>
-        new(name, false, causeIsAlreadyAnError ? "warning" : "error", detail);
+        new(name, false, causeIsAlreadyAnError ? "warning" : "error", detail) { NotRun = true };
 }

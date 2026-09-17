@@ -112,20 +112,21 @@ test('an unknown source count reads as "unknown", never as a blank or a zero', (
 });
 
 test('a not-run check is not a failed one and not a tick', () => {
+  // Ruling 139: the engine's own flag, not the wording. PreflightCheck.NotRun is set in Preflight.NotRun(...) and nowhere else.
   const notRunTarget = {
-    name: 'target_checks', ok: false, severity: 'warning',
+    name: 'target_checks', ok: false, severity: 'warning', notRun: true,
     detail: 'Not checked: the target connection could not be opened, so nothing is known about the target’s tables.',
   };
   const notRunDrift = {
-    name: 'schema_drift', ok: false, severity: 'error',
+    name: 'schema_drift', ok: false, severity: 'error', notRun: true,
     detail: 'The schemas could not be verified against the discovered catalogs: timeout.',
   };
   const notCounted = {
-    name: 'estimated_rows', ok: false, severity: 'warning',
+    name: 'estimated_rows', ok: false, severity: 'warning', notRun: true,
     detail: 'Not counted: the source connection could not be opened, so the number of rows this run would move is unknown.',
   };
-  const failedProbe = { name: 'target_probe', ok: false, severity: 'error', detail: 'The target checks stopped part-way: login failed.' };
-  const passed = { name: 'sql_plan', ok: true, severity: 'info', detail: 'Approved SQL plan v3 (7 tasks).' };
+  const failedProbe = { name: 'target_probe', ok: false, severity: 'error', notRun: false, detail: 'The target checks stopped part-way: login failed.' };
+  const passed = { name: 'sql_plan', ok: true, severity: 'info', notRun: false, detail: 'Approved SQL plan v3 (7 tasks).' };
 
   assert.equal(X.notRun(notRunTarget), true);
   assert.equal(X.notRun(notRunDrift), true);
@@ -138,6 +139,20 @@ test('a not-run check is not a failed one and not a tick', () => {
   assert.equal(X.checkState(notRunDrift), 'notrun');
   assert.equal(X.checkState(failedProbe), 'err');
   assert.equal(X.checkState({ name: 'target_rows', ok: false, severity: 'warning', detail: 'Target tables already contain rows: app.A.' }), 'warn');
+
+  /* F7, the harm rather than the shape. This is the engine's real target_probe check, built with Err() and carrying the SQL fault
+     itself; its sentence reads exactly like a check that did not run. Drawn as "not run" it tells an operator scanning for ✕ marks
+     that nobody looked, when the engine looked and found the thing blocking the transfer. */
+  const probeFault = {
+    name: 'target_probe', ok: false, severity: 'error', notRun: false,
+    detail: 'Some target tables could not be checked: app.Orders: Login failed for user \'dbm\'.',
+  };
+  assert.equal(X.notRun(probeFault), false);
+  assert.equal(X.checkState(probeFault), 'err');
+  assert.equal(X.checkGlyph(X.checkState(probeFault)), '✕');
+  assert.equal(X.checkLabel(X.checkState(probeFault)), 'failed');
+  // ...and the same sentence from the NotRun builder is still "not run": the flag decides, the wording never does.
+  assert.equal(X.checkState(Object.assign({}, probeFault, { notRun: true, severity: 'warning' })), 'notrun');
 
   assert.equal(X.checkGlyph('ok'), '✓');
   assert.equal(X.checkGlyph('notrun'), '?');
@@ -155,8 +170,8 @@ test('the pre-flight summary counts the checks nobody ran', () => {
     checks: [
       { name: 'sql_plan', ok: true, severity: 'info', detail: 'Approved SQL plan v3 (7 tasks).' },
       { name: 'target_connection', ok: false, severity: 'error', detail: 'Login failed for user.' },
-      { name: 'target_checks', ok: false, severity: 'warning', detail: 'Not checked: the target connection could not be opened.' },
-      { name: 'estimated_rows', ok: false, severity: 'error', detail: 'Not counted: the source estimate stopped before finishing.' },
+      { name: 'target_checks', ok: false, severity: 'warning', notRun: true, detail: 'Not checked: the target connection could not be opened.' },
+      { name: 'estimated_rows', ok: false, severity: 'error', notRun: true, detail: 'Not counted: the source estimate stopped before finishing.' },
     ],
   };
   assert.deepEqual(X.preflightSummary(result), { total: 4, ok: 1, errors: 2, warnings: 1, notRun: 2 });
@@ -171,7 +186,7 @@ test('the pre-flight summary counts the checks nobody ran', () => {
   // Passed with a check nobody ran is not "ready" without saying so.
   assert.equal(X.preflightText({
     passed: true,
-    checks: [{ name: 'b', ok: false, severity: 'warning', detail: 'Not checked: needs both connections open.' }],
+    checks: [{ name: 'b', ok: false, severity: 'warning', notRun: true, detail: 'Not checked: needs both connections open.' }],
   }), 'Ready to execute, 1 warning, including 1 check that did not run');
 });
 

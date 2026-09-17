@@ -9,12 +9,6 @@
   const X = {};
   const OPTION_KEYS = ['chunkSize', 'parallelism', 'errorMode', 'truncateTarget', 'tableLock', 'validateChecksums', 'fireTriggers', 'keepControlTable'];
 
-  /* A check the engine put in the list but could not carry out. PreflightCheck has no flag for it (it is ok:false with the severity
-   * ruling 120 gives it), so it is read from the sentence the engine wrote - which is also the sentence the screen shows. A miss
-   * degrades to "failed"/"warning" with that same sentence in full; it never degrades to a tick or to a blank. */
-  const NOT_RUN_OPENING = /^\s*not\s+(checked|counted|run|compared)\b/i;
-  const NOT_RUN_REASON = /\bcould not be (verified|established|checked|counted|determined)\b/i;
-
   const GLYPHS = { ok: '✓', notrun: '?', warn: '!', err: '✕' };
   const CHECK_LABELS = { ok: 'passed', notrun: 'not run', warn: 'warning', err: 'failed' };
 
@@ -188,12 +182,14 @@
 
   X.checkTone = function (c) { return c.ok ? 'ok' : (c.severity === 'error' ? 'err' : 'warn'); };
 
-  /** True for a check the engine listed but could not carry out (ruling 120/124). */
-  X.notRun = function (c) {
-    if (!c || c.ok) return false;
-    const detail = String(c.detail || '');
-    return NOT_RUN_OPENING.test(detail) || NOT_RUN_REASON.test(detail);
-  };
+  /**
+   * True for a check the engine listed but could not carry out (rulings 120/124/139). It reads `PreflightCheck.NotRun`, which the
+   * engine sets in its `NotRun(...)` builder and nowhere else.
+   * <p>It used to read the sentence instead, and that was wrong in the direction nobody measured: the engine's own `target_probe`
+   * **error** - "Some target tables could not be checked: …", built with `Err()` - matched the prose and drew the one check carrying
+   * the actual SQL fault as a neutral "not run" chip. An operator scanning for ✕ marks would not have found the cause.</p>
+   */
+  X.notRun = function (c) { return !!(c && !c.ok && c.notRun); };
 
   /** 'ok' | 'notrun' | 'err' | 'warn' - a not-run check is drawn as neither a pass nor a failure. */
   X.checkState = function (c) { return X.notRun(c) ? 'notrun' : X.checkTone(c); };

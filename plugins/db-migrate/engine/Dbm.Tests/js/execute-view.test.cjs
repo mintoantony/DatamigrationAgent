@@ -187,6 +187,29 @@ test('an unknown source count reads "unknown" and the totals say "at least"', as
   assert.equal(D.text(D.query(m.root, '.kpi .kpi-s')), 'of at least 100,000 · 72%');
 });
 
+/* ------------------------------------------------------------------ F7 / ruling 139: the flag, not the wording */
+
+test('a check the engine ran and failed is drawn as failed, however its sentence reads', async () => {
+  // The engine's own target_probe error: built with Err(), carrying the SQL fault, and worded exactly like a check that did not run.
+  const probe = {
+    name: 'target_probe', ok: false, severity: 'error', notRun: false,
+    detail: "Some target tables could not be checked: app.Orders: Login failed for user 'dbm'.",
+  };
+  const m = await mount(runningView({ canStart: true, active: false, run: null }), {
+    preflight: { passed: false, at: '2026-09-17T09:00:00+00:00', checks: [probe] },
+  });
+  D.query(m.root, 'button').fire('click');
+  await D.settle();
+  await D.settle();
+
+  const icon = D.query(m.root, '.exe-check-icon');
+  assert.equal(D.text(icon), '✕', 'an operator scanning for ✕ marks must find the check that names the cause');
+  assert.equal(icon.getAttribute('aria-label'), 'failed');
+  assert.equal(icon.classes().includes('is-notrun'), false);
+  assert.equal(D.text(D.query(m.root, '.exe-check-name')), 'Target probe');
+  assert.equal(D.text(D.query(m.root, '.card-b .badge')), '1 blocking problem');
+});
+
 test('the pre-flight headline counts what did not run without counting it twice', async () => {
   const m = await mount(runningView({ canStart: true, active: false, run: null }));
   D.query(m.root, 'button').fire('click');
