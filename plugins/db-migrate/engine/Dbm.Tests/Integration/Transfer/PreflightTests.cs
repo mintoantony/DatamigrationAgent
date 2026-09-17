@@ -1,4 +1,7 @@
+using Dbm.Core;
+using Dbm.Core.Catalog;
 using Dbm.Core.SqlGen;
+using Dbm.Core.State;
 using Dbm.Core.Transfer;
 using Dbm.Tests.Support;
 using Microsoft.Data.SqlClient;
@@ -10,6 +13,14 @@ namespace Dbm.Tests.Integration.Transfer;
 public sealed class PreflightTests(EngineSourceFixture fx) : IClassFixture<EngineSourceFixture>
 {
     private static PreflightCheck Check(IEnumerable<PreflightCheck> checks, string name) => checks.Single(c => c.Name == name);
+
+    /// <summary>Approves <paramref name="plan"/> as v0 so that Preflight.RunAsync gets past its sql_plan gate.</summary>
+    private static void Approve(DbmServices s, SqlPlanPayload plan)
+    {
+        s.Artifacts.Add(PhaseName.Sql, 0, Json.Serialize(plan), "script", null);
+        s.Phases.SetCurrentVersion(PhaseName.Sql, 0);
+        s.Phases.SetApproved(PhaseName.Sql, 0, null);
+    }
 
     private static SqlPlanPayload PlanWithMissingTable()
     {
@@ -122,5 +133,106 @@ public sealed class PreflightTests(EngineSourceFixture fx) : IClassFixture<Engin
         Assert.Contains("2,300 rows across 2 tasks", check.Detail);      // 300 + 2000; the 700 of T03 were never established
         Assert.Contains("T03", check.Detail);
         Assert.Contains("no number", check.Detail);
+    }
+
+    /// <summary>
+    /// Harm (F1, ruling 119): an INSERT-without-SELECT loader account - the ordinary case a preflight checklist exists for - passes
+    /// HAS_PERMS_BY_NAME('INSERT') and then dies on COUNT_BIG. Uncaught, the operator gets an exception where the checklist belongs and
+    /// loses every line that already succeeded, including the one sentence naming what to fix. Preflight never throws for a SQL fault:
+    /// it reports the fault as an error check, keeps the lines that ran, and says which tables the remaining verdicts could not cover.
+    /// </summary>
+    [Fact]
+    public async Task A_table_that_cannot_be_probed_is_reported_rather_than_thrown()
+    {
+        await using var tgt = await TempDatabase.CreateAsync("dbm_pre_deny");
+        await tgt.ExecAsync(TransferEngineTests.TargetSchema);
+        await tgt.ExecAsync("CREATE USER loader WITHOUT LOGIN; GRANT INSERT ON SCHEMA::app TO loader;");
+        await using var conn = new SqlConnection(tgt.ConnectionString);
+        await conn.OpenAsync();
+        await using (var cmd = new SqlCommand("EXECUTE AS USER = 'loader';", conn)) await cmd.ExecuteNonQueryAsync();
+
+        var checks = await Preflight.TargetChecksAsync(conn, TransferEngineTests.Plan(), new TransferOptions(), default);
+        await using (var cmd = new SqlCommand("REVERT;", conn)) await cmd.ExecuteNonQueryAsync();
+
+        var probe = Check(checks, "target_probe");
+        Assert.False(probe.Ok);
+        Assert.Equal("error", probe.Severity);
+        Assert.Contains("app.Parent", probe.Detail);
+        Assert.Contains("SELECT permission", probe.Detail);
+
+        Assert.True(Check(checks, "target_tables").Ok);                                   // the lines that ran are still here
+        Assert.True(Check(checks, "insert_permission").Ok);
+        Assert.NotEmpty(Check(checks, "control_table").Detail);
+        // and the verdict that depends on counting says which tables it could not cover, instead of "all empty"
+        Assert.Contains("app.Parent", Check(checks, "target_rows").Detail);
+        Assert.False(new PreflightResult(1, DateTimeOffset.UtcNow, [.. checks]).Passed);
+    }
+
+    /// <summary>
+    /// Harm (F2, ruling 120): NotRun was always a warning, so on the route where the drift checker itself fails - both connections
+    /// open, nothing else in the list an error - PreflightResult.Passed stayed true. Drift DETECTED blocks the run; drift
+    /// UNVERIFIABLE let it through, on the one-bit gate 5.5 hangs the Run button on.
+    /// <para>The rig is deterministic and needs no timing: a fingerprint was saved by discovery, so the drift check must run, but the
+    /// stored server metadata it needs is corrupt, so it cannot. Both connections still open, which is the shape of the finding -
+    /// nothing else in the list is an error.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_drift_check_that_could_not_run_is_an_error_not_a_pass()
+    {
+        await using var src = await TempDatabase.CreateAsync("dbm_pre_drift_src");
+        await src.ExecAsync("""
+            CREATE TABLE dbo.Parent (Id int NOT NULL, Name varchar(50) NOT NULL);
+            CREATE TABLE dbo.Child (Id int NOT NULL, ParentId int NOT NULL, Qty int NOT NULL, At datetime NOT NULL);
+            CREATE TABLE dbo.Log (Msg varchar(100) NOT NULL);
+            """);
+        await using var tgt = await TempDatabase.CreateAsync("dbm_pre_drift_tgt");
+        await tgt.ExecAsync(TransferEngineTests.TargetSchema);
+        using var svc = new XferServices();
+        var s = svc.Services;
+        s.Connections.Save(Side.Src, src.ConnectionString, TestCatalogs.Meta(src.Name));
+        s.Connections.Save(Side.Tgt, tgt.ConnectionString, TestCatalogs.Meta(tgt.Name));
+        s.Catalog.Save(Side.Src, TestCatalogs.Snapshot(TestCatalogs.Meta(src.Name), Array.Empty<TableInfo>()), "fingerprint-from-discovery");
+        Approve(s, TransferEngineTests.Plan());
+        s.Db.Execute("UPDATE connection SET server_meta_json = '{not json'");   // discovery ran; what it saved is unreadable now
+
+        var result = await Preflight.RunAsync(s, new TransferOptions(), default);
+
+        var drift = Check(result.Checks, "schema_drift");
+        Assert.False(drift.Ok);
+        Assert.Equal("error", drift.Severity);                             // ruling 120: nothing else records this fault
+        Assert.Contains("could not be verified", drift.Detail);
+        Assert.False(result.Passed);
+        Assert.True(Check(result.Checks, "source_connection").Ok);          // nothing else failed: this is the drift check alone
+        Assert.True(Check(result.Checks, "target_connection").Ok);
+        Assert.DoesNotContain(result.Checks, c => c.Name != "schema_drift" && !c.Ok && c.Severity == "error");
+    }
+
+    /// <summary>
+    /// Harm (F5): schema_drift and estimated_rows put server messages verbatim in front of an operator, and a server message can quote
+    /// the literal that failed. Deleting the redaction pass left the suite green, so the guard had no witness. Here the failing literal
+    /// IS the connection's password - integrated auth ignores a Password keyword, but Redactor.SecretsOf still reads it, so this is a
+    /// real connection secret arriving in a real server message.
+    /// </summary>
+    [Fact]
+    public async Task Server_messages_in_the_checklist_are_scrubbed_of_the_connection_secret()
+    {
+        const string secret = "Pa55word-never-used-here";
+        await using var tgt = await TempDatabase.CreateAsync("dbm_pre_secret");
+        await tgt.ExecAsync(TransferEngineTests.TargetSchema);
+        using var svc = new XferServices();
+        var s = svc.Services;
+        string srcCs = new SqlConnectionStringBuilder(fx.Src.ConnectionString) { Password = secret }.ConnectionString;
+        s.Connections.Save(Side.Src, srcCs, TestCatalogs.Meta(fx.Src.Name));
+        s.Connections.Save(Side.Tgt, tgt.ConnectionString, TestCatalogs.Meta(tgt.Name));
+        var plan = TransferEngineTests.Plan();
+        plan.Tasks["T01"].CountSql = $"SELECT CAST(N'{secret}' AS int);";   // the server quotes the failing literal back at us
+        Approve(s, plan);
+
+        var result = await Preflight.RunAsync(s, new TransferOptions(), default);
+
+        var estimate = Check(result.Checks, "estimated_rows");
+        Assert.Contains("T01", estimate.Detail);
+        Assert.Contains("***", estimate.Detail);
+        Assert.All(result.Checks, c => Assert.DoesNotContain(secret, c.Detail, StringComparison.Ordinal));
     }
 }

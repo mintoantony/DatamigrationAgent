@@ -35,6 +35,9 @@ public sealed record TaskReport(string TaskId, string Target, TransferTaskStatus
     /// <summary>The bound columns no checksum could cover, and why.</summary>
     public string? ChecksumColumnsNote { get; init; }
 
+    /// <summary>How many of them there are, so <see cref="FinalReportBuilder.Summary"/> can carry the shortfall in its one line.</summary>
+    public int ChecksumColumnsNotCompared { get; init; }
+
     /// <summary>Why <see cref="ErrorSamples"/> holds fewer rows than <see cref="RowsError"/> counts (ruling 105).</summary>
     public string? ErrorSamplesNote { get; init; }
 
@@ -63,8 +66,13 @@ public static class FinalReportBuilder
     public const int MaxErrorSamples = 5;
 
     /// <summary>
-    /// Builds the report for a run in any terminal state, not only a completed one: a cancelled or failed run's report is where the
-    /// operator learns what did not happen.
+    /// Builds the report for one run.
+    /// <para><b>Today it has exactly one production caller</b>, <c>TransferEngine.FinishCompletedAsync</c>, which is reached only after
+    /// every task is <c>Done</c> and always passes <see cref="RunStatus.Completed"/> and a non-null <paramref name="errorRowCount"/>.
+    /// So a completed run cannot contain a non-completed task, and the arms below that key on a task status other than <c>Done</c>, or
+    /// on a missing <paramref name="errorRowCount"/>, are <b>contract assertions against a trigger unreachable from this task</b>
+    /// (rulings 104, 112, 121) - they are exercised only by their unit tests, and only become live if 5.5 builds a report for a paused,
+    /// failed or cancelled run. They are written and kept so that doing so cannot silently produce a report that reads clean.</para>
     /// </summary>
     /// <param name="status">The run's status as the caller is about to record it, which is not always what the task rows say - a
     /// keyless task stopped by Cancel records "paused" (5.3 review F9), and only this join can tell that apart from an operator's pause.</param>
@@ -106,8 +114,13 @@ public static class FinalReportBuilder
         bool anyUnconfirmed = report.Tasks.Count == 0 || report.Tasks.Any(t => !t.CountCompared);
         int sums = report.Tasks.Sum(t => t.Checksums.Count);
         int matched = report.Tasks.Sum(t => t.Checksums.Count(c => c.Match));
+        // The columns nobody could compare belong in the headline, not only in the notes: "checksums 5/5 matched" over a six-column
+        // binding is the clean sweep this line is read as, and the sentence explaining it is several screens further down.
+        int notCompared = report.Tasks.Sum(t => t.ChecksumColumnsNotCompared);
         string rejected = report.RowsError > 0 ? $" ({N(report.RowsError)} rejected)" : "";
-        string checks = sums > 0 ? $", checksums {matched}/{sums} matched" : "";
+        string checks = sums > 0
+            ? $", checksums {matched}/{sums} matched" + (notCompared > 0 ? $", {notCompared} column{(notCompared == 1 ? "" : "s")} not compared" : "")
+            : "";
         // "of at least": while some task has no source count, the total below it is a floor and must not be offered as the whole.
         string of = report.TasksWithoutSource > 0 ? "of at least" : "of";
         string duration = report.DurationSec is { } d ? Dur(d) : "an unknown time";
@@ -137,6 +150,7 @@ public static class FinalReportBuilder
             RowsSourceNote = t.RowsSource is not null ? null
                 : v?.RowsSourceNote ?? "the source row count is unknown: this run never recorded one",
             ChecksumColumnsNote = v?.ChecksumColumnsNote,
+            ChecksumColumnsNotCompared = v?.ChecksumColumnsNotCompared ?? 0,
             ErrorSamplesNote = ErrorSamplesNote(t.RowsError, samples.Count, errorRowCount?.Invoke(t.TaskId)),
             StatusNote = StatusNote(t.Status, status),
         };
@@ -146,6 +160,9 @@ public static class FinalReportBuilder
     /// Ruling 105. A crash between a chunk's commit and its error rows being written loses which rows were rejected while rows_error
     /// still counts them: the operator is told "5 rejected" and handed two. 5.3 declares it at task end, so a task that never finished
     /// never does - which is why this comparison is made again here, for every task, whether or not the note was written.
+    /// <para>The <paramref name="recorded"/> shortfall branch is <b>reachable in production</b> - ruling 105's crash window leaves a
+    /// <c>Done</c> task in a <c>Completed</c> run exactly there. The <c>recorded is null</c> branch below is not: the only production
+    /// caller always supplies a count, so that one is a contract assertion for a future caller that does not (ruling 121).</para>
     /// </summary>
     internal static string? ErrorSamplesNote(long rowsError, int shown, long? recorded)
     {
@@ -167,6 +184,9 @@ public static class FinalReportBuilder
     /// A task's own status is not the whole story once the run's is known. A keyless task stopped by Cancel or Fail rolls back and
     /// records "paused" (5.3 review F9) - a reader of the task alone is told an operator paused it and that a resume will pick it up,
     /// and neither is true.
+    /// <para><b>Every arm here is a contract assertion against a trigger unreachable from this task</b> (rulings 104, 112, 121):
+    /// <see cref="Build"/>'s only production caller passes <c>Completed</c> with every task <c>Done</c>, so none of these pairs can
+    /// occur today. They become live the moment 5.5 builds a report for a paused, failed or cancelled run.</para>
     /// </summary>
     internal static string? StatusNote(TransferTaskStatus task, RunStatus run) => (task, run) switch
     {
@@ -211,10 +231,18 @@ public static class FinalReportBuilder
 
         var badSums = tasks.SelectMany(t => t.Checksums.Where(c => !c.Match).Select(c => $"{t.Target}.{c.Column}")).ToList();
         if (badSums.Count > 0) notes.Add("Column checksums differ for: " + string.Join(", ", badSums) + ".");
+        // What a matching checksum does and does not prove, said once, and only where a checksum actually ran.
+        if (tasks.Any(t => t.Checksums.Count > 0))
+            notes.Add("Column checksums are sums of per-row BINARY_CHECKSUM values; equal sums do not prove identical rows, because two "
+                      + "changed rows can cancel out. The row counts are the other half of the check.");
         foreach (var t in tasks.Where(t => t.ChecksumsSkipped is not null && t.ChecksumsSkipped != "disabled"))
             notes.Add($"Checksums skipped for {t.Target}: {t.ChecksumsSkipped}.");
         foreach (var t in tasks.Where(t => t.ChecksumColumnsNote is not null)) notes.Add($"{t.Target}: {t.ChecksumColumnsNote}");
         foreach (var t in tasks.Where(t => t.StatusNote is not null)) notes.Add($"{t.Target}: {t.StatusNote}");
+        // Carry-forward 8: a source figure that is NOT the snapshot taken when the task started says so here as well as on the task,
+        // because the number beside it looks exactly like a snapshot. (The "unknown" case has its own note below.)
+        foreach (var t in tasks.Where(t => t.RowsSource is not null && t.RowsSourceNote is not null))
+            notes.Add($"{t.Target}: the source row count was {t.RowsSourceNote}.");
 
         if (tasksWithoutSource > 0)
             notes.Add("The source row count is unknown for: "

@@ -187,27 +187,35 @@ public sealed class ReportingTests
     }
 
     /// <summary>
-    /// Harm (carry-forward 7, ruling 105): a crash between a chunk's commit and its checkpoint write loses the identity of a rejected
-    /// row. rows_error still counts it, so the operator is told "5 rejected" and handed two rows, with nothing saying the other three
-    /// are gone. 5.3 declares this at TASK end only, so a task that never finished never declares it - which is why the report must.
+    /// Harm (carry-forward 7, ruling 105): a crash between a chunk's commit and its rejected rows being written loses the identity of
+    /// a rejected row. rows_error still counts it, so the operator is told "5 rejected" and handed two rows, with nothing saying the
+    /// other three are gone.
+    /// <para>This is a <b>harm test</b>, and its rig is the shape production actually produces: a <c>Done</c> task under a
+    /// <c>Completed</c> run, with an <c>errorRowCount</c> supplied - which is exactly what <c>FinishCompletedAsync</c> hands
+    /// <see cref="FinalReportBuilder.Build"/>. Ruling 105's crash window leaves precisely this state behind.</para>
     /// </summary>
     [Fact]
     public void Rejected_rows_counted_but_never_recorded_are_named_beside_the_samples()
     {
         var samples = Enumerable.Range(0, 2).Select(i => new ErrorRowEntry(i, 1, "T01", null, "{}", $"bad {i}", T0)).ToList();
-        var tasks = new List<TransferTaskRow> { RowOf("T01", "app.A", 10, 5, 5, null, TransferTaskStatus.Paused) };
-        var report = FinalReportBuilder.Build(Run(RunStatus.Paused), RunStatus.Paused, tasks, _ => samples, T0.AddSeconds(1),
-            null, _ => 2);
+        var tasks = new List<TransferTaskRow> { RowOf("T01", "app.A", 10, 5, 5, null) };      // Done, under a Completed run
+        var report = FinalReportBuilder.Build(Run(), RunStatus.Completed, tasks, _ => samples, T0.AddSeconds(1), null, _ => 2);
 
+        Assert.Equal(TransferTaskStatus.Done, report.Tasks[0].Status);
         Assert.Equal(2, report.Tasks[0].ErrorSamples.Count);
         Assert.Contains("3 of the 5 rejected rows were counted but never recorded", report.Tasks[0].ErrorSamplesNote);
         Assert.Contains(report.Notes, n => n.Contains("app.A") && n.Contains("never recorded"));
     }
 
-    /// <summary>Harm: "0 error rows shown" for a task whose rows_error is not zero, with no reason given - even without a count to
-    /// compare against, an empty sample list beside a non-zero counter has to say something.</summary>
+    /// <summary>
+    /// <b>Contract assertion, not a harm test — its trigger is unreachable from this task</b> (rulings 104, 112, 121). The only
+    /// production caller of <see cref="FinalReportBuilder.Build"/> is <c>TransferEngine.FinishCompletedAsync</c>, which always passes
+    /// an <c>errorRowCount</c>, so the null-count arm below cannot be entered today. It exists because <c>Build</c> is public and its
+    /// count argument is optional: a 5.5 caller that omits it must still not be shown "0 rejected rows" beside a non-zero rows_error
+    /// with no reason. Deleting the arm fails only this test, and that is the recorded, intended outcome.
+    /// </summary>
     [Fact]
-    public void No_rejected_row_shown_for_a_task_that_rejected_rows_is_explained_even_without_a_count()
+    public void No_rejected_row_shown_is_explained_even_without_a_count_contract_assertion_trigger_unreachable_from_this_task()
     {
         var tasks = new List<TransferTaskRow> { RowOf("T01", "app.A", 10, 5, 5, null, TransferTaskStatus.Failed) };
         var report = FinalReportBuilder.Build(Run(RunStatus.Failed), RunStatus.Failed, tasks, _ => [], T0.AddSeconds(1));
@@ -217,11 +225,15 @@ public sealed class ReportingTests
     }
 
     /// <summary>
-    /// Harm (carry-forward 4, 5.3 review F9): a keyless task stopped by Cancel or Fail records status "paused" while the run records
-    /// "cancelled". A reader of the task alone is told an operator paused it and that resuming will pick it up - neither is true.
+    /// <b>Contract assertion, not a harm test — its trigger is unreachable from this task</b> (rulings 104, 112, 121). Carry-forward 4
+    /// is real (a keyless task stopped by Cancel records "paused" while the run records "cancelled", 5.3 review F9), but
+    /// <see cref="FinalReportBuilder.Build"/>'s only production caller runs after <c>allDone</c> and always passes
+    /// <c>RunStatus.Completed</c>, so a completed run cannot contain a paused task and no <c>(Paused, Cancelled)</c> pair can occur
+    /// today. The join exists for the moment 5.5 builds a report for a cancelled or failed run; until then, deleting this arm fails
+    /// only this test, and that is the recorded, intended outcome.
     /// </summary>
     [Fact]
-    public void A_paused_task_under_a_cancelled_run_says_the_run_ended_not_that_someone_paused_it()
+    public void A_paused_task_under_a_cancelled_run_says_the_run_ended_contract_assertion_trigger_unreachable_from_this_task()
     {
         var tasks = new List<TransferTaskRow>
         {
@@ -363,6 +375,98 @@ public sealed class ReportingTests
         // and nothing in the list is a target check that "passed"
         Assert.DoesNotContain(result.Checks, c => c.Name is "target_tables" or "insert_permission" or "control_table" or "target_rows");
         Assert.All(result.Checks, c => Assert.False(string.IsNullOrWhiteSpace(c.Detail)));
+    }
+
+    /// <summary>
+    /// Harm (F3, carry-forward 8): rows_source is a snapshot taken when the task's segment started. When the run never took one,
+    /// validation counts the source again at the end - a second, later figure. The label for that lives on TaskValidation, but what an
+    /// operator reads is the REPORT: without the label there, "rowsSource: 300" is taken for the snapshot, and a source that gained
+    /// rows during the load looks like a source that was always that size.
+    /// </summary>
+    [Fact]
+    public void A_source_count_measured_after_the_run_is_labelled_in_the_report()
+    {
+        var v = new TaskValidation(true, 300, 0, 0, 300, [], null)
+        {
+            RowsSourceNote = "counted after the run, not the snapshot this run takes when a task starts - the source may have changed in between",
+        };
+        var report = FinalReportBuilder.Build(Run(), RunStatus.Completed, [RowOf("T01", "app.A", null, 300, 0, v)], _ => [], T0.AddSeconds(1));
+
+        Assert.Equal(300, report.Tasks[0].RowsSource);
+        Assert.Equal(0, report.TasksWithoutSource);
+        Assert.Contains("counted after the run", report.Tasks[0].RowsSourceNote);
+        Assert.Contains("counted after the run", Json.Serialize(report.Tasks[0]));      // and it survives into summary_json
+        Assert.Contains(report.Notes, n => n.Contains("app.A") && n.Contains("counted after the run"));
+    }
+
+    /// <summary>
+    /// Harm (F8): the headline that becomes the Complete artifact summary said "checksums 5/5 matched" for a task binding six columns,
+    /// one of which nobody could compare. The sentence naming it is in the notes, but the one line an operator reads first has to carry
+    /// the shortfall or it reads as a clean sweep.
+    /// </summary>
+    [Fact]
+    public void Summary_names_the_columns_nobody_compared()
+    {
+        var v = new TaskValidation(true, 7, 0, 0, 7, [new ChecksumResult("A", true, 1, 1)], null)
+        {
+            ChecksumColumnsNotCompared = 1,
+            ChecksumColumnsNote = "1 of 2 bound columns were not compared: DT (datetime cannot be checksummed exactly).",
+        };
+        var report = FinalReportBuilder.Build(Run(), RunStatus.Completed, [Row("T01", "app.A", 7, 7, 0, v, 1)], _ => [], T0.AddSeconds(1));
+
+        Assert.Equal(1, report.Tasks[0].ChecksumColumnsNotCompared);
+        Assert.Contains("checksums 1/1 matched, 1 column not compared.", FinalReportBuilder.Summary(report));
+    }
+
+    /// <summary>F10: a sum of per-row checksums is not a set comparison - two changed rows can cancel. The report says so, once, and
+    /// only when a checksum actually ran (saying it when none did would be noise about a comparison that never happened).</summary>
+    [Fact]
+    public void Notes_say_a_checksum_is_a_sum_only_when_a_checksum_ran()
+    {
+        var withSums = new TaskValidation(true, 7, 0, 0, 7, [new ChecksumResult("A", true, 1, 1)], null);
+        var one = FinalReportBuilder.Build(Run(), RunStatus.Completed, [Row("T01", "app.A", 7, 7, 0, withSums, 1)], _ => [], T0.AddSeconds(1));
+        Assert.Contains(one.Notes, n => n.Contains("equal sums do not prove identical rows"));
+
+        var noSums = new TaskValidation(true, 7, 0, 0, 7, [], "disabled");
+        var other = FinalReportBuilder.Build(Run(), RunStatus.Completed, [Row("T01", "app.A", 7, 7, 0, noSums, 1)], _ => [], T0.AddSeconds(1));
+        Assert.DoesNotContain(other.Notes, n => n.Contains("equal sums do not prove identical rows"));
+    }
+
+    /// <summary>
+    /// Harm (F6): "approved" and "its artifact is gone" are two different states, and collapsing them sends the operator to re-approve
+    /// a plan they already approved - which cannot help, because the payload is what is missing.
+    /// </summary>
+    [Fact]
+    public async Task An_approved_plan_whose_artifact_is_missing_is_not_reported_as_never_approved()
+    {
+        using var svc = new XferServices();
+        var s = svc.Services;
+        s.Artifacts.Add(PhaseName.Sql, 0, Json.Serialize(new SqlPlanPayload()), "script", null);
+        s.Phases.SetCurrentVersion(PhaseName.Sql, 0);
+        s.Phases.SetApproved(PhaseName.Sql, 0, null);
+        s.Db.Execute("DELETE FROM artifact");                       // the payload is gone; the approval is not
+
+        var result = await Preflight.RunAsync(s, new TransferOptions(), default);
+
+        var check = Check(result, "sql_plan");
+        Assert.False(check.Ok);
+        Assert.Equal("error", check.Severity);
+        Assert.Contains("artifact", check.Detail);
+        Assert.DoesNotContain("not approved yet", check.Detail);
+        Assert.False(result.Passed);
+    }
+
+    /// <summary>
+    /// F5, the half that can be reached without a server: every check detail goes through the redaction pass, and a detail that is
+    /// blank after it says so rather than becoming an invisible reason. The pass itself is pinned end to end by
+    /// <c>PreflightTests.Server_messages_in_the_checklist_are_scrubbed_of_the_connection_secret</c>.
+    /// </summary>
+    [Fact]
+    public void A_preflight_detail_is_scrubbed_and_a_blank_one_says_so()
+    {
+        Assert.Equal("cannot connect as ***", Preflight.Scrubbed("cannot connect as hunter2xyz", ["hunter2xyz"]));
+        Assert.Contains("removed", Preflight.Scrubbed("", []));
+        Assert.False(string.IsNullOrWhiteSpace(Preflight.Scrubbed("   ", ["hunter2xyz"])));
     }
 
     private static PreflightCheck Check(PreflightResult result, string name) => result.Checks.Single(c => c.Name == name);

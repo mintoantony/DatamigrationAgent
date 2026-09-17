@@ -120,6 +120,51 @@ public sealed class RunValidatorTests(EngineSourceFixture fx) : IClassFixture<En
         Assert.False(noNumber.CountMatch);
         Assert.False(noNumber.CountCompared);
         Assert.Contains("no source row count", noNumber.CountNote);
+
+        // F9: the recount runs plan-supplied SQL inside the completion hook. A fault there - including the 120 s timeout that now
+        // bounds it - is a note on the validation, not an exception out of a method the engine calls on the success path.
+        broken.CountSql = "SELECT 1/0;";
+        var faulted = await RunValidator.ValidateTaskAsync(src, dst, broken, row with { RowsSource = null }, true, default);
+        Assert.Null(faulted.RowsSource);
+        Assert.False(faulted.CountCompared);
+        Assert.Contains("counting it now failed", faulted.RowsSourceNote);
+        Assert.Contains("Divide by zero", faulted.RowsSourceNote);
+    }
+
+    /// <summary>
+    /// Harm (F7): ValidateTaskAsync is public and 5.5 can hand it a task that has not finished. Its target holds part of a load, so
+    /// checksums over it mismatch and rowsSource - rowsError never equals rowsAfter - rowsBefore. Both would be reported as findings
+    /// against the data: a false alarm on a run that is simply not done, which costs the operator the same investigation a real
+    /// mismatch does and teaches them to discount the ones that matter.
+    /// </summary>
+    [Fact]
+    public async Task A_task_that_did_not_finish_is_not_checksummed_and_its_counts_are_not_compared()
+    {
+        await using var tgt = await TempDatabase.CreateAsync("dbm_val_unfinished");
+        await tgt.ExecAsync(TransferEngineTests.TargetSchema);
+        using var svc = new XferServices();
+        var plan = TransferEngineTests.Plan();
+        plan.Tasks.Remove("T02");
+        plan.Order.Remove("T02");
+        var engine = new TransferEngine(svc.Services, plan, fx.Src.ConnectionString, tgt.ConnectionString);
+        long runId = engine.CreateRun(1, new TransferOptions { ErrorMode = "skip" });
+        Assert.Equal(RunStatus.Completed, (await engine.RunAsync(runId, new TransferControl(), default)).Status);
+
+        await using var src = new SqlConnection(fx.Src.ConnectionString);
+        await using var dst = new SqlConnection(tgt.ConnectionString);
+        await src.OpenAsync();
+        await dst.OpenAsync();
+        var row = svc.Services.Transfers.Tasks(runId).Single(t => t.TaskId == "T01");
+
+        var v = await RunValidator.ValidateTaskAsync(src, dst, plan.Tasks["T01"], row with { Status = TransferTaskStatus.Paused }, true, default);
+
+        Assert.Empty(v.Checksums);
+        Assert.Contains("did not finish", v.ChecksumsSkipped);
+        Assert.Contains("paused", v.ChecksumsSkipped);
+        Assert.False(v.CountCompared);
+        Assert.False(v.CountMatch);
+        Assert.Contains("did not finish", v.CountNote);
+        Assert.Equal(300, v.RowsAfter);          // the numbers are still reported; it is the verdict that is withheld
     }
 
     // ---------------------------------------------------------------------------------------------------------------------------

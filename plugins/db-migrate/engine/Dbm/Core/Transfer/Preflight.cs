@@ -43,9 +43,11 @@ public static class Preflight
         ArgumentNullException.ThrowIfNull(s);
         ArgumentNullException.ThrowIfNull(options);
         var checks = new List<PreflightCheck>();
+        PhaseRow phase;
         ApprovedPlan? approved;
         try
         {
+            phase = s.Phases.Get(PhaseName.Sql);
             approved = LoadApprovedPlan(s);
         }
         catch (Exception ex) when (ex is JsonException or KeyNotFoundException)
@@ -55,10 +57,14 @@ public static class Preflight
         }
         if (approved is null)
         {
-            checks.Add(Err("sql_plan", "The SQL phase is not approved yet."));
+            // Two different states reach a null plan, and they need two different sentences: telling an operator to approve a plan
+            // they have already approved sends them to do the one thing that cannot help, because what is missing is the payload.
+            checks.Add(phase.Status == PhaseStatus.Approved && phase.ApprovedVersion is int approvedVersion
+                ? Err("sql_plan", $"The SQL phase is approved at v{approvedVersion}, but that version's artifact is missing from this "
+                                  + "workspace, so the plan cannot be read. Re-generate the SQL phase and approve it again.")
+                : Err("sql_plan", "The SQL phase is not approved yet."));
             return new PreflightResult(0, Clock.Now(), checks);
         }
-        var phase = s.Phases.Get(PhaseName.Sql);
         checks.Add(phase.CurrentVersion == approved.Version
             ? Ok("sql_plan", $"Approved SQL plan v{approved.Version} ({approved.Plan.Tasks.Count} tasks).")
             : Err("sql_plan", $"The current SQL version (v{phase.CurrentVersion}) is not the approved one (v{approved.Version}); approve it again."));
@@ -81,20 +87,41 @@ public static class Preflight
                         ? Err("schema_drift", $"The {sides} schema changed since discovery. Re-run discovery and review before transferring.")
                         : Ok("schema_drift", "Both schemas match the discovered catalogs."));
                 }
-                catch (Exception ex) when (ex is SqlException or InvalidOperationException)
+                // JsonException too: the drift check reads the ServerMeta discovery stored, and a stored value that will not parse must
+                // cost a line of the checklist, not the checklist.
+                catch (Exception ex) when (ex is SqlException or InvalidOperationException or TimeoutException or JsonException)
                 {
-                    checks.Add(NotRun("schema_drift", "Drift check failed: " + Describe(ex)));
+                    // Ruling 120: both connections are open here, so nothing else in the list is an error. Drift DETECTED blocks the
+                    // run; drift left UNVERIFIABLE must block it too, or the one-bit gate says "go" about the check that catches a
+                    // schema changed since discovery.
+                    checks.Add(NotRun("schema_drift",
+                        "The schemas could not be verified against the discovered catalogs: " + Describe(ex),
+                        causeIsAlreadyAnError: false));
                 }
             }
             else
             {
                 checks.Add(NotRun("schema_drift",
-                    "Not checked: comparing the schemas against the discovered catalogs needs both connections open."));
+                    "Not checked: comparing the schemas against the discovered catalogs needs both connections open.",
+                    causeIsAlreadyAnError: true));
             }
 
             if (tgt is not null)
             {
-                checks.AddRange(await TargetChecksAsync(tgt, approved.Plan, options, ct));
+                try
+                {
+                    checks.AddRange(await TargetChecksAsync(tgt, approved.Plan, options, ct));
+                }
+                catch (Exception ex) when (ex is SqlException or InvalidOperationException or TimeoutException)
+                {
+                    // Ruling 119: a fault that stops the whole group (the connection died mid-way) is reported the way TryOpenAsync
+                    // reports its own - the fault as an error, the checks behind it as not run beside it. RunAsync never throws for a
+                    // SQL fault, because an exception loses every line that already succeeded, including the one naming the problem.
+                    checks.Add(Err("target_probe", "The target checks stopped part-way: " + Describe(ex)));
+                    checks.Add(NotRun("target_checks",
+                        "Not checked: the target checks stopped before finishing, so the target's tables, permissions, checkpoint table "
+                        + "and row counts are only partly known.", causeIsAlreadyAnError: true));
+                }
             }
             else
             {
@@ -102,13 +129,15 @@ public static class Preflight
                 // and row counts are all unknown, and an absent check reads as a check that found nothing wrong.
                 checks.Add(NotRun("target_checks",
                     "Not checked: the target connection could not be opened, so nothing is known about the target's tables, INSERT and "
-                    + "ALTER permissions, the checkpoint table, or whether the target tables already hold rows."));
+                    + "ALTER permissions, the checkpoint table, or whether the target tables already hold rows.",
+                    causeIsAlreadyAnError: true));
             }
 
             checks.Add(src is not null
                 ? await SourceEstimateAsync(src, approved.Plan, ct)
                 : NotRun("estimated_rows",
-                    "Not counted: the source connection could not be opened, so the number of rows this run would move is unknown."));
+                    "Not counted: the source connection could not be opened, so the number of rows this run would move is unknown.",
+                    causeIsAlreadyAnError: true));
 
             var keyless = TransferEngine.PlanOrder(approved.Plan).Where(id => approved.Plan.Tasks[id].KeyColumns.Count == 0)
                 .Select(id => approved.Plan.Tasks[id].Target).ToList();
@@ -161,17 +190,34 @@ public static class Preflight
         var noAlter = new List<string>();
         var noTruncate = new List<string>();
         var nonEmpty = new List<string>();
+        var probeErrors = new List<string>();        // "app.X: <server message>" - what the target_probe check reports
+        var permFailed = new List<string>();         // tables whose permission probe never answered
+        var permFailedIdentity = new List<string>();
+        var countFailed = new List<string>();        // tables whose row count never answered
         foreach (var (target, identity) in targets)
         {
             int exists, insert, alter, delete;
-            await using (var cmd = new SqlCommand(
-                "SELECT CASE WHEN OBJECT_ID(@t, N'U') IS NULL THEN 0 ELSE 1 END, ISNULL(HAS_PERMS_BY_NAME(@t, N'OBJECT', N'INSERT'), 0), " +
-                "ISNULL(HAS_PERMS_BY_NAME(@t, N'OBJECT', N'ALTER'), 0), ISNULL(HAS_PERMS_BY_NAME(@t, N'OBJECT', N'DELETE'), 0)", tgt))
+            // Ruling 119. An INSERT-without-SELECT loader account passes HAS_PERMS_BY_NAME('INSERT') and then fails COUNT_BIG - the
+            // ordinary least-privilege case this checklist exists for. Uncaught, one denied table costs the operator every line that
+            // already succeeded, including the sentence naming what to fix. Each table is probed on its own and reports on its own.
+            try
             {
-                cmd.Parameters.Add(new SqlParameter("@t", SqlDbType.NVarChar, 600) { Value = SqlQuote.TableKey(target) });
-                await using var r = await cmd.ExecuteReaderAsync(ct);
-                await r.ReadAsync(ct);
-                (exists, insert, alter, delete) = (r.GetInt32(0), r.GetInt32(1), r.GetInt32(2), r.GetInt32(3));
+                await using (var cmd = new SqlCommand(
+                    "SELECT CASE WHEN OBJECT_ID(@t, N'U') IS NULL THEN 0 ELSE 1 END, ISNULL(HAS_PERMS_BY_NAME(@t, N'OBJECT', N'INSERT'), 0), " +
+                    "ISNULL(HAS_PERMS_BY_NAME(@t, N'OBJECT', N'ALTER'), 0), ISNULL(HAS_PERMS_BY_NAME(@t, N'OBJECT', N'DELETE'), 0)", tgt))
+                {
+                    cmd.Parameters.Add(new SqlParameter("@t", SqlDbType.NVarChar, 600) { Value = SqlQuote.TableKey(target) });
+                    await using var r = await cmd.ExecuteReaderAsync(ct);
+                    await r.ReadAsync(ct);
+                    (exists, insert, alter, delete) = (r.GetInt32(0), r.GetInt32(1), r.GetInt32(2), r.GetInt32(3));
+                }
+            }
+            catch (Exception ex) when (ex is SqlException or TimeoutException)
+            {
+                probeErrors.Add($"{target}: {Describe(ex)}");
+                permFailed.Add(target);
+                if (identity) permFailedIdentity.Add(target);
+                continue;
             }
             if (exists == 0)
             {
@@ -182,13 +228,23 @@ public static class Preflight
             if (insert == 0) noInsert.Add(target);
             if (identity && alter == 0) noAlter.Add(target);
             if (options.TruncateTarget && (alter == 0 || delete == 0)) noTruncate.Add(target);
-            long rows = await TargetOps.CountTargetAsync(tgt, target, ct);
-            if (rows > 0) nonEmpty.Add($"{target} ({rows.ToString("N0", CultureInfo.InvariantCulture)})");
+            try
+            {
+                long rows = await TargetOps.CountTargetAsync(tgt, target, ct);
+                if (rows > 0) nonEmpty.Add($"{target} ({rows.ToString("N0", CultureInfo.InvariantCulture)})");
+            }
+            catch (Exception ex) when (ex is SqlException or TimeoutException)
+            {
+                // The permission verdicts above are real and are kept; only "is it empty?" is unanswered for this table.
+                probeErrors.Add($"{target}: {Describe(ex)}");
+                countFailed.Add(target);
+            }
         }
 
-        string skipped = missing.Count == 0 ? "" : " Not checked, because they do not exist: " + string.Join(", ", missing) + ".";
-        string skippedIdentity = missingIdentity.Count == 0
-            ? "" : " Not checked, because they do not exist: " + string.Join(", ", missingIdentity) + ".";
+        string gone = Clause("they do not exist", missing);
+        string skipped = gone + Clause("probing them failed", permFailed);
+        string skippedIdentity = Clause("they do not exist", missingIdentity) + Clause("probing them failed", permFailedIdentity);
+        string skippedRows = gone + Clause("probing them failed", permFailed.Concat(countFailed));
         var checks = new List<PreflightCheck>
         {
             missing.Count == 0 ? Ok("target_tables", $"All {targets.Count} target tables exist.")
@@ -205,25 +261,46 @@ public static class Preflight
                 ? Ok("truncate_permission", "ALTER and DELETE permission to empty the target tables." + skipped)
                 : Err("truncate_permission", "Emptying targets needs ALTER and DELETE on: " + string.Join(", ", noTruncate) + "." + skipped));
 
-        int ctlExists, canCreate, canAlterDbo;
-        await using (var cmd = new SqlCommand(
-            $"SELECT CASE WHEN OBJECT_ID(N'{ControlTable.Name}', N'U') IS NULL THEN 0 ELSE 1 END, " +
-            "ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'CREATE TABLE'), 0), ISNULL(HAS_PERMS_BY_NAME(N'dbo', N'SCHEMA', N'ALTER'), 0)", tgt))
+        try
         {
-            await using var r = await cmd.ExecuteReaderAsync(ct);
-            await r.ReadAsync(ct);
-            (ctlExists, canCreate, canAlterDbo) = (r.GetInt32(0), r.GetInt32(1), r.GetInt32(2));
+            int ctlExists, canCreate, canAlterDbo;
+            await using (var cmd = new SqlCommand(
+                $"SELECT CASE WHEN OBJECT_ID(N'{ControlTable.Name}', N'U') IS NULL THEN 0 ELSE 1 END, " +
+                "ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), N'DATABASE', N'CREATE TABLE'), 0), ISNULL(HAS_PERMS_BY_NAME(N'dbo', N'SCHEMA', N'ALTER'), 0)", tgt))
+            {
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                await r.ReadAsync(ct);
+                (ctlExists, canCreate, canAlterDbo) = (r.GetInt32(0), r.GetInt32(1), r.GetInt32(2));
+            }
+            checks.Add(ctlExists == 1 ? Ok("control_table", $"The checkpoint table {ControlTable.Name} already exists and will be reused.")
+                : canCreate == 1 && canAlterDbo == 1 ? Ok("control_table", $"Can create the checkpoint table {ControlTable.Name}.")
+                : Err("control_table", $"Creating {ControlTable.Name} needs CREATE TABLE and ALTER on schema dbo."));
         }
-        checks.Add(ctlExists == 1 ? Ok("control_table", $"The checkpoint table {ControlTable.Name} already exists and will be reused.")
-            : canCreate == 1 && canAlterDbo == 1 ? Ok("control_table", $"Can create the checkpoint table {ControlTable.Name}.")
-            : Err("control_table", $"Creating {ControlTable.Name} needs CREATE TABLE and ALTER on schema dbo."));
+        catch (Exception ex) when (ex is SqlException or TimeoutException)
+        {
+            probeErrors.Add($"{ControlTable.Name}: {Describe(ex)}");
+            checks.Add(NotRun("control_table",
+                $"Not checked: whether {ControlTable.Name} exists or can be created could not be established.",
+                causeIsAlreadyAnError: true));
+        }
 
-        checks.Add(nonEmpty.Count == 0 ? Ok("target_rows", "All target tables that exist are empty." + skipped)
-            : options.TruncateTarget ? Ok("target_rows", "Will be emptied first: " + string.Join(", ", nonEmpty) + "." + skipped)
+        checks.Add(nonEmpty.Count == 0 ? Ok("target_rows", "All target tables that could be counted are empty." + skippedRows)
+            : options.TruncateTarget ? Ok("target_rows", "Will be emptied first: " + string.Join(", ", nonEmpty) + "." + skippedRows)
             : new PreflightCheck("target_rows", false, "warning",
                 "Target tables already contain rows: " + string.Join(", ", nonEmpty)
-                + ". Loading may hit duplicate keys; consider 'Truncate target first'." + skipped));
+                + ". Loading may hit duplicate keys; consider 'Truncate target first'." + skippedRows));
+
+        // The faults themselves, named, as an error: the verdicts above have each said which tables they could not cover, but the
+        // reason lives here, and without it the operator is told what was not checked and never why.
+        if (probeErrors.Count > 0)
+            checks.Add(Err("target_probe", "Some target tables could not be checked: " + string.Join("; ", probeErrors) + "."));
         return checks;
+    }
+
+    private static string Clause(string why, IEnumerable<string> names)
+    {
+        var list = names.ToList();
+        return list.Count == 0 ? "" : $" Not checked, because {why}: {string.Join(", ", list)}.";
     }
 
     /// <summary>
@@ -290,13 +367,19 @@ public static class Preflight
     private static string Describe(Exception ex) => TransferFailure.Describe(ex, t => t);
 
     /// <summary>Scrubbing can empty a detail whose whole content was a secret; an empty detail would then be an invisible reason.</summary>
-    private static string Scrubbed(string detail, IReadOnlyList<string> secrets)
+    internal static string Scrubbed(string detail, IReadOnlyList<string> secrets)
         => TransferFailure.NonBlank(Redactor.Scrub(detail, secrets), "(removed: the detail consisted of a secret)");
 
     private static PreflightCheck Ok(string name, string detail) => new(name, true, "info", detail);
     private static PreflightCheck Err(string name, string detail) => new(name, false, "error", detail);
 
-    /// <summary>A check that did not run. Not "ok", so it cannot be read as a pass; not an "error", so it does not block a run on its
-    /// own - whatever stopped it is already an error of its own in the list.</summary>
-    private static PreflightCheck NotRun(string name, string detail) => new(name, false, "warning", detail);
+    /// <summary>
+    /// A check that did not run. Never "ok", so it cannot be read as a pass.
+    /// <para>Ruling 120: it is a <b>warning</b> only when the thing that stopped it is already an error in the list - a failed
+    /// connection, say, which blocks the run on its own account and which the operator is already being sent to fix. When nothing else
+    /// records the fault it is an <b>error</b>, because <see cref="PreflightResult.Passed"/> is one bit: a check that was going to
+    /// catch a changed schema and never ran must not leave that bit saying "go".</para>
+    /// </summary>
+    private static PreflightCheck NotRun(string name, string detail, bool causeIsAlreadyAnError) =>
+        new(name, false, causeIsAlreadyAnError ? "warning" : "error", detail);
 }

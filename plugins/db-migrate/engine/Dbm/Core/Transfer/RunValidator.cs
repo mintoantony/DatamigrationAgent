@@ -39,6 +39,10 @@ public sealed record TaskValidation(bool CountMatch, long? RowsSource, long Rows
     /// <summary>Set when some bound columns were left out of the checksum comparison. "checksums 1/1 matched" over a table whose other
     /// columns nobody could compare is the same green light as no validation at all, so the drop has to be visible.</summary>
     public string? ChecksumColumnsNote { get; init; }
+
+    /// <summary>How many bound columns <see cref="ChecksumColumnsNote"/> is about, as a number, so the report's one-line headline can
+    /// carry the shortfall too - the sentence alone only reaches a reader who scrolls to the notes.</summary>
+    public int ChecksumColumnsNotCompared { get; init; }
 }
 
 /// <summary>Source alias in the task's SourceQuery, the target column it is bound to, and the target's type as SQL text.</summary>
@@ -56,6 +60,10 @@ public static class RunValidator
 {
     /// <summary>The one text a report uses for a task whose validation never ran. One string, one meaning: not "nothing was wrong".</summary>
     public const string NoValidation = "no validation was recorded for this task";
+
+    /// <summary>Seconds allowed for the source recount, matching <see cref="Preflight.SourceEstimateAsync"/>'s bound on the identical
+    /// query. Both run plan-supplied <c>CountSql</c>; this one runs inside the completion hook with the run lock held.</summary>
+    public const int RecountTimeoutSec = 120;
 
     /// <summary>
     /// System scalar types BINARY_CHECKSUM compares exactly after V8 normalisation. text/ntext/image/xml/spatial/hierarchyid/sql_variant/
@@ -94,19 +102,36 @@ public static class RunValidator
         string? sourceNote = null;
         if (source is null)
         {
-            source = await TargetOps.ScalarLongOrNullAsync(src, TargetOps.CountSqlOf(task), ct);
-            sourceNote = source is null
-                ? "the source row count is unknown: this run never recorded one, and counting the source now produced no number either"
-                : "counted after the run, not the snapshot this run takes when a task starts - the source may have changed in between";
+            try
+            {
+                // Bounded, like SourceEstimateAsync's identical query: this is plan-supplied SQL running inside the completion hook
+                // with the run lock held, and an unbounded wait there is a run nobody can finish and nobody can cancel softly.
+                source = await TargetOps.ScalarLongOrNullAsync(src, TargetOps.CountSqlOf(task), ct, timeoutSec: RecountTimeoutSec);
+                sourceNote = source is null
+                    ? "the source row count is unknown: this run never recorded one, and counting the source now produced no number either"
+                    : "counted after the run, not the snapshot this run takes when a task starts - the source may have changed in between";
+            }
+            catch (Exception ex) when (ex is SqlException or TimeoutException)
+            {
+                // Reported, not thrown: the count is one input to the report, and losing it must not lose the rest of the validation.
+                source = null;
+                sourceNote = $"the source row count is unknown: this run never recorded one, and counting it now failed within "
+                             + $"{RecountTimeoutSec} s ({TransferFailure.NonBlank(ex.Message, ex.GetType().Name)})";
+            }
         }
 
+        // A task that has not finished holds part of a load, so neither its counts nor its checksums can mean anything yet: reporting
+        // either would be a finding against the data where there is none, and a false alarm costs the same investigation as a real one.
+        bool finished = row.Status == TransferTaskStatus.Done;
         long? before = row.RowsBefore;
-        bool compared = source is not null && before is not null;
+        bool compared = finished && source is not null && before is not null;
         long expected = compared ? source!.Value - row.RowsError : 0;
         long found = compared ? after - before!.Value : 0;
         bool match = compared && expected == found;
         string? countNote =
-            !compared ? "the row counts could not be compared: " + (source is null
+            !compared ? "the row counts could not be compared: " + (!finished
+                ? $"the task did not finish (it is {EnumText.ToText(row.Status)}), so the target is not expected to hold all its rows yet"
+                : source is null
                 ? "no source row count was ever established for this task"
                 : "the target's row count before the run was never recorded, so the rows this run added cannot be told apart from rows "
                   + "that were already there")
@@ -117,11 +142,12 @@ public static class RunValidator
 
         var results = new List<ChecksumResult>();
         string? columnsNote = null;
+        int notCompared = 0;
         // Every skip route sets a reason, including the ones that are not about the option: an empty Checksums list must never be able
         // to mean "compared and found nothing to say".
         string? skipped =
             !checksums ? "disabled"
-            : row.Status != TransferTaskStatus.Done
+            : !finished
                 ? $"the task did not finish (it is {EnumText.ToText(row.Status)}), so the target holds part of a load"
             : before is null ? "the target's row count before the run was never recorded, so the table cannot be shown to have started empty"
             : before.Value != 0 ? "target table was not empty before the run"
@@ -132,6 +158,7 @@ public static class RunValidator
             var shape = await TargetShape.LoadAsync(tgt, task.Target, ct);
             var cols = ChecksumColumns(task, shape);
             var uncomparable = UncomparableColumns(task, shape);
+            notCompared = uncomparable.Count;
             if (uncomparable.Count > 0)
                 columnsNote = string.Create(CultureInfo.InvariantCulture,
                     $"{uncomparable.Count} of {task.Columns.Count} bound columns were not compared: {string.Join(", ", uncomparable)}.");
@@ -162,6 +189,7 @@ public static class RunValidator
             CountNote = countNote,
             RowsSourceNote = sourceNote,
             ChecksumColumnsNote = columnsNote,
+            ChecksumColumnsNotCompared = notCompared,
         };
     }
 
