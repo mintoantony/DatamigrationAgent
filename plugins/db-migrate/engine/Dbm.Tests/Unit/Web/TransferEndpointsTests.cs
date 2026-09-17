@@ -124,6 +124,64 @@ public sealed class TransferEndpointsTests : IDisposable
         Assert.DoesNotContain("protected-by-somebody-else", message);
     }
 
+    /// <summary>
+    /// Ruling 132, route 1. A saved record that will not parse must cost its own line, not the screen. Measured before the fix:
+    /// <c>GET /api/transfer</c> answered <b>400 bad_request "Invalid JSON body: …"</b> - a GET that has no body, telling the operator
+    /// their body is invalid, with a blank execute screen behind it.
+    /// </summary>
+    [Fact]
+    public async Task A_target_connection_whose_saved_details_will_not_parse_still_answers_a_view()
+    {
+        var s = _workspace.OpenServices();
+        s.Connections.Save(Side.Tgt, FakeServices.TgtConnection, FakeServices.Meta("tgt-host", "ShopV2"));
+        s.Db.Execute("UPDATE connection SET server_meta_json = '{not json' WHERE side = 'tgt'");
+        await using var server = await WebTestServer.StartAsync(_workspace.Ws, ws => DbmServices.Open(ws));
+
+        var (status, body) = await server.SendAsync(HttpMethod.Get, "/api/transfer");
+
+        Assert.Equal(HttpStatusCode.OK, status);
+        Assert.Null((string?)body!["targetDatabase"]);
+        Assert.Contains("target connection", (string?)body["cannotStart"] ?? "", StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("target connection", (string?)body["planNote"] ?? "", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Ruling 132, route 2: one task's unreadable validation costs that task's validation, not the whole screen - and the
+    /// task says so, because a null validation otherwise means nothing was ever checked.</summary>
+    [Fact]
+    public async Task A_task_whose_saved_validation_will_not_parse_still_answers_a_view()
+    {
+        var s = _workspace.OpenServices();
+        long runId = s.Transfers.CreateRun(1, new TransferOptions(), [("T01", "app.A")]);
+        s.Transfers.SetTaskValidation(runId, "T01", "{not json");
+        await using var server = await WebTestServer.StartAsync(_workspace.Ws, ws => DbmServices.Open(ws));
+
+        var (status, body) = await server.SendAsync(HttpMethod.Get, "/api/transfer");
+
+        Assert.Equal(HttpStatusCode.OK, status);
+        var task = body!["tasks"]!.AsArray()[0]!;
+        Assert.Null(task["validation"]);
+        Assert.Contains("could not be read", (string?)task["validationNote"] ?? "");
+    }
+
+    /// <summary>Ruling 132, route 3: <c>TransferRepo.MapRun</c> deserialises <c>options_json</c>, so a corrupt one throws on
+    /// <c>View()</c>'s first line, before there is a row to degrade. Guarded around the repo call, per the scope ruling.</summary>
+    [Fact]
+    public async Task A_run_whose_saved_options_will_not_parse_still_answer_a_view()
+    {
+        var s = _workspace.OpenServices();
+        long runId = s.Transfers.CreateRun(1, new TransferOptions(), [("T01", "app.A")]);
+        s.Db.Execute("UPDATE transfer_run SET options_json = '{not json' WHERE id = $Id", new { Id = runId });
+        await using var server = await WebTestServer.StartAsync(_workspace.Ws, ws => DbmServices.Open(ws));
+
+        var (status, body) = await server.SendAsync(HttpMethod.Get, "/api/transfer");
+
+        Assert.Equal(HttpStatusCode.OK, status);
+        Assert.Null(body!["run"]);
+        Assert.Contains("could not be read", (string?)body["planNote"] ?? "");
+        Assert.False((bool?)body["canStart"]);
+        Assert.Contains("could not be read", (string?)body["cannotStart"] ?? "");
+    }
+
     [Fact]
     public async Task A_malformed_body_is_a_bad_request_not_a_default_start()
     {

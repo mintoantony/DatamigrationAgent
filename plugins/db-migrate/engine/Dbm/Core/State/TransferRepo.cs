@@ -73,6 +73,27 @@ public sealed class TransferRepo(StateDb db)
         if (n == 0) throw UnknownRun(runId);
     }
 
+    /// <summary>
+    /// T5.5 ruling 131, additive: rewrites <c>summary_json</c> alone. It touches no other column - not <c>status</c>, not
+    /// <c>ended_at</c> - so a caller that has something to add to a run's record but changed nothing about the run itself cannot move
+    /// the run by writing it. <see cref="SetRunStatus"/> is the only other writer of that column and going through it costs a status:
+    /// a refused resume of a <c>failed</c> run recorded through it read <c>paused</c> afterwards, with <c>ended_at</c> cleared, the
+    /// failure gone from the error line and the Execute button disabled.
+    /// <para><paramref name="merge"/> is handed the run's current summary (null when there is none) inside the transaction and returns
+    /// the one to store, so a read-modify-write cannot interleave with another writer.</para>
+    /// </summary>
+    public void UpdateRunSummary(long runId, Func<string?, string> merge)
+    {
+        ArgumentNullException.ThrowIfNull(merge);
+        _db.InTransaction(() =>
+        {
+            var current = _db.Query<string?>("SELECT summary_json FROM transfer_run WHERE id = $Id", r => Str(r, 0), new { Id = runId });
+            if (current.Count == 0) throw UnknownRun(runId);
+            string summary = merge(current[0]) ?? throw new ArgumentException("The merge produced no summary.", nameof(merge));
+            return _db.Execute("UPDATE transfer_run SET summary_json = $Summary WHERE id = $Id", new { Summary = summary, Id = runId });
+        });
+    }
+
     /// <summary>Tasks of a run in ordinal order; empty when the run does not exist (check <see cref="GetRun"/> to tell the two apart).</summary>
     public IReadOnlyList<TransferTaskRow> Tasks(long runId)
         => _db.Query($"SELECT {TaskCols} FROM transfer_task WHERE run_id = $RunId ORDER BY ordinal", MapTask, new { RunId = runId });

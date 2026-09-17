@@ -41,6 +41,11 @@ public sealed record TransferTaskView(string TaskId, string Target, int Ordinal,
     /// Cancel or Fail rolls back and records <c>paused</c>: read alone it says an operator paused it and that a resume will pick it up,
     /// and neither is true.</summary>
     public string? StatusNote { get; init; }
+
+    /// <summary>Why <see cref="Validation"/> is null although something was recorded for this task (ruling 132): the stored validation
+    /// will not parse. A null <see cref="Validation"/> otherwise means no validation was recorded at all, and the two must not look
+    /// alike - one says nothing was checked, the other says the record of what was checked is unreadable.</summary>
+    public string? ValidationNote { get; init; }
 }
 
 /// <param name="RowsSource">The sum over the tasks that <b>have</b> a source count. While <see cref="TasksWithoutSource"/> is non-zero
@@ -105,6 +110,24 @@ public sealed class TransferService
     /// <summary>Raised on the worker thread right after a chunk and its checkpoint commit. 5.6 subscribes for progress; tests use it to
     /// stop a run at a known instant.</summary>
     public event Action<ChunkCommit>? ChunkCommitted;
+
+    private static readonly AsyncLocal<Func<Task>?> AfterFirstChunkHook = new();
+
+    /// <summary>
+    /// Test seam (ruling 133; 5.3's <c>TaskRunner.AfterChunkTransaction</c> is the precedent). Invoked once per launched segment, on the
+    /// worker, immediately after that segment's <b>first</b> chunk and checkpoint commit - the one instant where the run is provably
+    /// live, has written rows, and is still executing. <see cref="RunBackgroundAsync"/> <b>awaits</b> it, so a test can read
+    /// <see cref="IsActive"/>, <see cref="View"/> and <see cref="Pause"/> there instead of racing them.
+    /// <para>Without it the only way to observe a live run is a subscriber on <see cref="ChunkCommitted"/>, which is why the
+    /// two-concurrent-resumes test's kill landed on an observation that never happened (<c>Actual: null</c>) rather than on the harm it
+    /// names. Held in an <see cref="AsyncLocal{T}"/> so one test's seam cannot reach another test's run, and <b>null in production</b>,
+    /// where it costs one null check per launched segment and nothing per chunk.</para>
+    /// </summary>
+    internal static Func<Task>? AfterFirstChunk
+    {
+        get => AfterFirstChunkHook.Value;
+        set => AfterFirstChunkHook.Value = value;
+    }
 
     public PreflightResult? LastPreflight { get { lock (_lock) return _lastPreflight; } }
 
@@ -327,10 +350,25 @@ public sealed class TransferService
 
     public TransferView View()
     {
-        var run = _services.Transfers.Latest();
+        TransferRunRow? run;
+        IReadOnlyList<TransferTaskRow> taskRows;
+        try
+        {
+            run = _services.Transfers.Latest();
+            taskRows = run is null ? [] : _services.Transfers.Tasks(run.Id);
+        }
+        catch (JsonException ex)
+        {
+            // Ruling 132. TransferRepo.MapRun deserialises options_json, so a saved record that will not parse throws here - before
+            // this method has a row to degrade. It must still answer with a view: the endpoint's Guard maps a JsonException to
+            // 400 "Invalid JSON body", which is a GET with no body being told its body is invalid, above a blank execute screen.
+            return UnreadableRunView(ex);
+        }
         var (approved, planNote) = PlanForView();
         var (plan, runPlanNote) = PlanOfRun(run, approved);
         planNote = runPlanNote ?? planNote;
+        var (targetDatabase, targetProblem) = SavedTargetDatabase();
+        if (targetProblem is not null) planNote = planNote is null ? targetProblem : planNote + " " + targetProblem;
 
         List<TransferTaskView> tasks;
         if (run is null)
@@ -341,15 +379,16 @@ public sealed class TransferService
         }
         else
         {
-            tasks = _services.Transfers.Tasks(run.Id).Select(t =>
+            tasks = taskRows.Select(t =>
             {
                 var tp = plan?.Tasks.GetValueOrDefault(t.TaskId);
+                var (validation, validationNote) = ValidationOf(t);
                 return new TransferTaskView(t.TaskId, t.Target, t.Ordinal, t.Status, t.RowsSource, t.RowsBefore, t.RowsDone, t.RowsError,
-                    t.StartedAt, t.EndedAt, t.HeartbeatAt, t.Error,
-                    t.ValidationJson is null ? null : Json.Deserialize<TaskValidation>(t.ValidationJson),
+                    t.StartedAt, t.EndedAt, t.HeartbeatAt, t.Error, validation,
                     tp?.DependsOn.ToList() ?? [], tp is not null && tp.KeyColumns.Count == 0)
                 {
                     StatusNote = FinalReportBuilder.StatusNote(t.Status, run.Status),
+                    ValidationNote = validationNote,
                 };
             }).ToList();
         }
@@ -367,14 +406,16 @@ public sealed class TransferService
             active = _active;
             stopping = _active && _control is { StopRequested: true } c ? StopText(c.Kind) : null;
         }
-        string? cannotStart = WhyNotStart(run, approved, planNote, active);
+        // A target whose saved details cannot be read is a hard blocker for a start - the typed confirmation compares the very name
+        // that could not be read - so it is the reason, ahead of every other.
+        string? cannotStart = targetProblem ?? WhyNotStart(run, approved, planNote, active);
         string? cannotResume = WhyNotResume(run, active);
         var runView = run is null ? null : new TransferRunView(run.Id, run.SqlVersion, run.Status, run.Options, run.StartedAt, run.EndedAt,
             RunError(run), HasStoredReport(run))
         {
             Notes = RunNotes(run),
         };
-        return new TransferView(runView, tasks, totals, active, cannotStart is null, _services.Connections.GetMeta(Side.Tgt)?.Database,
+        return new TransferView(runView, tasks, totals, active, cannotStart is null, targetDatabase,
             approved?.Version, LastPreflight, new TransferOptions())
         {
             CannotStart = cannotStart,
@@ -513,6 +554,17 @@ public sealed class TransferService
 
     private async Task RunBackgroundAsync(TransferEngine engine, long runId, TransferControl control, IReadOnlyList<string> secrets)
     {
+        // Ruling 133's seam, subscribed only when a test set one - production pays one null check per launched segment and nothing at
+        // all per chunk. It is awaited on the worker on purpose: it holds the run at the instant it fires, so what a test reads there
+        // is a live transfer rather than whichever task the service happened to be holding when it looked.
+        if (AfterFirstChunk is { } afterFirstChunk)
+        {
+            int chunks = 0;
+            control.ChunkCommitted += _ =>
+            {
+                if (Interlocked.Increment(ref chunks) == 1) afterFirstChunk().GetAwaiter().GetResult();
+            };
+        }
         try
         {
             TransferOutcome outcome;
@@ -543,7 +595,10 @@ public sealed class TransferService
                 // blank one does arrive, the alternative is an ArgumentException out of the repo and a run left "running" for ever.
                 // Pinned by TransferServiceViewTests.A_failure_with_no_message_is_recorded_by_type_name_contract_assertion_…
                 string msg = TransferFailure.Describe(ex, t => Redactor.Scrub(t, secrets));
-                _services.Transfers.SetRunStatus(runId, RunStatus.Failed, Json.Serialize(new { error = msg }));
+                // Through the merge writer, not a fresh object: this arm owns the status, but a run can already be carrying notes from
+                // an earlier segment (a control table that was not ours), and writing {"error": …} over the summary would drop them.
+                _services.Transfers.SetRunStatus(runId, RunStatus.Failed,
+                    MergeSummary(_services.Transfers.GetRun(runId)?.SummaryJson, error: msg));
                 _services.Sink.Publish("transfer_run_changed", new { runId, status = EnumText.ToText(RunStatus.Failed) });
                 outcome = new TransferOutcome(RunStatus.Failed, msg);
             }
@@ -577,6 +632,15 @@ public sealed class TransferService
     internal static string MergeNote(string? summaryJson, string note)
     {
         ArgumentNullException.ThrowIfNull(note);
+        return MergeSummary(summaryJson, note: note);
+    }
+
+    /// <summary>
+    /// <see cref="MergeNote"/>'s general form: sets <c>error</c> when one is given, appends to <c>notes</c> when one is given, and
+    /// keeps every other key the run already carried.
+    /// </summary>
+    internal static string MergeSummary(string? summaryJson, string? error = null, string? note = null)
+    {
         JsonObject summary = new();
         string? unreadable = null;
         if (!string.IsNullOrWhiteSpace(summaryJson))
@@ -599,16 +663,26 @@ public sealed class TransferService
             notes.Add(odd.ToJsonString());
         if (unreadable is not null)
             notes.Add("The run's previous summary could not be read as JSON and is kept here verbatim: " + unreadable);
-        notes.Add(note);
+        if (note is not null) notes.Add(note);
+        if (error is not null) summary["error"] = JsonValue.Create(error);
         summary["notes"] = new JsonArray(notes.Select(n => (JsonNode?)JsonValue.Create(n)).ToArray());
         return summary.ToJsonString(Json.Options);
     }
 
+    /// <summary>
+    /// Ruling 131. The refusal did nothing to the run, so it writes nothing about the run - only the note, through the one repo method
+    /// that cannot touch anything else.
+    /// <para>Recording it through <c>SetRunStatus(Paused)</c> instead rewrote <b>five</b> things an operator reads on a <c>failed</c>
+    /// run: the status (<c>failed</c> to <c>paused</c>), <c>ended_at</c> (a timestamp to null, because paused is not terminal), the
+    /// error line (the failure's own sentence to null, since it is read only for a failed run), the notes, and <c>CanStart</c> (true to
+    /// false - the Execute button disabled with "resume or cancel it first"). None of that happened; a runner was simply told to wait.</para>
+    /// </summary>
     private void RecordNotRun(long runId, string why)
     {
-        var run = _services.Transfers.GetRun(runId);
-        _services.Transfers.SetRunStatus(runId, RunStatus.Paused, MergeNote(run?.SummaryJson, why));
-        _services.Sink.Publish("transfer_run_changed", new { runId, status = EnumText.ToText(RunStatus.Paused) });
+        _services.Transfers.UpdateRunSummary(runId, summary => MergeNote(summary, why));
+        var status = _services.Transfers.GetRun(runId)?.Status;
+        if (status is { } unchanged)
+            _services.Sink.Publish("transfer_run_changed", new { runId, status = EnumText.ToText(unchanged) });
         _services.Sink.Publish("log", new { level = "error", message = why });
     }
 
@@ -770,6 +844,62 @@ public sealed class TransferService
 
     private static IEnumerable<string> PlanTaskIds(SqlPlanPayload plan)
         => TransferEngine.PlanOrder(plan).Where(id => plan.Tasks[id] is not null);
+
+    /// <summary>
+    /// Ruling 132, route 3. The run's own row cannot be read, so there is nothing to show and nothing to do - but the screen still
+    /// renders, and every field that would otherwise be a bare absence says which saved record is at fault and what to do about it.
+    /// </summary>
+    private TransferView UnreadableRunView(Exception ex)
+    {
+        string why = "The latest transfer run could not be read: the options this workspace saved for it are not readable JSON ("
+                     + Describe(ex) + "). Nothing is known about that run - not its status, not what it loaded.";
+        var (targetDatabase, targetProblem) = SavedTargetDatabase();
+        return new TransferView(null, [], new TransferTotals(0, 0, 0, 0, 0), IsActive, false, targetDatabase, null, LastPreflight,
+            new TransferOptions())
+        {
+            CannotStart = why + " Starting a new run while an existing one cannot be read would load into a target that run may still "
+                          + "be using; repair or remove its row in the state database first.",
+            CanResume = false,
+            CannotResume = why,
+            PlanNote = targetProblem is null ? why : why + " " + targetProblem,
+        };
+    }
+
+    /// <summary>
+    /// Ruling 132, route 1. The saved target's database name, or null <b>with the sentence that says why</b> - a null here otherwise
+    /// reads as "no target saved", which is a different thing from "the target's saved details will not parse".
+    /// </summary>
+    private (string? Database, string? Problem) SavedTargetDatabase()
+    {
+        try
+        {
+            return (_services.Connections.GetMeta(Side.Tgt)?.Database, null);
+        }
+        catch (JsonException ex)
+        {
+            return (null, "The saved target connection's server details could not be read (" + Describe(ex)
+                          + "), so the target database name is unknown and the typed confirmation cannot be checked against it. "
+                          + "Re-test the target connection on the Setup screen.");
+        }
+    }
+
+    /// <summary>
+    /// Ruling 132, route 2. One task's unreadable validation costs that task's validation, not the whole screen - and it says so,
+    /// because a null <c>Validation</c> otherwise means nothing was ever checked (5.4's <c>RunValidator.NoValidation</c>).
+    /// </summary>
+    private static (TaskValidation? Validation, string? Note) ValidationOf(TransferTaskRow task)
+    {
+        if (task.ValidationJson is null) return (null, null);
+        try
+        {
+            return (Json.Deserialize<TaskValidation>(task.ValidationJson), null);
+        }
+        catch (JsonException ex)
+        {
+            return (null, "the validation recorded for this task could not be read (" + Describe(ex)
+                          + "), so its row counts and checksums are unknown - this is not a task that was never validated");
+        }
+    }
 
     private string? WhyNotStart(TransferRunRow? run, ApprovedPlan? approved, string? planNote, bool active)
     {

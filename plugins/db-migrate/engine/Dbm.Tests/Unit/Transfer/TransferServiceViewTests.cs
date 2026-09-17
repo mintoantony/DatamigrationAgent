@@ -299,6 +299,31 @@ public sealed class TransferServiceViewTests : IDisposable
         Assert.Contains("refused", kept);
     }
 
+    /// <summary>
+    /// Ruling 131's writer, which is why <c>TransferRepo</c> gained one additive method. Its only other summary writer is
+    /// <c>SetRunStatus</c>, which cannot leave the status alone - and going through it is what turned a refused resume of a
+    /// <c>failed</c> run into a <c>paused</c> one with <c>ended_at</c> cleared and the Execute button disabled.
+    /// </summary>
+    [Fact]
+    public void Updating_a_run_summary_leaves_the_status_and_the_end_time_alone()
+    {
+        long runId = S.Transfers.CreateRun(1, new TransferOptions(), [("T01", "app.A")]);
+        S.Transfers.SetRunStatus(runId, RunStatus.Failed, """{"error":"it broke"}""");
+        var before = S.Transfers.GetRun(runId)!;
+        Assert.NotNull(before.EndedAt);
+
+        S.Transfers.UpdateRunSummary(runId, summary => TransferService.MergeNote(summary, "a note"));
+
+        var after = S.Transfers.GetRun(runId)!;
+        Assert.Equal(RunStatus.Failed, after.Status);
+        Assert.Equal(before.EndedAt, after.EndedAt);
+        Assert.Equal(before.StartedAt, after.StartedAt);
+        Assert.Contains("it broke", after.SummaryJson);
+        Assert.Contains("a note", after.SummaryJson);
+        // An unknown run is refused rather than silently changing nothing, like every other mutator on this repo.
+        Assert.Equal("unknown_run", Assert.Throws<TransferException>(() => S.Transfers.UpdateRunSummary(runId + 99, _ => "{}")).Code);
+    }
+
     /// <summary>Three refusals that must each name the thing that is missing rather than share one "no".</summary>
     [Fact]
     public async Task Pause_resume_and_cancel_without_a_run_each_say_what_is_missing()

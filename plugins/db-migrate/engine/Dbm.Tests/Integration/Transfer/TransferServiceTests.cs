@@ -394,20 +394,28 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
     public async Task Two_concurrent_resumes_hand_the_run_to_one_runner_and_refuse_the_other()
     {
         await using var rig = await RigAsync();
-        bool resuming = false;
+        rig.Service.ChunkCommitted += c => { if (c.TaskId == "T02" && c.ChunkNo == 2) rig.Service.Pause(); };
+        long runId = await rig.Service.StartAsync(Skip, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Paused, rig.Service.View().Run!.Status);
+
+        // Ruling 133. Observed through the seam, not through a subscriber: the resumed run is live, has committed a chunk and is held
+        // inside this delegate while it is read, so every assertion below is about a running transfer rather than about whichever task
+        // the service happened to be holding when the test looked.
         bool? activeDuringResume = null;
         RunStatus? statusDuringResume = null;
         string? pauseDuringResume = "the resumed run committed no chunk";
-        rig.Service.ChunkCommitted += c =>
+        long childRowsDuringResume = -1;
+        var bothDoorsAnswered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var observed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int observations = 0;
+        TransferService.AfterFirstChunk = async () =>
         {
-            if (!resuming)
-            {
-                if (c.TaskId == "T02" && c.ChunkNo == 2) rig.Service.Pause();
-                return;
-            }
-            if (activeDuringResume is not null) return;
+            if (Interlocked.Increment(ref observations) > 1) return;
+            await bothDoorsAnswered.Task;
             activeDuringResume = rig.Service.IsActive;
             statusDuringResume = rig.Service.View().Run!.Status;
+            childRowsDuringResume = await rig.Tgt.CountAsync("app.Child");
             try
             {
                 rig.Service.Pause();
@@ -417,33 +425,41 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
             {
                 pauseDuringResume = ex.Code;
             }
+            observed.TrySetResult();
         };
 
-        long runId = await rig.Service.StartAsync(Skip, rig.Tgt.Name, default);
-        await rig.Service.Current;
-        Assert.Equal(RunStatus.Paused, rig.Service.View().Run!.Status);
-
-        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        async Task<(long? Id, string? Code)> ResumeOnceAsync()
+        try
         {
-            await gate.Task;
-            try { return (rig.Service.Resume(), null); }
-            catch (TransferException ex) { return (null, ex.Code); }
-        }
-        var first = Task.Run(ResumeOnceAsync);
-        var second = Task.Run(ResumeOnceAsync);
-        resuming = true;
-        gate.TrySetResult();
-        var outcomes = await Task.WhenAll(first, second);
-        await rig.Service.Current;
+            var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            async Task<(long? Id, string? Code)> ResumeOnceAsync()
+            {
+                await gate.Task;
+                try { return (rig.Service.Resume(), null); }
+                catch (TransferException ex) { return (null, ex.Code); }
+            }
+            var first = Task.Run(ResumeOnceAsync);
+            var second = Task.Run(ResumeOnceAsync);
+            gate.TrySetResult();
+            var outcomes = await Task.WhenAll(first, second);
+            bothDoorsAnswered.TrySetResult();
+            // Wait for the seam, not for Current: with two runners Current is whichever one launched last, and that is exactly the
+            // confusion this test is about. The seam fires on the winner, so it is the only handle on "the run is live".
+            await observed.Task.WaitAsync(TimeSpan.FromSeconds(60));
+            await rig.Service.Current;
 
-        // The harm first: while the winner was loading rows the service must not have described an idle, paused run.
-        Assert.True(activeDuringResume);
-        Assert.Equal(RunStatus.Running, statusDuringResume);
-        Assert.Null(pauseDuringResume);                                               // Pause() was accepted, not refused
-        Assert.Single(outcomes, o => o.Id is not null);
-        Assert.Equal(runId, outcomes.Single(o => o.Id is not null).Id);
-        Assert.Equal("busy", outcomes.Single(o => o.Id is null).Code);
+            // The harm first: rows were being written, so the service must not have described an idle, paused run that ignores Pause.
+            Assert.True(activeDuringResume);
+            Assert.Equal(RunStatus.Running, statusDuringResume);
+            Assert.Null(pauseDuringResume);                                           // Pause() was accepted, not refused
+            Assert.True(childRowsDuringResume > 200, $"the resumed run had written no new rows: {childRowsDuringResume}");
+            Assert.Single(outcomes, o => o.Id is not null);
+            Assert.Equal(runId, outcomes.Single(o => o.Id is not null).Id);
+            Assert.Equal("busy", outcomes.Single(o => o.Id is null).Code);
+        }
+        finally
+        {
+            TransferService.AfterFirstChunk = null;
+        }
 
         // And the pause that was accepted took effect, so the run is still the operator's to finish.
         Assert.Equal(RunStatus.Paused, rig.Service.View().Run!.Status);
@@ -552,16 +568,26 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
         Assert.Equal(RunStatus.Failed, rig.S.Transfers.GetRun(runId)!.Status);
         Assert.Contains("CK_Child_Qty", rig.S.Transfers.GetRun(runId)!.SummaryJson);
 
+        var before = rig.Service.View().Run!;
+
         await using (await RunLock.AcquireAsync(rig.Tgt.ConnectionString, runId, default))
         {
             Assert.Equal(runId, rig.Service.Resume());
             await rig.Service.Current;
         }
 
-        Assert.Contains("CK_Child_Qty", rig.S.Transfers.GetRun(runId)!.SummaryJson);
+        // Ruling 131. The refusal did nothing, so everything an operator reads is as it was - except the note.
         var view = rig.Service.View();
-        Assert.Contains(view.Run!.Notes, n => n.Contains("already being run", StringComparison.Ordinal));
+        Assert.Equal(RunStatus.Failed, view.Run!.Status);
+        Assert.Equal(before.EndedAt, view.Run.EndedAt);
+        Assert.Equal(before.Error, view.Run.Error);
+        Assert.Contains("CK_Child_Qty", view.Run.Error);
+        Assert.True(view.CanStart);                                                   // the Execute button is not disabled by a no-op
+        Assert.Null(view.CannotStart);
         Assert.True(view.CanResume);                                                  // ruling 125: resumable again once the lock is free
+        // Ruling 130: and the note is beside what was already there, in the record as well as the view.
+        Assert.Contains(view.Run.Notes, n => n.Contains("already being run", StringComparison.Ordinal));
+        Assert.Contains("CK_Child_Qty", rig.S.Transfers.GetRun(runId)!.SummaryJson);
     }
 
     /// <summary>
