@@ -71,11 +71,6 @@
   }
   function ts(iso) { return iso ? (DBM.fmt && DBM.fmt.ts ? DBM.fmt.ts(iso) : String(iso)) : '—'; }
 
-  /** A sentence the engine sent. Rendered whenever it is there; never summarised into a flag and never dropped. */
-  function note(text, kind) {
-    return text ? h('div', { class: 'exe-note' + (kind ? ' is-' + kind : ''), role: kind === 'err' ? 'alert' : null }, text) : null;
-  }
-
   function render(root, ctx, opts) {
     const keep = (opts && opts.rerender !== false && KEEP) || null;
     S = {

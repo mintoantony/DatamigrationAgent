@@ -879,8 +879,6 @@ dl.meta dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .exe-check-icon.is-notrun { background: var(--surface-2); color: var(--text-muted); border: 1px solid var(--border-strong); }
 .exe-check-name { font-weight: 600; }
 .exe-check-detail { color: var(--text-muted); font-size: 12px; overflow-wrap: anywhere; }
-.exe-note { font-size: 12px; color: var(--text-muted); overflow-wrap: anywhere; }
-.exe-note.is-err { color: var(--err); }
 .exe-task-note { font-size: 11px; color: var(--text-muted); max-width: 280px; overflow-wrap: anywhere; }
 .exe-form { display: grid; gap: 16px; }
 .exe-field { display: grid; gap: 4px; }
