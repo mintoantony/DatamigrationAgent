@@ -57,7 +57,7 @@ public class DemoCommandTests
 
         Assert.Equal(1, r.Exit);
         Assert.Equal("no_project", r.Json["error"]!.GetValue<string>());
-        Assert.False(File.Exists(tw.Ws.StateDbPath));
+        Assert.False(File.Exists(tw.Ws.StateDbPath), "demo --attach created a project instead of refusing: nothing may be initialised by a refusal.");
     }
 
     [Fact]
@@ -88,8 +88,8 @@ public class DemoCommandTests
         var b = new SqlConnectionStringBuilder(cs);
         Assert.Equal("DbmDemo_ShopV2", b.InitialCatalog);
         Assert.Equal("srv1", b.DataSource);
-        Assert.True(b.IntegratedSecurity);
-        Assert.True(b.TrustServerCertificate);
+        Assert.True(b.IntegratedSecurity, $"ForDatabase dropped Integrated Security from the connection string: '{cs}'.");
+        Assert.True(b.TrustServerCertificate, $"ForDatabase dropped TrustServerCertificate from the connection string: '{cs}'.");
     }
 
     [Fact]

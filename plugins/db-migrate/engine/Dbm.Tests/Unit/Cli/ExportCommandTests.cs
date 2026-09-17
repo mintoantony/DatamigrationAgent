@@ -71,11 +71,13 @@ public class ExportCommandTests
             var toFile = await CliRunner.RunAsync(tw.Ws, null, "export", "analysis", "--out", file);
 
             Assert.Equal(Path.Combine(directory, "analysis-v1.html"), toDirectory.Json["path"]!.GetValue<string>());
-            Assert.True(File.Exists(Path.Combine(directory, "analysis-v1.html")));
+            Assert.True(File.Exists(Path.Combine(directory, "analysis-v1.html")),
+                $"--out {directory} reported a path but wrote no file into that directory.");
             Assert.Equal(file, toFile.Json["path"]!.GetValue<string>());
-            Assert.True(File.Exists(file));
+            Assert.True(File.Exists(file), $"--out {file} reported a path but wrote no file there.");
             // the copy under .dbmigrate/exports is kept as well
-            Assert.True(File.Exists(Path.Combine(tw.Ws.ExportsDir, "analysis-v1.html")));
+            Assert.True(File.Exists(Path.Combine(tw.Ws.ExportsDir, "analysis-v1.html")),
+                "--out moved the export instead of copying it: the .dbmigrate/exports copy must survive.");
         });
     }
 
