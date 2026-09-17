@@ -74,7 +74,7 @@
       h('div', { class: 'grid-kpi' },
         kpi('Rows loaded', X.num(r.rowsLoaded), X.totalText(r.rowsSource, missing) + ' source rows'),
         kpi('Rejected', X.num(r.rowsError),
-          r.rowsError ? (r.rowsSource > 0 ? X.pct(r.rowsError, r.rowsSource) + '% of source · logged' : 'logged') : 'none',
+          r.rowsError ? (r.rowsSource > 0 ? X.pctText(r.rowsError, r.rowsSource) + ' of source · logged' : 'logged') : 'none',
           r.rowsError ? 'warn' : 'ok'),
         // A rate priced from a duration nobody established is no rate, not 0 rows/s.
         kpi('Duration', r.durationSec === null || r.durationSec === undefined ? 'unknown' : X.fmtEta(r.durationSec),

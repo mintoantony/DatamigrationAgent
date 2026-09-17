@@ -46,6 +46,14 @@
 
   X.pct = function (done, total) { return Math.floor(X.ratio(done, total) * 100); };
 
+  /** A share as text. A non-zero count that rounds to 0 % is "<1%", never "0%" - three rejected rows are not none. */
+  X.pctText = function (part, whole) {
+    if (!isNum(part) || !(Number(whole) > 0)) return '—';
+    const n = Number(part);
+    const p = X.pct(n, whole);
+    return p === 0 && n > 0 ? '<1%' : p + '%';
+  };
+
   /** Rows/second between the oldest sample inside the window (default 10 s) and the newest one. */
   X.rate = function (samples, windowMs) {
     const w = windowMs || 10000;
@@ -221,7 +229,9 @@
     const s = X.preflightSummary(result);
     const parts = [result.passed ? 'Ready to execute' : plural(s.errors, 'blocking problem', 'blocking problems')];
     if (s.warnings) parts.push(plural(s.warnings, 'warning', 'warnings'));
-    if (s.notRun) parts.push(plural(s.notRun, 'check not run', 'checks not run'));
+    // "including": a check that did not run is already counted above under the severity ruling 120 gave it, so naming it separately
+    // must not read as a second, additional problem.
+    if (s.notRun) parts.push('including ' + plural(s.notRun, 'check that did not run', 'checks that did not run'));
     return parts.join(', ');
   };
 

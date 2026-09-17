@@ -205,7 +205,8 @@
       h('span', { class: 'exe-check-icon is-' + state, role: 'img', 'aria-label': X.checkLabel(state) }, X.checkGlyph(state)),
       h('div', {},
         h('div', { class: 'exe-check-name' }, label(c.name),
-          state === 'notrun' ? h('span', { class: 'tag exe-tag' }, 'not run') : null),
+          // The space is a text node, not CSS: without it a screen reader reads "schema driftnot run".
+          state === 'notrun' ? [' ', h('span', { class: 'tag exe-tag' }, 'not run')] : null),
         // The engine's own sentence, in full: it is the only thing that says what was not checked and why.
         h('div', { class: 'exe-check-detail' }, c.detail || '(the engine gave no detail for this check)')));
   }

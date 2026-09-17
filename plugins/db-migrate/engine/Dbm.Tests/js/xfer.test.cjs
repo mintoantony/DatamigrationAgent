@@ -160,7 +160,8 @@ test('the pre-flight summary counts the checks nobody ran', () => {
     ],
   };
   assert.deepEqual(X.preflightSummary(result), { total: 4, ok: 1, errors: 2, warnings: 1, notRun: 2 });
-  assert.equal(X.preflightText(result), '2 blocking problems, 1 warning, 2 checks not run');
+  // "including": a not-run check already counts under its severity, so it must not read as an extra problem on top.
+  assert.equal(X.preflightText(result), '2 blocking problems, 1 warning, including 2 checks that did not run');
   assert.equal(X.preflightText(null), 'Pre-flight has not run yet');
   assert.equal(X.preflightText({ passed: true, checks: [{ name: 'a', ok: true, severity: 'info', detail: '' }] }), 'Ready to execute');
   assert.equal(X.preflightText({
@@ -171,7 +172,7 @@ test('the pre-flight summary counts the checks nobody ran', () => {
   assert.equal(X.preflightText({
     passed: true,
     checks: [{ name: 'b', ok: false, severity: 'warning', detail: 'Not checked: needs both connections open.' }],
-  }), 'Ready to execute, 1 warning, 1 check not run');
+  }), 'Ready to execute, 1 warning, including 1 check that did not run');
 });
 
 test('an ETA is withheld while a source count is unknown, and says why', () => {
@@ -252,6 +253,15 @@ test('a refusal is shown in the service\'s own words, and an unknown code is nev
   assert.equal(X.refusalText({ code: 'something_new', message: '' }), 'The server refused this (something_new).');
   assert.equal(X.refusalText({ message: 'boom' }), 'boom');
   assert.equal(X.refusalText(null), 'The request failed for a reason the server did not give.');
+});
+
+test('a share that rounds to nothing is not nothing', () => {
+  assert.equal(X.pctText(3, 184500), '<1%');       // three rejected rows are not "0% of source"
+  assert.equal(X.pctText(0, 100), '0%');
+  assert.equal(X.pctText(50, 100), '50%');
+  assert.equal(X.pctText(5, 0), '—');
+  assert.equal(X.pctText(3, null), '—');
+  assert.equal(X.pctText(null, 100), '—');
 });
 
 test('tasksWithoutSource counts the tables nobody has counted', () => {
