@@ -78,6 +78,14 @@ function fakeApi(view, over) {
   return api;
 }
 
+/**
+ * What a line should read as aloud: its elements, one space between them. Asserting `text(el) === spokenAs(el)` makes a missing
+ * separator print both sentences - "…did not runchecked just now" against "…did not run checked just now" - instead of `false`.
+ */
+function spokenAs(el) {
+  return el.children.filter((c) => c.tagName !== '#text').map((c) => D.text(c)).join(' ');
+}
+
 /** Renders the view fresh (no carried-over state) and lets its first GET settle. */
 async function mount(view, over) {
   const api = fakeApi(view, over);
@@ -115,24 +123,27 @@ test('a tag never runs into the word before it (kills M6, and F6 one function aw
   const notRun = D.texts(m.root, '.exe-check-name').filter((t) => /not run/.test(t));
   assert.deepEqual(notRun, ['Schemas unchanged since discovery not run']);
   // ...and the summary badge does not run into the timestamp beside it.
-  assert.ok(/^1 blocking problem, 1 warning, including 1 check that did not run checked /.test(D.text(D.query(m.root, '.card-b .row'))));
+  // Asserted as text against text, never as a boolean: a failure here has to print the run-together sentence itself, because that
+  // sentence is the whole finding. `spokenAs` is what the line should read as - its elements, one space between them.
+  const summary = D.query(m.root, '.card-b .row');
+  assert.equal(D.text(summary), spokenAs(summary), 'the pre-flight summary badge must not run into the timestamp beside it');
   // ...nor an option's label into its hint.
   assert.ok(D.texts(m.root, '.exe-choice').every((t) => !/[a-z][A-Z]/.test(t.replace(/ /g, ' '))),
     'an option label must not run into its hint: ' + D.texts(m.root, '.exe-choice').join(' | '));
 });
 
 test('the "no key" tag does not read as "Runningno key" (F6)', async () => {
-  const m = await mount(runningView());
-  const status = D.queryAll(m.root, '.exe-tasks tbody tr')[2].children[3];
-  // Measured three times in the review, in three statuses: "Pendingno key", "Runningno key", "Doneno key". The tag marks the task
-  // that cannot checkpoint and holds a pause, so it is the last one that should be hard to hear.
-  assert.equal(D.text(status).indexOf('Paused no key'), 0);
-
-  // Every status the row can be in, since the review found it in three of them.
-  for (const status_ of ['pending', 'running', 'done', 'failed']) {
-    const one = await mount(runningView({ tasks: [Object.assign({}, runningView().tasks[2], { status: status_ })] }));
-    const cell = D.query(one.root, '.exe-tasks tbody tr').children[3];
-    assert.ok(/ no key/.test(D.text(cell)), status_ + ' reads "' + D.text(cell) + '"');
+  /* Measured three times in the review, in three statuses: "Pendingno key", "Runningno key", "Doneno key". The tag marks the task
+     that cannot checkpoint and holds a pause, so it is the last one that should be hard to hear.
+     The fixture carries no statusNote, so the cell's whole text IS the status and the tag: the assertion is an equality on what the
+     cell reads as, and a failure prints "Runningno key" rather than a bare -1 or false. */
+  const keyless = {
+    taskId: 'T03', target: 'app.AuditEvents', ordinal: 0, rowsSource: null, rowsDone: 0, rowsError: 0, dependsOn: [], keyless: true,
+  };
+  for (const [status, label] of [['pending', 'Pending'], ['running', 'Running'], ['done', 'Done'], ['paused', 'Paused'], ['failed', 'Failed']]) {
+    const m = await mount(runningView({ tasks: [Object.assign({}, keyless, { status: status })] }));
+    const cell = D.query(m.root, '.exe-tasks tbody tr').children[3];
+    assert.equal(D.text(cell), label + ' no key');
   }
 });
 
@@ -209,10 +220,42 @@ test('an unknown source count reads "unknown" and the totals say "at least"', as
 
 /* ------------------------------------------------------------------ F8: the log tail is appended to, not rebuilt */
 
+/**
+ * F-a. The bound, the order, the placeholder and the one-frame rule are all satisfied by a full rebuild, so none of them can tell
+ * "appended to" from "torn down and rebuilt" - and the rebuild is what cost 7.9 s of main thread over 5,000 log events. Node
+ * identity is the difference, and it is the cheap decisive test: a line that is still the same object was not rebuilt.
+ *
+ * DO NOT "simplify" this into another text or count assertion, and do not replace it with a timing assertion - elapsed
+ * milliseconds on a build machine is a flake waiting to happen. This test is the only guard the performance fix has.
+ */
+test('a new log line leaves the lines above it untouched: the tail is appended to, never rebuilt (F-a)', async () => {
+  const m = await mount(runningView());
+  const log = D.query(m.root, '.exe-log');
+
+  VIEW.onEvent({ type: 'log', data: { level: 'info', message: 'app.Orders: chunk 1 committed' } });
+  const first = D.queryAll(log, '.exe-log-line')[0];
+  first.keptAcrossPushes = 'the very node the first line was rendered into';
+  VIEW.onEvent({ type: 'log', data: { level: 'info', message: 'app.Orders: chunk 2 committed' } });
+
+  const lines = D.queryAll(log, '.exe-log-line');
+  assert.equal(lines.length, 2);
+  assert.equal(lines[0].keptAcrossPushes, 'the very node the first line was rendered into',
+    'line 1 was replaced by a new element, so the whole tail is being rebuilt for every message (F8)');
+  // Same for a line far from the edge, once the tail is full and lines are being discarded from the top.
+  for (let i = 3; i <= 90; i++) VIEW.onEvent({ type: 'log', data: { level: 'info', message: 'app.Orders: chunk ' + i + ' committed' } });
+  const middle = D.queryAll(log, '.exe-log-line')[40];
+  middle.keptAcrossPushes = 'a line in the middle of a full tail';
+  VIEW.onEvent({ type: 'log', data: { level: 'info', message: 'app.Orders: chunk 91 committed' } });
+  assert.equal(D.queryAll(log, '.exe-log-line')[39].keptAcrossPushes, 'a line in the middle of a full tail',
+    'a full tail discards from the top and appends at the bottom; every other line keeps its element');
+  dom.flushFrames();          // the scroll this queued belongs to this test, not to the next one's frame count
+});
+
 test('5,000 log lines leave 80 in the DOM, in order, without rebuilding the tail', async () => {
   const m = await mount(runningView());
   const log = D.query(m.root, '.exe-log');
   assert.equal(D.text(log), 'Live messages appear here while the transfer runs.');
+  dom.flushFrames();          // start from no pending frames, so the count below is this burst's and nothing else's
 
   for (let i = 1; i <= 5000; i++) VIEW.onEvent({ type: 'log', data: { level: i % 50 === 0 ? 'warn' : 'info', message: 'chunk ' + i + ' committed' } });
 
