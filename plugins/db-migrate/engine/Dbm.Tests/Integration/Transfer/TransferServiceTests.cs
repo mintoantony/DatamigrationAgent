@@ -591,6 +591,77 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
     }
 
     /// <summary>
+    /// Ruling 134, the fresh-start arm. A run this attempt <b>created</b> never started and loaded nothing, so a refusal closes it
+    /// <c>cancelled</c> - the same close <c>EnsureNoOtherRunnerAsync</c> gives a start the probe refused (ruling 126). Left
+    /// <c>running</c> instead it is a run reading "running" with no runner: <c>CancelAsync</c> answers <c>not_cancellable</c>,
+    /// <c>Resume()</c> answers <c>not_resumable</c> and a new start is refused <c>not_ready</c>, so the operator cannot clear it at all
+    /// short of restarting the server.
+    /// <para><b>The trigger is unreachable from a test</b> (rulings 104, 112, 121): it needs a foreign runner to take this run's lock
+    /// in the window between <c>EnsureNoOtherRunnerAsync</c> releasing the probe and the engine acquiring it, which is microseconds
+    /// wide and not observable from here. So the arm is driven directly, with the origin its caller passes and the row in the state
+    /// the caller leaves - and the end state below is the real one, asserted by using it.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_fresh_run_the_engine_lock_refuses_is_closed_so_the_operator_can_start_again()
+    {
+        await using var rig = await RigAsync();
+        // Exactly what StartAsync leaves behind at the moment it launches: the run created and 'running', the workflow moved on.
+        long refused = rig.S.Transfers.CreateRun(1, Skip, [("T01", "app.Parent"), ("T02", "app.Child"), ("T03", "app.Log")]);
+        rig.S.Workflow.OnTransferStarted();
+        Assert.Equal(RunStatus.Running, rig.S.Transfers.GetRun(refused)!.Status);
+
+        rig.Service.RecordNotRun(refused, TransferService.RunOrigin.Created,
+            $"Transfer run {refused} is already being run: dbm:transfer_run:{refused} is held by another session in the target.");
+
+        // The harm first, and asserted by doing the thing the operator would do next: a run that cannot be cancelled, cannot be
+        // resumed and blocks every new start is one they cannot clear at all short of restarting the server.
+        var view = rig.Service.View();
+        Assert.True(view.CanStart, view.CannotStart ?? "");
+        long second = await rig.Service.StartAsync(Skip with { ChunkSize = 1000 }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.NotEqual(refused, second);
+        Assert.Equal(RunStatus.Completed, rig.S.Transfers.GetRun(second)!.Status);
+        Assert.Equal(300, await rig.Tgt.CountAsync("app.Parent"));
+
+        // And the refused run is closed, carrying the lock's sentence.
+        Assert.Equal(RunStatus.Cancelled, view.Run!.Status);
+        Assert.Contains(view.Run.Notes, n => n.Contains("already being run", StringComparison.Ordinal));
+        Assert.Equal(RunStatus.Cancelled, rig.S.Transfers.GetRun(refused)!.Status);
+    }
+
+    /// <summary>
+    /// Ruling 134, the paused arm - fully reachable, because <c>Resume()</c> takes no probe: the lock can simply be held before it is
+    /// called. A refusal leaves a paused run paused, with its note, and it resumes for real once the lock is free.
+    /// </summary>
+    [Fact]
+    public async Task A_resume_the_run_lock_refuses_leaves_a_paused_run_paused_and_resumable()
+    {
+        await using var rig = await RigAsync();
+        rig.Service.ChunkCommitted += c => { if (c.TaskId == "T01" && c.ChunkNo == 1) rig.Service.Pause(); };
+        long runId = await rig.Service.StartAsync(Skip, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Paused, rig.S.Transfers.GetRun(runId)!.Status);
+        var before = rig.Service.View().Run!;
+
+        await using (await RunLock.AcquireAsync(rig.Tgt.ConnectionString, runId, default))
+        {
+            Assert.Equal(runId, rig.Service.Resume());
+            await rig.Service.Current;
+        }
+
+        var view = rig.Service.View();
+        Assert.Equal(RunStatus.Paused, view.Run!.Status);
+        Assert.Equal(before.EndedAt, view.Run.EndedAt);
+        Assert.True(view.CanResume);
+        Assert.Contains(view.Run.Notes, n => n.Contains("already being run", StringComparison.Ordinal));
+
+        rig.Service.Resume();
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Completed, rig.Service.View().Run!.Status);
+        Assert.Equal(1998, await rig.Tgt.CountAsync("app.Child"));
+    }
+
+    /// <summary>
     /// F6 / R6. The typed confirmation is the last gate before a database is written to, so it is exact. The brief's own test types
     /// <c>Name.ToUpperInvariant() + "X"</c>, which differs by the trailing X whatever the comparison is; this one differs by case
     /// alone.

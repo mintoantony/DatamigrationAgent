@@ -252,7 +252,7 @@ public sealed class TransferService
             long runId = engine.CreateRun(approved.Version, options);
             await EnsureNoOtherRunnerAsync(runId, tgtCs, ct);
             if (!restart) _services.Workflow.OnTransferStarted();
-            Launch(engine, runId, srcCs, tgtCs);
+            Launch(engine, runId, srcCs, tgtCs, RunOrigin.Created);
             return runId;
         }
         finally
@@ -299,7 +299,7 @@ public sealed class TransferService
                 ?? throw new TransferException("no_plan", $"SQL plan v{run.SqlVersion} of run {run.Id} is missing.");
             var (srcCs, tgtCs) = ConnectionStrings();
             var engine = new TransferEngine(_services, Json.Deserialize<SqlPlanPayload>(artifact.PayloadJson), srcCs, tgtCs);
-            Launch(engine, run.Id, srcCs, tgtCs);
+            Launch(engine, run.Id, srcCs, tgtCs, RunOrigin.Found(run.Status));
             _services.Sink.Publish("log", new { level = "info", message = $"Resuming transfer run {run.Id} from its checkpoints." });
             return run.Id;
         }
@@ -539,7 +539,20 @@ public sealed class TransferService
 
     // ------------------------------------------------------------------ the background run
 
-    private void Launch(TransferEngine engine, long runId, string srcCs, string tgtCs)
+    /// <summary>
+    /// What a launched attempt found the run in, so that a refusal can put it back exactly there (ruling 134). The caller knows; it is
+    /// passed in rather than read off the row when the refusal arrives, by which time it is no longer a record of what was found.
+    /// </summary>
+    /// <param name="CreatedByThisAttempt">True on the fresh-start path, where the attempt created the run itself.</param>
+    /// <param name="FoundAs">The status the attempt found, for a run it did not create.</param>
+    internal sealed record RunOrigin(bool CreatedByThisAttempt, RunStatus? FoundAs)
+    {
+        internal static RunOrigin Created { get; } = new(true, null);
+
+        internal static RunOrigin Found(RunStatus status) => new(false, status);
+    }
+
+    private void Launch(TransferEngine engine, long runId, string srcCs, string tgtCs, RunOrigin origin)
     {
         var control = new TransferControl();
         control.ChunkCommitted += c => ChunkCommitted?.Invoke(c);
@@ -548,11 +561,12 @@ public sealed class TransferService
         {
             _control = control;
             _active = true;
-            _current = Task.Run(() => RunBackgroundAsync(engine, runId, control, secrets));
+            _current = Task.Run(() => RunBackgroundAsync(engine, runId, control, secrets, origin));
         }
     }
 
-    private async Task RunBackgroundAsync(TransferEngine engine, long runId, TransferControl control, IReadOnlyList<string> secrets)
+    private async Task RunBackgroundAsync(TransferEngine engine, long runId, TransferControl control, IReadOnlyList<string> secrets,
+        RunOrigin origin)
     {
         // Ruling 133's seam, subscribed only when a test set one - production pays one null check per launched segment and nothing at
         // all per chunk. It is awaited on the worker on purpose: it holds the run at the instant it fires, so what a test reads there
@@ -579,8 +593,9 @@ public sealed class TransferService
             catch (TransferException ex) when (ex.Code == "run_in_progress")
             {
                 // The lock refused this runner after EnsureNoOtherRunnerAsync let it through - another process took the run's lock in
-                // between. Nothing of it ran here, so it is not a failed run: it is left resumable, carrying the lock's sentence.
-                RecordNotRun(runId, ex.Message);
+                // between. Nothing of it ran here, so it is not a failed run: it is put back exactly where this attempt found it
+                // (ruling 134), carrying the lock's sentence.
+                RecordNotRun(runId, origin, ex.Message);
                 return;   // paused calls nothing on the workflow (Next() reads the run status)
             }
             catch (Exception ex)
@@ -670,19 +685,37 @@ public sealed class TransferService
     }
 
     /// <summary>
-    /// Ruling 131. The refusal did nothing to the run, so it writes nothing about the run - only the note, through the one repo method
-    /// that cannot touch anything else.
-    /// <para>Recording it through <c>SetRunStatus(Paused)</c> instead rewrote <b>five</b> things an operator reads on a <c>failed</c>
-    /// run: the status (<c>failed</c> to <c>paused</c>), <c>ended_at</c> (a timestamp to null, because paused is not terminal), the
-    /// error line (the failure's own sentence to null, since it is read only for a failed run), the notes, and <c>CanStart</c> (true to
-    /// false - the Execute button disabled with "resume or cancel it first"). None of that happened; a runner was simply told to wait.</para>
+    /// Rulings 130, 131 and 134: <b>a refused attempt restores what it changed, and changes nothing else. The note always lands.</b>
+    /// <para>Ruling 131 is why nothing else is written. Recording a refusal through <c>SetRunStatus(Paused)</c> rewrote <b>five</b>
+    /// things an operator reads on a <c>failed</c> run: the status (<c>failed</c> to <c>paused</c>), <c>ended_at</c> (a timestamp to
+    /// null, because paused is not terminal), the error line (the failure's own sentence to null, since it is read only for a failed
+    /// run), the notes, and <c>CanStart</c> (true to false - the Execute button disabled with "resume or cancel it first"). None of
+    /// that happened; a runner was simply told to wait.</para>
+    /// <para>Ruling 134 is why a created run is an exception rather than a contradiction: a run reading <c>running</c> with no runner
+    /// is not a true record, so closing it is not a rewrite. It never started and loaded nothing, so it closes <c>cancelled</c> - the
+    /// same close <see cref="EnsureNoOtherRunnerAsync"/> gives a start the probe refused (ruling 126). Left <c>running</c> it cannot be
+    /// cleared at all: <see cref="CancelAsync"/> and <see cref="Resume"/> both take only a paused or failed run, and a new start is
+    /// refused because the Ready step has already been approved.</para>
     /// </summary>
-    private void RecordNotRun(long runId, string why)
+    /// <param name="origin">What the attempt found when it launched - passed in, because by the time a refusal arrives the row is no
+    /// longer a record of that.</param>
+    internal void RecordNotRun(long runId, RunOrigin origin, string why)
     {
-        _services.Transfers.UpdateRunSummary(runId, summary => MergeNote(summary, why));
-        var status = _services.Transfers.GetRun(runId)?.Status;
-        if (status is { } unchanged)
-            _services.Sink.Publish("transfer_run_changed", new { runId, status = EnumText.ToText(unchanged) });
+        ArgumentNullException.ThrowIfNull(origin);
+        var current = _services.Transfers.GetRun(runId);
+        RunStatus? restore = origin.CreatedByThisAttempt ? RunStatus.Cancelled
+            // A status this attempt moved goes back to what it found. Unreachable today - TransferEngine.RunAsync takes the run lock
+            // before it writes "running", so a refused attempt has moved nothing - and kept so that a future caller which does move it
+            // first cannot leave the run somewhere neither it nor the operator put it. One caveat if that day comes: TransferRepo's
+            // only status writer derives ended_at from the status, so restoring a terminal status re-stamps it to now.
+            : origin.FoundAs is { } found && current is not null && current.Status != found ? found
+            : null;
+
+        if (restore is { } status) _services.Transfers.SetRunStatus(runId, status, MergeNote(current?.SummaryJson, why));
+        else _services.Transfers.UpdateRunSummary(runId, summary => MergeNote(summary, why));
+
+        if (_services.Transfers.GetRun(runId)?.Status is { } published)
+            _services.Sink.Publish("transfer_run_changed", new { runId, status = EnumText.ToText(published) });
         _services.Sink.Publish("log", new { level = "error", message = why });
     }
 
