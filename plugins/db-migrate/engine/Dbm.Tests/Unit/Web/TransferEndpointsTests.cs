@@ -1,0 +1,104 @@
+using System.Net;
+using System.Text;
+using Dbm.Core;
+using Dbm.Core.State;
+using Dbm.Core.Transfer;
+using Dbm.Tests.Support;
+using Xunit;
+
+namespace Dbm.Tests.Unit.Web;
+
+public sealed class TransferEndpointsTests : IDisposable
+{
+    private readonly TestWorkspace _workspace = new();
+
+    public void Dispose() => _workspace.Dispose();
+
+    private long SeedRunLeftRunning()
+    {
+        var s = _workspace.OpenServices();
+        long runId = s.Transfers.CreateRun(1, new TransferOptions(), [("T01", "app.A"), ("T02", "app.B")]);
+        s.Transfers.UpdateTaskStatus(runId, "T01", TransferTaskStatus.Running);
+        return runId;   // CreateRun leaves the run "running": exactly what a killed server process leaves behind
+    }
+
+    /// <summary>
+    /// 5.3's ordering, made load-bearing by ruling 103: <c>RecoverInterrupted</c> runs once at server start, before any endpoint can
+    /// reach <c>RunAsync</c>. A run left "running" by a dead process is the same row as a run being executed right now, so until it is
+    /// flipped to "paused" the execute screen shows a live transfer that will never move again and offers no way to resume it.
+    /// </summary>
+    [Fact]
+    public async Task A_server_start_recovers_a_run_left_running_as_paused()
+    {
+        long runId = SeedRunLeftRunning();
+
+        await using var server = await WebTestServer.StartAsync(_workspace.Ws, ws => DbmServices.Open(ws));
+        var view = await server.GetJsonAsync("/api/transfer");
+
+        Assert.Equal(runId, (long?)view["run"]!["id"]);
+        Assert.Equal("paused", (string?)view["run"]!["status"]);
+        Assert.False((bool?)view["active"]);
+        Assert.Equal("paused", (string?)view["tasks"]![0]!["status"]);   // the orphaned task travels with its run
+    }
+
+    [Fact]
+    public async Task A_refusal_is_a_409_carrying_the_services_own_code()
+    {
+        _workspace.OpenServices();
+        await using var server = await WebTestServer.StartAsync(_workspace.Ws, ws => DbmServices.Open(ws));
+
+        var (startStatus, startBody) = await server.SendAsync(HttpMethod.Post, "/api/transfer/start",
+            new { options = new { chunkSize = 100 }, confirmTarget = "ShopV2" });
+        Assert.Equal(HttpStatusCode.Conflict, startStatus);
+        Assert.Equal("not_ready", (string?)startBody!["error"]);
+        Assert.False(string.IsNullOrWhiteSpace((string?)startBody["message"]));
+
+        var (pauseStatus, pauseBody) = await server.SendAsync(HttpMethod.Post, "/api/transfer/pause");
+        Assert.Equal(HttpStatusCode.Conflict, pauseStatus);
+        Assert.Equal("not_running", (string?)pauseBody!["error"]);
+
+        var (resumeStatus, resumeBody) = await server.SendAsync(HttpMethod.Post, "/api/transfer/resume");
+        Assert.Equal(HttpStatusCode.Conflict, resumeStatus);
+        Assert.Equal("not_resumable", (string?)resumeBody!["error"]);
+    }
+
+    /// <summary>Ruling 123 at the HTTP boundary: pre-flight answers a checklist, whatever went wrong, because an exception loses every
+    /// line that already passed - including the one naming the problem.</summary>
+    [Fact]
+    public async Task Preflight_with_nothing_configured_answers_a_checklist_not_a_five_hundred()
+    {
+        _workspace.OpenServices();
+        await using var server = await WebTestServer.StartAsync(_workspace.Ws, ws => DbmServices.Open(ws));
+
+        var (status, body) = await server.SendAsync(HttpMethod.Post, "/api/transfer/preflight", new { });
+
+        Assert.Equal(HttpStatusCode.OK, status);
+        Assert.False((bool?)body!["passed"]);
+        Assert.NotEmpty(body["checks"]!.AsArray());
+        Assert.All(body["checks"]!.AsArray(), c => Assert.False(string.IsNullOrWhiteSpace((string?)c!["detail"])));
+    }
+
+    [Fact]
+    public async Task Errors_of_a_workspace_with_no_run_are_an_empty_list()
+    {
+        _workspace.OpenServices();
+        await using var server = await WebTestServer.StartAsync(_workspace.Ws, ws => DbmServices.Open(ws));
+
+        var body = await server.GetJsonAsync("/api/transfer/errors?task=T02&limit=10");
+
+        Assert.Empty(body.AsArray());
+    }
+
+    [Fact]
+    public async Task A_malformed_body_is_a_bad_request_not_a_default_start()
+    {
+        _workspace.OpenServices();
+        await using var server = await WebTestServer.StartAsync(_workspace.Ws, ws => DbmServices.Open(ws));
+        using var content = new StringContent("{not json", Encoding.UTF8, "application/json");
+
+        using var response = await server.Client.PostAsync("/api/transfer/start", content);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Contains("\"error\":\"bad_request\"", await response.Content.ReadAsStringAsync());
+    }
+}

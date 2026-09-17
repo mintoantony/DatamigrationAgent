@@ -30,6 +30,11 @@ public static class CommandRegistry
         new MapAutoCommand(),    // T3.3
         new SqlGenCommand(),     // T4.3
         new SqlValidateCommand(), // T4.3
+        new TransferStartCommand(),   // T5.5
+        new TransferPauseCommand(),   // T5.5
+        new TransferResumeCommand(),  // T5.5
+        new TransferCancelCommand(),  // T5.5
+        new TransferStatusCommand(),  // T5.5
         // Later milestones append their commands below this line.
     ];
 }

@@ -12,6 +12,7 @@ public sealed class Args
     public static readonly HashSet<string> BooleanFlags = new(StringComparer.Ordinal)
     {
         "quiet", "rebuild", "dry-run", "no-browser", "json", "human", "inline", "help", "force", "detached",
+        "skip-errors", "truncate",   // T5.5: `--truncate --yes-target X` must not read "X" as the value of --truncate
     };
 
     private readonly List<string> _positionals = new();

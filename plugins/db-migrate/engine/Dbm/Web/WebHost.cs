@@ -85,6 +85,12 @@ public static class WebHost
                 {
                     OnPrepareResponse = c => c.Context.Response.Headers.CacheControl = "no-store",
                 });
+                // Spec section 9 crash recovery, and ruling 103's ordering: runs and tasks a dead process left "running" become
+                // "paused" ONCE, before any RunAsync can be reached through an endpoint. A run left "running" is exactly what a
+                // crash leaves behind, so without this the UI cannot tell a resumable run from a live one.
+                var transfer = new Dbm.Core.Transfer.TransferService(services);
+                transfer.RecoverInterrupted();
+                state.Transfer = transfer;
                 EndpointRegistry.MapAll(app, state);
 
                 app.Lifetime.ApplicationStarted.Register(() =>
@@ -109,6 +115,10 @@ public static class WebHost
                 finally
                 {
                     background.Cancel();
+                    // Hard-stops a running transfer before services (and the state db it writes to) are disposed. This is crash
+                    // semantics on purpose: the run stays "running" and the next start recovers it as "paused", which is resumable
+                    // from its checkpoints. Draining it instead would hold shutdown for as long as the table takes.
+                    await Quietly(transfer.StopAsync());
                     // Removed before draining: once Kestrel has stopped, server.json must not keep advertising a
                     // server that can no longer answer requests, however long the job/pump drain takes.
                     DeleteInfo(ws, info);
