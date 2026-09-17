@@ -196,6 +196,109 @@ public sealed class TransferServiceViewTests : IDisposable
         Assert.True(service.View().Run!.HasReport);
     }
 
+    /// <summary>
+    /// F7 / ruling 127's other arm. With no discovered target catalog there is nothing to compare the saved connection against, and
+    /// "nothing to compare" is not "they match": failing open would resume a run into whatever the target connection happens to point
+    /// at today, which is the case the guard exists for.
+    /// </summary>
+    [Fact]
+    public void Resume_with_no_discovered_target_catalog_refuses_rather_than_assuming_a_match()
+    {
+        ApproveSql(Json.Serialize(MiniPlan()));
+        SaveTarget("ShopV2");                                                         // connection saved, but discovery never recorded one
+        long runId = S.Transfers.CreateRun(1, new TransferOptions(), [("T01", "app.A")]);
+        S.Transfers.SetRunStatus(runId, RunStatus.Paused);
+        var service = new TransferService(S);
+
+        var thrown = Record.Exception(() => service.Resume());
+
+        Assert.False(service.IsActive);                                               // nothing was launched
+        Assert.Equal(RunStatus.Paused, S.Transfers.GetRun(runId)!.Status);
+        var ex = Assert.IsType<TransferException>(thrown);
+        Assert.Equal("target_unknown", ex.Code);
+        Assert.Contains("discovery", ex.Message);
+    }
+
+    /// <summary>
+    /// F3 / ruling 128 at the start door, without a server: the guard runs before anything is created, so a repointed target is refused
+    /// with no run row. (The harm - rows loaded into the wrong database - is pinned end to end in
+    /// <c>TransferServiceTests.A_target_repointed_at_an_identical_database_is_refused_before_a_run_exists</c>.)
+    /// </summary>
+    [Fact]
+    public async Task Start_refuses_a_target_that_no_longer_matches_the_discovered_catalog()
+    {
+        ApproveSql(Json.Serialize(MiniPlan()));
+        SaveTarget("ShopV2");
+        SaveTargetCatalog("ShopV2");
+        SaveTarget("ShopV3");                                                         // repointed after discovery
+
+        var ex = await Assert.ThrowsAsync<TransferException>(() => new TransferService(S).StartAsync(new TransferOptions(), "ShopV3", default));
+
+        Assert.Equal("not_ready", ex.Code);
+        Assert.Contains("discovered catalog", ex.Message);
+        Assert.Null(S.Transfers.Latest());
+    }
+
+    /// <summary>
+    /// F2 / ruling 123 at the start door. A connection row that cannot be decrypted is the operator's answer, not an exception: the
+    /// Execute button is the one control the whole screen exists for, and a 500 gives no code, no sentence and no hint.
+    /// </summary>
+    [Fact]
+    public async Task Start_whose_connection_cannot_be_decrypted_is_a_refusal_naming_the_connection()
+    {
+        ApproveSql(Json.Serialize(MiniPlan()));
+        SaveTarget("ShopV2");
+        SaveTargetCatalog("ShopV2");
+        S.Db.Execute("UPDATE connection SET encrypted = 'protected-by-somebody-else' WHERE side = 'src'");
+
+        var ex = await Assert.ThrowsAsync<TransferException>(() => new TransferService(S).StartAsync(new TransferOptions(), "ShopV2", default));
+
+        Assert.Equal("no_connection", ex.Code);
+        Assert.Contains("source", ex.Message);
+        Assert.DoesNotContain("protected-by-somebody-else", ex.Message);
+        Assert.Null(S.Transfers.Latest());
+    }
+
+    /// <summary>
+    /// F10 / rulings 104, 112, 121. <b>Contract assertion against a trigger unreachable from this task.</b>
+    /// <c>TransferEngine.RunAsync</c> catches everything after it takes the run lock and records the run itself, so what can reach
+    /// <c>RunBackgroundAsync</c>'s general arm is only the three pre-lock <c>TransferException</c>s (<c>no_run</c>,
+    /// <c>run_finished</c>, <c>plan_mismatch</c>), an <c>ArgumentNullException</c> and a lock or connection fault - all of which carry
+    /// messages. The arm is kept because <c>TransferRepo</c> refuses a blank error outright and a failed run with no reason is a run
+    /// nobody can act on; this test asserts what it would write, by producing it the way the arm produces it.
+    /// </summary>
+    [Fact]
+    public void A_failure_with_no_message_is_recorded_by_type_name_contract_assertion_trigger_unreachable_from_this_task()
+    {
+        string message = TransferFailure.Describe(new InvalidOperationException(""), t => Redactor.Scrub(t, Array.Empty<string>()));
+        Assert.Equal("InvalidOperationException (the exception carried no message)", message);
+
+        long runId = S.Transfers.CreateRun(1, new TransferOptions(), [("T01", "app.A")]);
+        S.Transfers.SetRunStatus(runId, RunStatus.Failed, Json.Serialize(new { error = message }));
+
+        Assert.Equal(message, new TransferService(S).View().Run!.Error);
+    }
+
+    /// <summary>
+    /// F4 / ruling 130 as a unit: the merge keeps every key the run already carried and appends to <c>notes</c>. The end-to-end harm -
+    /// a lock-refused resume erasing a failed run's reason - is pinned in
+    /// <c>TransferServiceTests.A_resume_the_run_lock_refuses_keeps_the_reason_the_run_failed</c>.
+    /// </summary>
+    [Fact]
+    public void A_note_added_to_a_run_summary_keeps_everything_that_was_already_in_it()
+    {
+        string merged = TransferService.MergeNote("""{"error":"T02 failed","notes":["an earlier note"]}""", "refused");
+        Assert.Contains("\"error\":\"T02 failed\"", merged);
+        Assert.Contains("an earlier note", merged);
+        Assert.Contains("refused", merged);
+
+        Assert.Contains("refused", TransferService.MergeNote(null, "refused"));
+        // A summary that is not readable JSON is kept verbatim rather than thrown away for being inconvenient.
+        string kept = TransferService.MergeNote("{not json", "refused");
+        Assert.Contains("{not json", kept);
+        Assert.Contains("refused", kept);
+    }
+
     /// <summary>Three refusals that must each name the thing that is missing rather than share one "no".</summary>
     [Fact]
     public async Task Pause_resume_and_cancel_without_a_run_each_say_what_is_missing()

@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text;
 using Dbm.Core;
+using Dbm.Core.Catalog;
 using Dbm.Core.State;
 using Dbm.Core.Transfer;
 using Dbm.Tests.Support;
@@ -87,6 +88,40 @@ public sealed class TransferEndpointsTests : IDisposable
         var body = await server.GetJsonAsync("/api/transfer/errors?task=T02&limit=10");
 
         Assert.Empty(body.AsArray());
+    }
+
+    /// <summary>
+    /// F2 / ruling 123 at the start door. The same workspace answers <c>/api/transfer/preflight</c> with a 200 checklist naming the
+    /// fault; <c>/api/transfer/start</c> must not answer the same fault with a bare 500. The Execute button is the one control the
+    /// whole screen exists for, and a 500 gives the operator no code, no sentence and no hint that the connection is the problem.
+    /// </summary>
+    [Fact]
+    public async Task A_start_whose_connection_cannot_be_decrypted_is_a_conflict_not_a_five_hundred()
+    {
+        var s = _workspace.OpenServices();
+        foreach (var p in new[] { PhaseName.Setup, PhaseName.Discovery, PhaseName.Analysis, PhaseName.Mapping }) s.Phases.SetApproved(p, 1, null);
+        s.Artifacts.Add(PhaseName.Sql, 1, """{"order":["T01"],"tasks":{"T01":{"target":"app.A","sourceQuery":"SELECT 1 AS [X]","columns":[{"source":"X","target":"X"}],"countSql":"SELECT COUNT_BIG(*)"}}}""",
+            "script", "plan");
+        s.Phases.SetCurrentVersion(PhaseName.Sql, 1);
+        s.Phases.SetApproved(PhaseName.Sql, 1, null);
+        s.Phases.SetStatus(PhaseName.Ready, PhaseStatus.AwaitingReview);
+        s.Connections.Save(Side.Src, FakeServices.SrcConnection, FakeServices.Meta("src-host", "Legacy"));
+        s.Connections.Save(Side.Tgt, FakeServices.TgtConnection, FakeServices.Meta("tgt-host", "ShopV2"));
+        s.Catalog.Save(Side.Tgt, new CatalogSnapshot(FakeServices.Meta("tgt-host", "ShopV2"), [], new ObjectCounts(0, 0, 0, 0, 0), Clock.Now()), "fp");
+        s.Db.Execute("UPDATE connection SET encrypted = 'protected-by-somebody-else' WHERE side = 'src'");
+
+        await using var server = await WebTestServer.StartAsync(_workspace.Ws, ws => DbmServices.Open(ws));
+        var (preflightStatus, preflightBody) = await server.SendAsync(HttpMethod.Post, "/api/transfer/preflight", new { });
+        var (startStatus, startBody) = await server.SendAsync(HttpMethod.Post, "/api/transfer/start",
+            new { options = new { }, confirmTarget = "ShopV2" });
+
+        Assert.Equal(HttpStatusCode.OK, preflightStatus);
+        Assert.False((bool?)preflightBody!["passed"]);
+        Assert.Equal(HttpStatusCode.Conflict, startStatus);
+        Assert.Equal("no_connection", (string?)startBody!["error"]);
+        string message = (string?)startBody["message"] ?? "";
+        Assert.Contains("source", message);
+        Assert.DoesNotContain("protected-by-somebody-else", message);
     }
 
     [Fact]

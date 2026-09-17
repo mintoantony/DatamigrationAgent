@@ -12,7 +12,7 @@ see rows or connection strings, and never start a transfer on your own initiativ
 | `await` / `transfer_paused` | Paused by the human, or by a server restart (crash recovery turns interrupted runs into paused ones). All committed chunks are safe. | Say it is paused. Resume only when the human asks: `dbm transfer resume`. |
 | `stop` / `transfer_failed` | Stop-on-error rejected a row, or a task/script failed. | Run `dbm transfer status`; report the failed task, its target and its error (already redacted). Offer the options below. |
 | `stop` / `transfer_cancelled` | The human cancelled. Rows already committed stay in the target. | Report it. A new run can be started from the Execute screen (usually with "Truncate target first"). |
-| `stop` / `complete` | Finished and validated. | Report the one-line summary. The final report is under **Complete** in the UI; `dbm export report` writes it as HTML. |
+| `stop` / `complete` | Finished and validated. | Report the one-line summary. The final report is stored as the **Complete** artifact: the UI shows it, and `dbm artifact complete` prints it. |
 
 ## Commands (all JSON, all go through the local server)
 
@@ -47,5 +47,7 @@ loaded into — that one is for the human to fix in the UI, never by re-pointing
   `dbm transfer status` still reports `running` — that is the pause working, not a pause being ignored.
 - A run that completed can still carry notes (a checkpoint table that was not ours, rejected rows that were counted but never
   written down). They are in the final report under `notes`; a completed run with notes is not the same as a clean one.
+- The final report is the **Complete** artifact. There is no HTML export of it yet: the Final report screen and its
+  `GET /api/export/report` route arrive with a later task, so do not offer the human a download until they do.
 - Rejected rows (skip-and-log) are counted per task; the final report shows up to 5 samples per task and validates row counts and
   column checksums.

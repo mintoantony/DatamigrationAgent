@@ -380,4 +380,207 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
         Assert.Null(run.Error);                                                       // every row loaded: this is not a failed run
         Assert.Contains(run.Notes, n => n.Contains("control_table_mismatch", StringComparison.Ordinal));
     }
+
+    // ------------------------------------------------------------------ fix round 1
+
+    /// <summary>
+    /// F1 / ruling 129. Two <see cref="TransferService.Resume"/> calls - a double-click, or the UI button plus
+    /// <c>dbm transfer resume</c> - must not both launch. The reviewer measured what happens when they do: the loser is refused by the
+    /// run lock and its bookkeeping clobbers the winner's, so for the rest of the transfer the run row reads <c>paused</c>,
+    /// <c>Active</c> reads false and <c>Pause()</c> answers <c>not_running</c> <b>while rows are being written</b>. The operator's next
+    /// click on a paused run is Cancel, whose paused branch drops <c>dbo.__dbm_checkpoint</c> under the live runner.
+    /// </summary>
+    [Fact]
+    public async Task Two_concurrent_resumes_hand_the_run_to_one_runner_and_refuse_the_other()
+    {
+        await using var rig = await RigAsync();
+        bool resuming = false;
+        bool? activeDuringResume = null;
+        RunStatus? statusDuringResume = null;
+        string? pauseDuringResume = "the resumed run committed no chunk";
+        rig.Service.ChunkCommitted += c =>
+        {
+            if (!resuming)
+            {
+                if (c.TaskId == "T02" && c.ChunkNo == 2) rig.Service.Pause();
+                return;
+            }
+            if (activeDuringResume is not null) return;
+            activeDuringResume = rig.Service.IsActive;
+            statusDuringResume = rig.Service.View().Run!.Status;
+            try
+            {
+                rig.Service.Pause();
+                pauseDuringResume = null;
+            }
+            catch (TransferException ex)
+            {
+                pauseDuringResume = ex.Code;
+            }
+        };
+
+        long runId = await rig.Service.StartAsync(Skip, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Paused, rig.Service.View().Run!.Status);
+
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        async Task<(long? Id, string? Code)> ResumeOnceAsync()
+        {
+            await gate.Task;
+            try { return (rig.Service.Resume(), null); }
+            catch (TransferException ex) { return (null, ex.Code); }
+        }
+        var first = Task.Run(ResumeOnceAsync);
+        var second = Task.Run(ResumeOnceAsync);
+        resuming = true;
+        gate.TrySetResult();
+        var outcomes = await Task.WhenAll(first, second);
+        await rig.Service.Current;
+
+        // The harm first: while the winner was loading rows the service must not have described an idle, paused run.
+        Assert.True(activeDuringResume);
+        Assert.Equal(RunStatus.Running, statusDuringResume);
+        Assert.Null(pauseDuringResume);                                               // Pause() was accepted, not refused
+        Assert.Single(outcomes, o => o.Id is not null);
+        Assert.Equal(runId, outcomes.Single(o => o.Id is not null).Id);
+        Assert.Equal("busy", outcomes.Single(o => o.Id is null).Code);
+
+        // And the pause that was accepted took effect, so the run is still the operator's to finish.
+        Assert.Equal(RunStatus.Paused, rig.Service.View().Run!.Status);
+        rig.Service.Resume();
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Completed, rig.Service.View().Run!.Status);
+        Assert.Equal(300, await rig.Tgt.CountAsync("app.Parent"));
+        Assert.Equal(1998, await rig.Tgt.CountAsync("app.Child"));
+        Assert.Equal(700, await rig.Tgt.CountAsync("app.Log"));
+    }
+
+    /// <summary>
+    /// F5 / R1's headline property. Two <c>StartAsync</c> calls racing must produce one run, not two: the second run id gets its own
+    /// <see cref="RunLock"/> resource, so the engine's lock does not exclude it and two runners load the same tables at once.
+    /// <para>Also F8: <c>ArtifactRepo.NextVersion</c> answers <b>0</b> for a phase with no artifact, so without the brief's
+    /// <c>Math.Max(1, …)</c> floor the first Complete artifact - the migration's certificate - is stored as v0 and the Complete phase
+    /// is approved at v0.</para>
+    /// </summary>
+    [Fact]
+    public async Task Two_concurrent_starts_produce_one_run_and_its_report_is_version_one()
+    {
+        await using var rig = await RigAsync();
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        async Task<(long? Id, string? Code)> StartOnceAsync()
+        {
+            await gate.Task;
+            try { return (await rig.Service.StartAsync(Skip with { ChunkSize = 1000 }, rig.Tgt.Name, default), null); }
+            catch (TransferException ex) { return (null, ex.Code); }
+        }
+        var first = Task.Run(StartOnceAsync);
+        var second = Task.Run(StartOnceAsync);
+        gate.TrySetResult();
+        var outcomes = await Task.WhenAll(first, second);
+        await rig.Service.Current;
+
+        // The harm first: one run row, one runner, one set of rows.
+        var ids = rig.S.Db.Query("SELECT id FROM transfer_run ORDER BY id", r => r.GetInt64(0));
+        Assert.Single(ids);
+        Assert.Equal(RunStatus.Completed, rig.S.Transfers.GetRun(ids[0])!.Status);
+        Assert.Equal(300, await rig.Tgt.CountAsync("app.Parent"));
+        Assert.Equal(1998, await rig.Tgt.CountAsync("app.Child"));
+        Assert.Single(outcomes, o => o.Id is not null);
+        Assert.Equal("busy", outcomes.Single(o => o.Id is null).Code);
+
+        // F8: the first Complete artifact of a fresh workspace is v1, not v0.
+        Assert.Equal(1, rig.S.Artifacts.Latest(PhaseName.Complete)!.Version);
+        Assert.Equal(1, rig.S.Phases.Get(PhaseName.Complete).ApprovedVersion);
+    }
+
+    /// <summary>
+    /// F3 / ruling 128. The typed confirmation compares the name the <b>saved connection</b> reports, and <c>schema_drift</c> compares
+    /// a fingerprint that is purely structural, so a target repointed at a different database with an identical schema passes both. The
+    /// plan was generated against the discovered catalog, and that is what the saved connection has to still match.
+    /// </summary>
+    [Fact]
+    public async Task A_target_repointed_at_an_identical_database_is_refused_before_a_run_exists()
+    {
+        await using var rig = await RigAsync();
+        await using var other = await TempDatabase.CreateAsync("dbm_svc_swap");
+        // The same schema down to the auto-generated primary-key constraint names, which is what makes the fingerprints identical -
+        // otherwise schema_drift would catch the swap by accident and this guard would look unnecessary.
+        string pkParent = await rig.Tgt.ScalarAsync<string>("SELECT name FROM sys.indexes WHERE object_id = OBJECT_ID('app.Parent') AND is_primary_key = 1");
+        string pkChild = await rig.Tgt.ScalarAsync<string>("SELECT name FROM sys.indexes WHERE object_id = OBJECT_ID('app.Child') AND is_primary_key = 1");
+        await other.ExecAsync($"""
+            CREATE SCHEMA app;
+            GO
+            CREATE TABLE app.Parent (Id int NOT NULL CONSTRAINT [{pkParent}] PRIMARY KEY, Name nvarchar(50) NOT NULL);
+            CREATE TABLE app.Child (Id int NOT NULL CONSTRAINT [{pkChild}] PRIMARY KEY,
+              ParentId int NOT NULL CONSTRAINT FK_Child_Parent REFERENCES app.Parent (Id),
+              Qty int NOT NULL CONSTRAINT CK_Child_Qty CHECK (Qty > 0), At datetime2(0) NOT NULL);
+            CREATE TABLE app.Log (Msg nvarchar(100) NOT NULL);
+            """);
+        var swapped = await SqlConnect.ProbeAsync(other.ConnectionString, default);
+        await using (var conn = await SqlConnect.OpenAsync(other.ConnectionString, default))
+        {
+            // The premise, asserted: nothing about the schema tells these two databases apart, so nothing but this guard can.
+            Assert.Equal(rig.S.Catalog.Fingerprint(Side.Tgt),
+                Fingerprint.Compute(await CatalogExtractor.ExtractAsync(conn, swapped, default)));
+        }
+        rig.S.Connections.Save(Side.Tgt, other.ConnectionString, swapped);
+
+        var thrown = await Record.ExceptionAsync(() => rig.Service.StartAsync(Skip, other.Name, default));
+        await rig.Service.Current;
+
+        // The harm first: a plan written for one database must never be loaded into another.
+        Assert.Null(rig.S.Transfers.Latest());
+        Assert.Equal(0, await other.CountAsync("app.Parent"));
+        Assert.Equal(PhaseStatus.AwaitingReview, rig.S.Phases.Get(PhaseName.Ready).Status);
+        var ex = Assert.IsType<TransferException>(thrown);
+        Assert.Equal("not_ready", ex.Code);
+        Assert.Contains("discovered catalog", ex.Message);
+        Assert.Contains(other.Name, ex.Message);
+    }
+
+    /// <summary>
+    /// F4 / ruling 130. A resume the run lock refuses did nothing at all, so it must not be the thing that erases why the run failed.
+    /// <c>TransferRepo.SetRunStatus</c> is <c>COALESCE($Summary, summary_json)</c>: a non-null summary <b>replaces</b>.
+    /// <para>This also ships the test F11 says <c>RecordNotRun</c> never had.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_resume_the_run_lock_refuses_keeps_the_reason_the_run_failed()
+    {
+        await using var rig = await RigAsync();
+        long runId = await rig.Service.StartAsync(Skip with { ErrorMode = "stop", ChunkSize = 500 }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Failed, rig.S.Transfers.GetRun(runId)!.Status);
+        Assert.Contains("CK_Child_Qty", rig.S.Transfers.GetRun(runId)!.SummaryJson);
+
+        await using (await RunLock.AcquireAsync(rig.Tgt.ConnectionString, runId, default))
+        {
+            Assert.Equal(runId, rig.Service.Resume());
+            await rig.Service.Current;
+        }
+
+        Assert.Contains("CK_Child_Qty", rig.S.Transfers.GetRun(runId)!.SummaryJson);
+        var view = rig.Service.View();
+        Assert.Contains(view.Run!.Notes, n => n.Contains("already being run", StringComparison.Ordinal));
+        Assert.True(view.CanResume);                                                  // ruling 125: resumable again once the lock is free
+    }
+
+    /// <summary>
+    /// F6 / R6. The typed confirmation is the last gate before a database is written to, so it is exact. The brief's own test types
+    /// <c>Name.ToUpperInvariant() + "X"</c>, which differs by the trailing X whatever the comparison is; this one differs by case
+    /// alone.
+    /// </summary>
+    [Fact]
+    public async Task The_typed_confirmation_differing_only_by_case_starts_nothing()
+    {
+        await using var rig = await RigAsync();
+        string wrongCase = rig.Tgt.Name.ToUpperInvariant();
+        Assert.NotEqual(rig.Tgt.Name, wrongCase);                                     // the rig's name really does have letters in it
+
+        var thrown = await Record.ExceptionAsync(() => rig.Service.StartAsync(Skip, wrongCase, default));
+        await rig.Service.Current;
+
+        Assert.Null(rig.S.Transfers.Latest());
+        Assert.Equal(PhaseStatus.AwaitingReview, rig.S.Phases.Get(PhaseName.Ready).Status);
+        Assert.Equal("confirm_mismatch", Assert.IsType<TransferException>(thrown).Code);
+    }
 }

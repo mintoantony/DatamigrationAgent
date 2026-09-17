@@ -1,4 +1,6 @@
+using System.Reflection;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using Dbm.Cli;
 using Dbm.Cli.Commands;
 using Xunit;
@@ -78,6 +80,28 @@ public sealed class TransferCommandsTests
         var (o2, confirm2) = TransferStartCommand.Parse(Args.Parse(new[] { "--skip-errors", "ShopV2" }));
         Assert.Equal("skip", o2.ErrorMode);
         Assert.Null(confirm2);
+    }
+
+    /// <summary>
+    /// F9. The playbook is the orchestrator's instruction sheet: a command it names that does not exist is a step the agent will try,
+    /// fail, and then have to explain to the human in the middle of a migration. Every backticked <c>dbm …</c> in it must resolve in
+    /// <see cref="CommandRegistry"/>.
+    /// </summary>
+    [Fact]
+    public void Every_dbm_command_the_transfer_playbook_names_exists()
+    {
+        string path = typeof(TransferCommandsTests).Assembly.GetCustomAttributes<AssemblyMetadataAttribute>()
+            .Single(a => a.Key == "TransferPlaybookSource").Value!;
+        Assert.True(File.Exists(path), $"The transfer playbook is not where the build says it is: {path}");
+        string text = File.ReadAllText(path);
+
+        var named = Regex.Matches(text, @"`dbm ([a-z][a-z-]*(?: [a-z][a-z-]*)?)", RegexOptions.None, TimeSpan.FromSeconds(5))
+            .Select(m => m.Groups[1].Value).Distinct(StringComparer.Ordinal).ToList();
+        Assert.NotEmpty(named);
+        var known = CommandRegistry.All().Select(c => c.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var command in named)
+            Assert.True(known.Contains(command) || known.Contains(command.Split(' ')[0]),
+                $"The playbook tells the orchestrator to run `dbm {command}`, which is not a command in CommandRegistry.");
     }
 
     /// <summary>A status line an agent can act on: the failed task's own error is the one thing it must carry, and it is the field

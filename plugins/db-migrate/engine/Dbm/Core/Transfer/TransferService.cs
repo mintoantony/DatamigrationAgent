@@ -187,10 +187,23 @@ public sealed class TransferService
                            && latest?.Status is RunStatus.Failed or RunStatus.Cancelled;
             if (!restart && _services.Phases.Get(PhaseName.Ready).Status != PhaseStatus.AwaitingReview)
                 throw new TransferException("not_ready", "The transfer starts from the Ready step: approve the SQL phase first.");
-            string? database = _services.Connections.GetMeta(Side.Tgt)?.Database;
-            if (database is null || !string.Equals((confirmTarget ?? "").Trim(), database, StringComparison.Ordinal))
+            var savedTarget = SavedTargetMeta();
+            // Ordinal, and only after Trim: this is the last gate before a database is written to, so it is exact (R6). A near miss
+            // accepted here makes the typed confirmation a formality.
+            if (savedTarget?.Database is not { } database || !string.Equals((confirmTarget ?? "").Trim(), database, StringComparison.Ordinal))
                 throw new TransferException("confirm_mismatch", "Type the target database name exactly to confirm the transfer.");
-            var approved = Preflight.LoadApprovedPlan(_services) ?? throw new TransferException("not_ready", "The SQL phase is not approved.");
+            EnsureTargetMatchesTheDiscoveredCatalog(savedTarget);
+            ApprovedPlan approved;
+            try
+            {
+                approved = Preflight.LoadApprovedPlan(_services) ?? throw new TransferException("not_ready", "The SQL phase is not approved.");
+            }
+            catch (Exception ex) when (ex is JsonException or KeyNotFoundException)
+            {
+                // Ruling 123 at the start door: the plan artifact is read here before pre-flight can report anything about it.
+                throw new TransferException("not_ready", "The approved SQL plan could not be read: " + Describe(ex)
+                                                         + " Re-generate the SQL phase and approve it again.");
+            }
             if (MalformedTasks(approved.Plan) is { Count: > 0 } malformed)
                 throw new TransferException("not_ready", $"The approved SQL plan artifact (sql v{approved.Version}) is malformed: "
                                                          + string.Join(", ", malformed) + " has no task body. Re-generate the SQL phase.");
@@ -236,22 +249,42 @@ public sealed class TransferService
         _services.Sink.Publish("log", new { level = "info", message = "Pause requested: running tasks stop after their current chunk." });
     }
 
-    /// <summary>Continues the latest paused or failed run from its checkpoints and returns its id.</summary>
+    /// <summary>
+    /// Continues the latest paused or failed run from its checkpoints and returns its id.
+    /// <para><b>Ruling 129: this takes the same latch <see cref="StartAsync"/> takes, test-and-set under one lock.</b> Merely reading
+    /// <c>_active</c>/<c>_starting</c> lets two resumes - a double-click, or the UI button plus <c>dbm transfer resume</c> - both get
+    /// past the check and both <see cref="Launch"/>. The second overwrites <c>_control</c>/<c>_current</c>/<c>_active</c>, the engine's
+    /// run lock refuses it, and its <see cref="RecordNotRun"/> and <c>finally</c> then write state belonging to the runner that won:
+    /// for the rest of the transfer the run row reads <c>paused</c>, <see cref="IsActive"/> reads false and <see cref="Pause"/> answers
+    /// <c>not_running</c> while rows are being written - and the operator's next click, Cancel, takes the paused branch and drops the
+    /// checkpoint table under the live runner. A second caller is refused <c>busy</c> here and touches nothing.</para>
+    /// </summary>
     public long Resume()
     {
         lock (_lock)
+        {
             if (_active || _starting) throw new TransferException("busy", "The transfer is already running.");
-        var run = _services.Transfers.Latest();
-        if (run is null || run.Status is not (RunStatus.Paused or RunStatus.Failed))
-            throw new TransferException("not_resumable", "There is no paused or failed transfer run to resume.");
-        EnsureTargetIsTheOneTheRunStartedIn(run);
-        var artifact = _services.Artifacts.Get(PhaseName.Sql, run.SqlVersion)
-            ?? throw new TransferException("no_plan", $"SQL plan v{run.SqlVersion} of run {run.Id} is missing.");
-        var (srcCs, tgtCs) = ConnectionStrings();
-        var engine = new TransferEngine(_services, Json.Deserialize<SqlPlanPayload>(artifact.PayloadJson), srcCs, tgtCs);
-        Launch(engine, run.Id, srcCs, tgtCs);
-        _services.Sink.Publish("log", new { level = "info", message = $"Resuming transfer run {run.Id} from its checkpoints." });
-        return run.Id;
+            _starting = true;
+        }
+        try
+        {
+            var run = _services.Transfers.Latest();
+            if (run is null || run.Status is not (RunStatus.Paused or RunStatus.Failed))
+                throw new TransferException("not_resumable", "There is no paused or failed transfer run to resume.");
+            EnsureTargetIsTheOneTheRunStartedIn(run);
+            var artifact = _services.Artifacts.Get(PhaseName.Sql, run.SqlVersion)
+                ?? throw new TransferException("no_plan", $"SQL plan v{run.SqlVersion} of run {run.Id} is missing.");
+            var (srcCs, tgtCs) = ConnectionStrings();
+            var engine = new TransferEngine(_services, Json.Deserialize<SqlPlanPayload>(artifact.PayloadJson), srcCs, tgtCs);
+            Launch(engine, run.Id, srcCs, tgtCs);
+            _services.Sink.Publish("log", new { level = "info", message = $"Resuming transfer run {run.Id} from its checkpoints." });
+            return run.Id;
+        }
+        finally
+        {
+            // Safe to drop here and not before: Launch set _active under the same lock, so the latch is never released into a gap.
+            lock (_lock) _starting = false;
+        }
     }
 
     /// <summary>Running: stop after the current chunk. Paused or failed: cancel now, and drop the checkpoint table.</summary>
@@ -388,30 +421,77 @@ public sealed class TransferService
     /// </summary>
     private void EnsureTargetIsTheOneTheRunStartedIn(TransferRunRow run)
     {
-        var saved = _services.Connections.GetMeta(Side.Tgt)
+        var saved = SavedTargetMeta()
             ?? throw new TransferException("no_connection", "The target connection is not saved, so run "
                                                             + $"{run.Id} cannot be continued against the database it started in.");
-        ServerMeta? discovered;
-        try
-        {
-            discovered = _services.Catalog.Get(Side.Tgt)?.Server;
-        }
-        catch (JsonException ex)
-        {
+        var (discovered, problem) = DiscoveredTarget();
+        // Ruling 127, fail closed: "there is nothing to compare against" is not "they match". Failing open here would resume the run
+        // into whatever the target connection happens to point at today, which is the one thing this guard exists to stop.
+        if (discovered is null)
             throw new TransferException("target_unknown",
-                "The discovered target catalog could not be read, so it cannot be confirmed that the saved target is the database run "
-                + $"{run.Id} loaded into: {Describe(ex)}. Re-run discovery.");
-        }
-        if (discovered is null || string.IsNullOrWhiteSpace(discovered.Database))
-            throw new TransferException("target_unknown",
-                $"No discovered target catalog is recorded in this workspace, so it cannot be confirmed that {saved.Database} on "
-                + $"{saved.Server} is the database run {run.Id} loaded into. Re-run discovery, or cancel this run and start a new one.");
+                $"Because {problem}, it cannot be confirmed that {saved.Database} on {saved.Server} is the database run {run.Id} "
+                + "loaded into. Re-run discovery, or cancel this run and start a new one.");
         if (Same(saved.Database, discovered.Database) && Same(saved.Server, discovered.Server)) return;
         throw new TransferException("target_changed",
             $"The saved target connection now points at {saved.Database} on {saved.Server}, but run {run.Id} loaded into "
             + $"{discovered.Database} on {discovered.Server}. Its checkpoints and the {ControlTable.Name} table live in that database, "
             + "so resuming against this one would load every row again from the beginning. Point the target connection back at "
             + $"{discovered.Database}, or cancel run {run.Id} and start a new one.");
+    }
+
+    /// <summary>
+    /// Ruling 128, the start-side twin. The typed confirmation compares the name the <b>saved connection</b> reports, and
+    /// <c>schema_drift</c> compares a fingerprint that is purely structural - so a target repointed at a different database with the
+    /// same schema satisfies both, and a plan generated for one database is loaded into another. What the plan was written against is
+    /// the discovered catalog, and that is what the saved connection has to still match.
+    /// </summary>
+    private void EnsureTargetMatchesTheDiscoveredCatalog(ServerMeta saved)
+    {
+        var (discovered, problem) = DiscoveredTarget();
+        if (discovered is null)
+            throw new TransferException("not_ready",
+                $"The transfer cannot start because {problem}: the SQL plan was generated against the discovered target, and there is "
+                + "nothing to check the saved connection against. Re-run discovery.");
+        if (Same(saved.Database, discovered.Database) && Same(saved.Server, discovered.Server)) return;
+        throw new TransferException("not_ready",
+            $"The saved target connection no longer matches the discovered catalog ({saved.Database} on {saved.Server} against "
+            + $"{discovered.Database} on {discovered.Server}); re-run discovery. The SQL plan was generated for "
+            + $"{discovered.Database}, and neither the typed confirmation nor the schema-drift check can tell a different database "
+            + "with the same schema apart from it.");
+    }
+
+    /// <summary>
+    /// The target <see cref="ServerMeta"/> discovery recorded - the database the plan was generated against. Null <b>with a sentence
+    /// saying why</b>, never a bare null: "nobody recorded one" and "the record will not parse" send an operator to two different
+    /// places, and both are refusals rather than matches.
+    /// </summary>
+    private (ServerMeta? Meta, string? Problem) DiscoveredTarget()
+    {
+        try
+        {
+            var meta = _services.Catalog.Get(Side.Tgt)?.Server;
+            return meta is null || string.IsNullOrWhiteSpace(meta.Database)
+                ? (null, "no discovered target catalog is recorded in this workspace")
+                : (meta, null);
+        }
+        catch (JsonException ex)
+        {
+            return (null, "the discovered target catalog could not be read (" + Describe(ex) + ")");
+        }
+    }
+
+    /// <summary>The saved target's server details. A row that will not parse is a refusal, not a 500 (ruling 123 at the start door).</summary>
+    private ServerMeta? SavedTargetMeta()
+    {
+        try
+        {
+            return _services.Connections.GetMeta(Side.Tgt);
+        }
+        catch (JsonException ex)
+        {
+            throw new TransferException("no_connection", "The saved target connection's server details could not be read: "
+                                                         + Describe(ex) + " Re-enter the target connection on the Setup screen.");
+        }
     }
 
     private static bool Same(string? a, string? b) => string.Equals(a ?? "", b ?? "", StringComparison.OrdinalIgnoreCase);
@@ -455,6 +535,13 @@ public sealed class TransferService
             {
                 // A message that scrubbing emptied, or that was never there, becomes the exception's type name: TransferRepo refuses a
                 // blank error outright, and a failed run with no reason is a run nobody can act on.
+                //
+                // CONTRACT ASSERTION AGAINST A TRIGGER UNREACHABLE FROM THIS TASK (rulings 104, 112, 121). TransferEngine.RunAsync
+                // catches everything after it takes the run lock and records the run itself, so what can arrive here is only its three
+                // pre-lock TransferExceptions (no_run, run_finished, plan_mismatch), an ArgumentNullException, and a lock or connection
+                // fault - all of which carry messages, so the type-name fallback below never fires today. It is kept because the day a
+                // blank one does arrive, the alternative is an ArgumentException out of the repo and a run left "running" for ever.
+                // Pinned by TransferServiceViewTests.A_failure_with_no_message_is_recorded_by_type_name_contract_assertion_…
                 string msg = TransferFailure.Describe(ex, t => Redactor.Scrub(t, secrets));
                 _services.Transfers.SetRunStatus(runId, RunStatus.Failed, Json.Serialize(new { error = msg }));
                 _services.Sink.Publish("transfer_run_changed", new { runId, status = EnumText.ToText(RunStatus.Failed) });
@@ -464,6 +551,10 @@ public sealed class TransferService
         }
         catch (Exception ex)
         {
+            // CONTRACT ASSERTION AGAINST A TRIGGER UNREACHABLE FROM THIS TASK (rulings 104, 112, 121). Everything inside is already
+            // handled; what is left is the bookkeeping itself - a state database that has gone away under a run that is finishing. It
+            // is caught rather than left to fault the background task, because an unobserved faulted task would leave _active true for
+            // the life of the process and every later start refused "busy" with no way back.
             _services.Sink.Publish("log", new { level = "error",
                 message = "Transfer bookkeeping failed: " + TransferFailure.Describe(ex, t => Redactor.Scrub(t, secrets)) });
         }
@@ -477,9 +568,46 @@ public sealed class TransferService
         }
     }
 
+    /// <summary>
+    /// Ruling 130. Adds <paramref name="note"/> to what the run already carries; it replaces nothing.
+    /// <para><c>TransferRepo.SetRunStatus</c> writes <c>COALESCE($Summary, summary_json)</c>, so a non-null summary <b>replaces</b> -
+    /// and the summary of a failed run holds the reason it failed. A refusal that did nothing to the run must not be the thing that
+    /// erases it. A summary that is not readable JSON is kept verbatim as a note rather than discarded for being inconvenient.</para>
+    /// </summary>
+    internal static string MergeNote(string? summaryJson, string note)
+    {
+        ArgumentNullException.ThrowIfNull(note);
+        JsonObject summary = new();
+        string? unreadable = null;
+        if (!string.IsNullOrWhiteSpace(summaryJson))
+        {
+            try
+            {
+                if (JsonNode.Parse(summaryJson) is JsonObject parsed) summary = parsed;
+                else unreadable = summaryJson;
+            }
+            catch (JsonException)
+            {
+                unreadable = summaryJson;
+            }
+        }
+
+        var notes = new List<string>();
+        if (summary["notes"] is JsonArray existing)
+            notes.AddRange(existing.Select(n => n is JsonValue v && v.TryGetValue(out string? text) ? text : n?.ToJsonString() ?? ""));
+        else if (summary["notes"] is { } odd)
+            notes.Add(odd.ToJsonString());
+        if (unreadable is not null)
+            notes.Add("The run's previous summary could not be read as JSON and is kept here verbatim: " + unreadable);
+        notes.Add(note);
+        summary["notes"] = new JsonArray(notes.Select(n => (JsonNode?)JsonValue.Create(n)).ToArray());
+        return summary.ToJsonString(Json.Options);
+    }
+
     private void RecordNotRun(long runId, string why)
     {
-        _services.Transfers.SetRunStatus(runId, RunStatus.Paused, Json.Serialize(new { notes = new[] { why } }));
+        var run = _services.Transfers.GetRun(runId);
+        _services.Transfers.SetRunStatus(runId, RunStatus.Paused, MergeNote(run?.SummaryJson, why));
         _services.Sink.Publish("transfer_run_changed", new { runId, status = EnumText.ToText(RunStatus.Paused) });
         _services.Sink.Publish("log", new { level = "error", message = why });
     }
@@ -551,19 +679,24 @@ public sealed class TransferService
         return plan.Tasks.Where(kv => kv.Value is null).Select(kv => kv.Key).OrderBy(k => k, StringComparer.Ordinal).ToList();
     }
 
-    private PreflightResult CouldNotRun(Exception ex)
+    /// <summary>The scrubbed message, or the exception's type name when scrubbing itself cannot run or leaves nothing: a line that says
+    /// nothing is worse than a bare type name.</summary>
+    private string ScrubbedMessage(Exception ex)
     {
-        string message;
         try
         {
-            message = TransferFailure.Describe(ex, t => Redactor.Scrub(t, Secrets()));
+            return TransferFailure.Describe(ex, t => Redactor.Scrub(t, Secrets()));
         }
         catch (Exception)
         {
-            // Redactor.SecretsOf is itself one of the things that can throw here, and a checklist line that says nothing is worse than
-            // a bare type name.
-            message = ex.GetType().Name;
+            // Redactor.SecretsOf is itself one of the things that can throw here (5.4 fix-round-1 concern 3).
+            return ex.GetType().Name;
         }
+    }
+
+    private PreflightResult CouldNotRun(Exception ex)
+    {
+        string message = ScrubbedMessage(ex);
         return new PreflightResult(0, Clock.Now(),
         [
             new PreflightCheck("preflight", false, "error",
@@ -714,9 +847,30 @@ public sealed class TransferService
 
     // ------------------------------------------------------------------ shared
 
-    private (string Source, string Target) ConnectionStrings()
-        => (_services.Connections.GetConnectionString(Side.Src) ?? throw new TransferException("no_connection", "The source connection is not saved."),
-            _services.Connections.GetConnectionString(Side.Tgt) ?? throw new TransferException("no_connection", "The target connection is not saved."));
+    private (string Source, string Target) ConnectionStrings() => (Resolve(Side.Src, "source"), Resolve(Side.Tgt, "target"));
+
+    /// <summary>
+    /// Ruling 123's boundary, at the start door. <c>ConnectionRepo.GetConnectionString</c> decrypts, so a connection row protected
+    /// under a different Windows user - a copied workspace, a different service account - raises a
+    /// <see cref="System.Security.Cryptography.CryptographicException"/> from here. Uncaught it is a bare 500 at the one control the
+    /// execute screen exists for: no code, no sentence, and nothing saying the connection is the problem, while
+    /// <c>POST /api/transfer/preflight</c> answers the identical fault with a checklist line.
+    /// </summary>
+    private string Resolve(Side side, string which)
+    {
+        string? connectionString;
+        try
+        {
+            connectionString = _services.Connections.GetConnectionString(side);
+        }
+        catch (Exception ex)
+        {
+            throw new TransferException("no_connection",
+                $"The saved {which} connection could not be read: {ScrubbedMessage(ex)} It was saved by a different Windows user, or "
+                + "this workspace was copied from another machine; re-enter it on the Setup screen.");
+        }
+        return connectionString ?? throw new TransferException("no_connection", $"The {which} connection is not saved.");
+    }
 
     private async Task DropControlTableAsync(string targetCs, CancellationToken ct)
     {
