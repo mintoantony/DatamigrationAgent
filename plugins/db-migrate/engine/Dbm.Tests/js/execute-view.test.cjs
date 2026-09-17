@@ -114,6 +114,26 @@ test('a tag never runs into the word before it (kills M6, and F6 one function aw
   // A screen reader reads textContent, so "schema driftnot run" is what a missing text node sounds like.
   const notRun = D.texts(m.root, '.exe-check-name').filter((t) => /not run/.test(t));
   assert.deepEqual(notRun, ['Schemas unchanged since discovery not run']);
+  // ...and the summary badge does not run into the timestamp beside it.
+  assert.ok(/^1 blocking problem, 1 warning, including 1 check that did not run checked /.test(D.text(D.query(m.root, '.card-b .row'))));
+  // ...nor an option's label into its hint.
+  assert.ok(D.texts(m.root, '.exe-choice').every((t) => !/[a-z][A-Z]/.test(t.replace(/ /g, ' '))),
+    'an option label must not run into its hint: ' + D.texts(m.root, '.exe-choice').join(' | '));
+});
+
+test('the "no key" tag does not read as "Runningno key" (F6)', async () => {
+  const m = await mount(runningView());
+  const status = D.queryAll(m.root, '.exe-tasks tbody tr')[2].children[3];
+  // Measured three times in the review, in three statuses: "Pendingno key", "Runningno key", "Doneno key". The tag marks the task
+  // that cannot checkpoint and holds a pause, so it is the last one that should be hard to hear.
+  assert.equal(D.text(status).indexOf('Paused no key'), 0);
+
+  // Every status the row can be in, since the review found it in three of them.
+  for (const status_ of ['pending', 'running', 'done', 'failed']) {
+    const one = await mount(runningView({ tasks: [Object.assign({}, runningView().tasks[2], { status: status_ })] }));
+    const cell = D.query(one.root, '.exe-tasks tbody tr').children[3];
+    assert.ok(/ no key/.test(D.text(cell)), status_ + ' reads "' + D.text(cell) + '"');
+  }
 });
 
 /* ------------------------------------------------------------------ M4: the notes are on the screen */

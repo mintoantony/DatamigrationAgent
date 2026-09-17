@@ -194,7 +194,7 @@
     const tone = pf.passed ? (s.warnings || s.notRun ? 'st-paused' : 'st-done') : 'st-failed';
     return h('div', { class: 'stack-sm' },
       h('div', { class: 'row' },
-        h('span', { class: 'badge ' + tone }, X.preflightText(pf)),
+        h('span', { class: 'badge ' + tone }, X.preflightText(pf)), ' ',
         h('span', { class: 'muted small' }, 'checked ' + (DBM.fmt && DBM.fmt.rel ? DBM.fmt.rel(pf.at) : pf.at))),
       s.notRun ? h('div', { class: 'muted small' },
         (s.notRun === 1 ? 'One check' : s.notRun + ' checks') + ' could not be carried out. What they would have caught is unknown, '
@@ -234,13 +234,14 @@
     const radio = function (value, label_, hint) {
       const input = h('input', { type: 'radio', name: 'exe-errmode', value: value, on: { change: function () { set('errorMode', value); } } });
       input.checked = o.errorMode === value;
-      return h('label', { class: 'exe-choice' }, input, h('span', { class: 'stack' }, h('span', {}, label_), h('span', { class: 'muted small' }, hint)));
+      return h('label', { class: 'exe-choice' }, input,
+        h('span', { class: 'stack' }, h('span', {}, label_), ' ', h('span', { class: 'muted small' }, hint)));
     };
     const check = function (key, label_, hint, danger) {
       const input = h('input', { type: 'checkbox', class: 'check', on: { change: function (e) { set(key, e.target.checked); } } });
       input.checked = !!o[key];
       return h('label', { class: 'exe-choice' }, input,
-        h('span', { class: 'stack' }, h('span', {}, label_), h('span', { class: 'small ' + (danger ? 'exe-danger-note' : 'muted') }, hint)));
+        h('span', { class: 'stack' }, h('span', {}, label_), ' ', h('span', { class: 'small ' + (danger ? 'exe-danger-note' : 'muted') }, hint)));
     };
     S.execBtn = h('button', { class: 'btn btn-primary', type: 'button', on: { click: confirmAndStart } }, 'Execute…');
     S.execHint = h('div', { class: 'muted small wrap-anywhere' });
@@ -477,7 +478,9 @@
       h('td', { class: 'mono ellipsis', title: t.target }, t.target),
       h('td', {},
         DBM.components.badge(t.status),
-        t.keyless ? h('span', { class: 'tag exe-tag', title: 'Loads in one transaction' }, 'no key') : null,
+        // The space is a text node, not the CSS margin: without it this reads aloud as "Runningno key", and a keyless task carries
+        // the most operationally significant property on the screen - it cannot checkpoint and it holds a pause.
+        t.keyless ? [' ', h('span', { class: 'tag exe-tag', title: 'Loads in one transaction' }, 'no key')] : null,
         // A task reading "paused" under a cancelled or failed run was not paused by an operator: the note says which it is.
         t.statusNote ? h('div', { class: 'exe-task-note' }, t.statusNote) : null,
         t.validationNote ? h('div', { class: 'exe-task-note' }, t.validationNote) : null),

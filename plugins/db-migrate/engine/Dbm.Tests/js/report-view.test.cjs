@@ -99,6 +99,16 @@ test('expanding a task shows every note the engine attached to it', () => {
   assert.ok(text.indexOf('3 rows were counted as rejected but only 1 was recorded.') >= 0, 'the errorSamplesNote');
 });
 
+test('a sample\'s key does not run into its message, nor a target into its count (F6, the same defect)', () => {
+  const root = mount(report());
+  // Twice on the page: once in the task's detail row, once in the Rejected row samples card. Both are read aloud.
+  assert.deepEqual(D.texts(root, '.rep-samples li'), [
+    "Id=88213 Cannot insert the value NULL into column 'CustomerId'.",
+    "Id=88213 Cannot insert the value NULL into column 'CustomerId'.",
+  ]);
+  assert.equal(D.text(D.query(root, '.card-b .row')), 'app.Orders 3 rejected rows; 1 sample below');
+});
+
 test('the notes are rendered verbatim and in order', () => {
   const r = report();
   assert.deepEqual(D.texts(mount(r), '.rep-notes li'), r.notes);

@@ -202,7 +202,8 @@
 
   function samplesList(samples) {
     return h('ul', { class: 'rep-samples' }, ...samples.map(function (s) {
-      return h('li', {}, h('span', { class: 'mono small' }, X.keyText(s.key)), h('span', { class: 'small' }, s.error));
+      // The separator is a text node, not the grid gap: read aloud these two run together into "Id=88213Cannot insert…".
+      return h('li', {}, h('span', { class: 'mono small' }, X.keyText(s.key)), ' ', h('span', { class: 'small' }, s.error));
     }));
   }
 
@@ -213,7 +214,7 @@
   function samplesBlock(t) {
     const samples = t.errorSamples || [];
     return h('div', { class: 'stack-sm' },
-      h('div', { class: 'row' }, h('span', { class: 'mono' }, t.target), h('span', { class: 'muted small' },
+      h('div', { class: 'row' }, h('span', { class: 'mono' }, t.target), ' ', h('span', { class: 'muted small' },
         X.num(t.rowsError) + (t.rowsError === 1 ? ' rejected row; ' : ' rejected rows; ')
         + (samples.length ? samples.length + ' sample' + (samples.length === 1 ? '' : 's') + ' below' : 'no samples were recorded'))),
       samples.length ? samplesList(samples) : null,
