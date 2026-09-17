@@ -204,7 +204,18 @@ public sealed class TransferService
         }
         try
         {
-            var latest = _services.Transfers.Latest();
+            TransferRunRow? latest;
+            try
+            {
+                latest = _services.Transfers.Latest();
+            }
+            catch (JsonException ex)
+            {
+                // Ruling 142, read one of three. Its own guard, not a shared one: each route has to refuse in its own words, and one
+                // catch-all would hide two of them the day a second thing throws.
+                throw UnreadableRun(ex, "No new run can start until that row is repaired or removed: it may still be loading into the "
+                                        + "same target, and this run would load into it too.");
+            }
             if (latest?.Status == RunStatus.Paused)
                 throw new TransferException("paused_run", $"Run {latest.Id} is paused; resume or cancel it first.");
             // A restart abandons a failed or cancelled run for a NEW run id: its checkpoint rows are ignored, and the __dbm_* tables
@@ -313,7 +324,16 @@ public sealed class TransferService
         }
         try
         {
-            var run = _services.Transfers.Latest();
+            TransferRunRow? run;
+            try
+            {
+                run = _services.Transfers.Latest();
+            }
+            catch (JsonException ex)
+            {
+                // Ruling 142, read two of three.
+                throw UnreadableRun(ex, "It cannot be resumed: nothing is known about where it stopped or what it was loading.");
+            }
             if (run is null || run.Status is not (RunStatus.Paused or RunStatus.Failed))
                 throw new TransferException("not_resumable", "There is no paused or failed transfer run to resume.");
             EnsureTargetIsTheOneTheRunStartedIn(run);
@@ -350,7 +370,17 @@ public sealed class TransferService
             AnnounceStopping(activeRunId, StopKind.Cancel);
             return;
         }
-        var run = _services.Transfers.Latest();
+        TransferRunRow? run;
+        try
+        {
+            run = _services.Transfers.Latest();
+        }
+        catch (JsonException ex)
+        {
+            // Ruling 142, read three of three.
+            throw UnreadableRun(ex, "It cannot be cancelled: nothing is known about whether it is still running, or about what "
+                                    + "cancelling it would leave in the target.");
+        }
         if (run is null || run.Status is not (RunStatus.Paused or RunStatus.Failed))
             throw new TransferException("not_cancellable", "There is no running, paused or failed transfer to cancel.");
         if (!run.Options.KeepControlTable) await DropControlTableAsync(ConnectionStrings().Target, ct);
@@ -983,6 +1013,21 @@ public sealed class TransferService
         return run.Status is RunStatus.Paused or RunStatus.Failed ? null
             : $"Run {run.Id} is {EnumText.ToText(run.Status)}; only a paused or failed run can be resumed.";
     }
+
+    /// <summary>
+    /// Ruling 142. <c>TransferRepo.MapRun</c> deserialises <c>options_json</c>, so a saved run that will not parse throws out of
+    /// <c>Latest()</c> - and out of <c>start</c>, <c>resume</c> and <c>cancel</c>, where 5.6's endpoint <c>Guard</c> mapped it to
+    /// <b>400 "Invalid JSON body"</b>. On those three routes the body really is fine: the unreadable thing is a record on disk, so the
+    /// operator was told to fix the one thing that was not broken, on the three buttons of a screen that was already saying the saved
+    /// run could not be read (ruling 132). A refusal by name with the record in the sentence is the same answer ruling 135 gave the
+    /// errors route.
+    /// <para>The code is new rather than borrowed: <c>not_resumable</c> and <c>not_cancellable</c> both claim to know the run's status,
+    /// and knowing it is exactly what failed here.</para>
+    /// </summary>
+    private static TransferException UnreadableRun(JsonException ex, string consequence) =>
+        new("unreadable_run",
+            "The latest transfer run could not be read: the options this workspace saved for it are not readable JSON ("
+            + Describe(ex) + "). " + consequence);
 
     private static string StopText(StopKind kind) => kind switch
     {
