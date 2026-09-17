@@ -207,6 +207,25 @@ test('an unknown source count reads "unknown" and the totals say "at least"', as
   assert.equal(D.text(D.query(m.root, '.kpi .kpi-s')), 'of at least 100,000 · 72%');
 });
 
+/* ------------------------------------------------------------------ F8: the log tail is appended to, not rebuilt */
+
+test('5,000 log lines leave 80 in the DOM, in order, without rebuilding the tail', async () => {
+  const m = await mount(runningView());
+  const log = D.query(m.root, '.exe-log');
+  assert.equal(D.text(log), 'Live messages appear here while the transfer runs.');
+
+  for (let i = 1; i <= 5000; i++) VIEW.onEvent({ type: 'log', data: { level: i % 50 === 0 ? 'warn' : 'info', message: 'chunk ' + i + ' committed' } });
+
+  const lines = D.queryAll(log, '.exe-log-line');
+  assert.equal(lines.length, 80, 'the bound is the DOM, not just the buffer');
+  assert.ok(/chunk 4921 committed$/.test(D.text(lines[0])), 'oldest kept line: ' + D.text(lines[0]));
+  assert.ok(/chunk 5000 committed$/.test(D.text(lines[79])), 'newest line last: ' + D.text(lines[79]));
+  assert.equal(D.text(log).indexOf('Live messages appear here'), -1, 'the placeholder is gone, once');
+  // One frame for the whole burst: the scroll is what forced a layout per line and cost 7.9 s over these 5,000 events.
+  assert.equal(dom.pendingFrames(), 1);
+  dom.flushFrames();
+});
+
 /* ------------------------------------------------------------------ F5: an explanation must not outlive what it explained */
 
 test('the ETA\'s reason clears the moment there is an ETA', async () => {

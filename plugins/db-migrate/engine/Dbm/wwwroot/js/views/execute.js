@@ -83,7 +83,7 @@
       rateHistory: keep ? keep.rateHistory : [],
       log: keep ? keep.log : [],
       runId: keep ? keep.runId : null,
-      rowEls: {}, live: null, logEl: null, busy: false, reloadTimer: 0, frame: 0, sparkAt: 0, lastOverall: null,
+      rowEls: {}, live: null, logEl: null, logEmpty: true, logFrame: 0, busy: false, reloadTimer: 0, frame: 0, sparkAt: 0, lastOverall: null,
     };
     KEEP = S;
     clear(root);
@@ -92,7 +92,10 @@
   }
 
   function leave() {
-    if (S) { clearTimeout(S.reloadTimer); if (S.frame) cancelAnimationFrame(S.frame); }
+    if (!S) return;
+    clearTimeout(S.reloadTimer);
+    if (S.frame) cancelAnimationFrame(S.frame);
+    if (S.logFrame) cancelAnimationFrame(S.logFrame);
   }
 
   function reload() {
@@ -502,20 +505,43 @@
       h('div', { class: 'card-b' }, S.logEl));
   }
 
+  function logLine(l) {
+    const time = l.t.toTimeString().slice(0, 8);
+    return h('div', { class: 'exe-log-line lvl-' + l.level }, time + '  ' + (l.level + '     ').slice(0, 5) + '  ' + l.message);
+  }
+
+  /**
+   * One line in, one line out. It used to rebuild the whole tail per message - clear the &lt;pre&gt;, build up to 80 divs again and
+   * force a layout with scrollTop = scrollHeight - which cost 7.9 seconds of main thread over 5,000 log events, reachable with a
+   * small chunk size over millions of rows or with errorMode "skip" logging every rejected row. The bound itself was never the
+   * problem; the repaint was. The scroll is batched behind one frame for the same reason transfer_progress is.
+   */
   function pushLog(level, message) {
-    S.log.push({ t: new Date(), level: level, message: message });
+    const line = { t: new Date(), level: level, message: message };
+    S.log.push(line);
     if (S.log.length > LOG_LIMIT) S.log.shift();
-    if (S.logEl) paintLog();
+    if (!S.logEl) return;
+    if (S.logEmpty) { clear(S.logEl); S.logEmpty = false; }
+    S.logEl.appendChild(logLine(line));
+    while (S.logEl.children.length > LOG_SHOWN) S.logEl.removeChild(S.logEl.firstChild);
+    scrollLogSoon();
+  }
+
+  function scrollLogSoon() {
+    if (S.logFrame) return;
+    const el = S.logEl;
+    S.logFrame = requestAnimationFrame(function () {
+      S.logFrame = 0;
+      if (el) el.scrollTop = el.scrollHeight;
+    });
   }
 
   function paintLog() {
     clear(S.logEl);
-    if (!S.log.length) { S.logEl.appendChild(h('span', { class: 'muted' }, 'Live messages appear here while the transfer runs.')); return; }
-    S.log.slice(-LOG_SHOWN).forEach(function (l) {
-      const time = l.t.toTimeString().slice(0, 8);
-      S.logEl.appendChild(h('div', { class: 'exe-log-line lvl-' + l.level }, time + '  ' + (l.level + '     ').slice(0, 5) + '  ' + l.message));
-    });
-    S.logEl.scrollTop = S.logEl.scrollHeight;
+    S.logEmpty = !S.log.length;
+    if (S.logEmpty) { S.logEl.appendChild(h('span', { class: 'muted' }, 'Live messages appear here while the transfer runs.')); return; }
+    S.log.slice(-LOG_SHOWN).forEach(function (l) { S.logEl.appendChild(logLine(l)); });
+    scrollLogSoon();
   }
 
   /* ---------- rejected rows drawer ---------- */
