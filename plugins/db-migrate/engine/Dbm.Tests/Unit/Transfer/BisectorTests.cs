@@ -139,11 +139,70 @@ public sealed class BisectorTests
     private sealed class RowFaultTarget(bool rowFault) : IBisectTarget
     {
         public const string Error = "The INSERT statement conflicted with the FOREIGN KEY constraint \"FK_C_P\".";
+        public int Attempts;
 
         public Task<LoadAttempt> TryLoadAsync(IReadOnlyList<int> rows, CancellationToken ct)
-            => Task.FromResult(new LoadAttempt(false, Error) { RowFault = rowFault });
+        {
+            Attempts++;
+            return Task.FromResult(new LoadAttempt(false, Error) { RowFault = rowFault });
+        }
 
         public Task RestartAsync(CancellationToken ct) => Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// A re-run into a target that already holds every row: each attempt fails on a duplicate key, and SQL Server's message names the
+    /// duplicate value, so no two texts agree - only the error number does. <paramref name="numberOf"/> gives the number an attempt fails
+    /// with, from the first row it carries.
+    /// </summary>
+    private sealed class DuplicateTarget(Func<int, int> numberOf) : IBisectTarget
+    {
+        public int Attempts;
+
+        public static string TextFor(int row) =>
+            $"Violation of PRIMARY KEY constraint 'PK_P'. Cannot insert duplicate key in object 'app.P'. The duplicate key value is ({row}).";
+
+        public Task<LoadAttempt> TryLoadAsync(IReadOnlyList<int> rows, CancellationToken ct)
+        {
+            Attempts++;
+            return Task.FromResult(new LoadAttempt(false, TextFor(rows[0])) { RowFault = true, ErrorNumbers = [numberOf(rows[0])] });
+        }
+
+        public Task RestartAsync(CancellationToken ct) => Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Ruling 193 (open item 29). Every row of the chunk is a duplicate, and every message differs because it names its own value, so
+    /// the text short-cut never engages; the error number is the same every time, and once the whole chunk and two single rows have
+    /// failed on it nothing multi-row can load. <b>Harm:</b> without the number short-cut every node of the bisection tree is attempted,
+    /// 2N-1 = 127 round trips for 64 rows - 5.7 measured 4 m 03 s for a re-run of 14 707 such rows.
+    /// </summary>
+    [Fact]
+    public async Task A_chunk_of_duplicates_goes_straight_to_single_rows_once_the_error_number_repeats()
+    {
+        var t = new DuplicateTarget(_ => 2627);
+        var r = await Bisector.RunAsync(64, t, false, default);
+        Assert.True(t.Attempts == 64 + 6,
+            $"{t.Attempts} attempts for 64 duplicate rows: every multi-row attempt was re-run although each one had already failed on "
+            + "error 2627 (expected 64 + 6, the rows plus the whole chunk and the halvings above the first row)");
+        // Every row still rejected with its own reason, naming its own duplicate value.
+        Assert.Equal(Enumerable.Range(0, 64), r.Failed.Select(f => f.Row));
+        Assert.All(r.Failed, f => Assert.Equal(DuplicateTarget.TextFor(f.Row), f.Error));
+        Assert.All(r.Failed, f => Assert.Equal(2627, f.ErrorNumber));
+        Assert.Empty(r.Loaded);
+        Assert.Null(r.UniformError);   // the texts differ: this is rejected rows, never a failed task
+    }
+
+    /// <summary>The other side of ruling 193: the short-cut is for one repeated number, not for "some number". Two different numbers mean
+    /// two different faults, and every segment keeps its multi-row attempt, exactly as before.</summary>
+    [Fact]
+    public async Task Different_error_numbers_keep_every_multi_row_attempt()
+    {
+        var t = new DuplicateTarget(row => row % 2 == 0 ? 2627 : 2601);
+        var r = await Bisector.RunAsync(64, t, false, default);
+        Assert.True(t.Attempts == 2 * 64 - 1,
+            $"{t.Attempts} attempts: the bisection short-cut fired although the attempts failed with two different error numbers");
+        Assert.Equal(64, r.Failed.Count);
     }
 
     /// <summary>
@@ -156,13 +215,44 @@ public sealed class BisectorTests
     [Fact]
     public async Task A_chunk_of_nothing_but_constraint_violations_is_rejected_rows_not_a_broken_load()
     {
-        var r = await Bisector.RunAsync(8, new RowFaultTarget(rowFault: true), false, default);
+        var t = new RowFaultTarget(rowFault: true);
+        var r = await Bisector.RunAsync(8, t, false, default);
         // A UniformError here is what BulkLoader turns into bad_task, so it is named for what it would do rather than for the property.
         Assert.True(r.UniformError is null,
             $"the task was failed for {r.Failed.Count} individually bad rows (H2 read their constraint violation as a broken load): {r.UniformError}");
         Assert.Equal(Enumerable.Range(0, 8), r.Failed.Select(f => f.Row));
         Assert.All(r.Failed, f => Assert.Equal(RowFaultTarget.Error, f.Error));
         Assert.Empty(r.Loaded);
+        // Ruling 147 kept the short-cut for row faults: only the verdict changed. Harm (5.7 review F2, mutation M6): with the short-cut
+        // off for constraint rejects, a 100 000-row chunk of alike rejects costs 2N-1 round trips instead of N + log2(N).
+        Assert.True(t.Attempts == 8 + 3,
+            $"{t.Attempts} attempts for 8 alike constraint rejects: every multi-row attempt was re-run (expected 8 + 3, the rows plus the "
+            + "whole chunk and the halvings above the first row)");
+    }
+
+    /// <summary>A target whose first attempt fails on something that is not a row fault and whose later ones fail on a constraint, all
+    /// with one text - the only shape that tells "every attempt was a row fault" from "the last one was".</summary>
+    private sealed class MixedVerdictTarget : IBisectTarget
+    {
+        public const string Error = "one text for every attempt";
+        private int _attempts;
+
+        public Task<LoadAttempt> TryLoadAsync(IReadOnlyList<int> rows, CancellationToken ct)
+            => Task.FromResult(new LoadAttempt(false, Error) { RowFault = _attempts++ > 0 });
+
+        public Task RestartAsync(CancellationToken ct) => Task.CompletedTask;
+    }
+
+    /// <summary>One attempt that is not a row fault keeps H2 - the stricter reading wins (ruling 147). <b>Harm</b> (5.7 review F6,
+    /// mutation M5): if only the last attempt's reading counted, a chunk whose whole-chunk load failed on a plan defect would be reported
+    /// as rejected rows because its single-row attempts happened to fail on a constraint.</summary>
+    [Fact]
+    public async Task One_attempt_that_is_not_a_row_fault_keeps_H2_for_the_chunk()
+    {
+        var r = await Bisector.RunAsync(8, new MixedVerdictTarget(), false, default);
+        Assert.True(r.UniformError == MixedVerdictTarget.Error,
+            "the chunk came back as 8 rejected rows although its first attempt failed on something that is not a constraint violation: "
+            + "only the last attempt's row-fault reading was kept");
     }
 
     /// <summary>

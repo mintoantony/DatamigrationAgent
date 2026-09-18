@@ -383,16 +383,48 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options, TargetSha
     /// </summary>
     internal static bool IsRowFault(Exception ex) => IsRowFault(ErrorNumbers(ex));
 
-    /// <summary>The numbers of the server errors (class above 10) in <paramref name="ex"/> and every inner exception; empty when the
-    /// chain holds no SqlException at all, as SqlBulkCopy's client-side truncation and NULL checks do not.</summary>
+    /// <summary>A failed attempt as the bisector is handed it, doomed or not: the text, the error numbers, and ruling 147's verdict on
+    /// them. One constructor for both returns, so a transaction-ending constraint violation cannot lose its row-fault reading on the way.</summary>
+    internal static LoadAttempt FailedAttempt(string error, IReadOnlyList<int> numbers, bool doomed)
+    {
+        ArgumentNullException.ThrowIfNull(numbers);
+        return new LoadAttempt(false, error, doomed) { RowFault = IsRowFault(numbers), ErrorNumbers = numbers };
+    }
+
+    /// <summary>The numbers of the server errors (class above 10) anywhere in <paramref name="ex"/>: its <c>InnerException</c> chain and,
+    /// for an <see cref="AggregateException"/>, every one of its inner exceptions, not only the first; empty when nothing in it is a
+    /// SqlException, as SqlBulkCopy's client-side truncation and NULL checks are not.</summary>
     internal static List<int> ErrorNumbers(Exception ex)
     {
         ArgumentNullException.ThrowIfNull(ex);
         var messages = new List<(int Number, byte Class)>();
-        for (var e = ex; e is not null; e = e.InnerException)
+        foreach (var e in Chain(ex))
             if (e is SqlException sql)
                 foreach (SqlError error in sql.Errors) messages.Add((error.Number, error.Class));
         return ErrorNumbers(messages);
+    }
+
+    /// <summary><paramref name="ex"/> and everything inside it, depth first: the <c>InnerException</c> chain, and each of an
+    /// <see cref="AggregateException"/>'s <c>InnerExceptions</c> with its own chain (5.7 review F7). An error hiding in a second inner
+    /// exception is still an error, and missing it would read a constraint violation beside an invalid column as a row fault.</summary>
+    internal static IEnumerable<Exception> Chain(Exception ex)
+    {
+        ArgumentNullException.ThrowIfNull(ex);
+        var stack = new Stack<Exception>();
+        stack.Push(ex);
+        while (stack.Count > 0)
+        {
+            var e = stack.Pop();
+            yield return e;
+            if (e is AggregateException agg)
+            {
+                for (int i = agg.InnerExceptions.Count - 1; i >= 0; i--) stack.Push(agg.InnerExceptions[i]);
+            }
+            else if (e.InnerException is { } inner)
+            {
+                stack.Push(inner);
+            }
+        }
     }
 
     /// <summary>The class filter on its own, so it can be tested without a server: the numbers of the messages above class 10 (errors),
@@ -455,14 +487,14 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options, TargetSha
             }
             catch (Exception ex) when ((ex is SqlException or InvalidOperationException) && !ct.IsCancellationRequested)
             {
-                bool rowFault = IsRowFault(ex);         // ruling 147: a constraint violation is N bad rows, never a broken load
+                var numbers = ErrorNumbers(ex);
                 if (saved && await scope.XactStateAsync(ct) == 1)
                 {
                     scope.Tx.Rollback(SavepointName);   // V1/V2
                     Report(_confirmed);                 // the attempt's rows are gone again: never leave the caller counting them
-                    return new LoadAttempt(false, Describe(ex)) { RowFault = rowFault };
+                    return FailedAttempt(Describe(ex), numbers, doomed: false);
                 }
-                return new LoadAttempt(false, Describe(ex), Doomed: true) { RowFault = rowFault };   // V3
+                return FailedAttempt(Describe(ex), numbers, doomed: true);   // V3
             }
         }
 
