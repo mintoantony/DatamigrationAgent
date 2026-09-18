@@ -112,6 +112,18 @@ public sealed class ReportingTests
             "a task that loaded nothing is not named beside a mismatch: " + mixedHeadline);
     }
 
+    /// <summary>Review F7: a task that loaded nothing and rejected nothing - the source shrank between count and read - is not told
+    /// that "every row is rejected". <b>Harm:</b> the note sends the operator to rejected rows that do not exist.</summary>
+    [Fact]
+    public void A_task_that_loaded_nothing_and_rejected_nothing_is_not_described_as_rejected()
+    {
+        var tasks = new List<TransferTaskRow> { Row("T01", "app.Gone", 40, 0, 0, new TaskValidation(false, 40, 0, 0, 0, [], null), 1) };
+        var report = FinalReportBuilder.Build(Run(), RunStatus.Completed, tasks, _ => [], T0.AddSeconds(1));
+        string note = report.Notes.Single(n => n.StartsWith("app.Gone loaded 0 of 40 source rows", StringComparison.Ordinal));
+        Assert.True(!note.Contains("rejected)", StringComparison.Ordinal) && note.Contains("source query returned no rows", StringComparison.Ordinal),
+            "a task that rejected nothing was described as having its rows rejected: " + note);
+    }
+
     [Fact]
     public void Mismatches_are_called_out_in_notes_and_summary()
     {

@@ -261,9 +261,14 @@ public static class FinalReportBuilder
                       + "this run added against the source, not the table's contents; a table with no key can hold its rows twice.");
         var nothing = LoadedNothing(tasks);
         foreach (var t in nothing)
-            notes.Add($"{t.Target} loaded 0 of {N(t.RowsSource!.Value)} source rows ({N(t.RowsError)} rejected). A table that received "
-                      + "nothing is not validated by counts that balance: when every row is rejected, the mapping or SQL is the likelier "
-                      + "cause than the data - read the rejected rows' errors.");
+            notes.Add(t.RowsError > 0
+                ? $"{t.Target} loaded 0 of {N(t.RowsSource!.Value)} source rows ({N(t.RowsError)} rejected). A table that received "
+                  + "nothing is not validated by counts that balance: when every row is rejected, the mapping or SQL is the likelier "
+                  + "cause than the data - read the rejected rows' errors. In a re-run into a table that already held rows, duplicate-key "
+                  + "rejects mean those rows were already there."
+                // Review F7: nothing loaded and nothing rejected - the source had rows when it was counted and none when it was read.
+                : $"{t.Target} loaded 0 of {N(t.RowsSource!.Value)} source rows and rejected none: the source query returned no rows "
+                  + "although the source count said it had some - the source changed during the run, or the count and the query disagree.");
         if (mismatch.Count == 0 && notCompared.Count == 0 && notValidated.Count == 0 && tasks.Count > 0)
             notes.Add(before.Count > 0 ? $"Row counts balance for all {tasks.Count} tasks as rows added."
                       : nothing.Count > 0 ? $"Row counts balance for all {tasks.Count} tasks, but {nothing.Count} of them loaded nothing."
