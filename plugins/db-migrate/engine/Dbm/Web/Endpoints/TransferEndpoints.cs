@@ -18,7 +18,8 @@ public static class TransferEndpoints
 {
     public sealed record PreflightBody(TransferOptions? Options);
 
-    public sealed record StartBody(TransferOptions? Options, string? ConfirmTarget);
+    /// <param name="ConfirmNonEmpty">Ruling 186: the non-empty target tables the operator confirmed loading into (the start dialog).</param>
+    public sealed record StartBody(TransferOptions? Options, string? ConfirmTarget, List<string>? ConfirmNonEmpty = null);
 
     public static void Map(IEndpointRouteBuilder app, WebState state)
     {
@@ -39,7 +40,8 @@ public static class TransferEndpoints
         app.MapPost("/api/transfer/start", (HttpRequest req, CancellationToken ct) => Guard(async () =>
         {
             var body = await ReadAsync<StartBody>(req, ct);
-            long runId = await Service(state).StartAsync(body?.Options ?? new TransferOptions(), body?.ConfirmTarget ?? "", ct);
+            long runId = await Service(state).StartAsync(body?.Options ?? new TransferOptions(), body?.ConfirmTarget ?? "", ct,
+                body?.ConfirmNonEmpty);
             return ApiResults.Json(new { ok = true, runId });
         }));
 

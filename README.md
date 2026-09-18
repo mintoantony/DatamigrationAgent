@@ -157,7 +157,9 @@ Claude Code session ── /db-migrate skill + 3 subagents ──> dbm (CLI, on 
 - **Three subagents**: `schema-analyst` writes the analysis narrative, `mapping-architect` resolves uncertain mappings
   and writes transforms, `sql-engineer` writes custom SQL.
 - **Reopen and staleness.** Reopening an approved phase marks the later phases up to Execute *stale*; each is
-  regenerated and must be approved again. Nothing can be reopened once a transfer has started.
+  regenerated and must be approved again. Analysis, Mapping and SQL can be reopened before the first run and after a
+  run that completed, was cancelled or failed (a failed run is cancelled by the reopen); not while a run is running or
+  paused. After re-approval, Execute starts a new run; earlier runs' final reports stay on the Report screen.
 - **Drift check.** Schema fingerprints are re-checked before approval and in the pre-flight before execution; if a
   database changed, approval is refused until you press **Re-run discovery** on the Analysis screen.
 - **Pause / resume.** **Pause** in the top bar stops agent work: Claude finishes the patch it is writing and takes no
@@ -168,7 +170,9 @@ Claude Code session ── /db-migrate skill + 3 subagents ──> dbm (CLI, on 
 
 - Tasks follow the target's foreign-key order: up to *Parallel tasks* load at once, and a task starts only when the
   tables it depends on are loaded. FK cycles load with the cut constraints `NOCHECK` and re-enable them `WITH CHECK` in
-  a post-script.
+  a post-script. **Cancel** runs that post-script too, best effort, and the run's notes say per constraint what was
+  restored (a constraint the loaded rows violate is re-enabled without the check and reported as not trusted). A paused
+  or failed run keeps the pre-script in force - Resume expects it - and the Execute screen names it.
 - Rows stream from a `SqlDataReader` on the source into `SqlBulkCopy` on the target; Claude is never in the data path.
 - Keyed tables are copied in key-ordered chunks (100 000 rows by default, 5 000 for tasks with LOB columns). Each chunk
   commits in its own target transaction together with its checkpoint row in `dbo.__dbm_checkpoint`, so a crash or a
@@ -179,7 +183,12 @@ Claude Code session ── /db-migrate skill + 3 subagents ──> dbm (CLI, on 
 - A failed bulk batch is bisected to isolate the bad rows; they are recorded with the reason, and the task stops or
   skips-and-logs per the run's options.
 - Pre-flight checks connectivity, schema drift against the approved fingerprints, target row counts, permissions and
-  the estimated volume; running the transfer requires typing the target database name.
+  the estimated volume, and - for a task whose source query joins - that its chunk key is unique (a repeated key would
+  lose rows at chunk boundaries; it blocks the run). Running the transfer requires typing the target database name. A
+  new run into target tables that already hold rows also needs *Truncate target first* or a confirmation naming those
+  tables; pre-flight says which of them have no key (their rows would be loaded twice).
+- Over a target that was not empty, the report's headline says "target tables were not empty before this run; counts
+  compare rows added" instead of "validated".
 - After the run, validation compares source and target row counts per task and, where possible, per-column checksums,
   and the final report says in words what it could not check and why.
 
@@ -309,7 +318,8 @@ The implementation plan is under `docs/superpowers/plans/`, one file per milesto
 | M3 Mapping loop | done |
 | M4 SQL loop and script pack | done |
 | M5 Transfer engine and report | done (including the end-to-end LegacyShop → ShopV2 test) |
-| M6 Packaging, demo, docs | in progress — `dbm demo`/`dbm export`, doctor checks, launchers and release scripts and these docs are done; the committed `engine/dist` build is next |
+| M6 Packaging, demo, docs | done — `dbm demo`/`dbm export`, doctor checks, launchers, release scripts, these docs and the committed `engine/dist` build |
+| Final review fixes | done — a completed run always reaches Complete, Reopen after a run, Cancel restores the plan's pre-load SQL, the new-run guard, pageable work packets, the chunk-key check, a reproducible `engine/dist` |
 
 As of 2026-09-18. Each task is implemented and reviewed on its own branch before it reaches `main`.
 

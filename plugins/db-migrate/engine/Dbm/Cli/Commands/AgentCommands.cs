@@ -21,6 +21,9 @@ public sealed class NextCommand : ICommand
         await ServerControl.EnsureRunningAsync(ws);
         using var services = ctx.OpenServices(ws);
         services.Project.TouchAgent();
+        // Ruling 183: a run that completed while the workflow was never told (a crash in that window, or a finisher that threw) is
+        // finished here, so the orchestrator is not left answering "await/transfer" for a transfer that has ended.
+        Dbm.Core.Transfer.RunFinisher.Reconcile(services);
         return Output.Ok(ctx, services.Workflow.Next());
     }
 }

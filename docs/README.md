@@ -120,8 +120,12 @@ that needs reasoning (splits, merges, lookups, T-SQL transforms).
 ## Reopen, stale phases and drift
 
 - **Reopen** an approved phase to change it: every later phase up to Execute becomes *Stale*, is regenerated after your
-  re-approval (carrying over what still applies) and comes back for review. Reopening is not possible once a transfer
-  has started.
+  re-approval (carrying over what still applies) and comes back for review.
+- **After a run.** Analysis, Mapping and SQL can be reopened - and discovery re-run, and the connections changed - before
+  the first run and after a run that completed, was cancelled or failed. Reopening after a failed run cancels it first
+  (see *Cancel* below). While a run is running or paused the Reopen button is disabled with the reason: pause and cancel
+  it first. After you approve SQL again, **Execute** starts a new run; the earlier runs' final reports stay on the Report
+  screen (pick one from the list at the top).
 - **Drift**: before approval and in the pre-flight before execution the engine re-reads both schemas and compares
   fingerprints. If a database changed, approval is refused with "Schema changed since discovery"; press **Re-run
   discovery** on the Analysis screen, which refreshes the catalogs and marks the later phases stale.
@@ -146,13 +150,20 @@ that needs reasoning (splits, merges, lookups, T-SQL transforms).
 
 3. Press **Execute…**, type the **target database name** and press **Start transfer**.
 
-**Loading into a target that already has rows.** Pre-flight only *warns* about non-empty target tables. Tables with a
-key reject the duplicates as row errors, but a table without a key is loaded again and its rows double — and the row
-count validation still passes, because it counts the rows added by this run. The same applies to a new run after a
-cancelled or failed one: checkpoints belong to one run, so a new run starts from the first row again. If you are
-re-running a migration, tick **Truncate target first** — but only if the target tables hold nothing you need to keep,
-because it deletes every row in them, not only this migration's. Otherwise the target has to be restored (for example
-from a backup); never edit it by hand.
+**Loading into a target that already has rows.** Pre-flight's *Target row counts* line names the target tables that
+already hold rows and says which of them have no primary key or unique index: those would get their rows a second time
+(duplicates), while tables with a key reject the repeated rows as row errors. The same applies to a new run after a
+cancelled or failed one: checkpoints belong to one run, so a new run starts from the first row again. So a new run into
+non-empty tables needs a deliberate choice: tick **Truncate target first** — but only if the target tables hold nothing
+you need to keep, because it deletes every row in them, not only this migration's — or tick the confirmation in the
+start dialog, which names the non-empty tables and the keyless ones. Without either the server refuses the start
+(`target_not_empty`). The final report of such a run says "target tables were not empty before this run; counts compare
+rows added" instead of "validated". If neither choice is right, the target has to be restored (for example from a
+backup); never edit it by hand.
+
+**Chunk keys.** When a task's source query joins other tables, pre-flight checks that its chunk key is still unique in
+that query. A join that repeats rows (one order per order line, say) would make the key repeat and lose rows at chunk
+boundaries, so it blocks the run with the task and one repeated key named; fix the key or the join in the SQL phase.
 
 **Rejected rows under *Skip and log bad rows*.** Constraint violations (foreign key, CHECK, primary key or unique) are
 always skipped and logged row by row, even when every row of a chunk fails alike. But when every row of a chunk (of more
@@ -163,18 +174,26 @@ error:
   **Resume**; the run continues from its checkpoints.
 - **Bad source data** (a value that does not convert or fit): fix the data and press **Resume**.
 - **A mapping or SQL defect** (an invalid column or object, a conversion or truncation the plan itself causes, NULL
-  into NOT NULL): the mapping and SQL phases cannot be reopened once a transfer has started, so fixing it means
-  cancelling the run and repeating the migration in a new project folder. The target still holds what this run
-  committed, so the new run needs **Truncate target first** (with the caution above) or a restored target.
+  into NOT NULL): reopen Mapping or SQL, fix it and approve again (the reopen cancels the failed run first). The target
+  still holds what this run committed, so the new run needs **Truncate target first** (with the caution above) or the
+  confirmation by name.
 
 **A task that loaded 0 rows is a mapping problem.** Because constraint violations are always per-row rejects, a wrong
 foreign-key or CHECK mapping under *Skip and log bad rows* does not fail the run: it can end *Completed* with every row
 of a table rejected. If a task shows 0 rows loaded and many rejected, do not treat it as bad data — read the rejected
-rows' error and fix the mapping in a new project folder, as above (a completed run allows no new run in this project).
+rows' error, reopen Mapping, fix it and run again with **Truncate target first**, as above.
 
 **Live view**: overall and per-task progress bars, rows per second, ETA, a throughput sparkline, the rejected-row count
 and a log tail. **Pause** lets every task commit its current chunk and stops; **Resume** continues from the checkpoints,
 also after a failure, a crash or a reboot; **Cancel run** stops for good, and rows already committed stay in the target.
+
+**What Cancel restores.** The plan's pre-load SQL can switch things off in the target for the load - for a foreign-key
+cycle it disables the cut constraint (`NOCHECK`). While a run is running, paused or failed that stays in force (Resume
+expects it), and the Execute screen lists the statements. **Cancel** then runs the plan's post-load SQL, best effort,
+and the run's notes say per statement what was restored and what was not, with the server's own message. A constraint
+that the rows already loaded violate is re-enabled without the check - it guards new writes but is *not trusted* - and
+the note tells you to fix or remove those rows and run the statement again. A completed run runs the post-load SQL as
+part of finishing.
 
 ## Final report
 

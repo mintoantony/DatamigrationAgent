@@ -59,6 +59,28 @@ public sealed class ReportingTests
             FinalReportBuilder.Summary(report));
     }
 
+    /// <summary>Ruling 186 (open item 27): over a target that already held rows the counts balance rows added - a doubled keyless table
+    /// balances too - so the headline says what was compared instead of an unqualified "validated".</summary>
+    [Fact]
+    public void A_target_that_was_not_empty_before_the_run_is_named_in_the_headline_instead_of_validated()
+    {
+        var run = new TransferRunRow(1, 3, RunStatus.Completed, new TransferOptions { ErrorMode = "skip" }, T0, null, null);
+        var tasks = new List<TransferTaskRow>
+        {
+            Row("T01", "app.Customers", 1000, 1000, 0, new TaskValidation(true, 1000, 0, 0, 1000, [], "disabled"), 4),
+            Row("T02", "app.AuditEvents", 5000, 5000, 0, new TaskValidation(true, 5000, 0, 5000, 10000, [], "target table was not empty before the run"), 6)
+                with { RowsBefore = 5000 },
+        };
+
+        var report = FinalReportBuilder.Build(run, RunStatus.Completed, tasks, _ => [], T0.AddSeconds(10));
+        string headline = FinalReportBuilder.Summary(report);
+
+        Assert.True(headline == "Transferred 6,000 of 6,000 rows into 2 tables in 10s; target tables were not empty before this run; counts compare rows added.",
+            "headline over a target that already held rows: " + headline);
+        Assert.Contains(report.Notes, n => n.StartsWith("Target tables were not empty before this run: app.AuditEvents (5,000).", StringComparison.Ordinal));
+        Assert.DoesNotContain(report.Notes, n => n.Contains("Row counts validated", StringComparison.Ordinal));
+    }
+
     [Fact]
     public void Mismatches_are_called_out_in_notes_and_summary()
     {

@@ -13,6 +13,8 @@ public sealed class TransferEngine
     private readonly SqlPlanPayload _plan;
     private readonly string _sourceCs;
     private readonly string _targetCs;
+    /// <summary>True once this segment has run the plan's PreSql and nothing has undone it (ruling 184).</summary>
+    private bool _preSqlApplied;
 
     public TransferEngine(DbmServices services, SqlPlanPayload plan, string sourceCs, string targetCs)
     {
@@ -76,6 +78,9 @@ public sealed class TransferEngine
             bool allDone = repo.Tasks(runId).All(t => t.Status == TransferTaskStatus.Done);
             if (!allDone && control.Kind == StopKind.Cancel)
             {
+                // Ruling 184: the plan's PreSql is not left in force behind a cancel. Best effort, one note per statement.
+                foreach (var note in await GlobalSql.RestoreAsync(_targetCs, _plan.PostSql, rc.Scrub, ct)) rc.AddNote(note);
+                _preSqlApplied = false;
                 await DropControlTableAsync(rc, ct);
                 return Finish(rc, RunStatus.Cancelled, null);
             }
@@ -105,6 +110,7 @@ public sealed class TransferEngine
         await using var tgt = await SqlConnect.OpenAsync(_targetCs, ct);
         await ControlTable.EnsureAsync(tgt, ct);
         await TargetOps.ExecAllAsync(tgt, _plan.PreSql, ct);   // every segment (idempotent); before truncation (V10)
+        _preSqlApplied = true;
         if (tasks.All(t => t.RowsBefore is not null)) return;   // setup finished in an earlier segment
 
         if (rc.Options.TruncateTarget)
@@ -280,6 +286,9 @@ public sealed class TransferEngine
 
     private TransferOutcome Finish(RunContext rc, RunStatus status, string? error, string? summaryJson = null)
     {
+        // Ruling 184: a failed or paused run keeps the plan's PreSql in force on purpose (Resume expects it), and says so.
+        if (status is RunStatus.Failed or RunStatus.Paused && _preSqlApplied && GlobalSql.InForceNote(_plan.PreSql) is { } inForce)
+            rc.AddNote(inForce);
         string text = EnumText.ToText(status);
         rc.Repo.SetRunStatus(rc.RunId, status, summaryJson ?? RunSummary(rc, error));
         _services.Sink.Publish("transfer_run_changed", new { runId = rc.RunId, status = text });

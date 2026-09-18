@@ -90,6 +90,9 @@ public static class WebHost
                 // crash leaves behind, so without this the UI cannot tell a resumable run from a live one.
                 var transfer = new Dbm.Core.Transfer.TransferService(services);
                 transfer.RecoverInterrupted();
+                // Ruling 183: a run that completed while the workflow was never told is finished before any request can see the
+                // wedge (Start, Resume, Cancel and Reopen all refuse it).
+                transfer.ReconcileFinished();
                 state.Transfer = transfer;
                 EndpointRegistry.MapAll(app, state);
 

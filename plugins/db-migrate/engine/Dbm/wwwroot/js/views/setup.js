@@ -29,8 +29,13 @@
   function sideCard(ctx, side) {
     var conn = (ctx.state.connections && ctx.state.connections[side.key]) || { saved: false };
     var st = local[side.key];
-    var transfer = ctx.state.phases.filter(function (p) { return p.name === 'transfer'; })[0];
-    var locked = transfer && transfer.status !== 'pending';
+    // Ruling 185: the connections may change before the first run and after a completed, cancelled or failed one (the server
+    // cancels a failed run first); the server's sentence says why when they may not.
+    var locked = DBM.review && DBM.review.changesLocked ? DBM.review.changesLocked(ctx)
+      : (function () {
+        var transfer = ctx.state.phases.filter(function (p) { return p.name === 'transfer'; })[0];
+        return transfer && transfer.status !== 'pending' ? 'The transfer has started.' : null;
+      })();
 
     if (conn.saved && !st.editing) {
       return h('section', { class: 'card setup-card', 'aria-label': side.title + ' connection' },
@@ -38,7 +43,7 @@
         h('div', { class: 'card-b' },
           h('div', { class: 'setup-describe' }, conn.describe),
           metaList(conn.meta),
-          locked ? h('p', { class: 'small muted' }, 'Connections are locked while a transfer exists.')
+          locked ? h('p', { class: 'small muted wrap-anywhere' }, locked)
             : h('div', { class: 'row' }, h('button', {
               type: 'button',
               class: 'btn btn-sm',

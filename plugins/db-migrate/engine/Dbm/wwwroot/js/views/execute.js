@@ -31,6 +31,7 @@
     target_rows: 'Target row counts',
     estimated_rows: 'Estimated volume',
     keyless_tasks: 'Tasks without a key',
+    chunk_keys: 'Chunk keys unique',
   };
 
   const LOG_LIMIT = 200;          // lines kept in memory
@@ -287,31 +288,59 @@
     S.execHint.textContent = hint;
   }
 
+  /** Ruling 186: the non-empty target tables the last pre-flight counted, when this start would load into them without truncating. */
+  function nonEmptyTargets() {
+    const pf = S.preflight;
+    if (!pf || S.options.truncateTarget) return [];
+    return pf.nonEmptyTargets || [];
+  }
+
   function confirmAndStart() {
     const d = S.data;
     const o = S.options;
+    const nonEmpty = nonEmptyTargets();
+    const keyless = nonEmpty.filter(function (t) { return t.keyless; });
     const body = h('div', { class: 'stack' },
       h('p', {}, 'Load ', h('strong', {}, d.tasks.length + ' tables'), ' into ', h('span', { class: 'mono' }, d.targetDatabase), '.'),
       h('ul', { class: 'small' },
         h('li', {}, 'Chunk size ' + X.num(o.chunkSize) + ', ' + o.parallelism + ' parallel tasks'),
         h('li', {}, o.errorMode === 'skip' ? 'Bad rows are skipped and logged' : 'Stops at the first bad row'),
         o.truncateTarget ? h('li', { class: 'exe-danger-note' }, 'All existing rows in the target tables are deleted first') : null),
+      nonEmpty.length ? h('div', { class: 'stack-sm exe-nonempty' },
+        h('p', { class: 'exe-danger-note' }, 'These target tables already hold rows, and this new run loads every table from the start'
+          + (keyless.length ? ' - the ones without a key get their rows a second time:' : ':')),
+        h('ul', { class: 'small' }, ...nonEmpty.map(function (t) {
+          return h('li', { class: t.keyless ? 'exe-danger-note' : '' }, h('span', { class: 'mono' }, t.target), ' ' + X.num(t.rows) + ' rows - ',
+            t.keyless ? 'no primary key or unique index: rows will be loaded again (duplicates)' : 'keyed: rows whose keys are already there are rejected');
+        })),
+        h('p', { class: 'small muted' }, 'To start clean instead, cancel and tick Truncate target first.')) : null,
       h('p', { class: 'small muted' }, 'Type the target database name to confirm.'));
-    DBM.components.modal({ title: 'Start the transfer?', body: body, confirmText: 'Start transfer', requireText: d.targetDatabase })
+    DBM.components.modal({
+      title: 'Start the transfer?', body: body, confirmText: 'Start transfer', requireText: d.targetDatabase, danger: nonEmpty.length > 0,
+      requireCheck: nonEmpty.length ? 'Load into the ' + nonEmpty.length + (nonEmpty.length === 1 ? ' table' : ' tables') + ' that already hold rows'
+        + (keyless.length ? ', including ' + keyless.map(function (t) { return t.target; }).join(', ') + ' (duplicates)' : '') : null,
+    })
       .then(function (ok) {
         if (!ok) return null;
         S.busy = 'start';
         updateExecuteState();
         // confirmTarget must equal the target database name exactly, case included: the name is sent as the service reported it.
-        return DBM.api.post('/api/transfer/start', { options: o, confirmTarget: d.targetDatabase })
+        const req = { options: o, confirmTarget: d.targetDatabase };
+        if (nonEmpty.length) req.confirmNonEmpty = nonEmpty.map(function (t) { return t.target; });
+        return DBM.api.post('/api/transfer/start', req)
           .then(function (r) {
             S.samples = [];
             S.rateHistory = [];
             S.log = [];
             S.ctx.toast('Transfer run #' + r.runId + ' started', 'ok');
           })
-          .catch(function (e) { S.ctx.toast(errText(e), 'err'); })
-          .then(function () { S.busy = false; return reload(); });
+          .catch(function (e) {
+            S.ctx.toast(errText(e), 'err');
+            // Ruling 186: the server counted rows this screen had not seen (a restart re-runs pre-flight). Re-run it here, so the next
+            // Execute shows the tables and asks for the confirmation by name.
+            if (e && e.code === 'target_not_empty') S.preflight = null;
+          })
+          .then(function () { S.busy = false; if (!S.preflight) { runPreflight(); return null; } return reload(); });
       });
   }
 
@@ -370,23 +399,43 @@
       return h('div', { class: 'exe-banner ' + (notes ? 'is-warn' : 'is-ok'), role: 'status' },
         h('strong', {}, notes ? 'Transfer completed, with notes. ' : 'Transfer completed. '),
         notes ? 'Read the notes below before you treat this run as clean.'
-          : 'Validation finished — open Complete in the stepper for the final report.');
+          : 'Validation finished — open Report in the stepper for the final report.',
+        // Ruling 185: the way to another run is through the plan.
+        h('div', { class: 'small muted' }, 'To run again with a changed plan, reopen Analysis, Mapping or SQL; once SQL is approved '
+          + 'again, Execute starts a new run and this run’s report stays on the Report screen.'));
     }
     if (run.status === 'failed') {
       const failed = d.tasks.filter(function (t) { return t.status === 'failed'; });
       const msg = run.error || (failed.length ? failed[0].taskId + ' ' + failed[0].target + ': ' + failed[0].error : 'See the log.');
       return h('div', { class: 'exe-banner is-err', role: 'alert' }, h('strong', {}, 'Transfer failed. '), msg,
-        h('div', { class: 'small muted' }, 'Resume retries from the last committed checkpoint; Cancel abandons the run.'));
+        h('div', { class: 'small muted' }, (d.canResume
+          ? 'Resume continues from the last committed checkpoint and loads nothing twice. Cancel abandons the run. '
+          : 'Cancel abandons the run. ')
+          + 'A new run below loads every table from the start: it needs Truncate target first, or a confirmation naming the tables '
+          + 'that already hold rows.'),
+        inForce(run));
     }
     if (run.status === 'paused') {
       return h('div', { class: 'exe-banner is-warn', role: 'status' }, h('strong', {}, 'Paused. '),
-        'Committed chunks are safe; Resume continues exactly where each task stopped.');
+        'Committed chunks are safe; Resume continues exactly where each task stopped.', inForce(run));
     }
     if (run.status === 'cancelled') {
       return h('div', { class: 'exe-banner', role: 'status' }, h('strong', {}, 'Cancelled. '),
-        'Rows already committed remain in the target. You can start a new run below.');
+        'Rows already committed remain in the target, and a cancelled run cannot be resumed. A new run loads every table from the '
+        + 'start: choose Truncate target first, or confirm by name the tables that already hold rows - a table with no key would get '
+        + 'its rows twice. To change the plan first, reopen Analysis, Mapping or SQL.');
     }
     return null;
+  }
+
+  /** Ruling 184: the plan's pre-load statements a paused or failed run keeps in force in the target, named - Resume expects them,
+   *  and only Cancel (which runs the post-load SQL) or a completed run undoes them. */
+  function inForce(run) {
+    const list = run.preSqlInForce || [];
+    if (!list.length) return null;
+    return h('div', { class: 'stack-sm exe-inforce' },
+      h('div', { class: 'small' }, 'Still in force in the target (the plan’s pre-load SQL; Resume expects it, Cancel restores it):'),
+      h('ul', { class: 'small mono' }, ...list.map(function (s) { return h('li', { class: 'wrap-anywhere' }, s); })));
   }
 
   /** The run's own notes, word for word and in order: a control table that was not ours, rows counted but never recorded, a
@@ -436,7 +485,8 @@
   function confirmCancel() {
     DBM.components.modal({
       title: 'Cancel this run?',
-      body: h('p', {}, 'Running tasks stop after their current chunk. Rows already committed stay in the target and the run cannot be resumed.'),
+      body: h('p', {}, 'Running tasks stop after their current chunk. Rows already committed stay in the target and the run cannot be resumed. '
+        + 'The plan’s post-load SQL then runs to re-enable what its pre-load SQL disabled; the run’s notes say what was restored.'),
       confirmText: 'Cancel run',
       danger: true,
     }).then(function (ok) { if (ok) act('cancel'); });

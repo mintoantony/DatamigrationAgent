@@ -394,3 +394,70 @@ test('the pre-flight headline counts what did not run without counting it twice'
   await D.settle();
   assert.equal(D.text(D.query(m.root, '.card-b .badge')), '1 blocking problem, 1 warning, including 1 check that did not run');
 });
+
+test('a failed run names the pre-load statements it leaves in force (ruling 184)', async () => {
+  const stmt = 'ALTER TABLE [app].[Customers] NOCHECK CONSTRAINT [FK_Customers_PrimaryAddress];';
+  const view = runningView({
+    active: false,
+    run: Object.assign({}, runningView().run, { status: 'failed', error: 'T04: boom', notes: [], preSqlInForce: [stmt] }),
+  });
+  const m = await mount(view);
+  const banner = D.query(m.root, '.exe-banner');
+  assert.ok(D.text(banner).indexOf(stmt) >= 0, 'the failed banner does not name what is still in force: ' + D.text(banner));
+});
+
+/* ------------------------------------------------------------------ ruling 186: a new run into a non-empty target is deliberate */
+
+function modalIn(body) { return D.find(body, (n) => /modal-backdrop/.test(n.className || '')); }
+function startButton(modal) { return D.find(modal, (n) => String(n.tagName).toLowerCase() === 'button' && D.text(n) === 'Start transfer'); }
+
+async function openStartDialog(nonEmpty, over) {
+  document.body = new D.FakeNode('body');
+  const pf = { passed: true, at: '2026-09-17T09:00:00+00:00', sqlVersion: 1, checks: [], nonEmptyTargets: nonEmpty };
+  const m = await mount(runningView(Object.assign({ active: false, canStart: true, run: null, preflight: pf }, over || {})));
+  const exec = D.queryAll(m.root, 'button').filter((b) => D.text(b).indexOf('Execute') === 0)[0];
+  assert.equal(exec.disabled, false, 'Execute is not armed: ' + D.text(D.query(m.root, '.exe-form .toolbar .muted')));
+  exec.fire('click');
+  const modal = modalIn(document.body);
+  const text = D.find(modal, (n) => String(n.tagName).toLowerCase() === 'input' && n.getAttribute('type') === 'text');
+  text.value = 'ShopV2';
+  text.fire('input');
+  return { m, modal };
+}
+
+test('the start dialog names the non-empty tables and will not start until they are confirmed (ruling 186)', async () => {
+  const { m, modal } = await openStartDialog([
+    { target: 'app.Customers', rows: 1000, keyless: false },
+    { target: 'app.AuditEvents', rows: 5000, keyless: true },
+  ]);
+  assert.ok(/app\.AuditEvents 5,000 rows - no primary key or unique index: rows will be loaded again \(duplicates\)/.test(D.text(modal)),
+    'the dialog does not name the keyless table: ' + D.text(modal));
+  const start = startButton(modal);
+  assert.equal(start.disabled, true, 'typing the database name alone armed a new run into tables that already hold rows');
+  const check = D.find(modal, (n) => String(n.tagName).toLowerCase() === 'input' && n.getAttribute('type') === 'checkbox');
+  assert.ok(/including app\.AuditEvents \(duplicates\)/.test(D.text(check.parentNode || modal)), 'the confirmation does not name the keyless table');
+  check.checked = true;
+  check.fire('change');
+  assert.equal(start.disabled, false);
+  start.fire('click');
+  await D.settle();
+  const post = m.api.posts.filter((p) => p.url === '/api/transfer/start')[0];
+  assert.deepEqual(post.body.confirmNonEmpty, ['app.Customers', 'app.AuditEvents']);
+});
+
+test('with Truncate target first the dialog asks for nothing more than the name', async () => {
+  const { modal } = await openStartDialog([{ target: 'app.AuditEvents', rows: 5000, keyless: true }],
+    { defaults: { chunkSize: 100000, parallelism: 4, errorMode: 'stop', truncateTarget: true } });
+  assert.equal(D.find(modal, (n) => String(n.tagName).toLowerCase() === 'input' && n.getAttribute('type') === 'checkbox'), null);
+  assert.equal(startButton(modal).disabled, false);
+});
+
+test('the cancelled banner says what a new run does and how to avoid duplicates (ruling 186)', async () => {
+  const m = await mount(runningView({
+    active: false, canStart: true,
+    run: Object.assign({}, runningView().run, { status: 'cancelled', notes: [] }),
+  }));
+  const banner = D.text(D.query(m.root, '.exe-banner'));
+  assert.ok(/cannot be resumed/.test(banner) && /Truncate target first/.test(banner) && /rows twice/.test(banner),
+    'the cancelled banner still invites a plain new run: ' + banner);
+});

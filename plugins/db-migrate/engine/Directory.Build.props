@@ -12,12 +12,15 @@
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
   </PropertyGroup>
   <!-- Release builds ship in the committed engine/dist (T6.2, Ruling 180): no builder's path may reach a shipped binary,
-       and the bytes must not depend on the directory the checkout sits in. PathMap rewrites every compiler-emitted
-       path under engine/ (a PDB's CodeView path, [CallerFilePath]) to /_/; ContinuousIntegrationBuild turns on the
-       SDK's deterministic-build settings. The release scripts also compile from scratch with DebugType=none, so no
-       CodeView entry survives from an earlier Release compile in obj/. -->
+       and the bytes must not depend on the directory the checkout sits in. PathMap rewrites every compiler-emitted path
+       under engine/ to /_/ - a PDB's CodeView path, [CallerFilePath], and the file-local type names the Regex source
+       generator derives from its generated file's path (without the map they differ per checkout directory even though
+       no path string survives); ContinuousIntegrationBuild turns on the SDK's deterministic-build settings.
+       Ruling 189 (open item 41): the compiler's /pathmap splits on ',' and '=', so both are doubled here - unescaped, a
+       checkout path containing either failed every Release compile with CS8101. The release scripts also compile from
+       scratch with DebugType=none, so no CodeView entry survives from an earlier Release compile in obj/. -->
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
     <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
-    <PathMap>$(MSBuildThisFileDirectory)=/_/</PathMap>
+    <PathMap>$(MSBuildThisFileDirectory.Replace(',', ',,').Replace('=', '=='))=/_/</PathMap>
   </PropertyGroup>
 </Project>

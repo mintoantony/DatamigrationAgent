@@ -107,6 +107,12 @@ $lock = Join-Path $engine '.build.lock'
 $lockOwner = "release-ps1-$PID"
 $LockStaleMinutes = 15
 
+# `dotnet publish -o` hands the path to MSBuild as a property, where ',' and ';' separate values: a checkout path containing
+# either failed with MSB1006 (ruling 189, open item 41). MSBuild unescapes %XX in property values.
+function ConvertTo-MSBuildValue([string]$Value) {
+    return $Value.Replace('%', '%25').Replace(',', '%2C').Replace(';', '%3B')
+}
+
 function Invoke-Checked([string]$What, [scriptblock]$Command) {
     & $Command
     if ($LASTEXITCODE -ne 0) { throw "$What failed (exit code $LASTEXITCODE)" }
@@ -189,8 +195,12 @@ try {
         $path = Join-Path $engine $stale
         if (Test-Path -LiteralPath $path) { Remove-Item -Recurse -Force -LiteralPath $path }
     }
+    # Static web assets record each wwwroot file's last-write time as Last-Modified in Dbm.staticwebassets.endpoints.json,
+    # so the time a checkout happened would reach the committed dist (ruling 189). Pin it.
+    $pinned = [DateTime]::new(2000, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+    Get-ChildItem -LiteralPath (Join-Path $engine 'Dbm/wwwroot') -Recurse -File | ForEach-Object { $_.LastWriteTimeUtc = $pinned }
     Invoke-Checked 'dotnet publish' {
-        dotnet publish (Join-Path $engine 'Dbm/Dbm.csproj') -c Release -o $tmp --nologo `
+        dotnet publish (Join-Path $engine 'Dbm/Dbm.csproj') -c Release -o (ConvertTo-MSBuildValue $tmp) --nologo `
             "-p:Version=$version" -p:DebugType=none -p:UseAppHost=false
     }
     if (-not $KeepAllRuntimes) { Remove-UnusedNatives $tmp }

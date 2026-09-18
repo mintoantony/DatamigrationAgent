@@ -195,12 +195,15 @@
     return svg;
   };
 
-  /** modal({title, body (node|string), confirmText, cancelText, danger, requireText}) → Promise<bool> */
+  /** modal({title, body (node|string), confirmText, cancelText, danger, requireText, requireCheck}) → Promise<bool>
+   *  requireCheck: a label (node|string) for a checkbox that must be ticked before Confirm arms (ruling 186). */
   C.modal = function (o) {
     return new Promise(function (resolve) {
       var previous = document.activeElement;
       var input = o.requireText ? h('input', { class: 'input mono', type: 'text', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Type ' + o.requireText + ' to confirm' }) : null;
-      var confirm = h('button', { type: 'button', class: ['btn', o.danger ? 'btn-danger' : 'btn-primary'], disabled: !!o.requireText }, o.confirmText || 'OK');
+      var check = o.requireCheck ? h('input', { type: 'checkbox', class: 'check modal-require-check' }) : null;
+      var confirm = h('button', { type: 'button', class: ['btn', o.danger ? 'btn-danger' : 'btn-primary'], disabled: !!(o.requireText || o.requireCheck) }, o.confirmText || 'OK');
+      function arm() { confirm.disabled = (!!input && input.value !== o.requireText) || (!!check && !check.checked); }
       var cancel = h('button', { type: 'button', class: 'btn' }, o.cancelText || 'Cancel');
       var titleId = 'modal-title-' + Date.now();
       var dialog = h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': titleId },
@@ -208,7 +211,8 @@
         h('div', { class: 'modal-b stack-sm' },
           typeof o.body === 'string' ? h('p', { style: { margin: '0' } }, o.body) : o.body,
           o.requireText ? h('label', { class: 'field' },
-            h('span', { class: 'field-hint' }, 'Type ', h('code', null, o.requireText), ' to confirm'), input) : null),
+            h('span', { class: 'field-hint' }, 'Type ', h('code', null, o.requireText), ' to confirm'), input) : null,
+          check ? h('label', { class: 'exe-choice' }, check, h('span', null, o.requireCheck)) : null),
         h('div', { class: 'modal-f' }, o.cancelText === null ? null : cancel, confirm));
       var backdrop = h('div', { class: 'modal-backdrop' }, dialog);
 
@@ -230,9 +234,10 @@
         }
       }
       if (input) {
-        input.addEventListener('input', function () { confirm.disabled = input.value !== o.requireText; });
+        input.addEventListener('input', arm);
         input.addEventListener('keydown', function (e) { if (e.key === 'Enter' && !confirm.disabled) close(true); });
       }
+      if (check) check.addEventListener('change', arm);
       confirm.addEventListener('click', function () { close(true); });
       cancel.addEventListener('click', function () { close(false); });
       backdrop.addEventListener('mousedown', function (e) { if (e.target === backdrop) close(false); });

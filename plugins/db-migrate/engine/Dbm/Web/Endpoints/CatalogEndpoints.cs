@@ -41,12 +41,16 @@ public static class CatalogEndpoints
                 : Results.Json(detail, Json.Options);
         });
 
-        app.MapPost("/api/rediscover", () =>
+        app.MapPost("/api/rediscover", async (CancellationToken ct) =>
         {
             if (!state.Services.Connections.Has(Side.Src) || !state.Services.Connections.Has(Side.Tgt))
                 return Error(409, "no_connections", "Save both connection strings first.");
             try
             {
+                // Ruling 185: the same rule as reopen; a failed run is cancelled (its PostSql runs) before the catalogs change.
+                if (state.Services.Workflow.UpstreamLock(failedRunWillBeCancelled: true) is { } locked)
+                    return Error(409, "workflow", "Discovery cannot run again: " + locked);
+                await CoreEndpoints.CancelFailedRunAsync(state, "discovery was run again", ct);
                 state.Services.Workflow.Rediscover();
                 return Results.Json(new { ok = true }, Json.Options);
             }

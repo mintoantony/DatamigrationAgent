@@ -23,6 +23,10 @@ public sealed record TransferRunView(long Id, int SqlVersion, RunStatus Status, 
     /// into a flag - a completed run with notes is not the same thing as a clean one, and this is the only place the difference shows.
     /// </summary>
     public List<string> Notes { get; init; } = [];
+
+    /// <summary>Ruling 184: the plan's pre-load statements still in force in the target - a paused or failed run keeps them on purpose
+    /// (Resume expects them), and the Execute screen names them. Empty for every other run, and when the plan has none.</summary>
+    public List<string> PreSqlInForce { get; init; } = [];
 }
 
 /// <summary>
@@ -107,6 +111,9 @@ public sealed class TransferService
     private TransferControl? _control;
     private TransferOptions? _preflightOptions;
     private PreflightResult? _lastPreflight;
+    /// <summary>Ruling 190: the workflow and run state the cached pre-flight was taken in (<see cref="WorkflowStamp"/>). A run created
+    /// since, or a Transfer reset by Reopen, Rediscover or a reconnect, changes it and the cache is not reused.</summary>
+    private string? _preflightStamp;
 
     public TransferService(DbmServices services) => _services = services ?? throw new ArgumentNullException(nameof(services));
 
@@ -157,6 +164,31 @@ public sealed class TransferService
     }
 
     /// <summary>
+    /// Server start, once, right after <see cref="RecoverInterrupted"/> (ruling 183): a run that completed while the workflow was never
+    /// told - the process died between the two, or <see cref="OnFinished"/> threw - is finished now. Returns the run id it finished,
+    /// or null when there was nothing to reconcile. A fault here is a log line, never a server that will not start: the same
+    /// reconciliation runs again on every <c>dbm next</c> and <c>dbm status</c>.
+    /// </summary>
+    public long? ReconcileFinished()
+    {
+        try
+        {
+            long? runId = RunFinisher.Reconcile(_services);
+            if (runId is long id)
+                _services.Sink.Publish("log", new { level = "warn",
+                    message = $"Transfer run {id} had completed, but the workflow had not recorded it; its final report is stored now." });
+            return runId;
+        }
+        catch (Exception ex)
+        {
+            _services.Sink.Publish("log", new { level = "error",
+                message = "The completed transfer run could not be recorded in the workflow: " + ScrubbedMessage(ex)
+                          + " It is retried on the next server start, dbm next or dbm status." });
+            return null;
+        }
+    }
+
+    /// <summary>
     /// The execute screen's checklist, and <b>the boundary for everything that can go wrong producing one</b> (ruling 123).
     /// <para><c>Preflight.RunAsync</c> never throws for a SQL fault (ruling 119), but it can still throw before it reaches a probe at
     /// all: a connection row that cannot be decrypted (protected under another Windows user), a fault in <c>Redactor.SecretsOf</c>, or
@@ -173,6 +205,7 @@ public sealed class TransferService
         // line about a transfer nobody asked to check.
         var normalized = options.Normalized();
         PreflightResult result;
+        string? stamp = WorkflowStamp();
         try
         {
             result = MalformedPlanResult() ?? await Preflight.RunAsync(_services, normalized, ct);
@@ -185,6 +218,7 @@ public sealed class TransferService
         {
             _lastPreflight = result;
             _preflightOptions = normalized;
+            _preflightStamp = stamp;
         }
         return result;
     }
@@ -193,7 +227,10 @@ public sealed class TransferService
     /// Starts a new run (contract C7's start rules) and returns its id; the run itself proceeds in the background on
     /// <see cref="Current"/>.
     /// </summary>
-    public async Task<long> StartAsync(TransferOptions options, string confirmTarget, CancellationToken ct)
+    /// <param name="confirmNonEmpty">Ruling 186: the target tables the operator confirmed loading into although they already hold rows.
+    /// Without Truncate target first, a new run is refused (<c>target_not_empty</c>) unless every non-empty table is named here.</param>
+    public async Task<long> StartAsync(TransferOptions options, string confirmTarget, CancellationToken ct,
+        IReadOnlyCollection<string>? confirmNonEmpty = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         options = options.Normalized();
@@ -248,22 +285,30 @@ public sealed class TransferService
 
             PreflightResult? pre;
             TransferOptions? preOptions;
+            string? preStamp;
             lock (_lock)
             {
                 pre = _lastPreflight;
                 preOptions = _preflightOptions;
+                preStamp = _preflightStamp;
             }
             // Structural, not reference: both sides are normalised copies, so a reference test would re-run the checklist every time
             // and a missing test would start a run on a checklist taken for different options against a target that has since changed.
             if (restart || pre is null || !pre.Passed || pre.SqlVersion != approved.Version || Clock.Now() - pre.At > PreflightMaxAge
-                || preOptions != options)
+                || preOptions != options || preStamp is null || preStamp != WorkflowStamp())
                 pre = await PreflightAsync(options, ct);
             if (!pre.Passed)
                 throw new TransferException("preflight_failed", "Pre-flight checks failed.",
                     pre.Checks.Where(c => !c.Ok && c.Severity == "error").Select(c => $"{c.Name}: {c.Detail}").ToList());
+            // Ruling 190: counted live, never from the cached pre-flight (which can predate a run that filled these tables).
+            if (!options.TruncateTarget)
+                EnsureNonEmptyTargetsConfirmed(await LiveNonEmptyTargetsAsync(tgtCs, approved.Plan, ct), confirmNonEmpty);
 
             var engine = new TransferEngine(_services, approved.Plan, srcCs, tgtCs);
             long runId = engine.CreateRun(approved.Version, options);
+            // Ruling 190: a checklist taken before this run says nothing about the target after it - never reused for another start.
+            // (The new run id changes WorkflowStamp too; the result itself stays readable as LastPreflight for the screen.)
+            lock (_lock) _preflightStamp = null;
             await EnsureNoOtherRunnerAsync(runId, tgtCs, ct);
             if (!restart) _services.Workflow.OnTransferStarted();
             Launch(engine, runId, srcCs, tgtCs, RunOrigin.Created);
@@ -383,8 +428,61 @@ public sealed class TransferService
         }
         if (run is null || run.Status is not (RunStatus.Paused or RunStatus.Failed))
             throw new TransferException("not_cancellable", "There is no running, paused or failed transfer to cancel.");
-        if (!run.Options.KeepControlTable) await DropControlTableAsync(ConnectionStrings().Target, ct);
-        _services.Transfers.SetRunStatus(run.Id, RunStatus.Cancelled);
+        await CancelStoppedRunAsync(run, null, ct);
+    }
+
+    /// <summary>
+    /// Ruling 185: a failed run is cancelled by a reopen, a re-discovery or a reconnect - through the same door as Cancel, so the
+    /// plan's PostSql runs (ruling 184) before the plan it belongs to is changed. Returns true when it cancelled one; false when the
+    /// latest run is not a failed one (nothing to do). Refused <c>busy</c> while a run is executing in this process.
+    /// </summary>
+    public async Task<bool> CancelFailedRunAsync(string why, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(why);
+        lock (_lock)
+        {
+            if (_active || _starting) throw new TransferException("busy", "A transfer is running; pause and cancel it first.");
+        }
+        TransferRunRow? run;
+        try
+        {
+            run = _services.Transfers.Latest();
+        }
+        catch (JsonException ex)
+        {
+            throw UnreadableRun(ex, "It cannot be cancelled, so the plan cannot be changed under it.");
+        }
+        if (run is not { Status: RunStatus.Failed }) return false;
+        await CancelStoppedRunAsync(run, $"Cancelled because {why}.", ct);
+        return true;
+    }
+
+    /// <summary>A paused or failed run: drop the checkpoint table, record it cancelled, tell the workflow.</summary>
+    /// <para>Ruling 184: the plan's PostSql runs first, best effort and statement by statement, so the PreSql a paused or failed run
+    /// left in force (NOCHECK on a cut FK, a disabled trigger) is restored - and each statement's outcome, with the server's own text
+    /// when it failed, replaces the run's "still in force" note.</para>
+    private async Task CancelStoppedRunAsync(TransferRunRow run, string? note, CancellationToken ct)
+    {
+        string targetCs = ConnectionStrings().Target;
+        var notes = new List<string>();
+        if (note is not null) notes.Add(note);
+        try
+        {
+            var plan = _services.Artifacts.Get(PhaseName.Sql, run.SqlVersion) is { } artifact
+                ? Json.Deserialize<SqlPlanPayload>(artifact.PayloadJson) : null;
+            if (plan is null)
+                notes.Add($"{GlobalSql.RestorePrefix} it could not run, because SQL plan v{run.SqlVersion} of this run is no longer in the "
+                          + "workspace; whatever its pre-load SQL disabled in the target is still disabled.");
+            else
+                notes.AddRange(await GlobalSql.RestoreAsync(targetCs, plan.PostSql, ScrubFor(targetCs), ct));
+        }
+        catch (JsonException ex)
+        {
+            notes.Add($"{GlobalSql.RestorePrefix} it could not run, because SQL plan v{run.SqlVersion} could not be read ({Describe(ex)}); "
+                      + "whatever its pre-load SQL disabled in the target is still disabled.");
+        }
+        if (!run.Options.KeepControlTable) await DropControlTableAsync(targetCs, ct);
+        _services.Transfers.SetRunStatus(run.Id, RunStatus.Cancelled, WithNotes(_services.Transfers.GetRun(run.Id)?.SummaryJson, notes));
         _services.Sink.Publish("transfer_run_changed", new { runId = run.Id, status = EnumText.ToText(RunStatus.Cancelled) });
         _services.Workflow.OnTransferFinished("cancelled", null);
     }
@@ -473,6 +571,7 @@ public sealed class TransferService
             RunError(run), HasStoredReport(run))
         {
             Notes = RunNotes(run),
+            PreSqlInForce = run.Status is RunStatus.Paused or RunStatus.Failed ? GlobalSql.Statements(plan?.PreSql) : [],
         };
         return new TransferView(runView, tasks, totals, active, cannotStart is null, targetDatabase,
             approved?.Version, LastPreflight, new TransferOptions())
@@ -486,6 +585,63 @@ public sealed class TransferService
     }
 
     // ------------------------------------------------------------------ start / resume guards
+
+    /// <summary>
+    /// Ruling 186 (open item 27). A new run loads every table from the start. Into a table that already holds rows that means
+    /// duplicates wherever nothing refuses them (no primary key, no unique index) and a wall of rejects everywhere else - and one click
+    /// on the default options used to do it, under a report that then said "validated". So a new run into a non-empty target is a
+    /// deliberate act: Truncate target first, or a confirmation that names every non-empty table. Resume is not affected: it continues
+    /// from checkpoints and loads nothing twice.
+    /// </summary>
+    private static void EnsureNonEmptyTargetsConfirmed(IReadOnlyList<NonEmptyTarget> nonEmpty, IReadOnlyCollection<string>? confirmed)
+    {
+        if (nonEmpty.Count == 0) return;
+        var named = new HashSet<string>(confirmed ?? [], StringComparer.OrdinalIgnoreCase);
+        var unconfirmed = nonEmpty.Where(t => !named.Contains(t.Target)).ToList();
+        if (unconfirmed.Count == 0) return;
+        var keyless = nonEmpty.Where(t => t.Keyless).Select(t => t.Target).ToList();
+        throw new TransferException("target_not_empty",
+            "Target tables already hold rows, and a new run loads every table from the start"
+            + (keyless.Count > 0 ? $": {string.Join(", ", keyless)} {(keyless.Count == 1 ? "has" : "have")} no primary key or unique index, "
+                                   + "so rows will be loaded again — duplicates" : "")
+            + ". Choose 'Truncate target first', or confirm loading into the non-empty tables by name.",
+            nonEmpty.Select(t => $"{t.Target}: {t.Rows.ToString("N0", System.Globalization.CultureInfo.InvariantCulture)} rows"
+                                            + (t.Keyless ? " (no key: rows will be loaded again — duplicates)" : " (keyed: repeated keys are rejected)")).ToList());
+    }
+
+    /// <summary>Ruling 190: the plan's non-empty target tables right now. A count that cannot be made refuses the start - "could not
+    /// look" is not "empty".</summary>
+    private async Task<List<NonEmptyTarget>> LiveNonEmptyTargetsAsync(string targetCs, SqlGen.SqlPlanPayload plan, CancellationToken ct)
+    {
+        try
+        {
+            await using var conn = await SqlConnect.OpenAsync(targetCs, ct);
+            return await Preflight.NonEmptyTargetsAsync(conn, plan, ct);
+        }
+        catch (Exception ex) when (ex is SqlException or InvalidOperationException or TimeoutException)
+        {
+            throw new TransferException("preflight_failed", "The target tables could not be counted before the start, so it is unknown "
+                                                            + "whether this run would load into tables that already hold rows: "
+                                                            + TransferFailure.Describe(ex, t => Redactor.Scrub(t, Redactor.SecretsOf(targetCs).ToList())));
+        }
+    }
+
+    /// <summary>Ruling 190: the latest run's id and the Transfer and Ready phases' last change. Null when it cannot be read.</summary>
+    private string? WorkflowStamp()
+    {
+        try
+        {
+            long? run = _services.Db.Scalar<long?>("SELECT MAX(id) FROM transfer_run");
+            var transfer = _services.Phases.Get(PhaseName.Transfer);
+            var ready = _services.Phases.Get(PhaseName.Ready);
+            return string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                $"{run}|{EnumText.ToText(transfer.Status)}|{transfer.UpdatedAt:O}|{EnumText.ToText(ready.Status)}|{ready.UpdatedAt:O}");
+        }
+        catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or KeyNotFoundException)
+        {
+            return null;
+        }
+    }
 
     /// <summary>
     /// Ruling 103's lock, asked for before the run is launched instead of only inside <see cref="TransferEngine.RunAsync"/>. A refusal
@@ -685,8 +841,29 @@ public sealed class TransferService
             // handled; what is left is the bookkeeping itself - a state database that has gone away under a run that is finishing. It
             // is caught rather than left to fault the background task, because an unobserved faulted task would leave _active true for
             // the life of the process and every later start refused "busy" with no way back.
-            _services.Sink.Publish("log", new { level = "error",
-                message = "Transfer bookkeeping failed: " + TransferFailure.Describe(ex, t => Redactor.Scrub(t, secrets)) });
+            //
+            // Ruling 183: this is also where a finisher that threw lands, after the engine has already recorded the run's own status. The
+            // run records the fault in its notes (best effort - the state database may be the thing that failed), and the next server
+            // start, dbm next or dbm status re-runs the idempotent finish (RunFinisher.Reconcile).
+            string why = TransferFailure.Describe(ex, t => Redactor.Scrub(t, secrets));
+            try
+            {
+                _services.Transfers.UpdateRunSummary(runId, summary => MergeNote(summary,
+                    $"The run ended, but recording its outcome in the workflow failed: {why} It is retried on the next server start, "
+                    + "dbm next or dbm status."));
+            }
+            catch (Exception)
+            {
+                // nothing more can be written; the log line below is what is left
+            }
+            try
+            {
+                _services.Sink.Publish("log", new { level = "error", message = "Transfer bookkeeping failed: " + why });
+            }
+            catch (Exception)
+            {
+                // the sink itself may be what threw
+            }
         }
         finally
         {
@@ -708,6 +885,23 @@ public sealed class TransferService
     {
         ArgumentNullException.ThrowIfNull(note);
         return MergeSummary(summaryJson, note: note);
+    }
+
+    /// <summary>The run's summary with the "PreSql still in force" notes dropped (a cancel has just dealt with them) and
+    /// <paramref name="notes"/> appended; every other key is kept.</summary>
+    internal static string WithNotes(string? summaryJson, IReadOnlyList<string> notes)
+    {
+        var merged = MergeSummary(summaryJson);
+        var node = JsonNode.Parse(merged)!.AsObject();
+        var kept = (node["notes"] as JsonArray ?? []).Select(n => n?.GetValue<string>() ?? "").ToList();
+        node["notes"] = new JsonArray(GlobalSql.WithoutInForce(kept).Concat(notes).Select(n => (JsonNode?)JsonValue.Create(n)).ToArray());
+        return node.ToJsonString(Json.Options);
+    }
+
+    private static Func<string, string> ScrubFor(string cs)
+    {
+        var secrets = Redactor.SecretsOf(cs).ToList();
+        return t => Redactor.Scrub(t, secrets);
     }
 
     /// <summary>
@@ -786,26 +980,11 @@ public sealed class TransferService
     /// phase on the strength of it. Storing one for a failed or cancelled run would close the migration over a half-loaded target.
     /// A paused run finishes nothing, so it calls nothing.</para>
     /// </summary>
+    /// <para>Ruling 183: the work is <see cref="RunFinisher.Finish"/>, one idempotent transaction shared with the reconciliation that
+    /// server start, <c>dbm next</c> and <c>dbm status</c> run - so a finisher that throws here is finished by the next of those.</para>
     private void OnFinished(long runId, TransferOutcome outcome)
     {
-        switch (outcome.Status)
-        {
-            case RunStatus.Completed:
-                var run = _services.Transfers.GetRun(runId)!;
-                var report = run.SummaryJson is null ? null : Json.Deserialize<FinalReport>(run.SummaryJson);
-                string summary = report is null ? $"Transfer run {runId} completed." : FinalReportBuilder.Summary(report);
-                int version = Math.Max(1, _services.Artifacts.NextVersion(PhaseName.Complete));
-                _services.Artifacts.Add(PhaseName.Complete, version, run.SummaryJson ?? "{}", "script", summary);
-                _services.Sink.Publish("artifact_created", new { phase = "complete", version, author = "script" });
-                _services.Workflow.OnTransferFinished("completed", version);
-                break;
-            case RunStatus.Failed:
-                _services.Workflow.OnTransferFinished("failed", null);
-                break;
-            case RunStatus.Cancelled:
-                _services.Workflow.OnTransferFinished("cancelled", null);
-                break;
-        }
+        if (outcome.Status is RunStatus.Completed or RunStatus.Failed or RunStatus.Cancelled) RunFinisher.Finish(_services, runId);
     }
 
     // ------------------------------------------------------------------ pre-flight boundary
@@ -1003,6 +1182,12 @@ public sealed class TransferService
                            && run?.Status is RunStatus.Failed or RunStatus.Cancelled;
         var ready = _services.Phases.Get(PhaseName.Ready).Status;
         if (ready == PhaseStatus.AwaitingReview || restartable) return null;
+        // Ruling 185: after a completed run the way to a new one is through the plan, not around it.
+        if (run?.Status == RunStatus.Completed)
+            return $"Run {run.Id} completed. To run the migration again, reopen Analysis, Mapping or SQL on its review screen and approve "
+                   + "it again; Execute then starts a new run.";
+        if (ready is PhaseStatus.Stale or PhaseStatus.Pending)
+            return $"The transfer starts from the Ready step, which is {EnumText.ToText(ready)}: approve the SQL phase (again) first.";
         return $"The transfer starts from the Ready step, which is {EnumText.ToText(ready)}.";
     }
 
