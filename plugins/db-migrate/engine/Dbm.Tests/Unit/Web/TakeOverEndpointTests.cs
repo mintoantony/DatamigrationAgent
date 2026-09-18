@@ -1,6 +1,7 @@
 using System.Net;
 using Dbm.Core.State;
 using Dbm.Tests.Support;
+using Dbm.Web;
 
 namespace Dbm.Tests.Unit.Web;
 
@@ -45,6 +46,25 @@ public class TakeOverEndpointTests
         Assert.True(status == HttpStatusCode.Conflict && body!["error"]!.GetValue<string>() == "agent_active",
             $"Take over while Claude may be applying a patch must be 409 agent_active, got {(int)status} {body}");
         Assert.Equal(PhaseStatus.Drafting, server.Services.Phases.Get(PhaseName.Analysis).Status);
+    }
+
+    /// <summary>Ruling 197: nothing is published when the CLI-touch window lapses, so the state names the instant.</summary>
+    [Fact]
+    public async Task While_the_cli_touch_keeps_the_agent_online_the_state_says_until_when()
+    {
+        using var tw = new TestWorkspace();
+        await using var server = await StartDraftingAsync(tw);
+        Assert.Null((await server.GetJsonAsync("/api/state"))["project"]!["agentSeenUntil"]);
+
+        server.Services.Project.TouchAgent();
+        var seen = server.Services.Project.Get().AgentSeenAt!.Value;
+        var project = (await server.GetJsonAsync("/api/state"))["project"]!;
+
+        var until = project["agentSeenUntil"]?.GetValue<string>();
+        Assert.True(until is not null && DateTimeOffset.Parse(until, System.Globalization.CultureInfo.InvariantCulture) == seen + AgentPresence.SeenWindow
+                    && until.EndsWith("+00:00", StringComparison.Ordinal),
+            $"while online by the CLI touch, state.project.agentSeenUntil must be agent_seen_at + {AgentPresence.SeenWindow.TotalSeconds} s in UTC "
+            + $"(the UI refreshes once then); got {project.ToJsonString()}");
     }
 
     [Fact]
