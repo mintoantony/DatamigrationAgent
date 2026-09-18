@@ -318,6 +318,33 @@ public class ScriptPackTests
             Assert.DoesNotContain("TASK(S) HAVE ERRORS", content, StringComparison.Ordinal);
     }
 
+    /// <summary>Open item 18: 99_post.sql used to get <c>PackNotes.None</c> because nothing constructed its notes, not because there was
+    /// nothing to say — the "silence reads as none" shape Ruling 77 closed for 00_pre.sql. The post file runs after every task (it
+    /// re-enables constraints <c>WITH CHECK</c>), so a DBA who opens it alone must read the same warnings the pre file carries.</summary>
+    [Fact]
+    public void The_post_file_carries_the_same_warnings_as_the_pre_file()
+    {
+        var plan = Plan();
+        plan.Warnings.Add(SqlPlanSource.SkippedPrefix + "source connection, target connection missing");
+        plan.Errors.Add("target connection failed: timeout");
+        plan.Tasks["T05"].Errors.Add("sourceQuery: Invalid column name 'X'.");
+        plan.Order.Remove("T03");
+
+        var files = ScriptPack.BuildFiles(plan, "demo");
+        var pre = Warnings(files.Single(f => f.Name == "00_pre.sql").Content);
+        var post = Warnings(files.Single(f => f.Name == "99_post.sql").Content);
+
+        Assert.Equal(4, pre.Count(l => l.StartsWith("-- WARNING: ", StringComparison.Ordinal)));   // fixture guard: all four lists speak
+        Assert.True(pre.SequenceEqual(post), "99_post.sql does not carry 00_pre.sql's warnings:\npre:\n" + string.Join('\n', pre) + "\npost:\n" + string.Join('\n', post));
+
+        var clean = ScriptPack.BuildFiles(Plan(), "demo").Single(f => f.Name == "99_post.sql").Content;
+        Assert.Empty(Warnings(clean));   // a plan with nothing to say says nothing in the post file either
+
+        // The header lines after the two that name the file and say when it runs, up to the closing rule.
+        static List<string> Warnings(string file) =>
+            file.Split('\n').Skip(3).TakeWhile(l => !l.StartsWith("-- ====", StringComparison.Ordinal)).ToList();
+    }
+
     /// <summary>Ruling 97, which makes Ruling 79's condition mechanical instead of remembered. Four warning lists have four heading
     /// tests today only because someone recalls the rule; nothing makes a fifth list arrive with one. This pins the list-typed
     /// properties of <c>PackNotes</c> against a literal map to the test that asserts each one's heading, so a list added without a

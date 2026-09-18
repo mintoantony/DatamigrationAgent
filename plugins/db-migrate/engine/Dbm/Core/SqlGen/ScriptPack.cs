@@ -29,9 +29,10 @@ public static class ScriptPack
     /// errors at all, and a DBA who opens it alone would read that silence as "none".</summary>
     static string TaskErrorsTitle(int count) => FormattableString.Invariant($"WARNING: {count} TASK(S) HAVE ERRORS");
 
-    /// <summary>The warning lists 00_pre.sql and README.md print, ahead of anything else, in this order. They travel together and in
-    /// named fields on purpose: four <c>List&lt;string&gt;</c> parameters in a row is a transposition no compiler can catch, and a
-    /// swapped pair would quietly file one warning under another's heading. <see cref="None"/> is "nothing to say".</summary>
+    /// <summary>The warning lists 00_pre.sql, 99_post.sql and README.md print, ahead of anything else, in this order. They travel
+    /// together and in named fields on purpose: four <c>List&lt;string&gt;</c> parameters in a row is a transposition no compiler can
+    /// catch, and a swapped pair would quietly file one warning under another's heading. There is no ready-made empty instance: every
+    /// file's notes come from the checks in <see cref="BuildFiles"/>, so "nothing to say" is always a finding (open item 18).</summary>
     sealed record PackNotes
     {
         /// <summary>Every way <see cref="SqlPlanPayload.Order"/> fails to list each task exactly once.</summary>
@@ -42,8 +43,6 @@ public static class ScriptPack
         public required List<string> PlanErrors { get; init; }
         /// <summary>"T04 (app.Addresses): 9 error(s)" per errored task; the error text itself stays in the task file.</summary>
         public required List<string> TaskErrors { get; init; }
-
-        public static PackNotes None => new() { Problems = [], NotValidated = [], PlanErrors = [], TaskErrors = [] };
     }
 
     public static byte[] BuildZip(SqlPlanPayload plan, string projectName)
@@ -102,7 +101,9 @@ public static class ScriptPack
             files.Add((name, TaskFile(projectName, id, task, errorsOf[id])));
             index.Add((name, id, task));
         }
-        files.Add((postName, GlobalFile(projectName, postName, "post-load", "after the last task", plan.PostSql, PackNotes.None)));
+        // Open item 18: the post file carries the same roll-up as the pre file. It runs after every task, and a DBA who opens it alone
+        // must not read "nothing to report" from notes nobody constructed.
+        files.Add((postName, GlobalFile(projectName, postName, "post-load", "after the last task", plan.PostSql, notes)));
         files.Add(("README.md", Readme(projectName, preName, postName, index, notes)));
         return files;
     }
