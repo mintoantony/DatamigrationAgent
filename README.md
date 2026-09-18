@@ -206,7 +206,7 @@ unless noted: exit code 0 on success, and 1 with `{"error":"<code>","message":"â
 | `dbm status` | Project, phase, status, next action, UI URL |
 | `dbm next` / `dbm await [--timeout s]` | The orchestrator's next action; block until it changes (`0` = no timeout, the default) |
 | `dbm pause` / `dbm resume` | Pause or resume agent work |
-| `dbm config sample-values [on\|off]` | Show or switch whether the column profiles Claude reads include sample values (see Security) |
+| `dbm config sample-values [off]` | Show whether the column profiles Claude reads include sample values, or switch them off; switching them back on is done only on the Setup screen (see Security) |
 | `dbm discover [--inline]` | Extract and profile both catalogs, rebuild the vector index |
 | `dbm search <query> [--side src\|tgt] [--kind table\|column] [-k n] [--json]` | Vector search over both catalogs (text output unless `--json`) |
 | `dbm show <schema.table[.column]\|F001> [--side src\|tgt] [--json]` | Compact view of a table, column or finding |
@@ -237,9 +237,9 @@ unless noted: exit code 0 on success, and 1 with `{"error":"<code>","message":"â
   Setup screen or with `dbm config sample-values off`: the sample values and text min/max already collected are removed
   from the project (the database files and the work packets included), so no work packet and no `dbm show` carries
   any, and later discoveries collect none. Files you exported earlier to `.dbmigrate/exports` keep the values they
-  were written with. Claude still sees
-  the statistics and patterns, so its analysis and mapping suggestions may be less precise. Switching it back on takes
-  effect at the next discovery (**Re-run discovery**).
+  were written with. Claude still sees the statistics and patterns, so its analysis and mapping suggestions may be less
+  precise. Switching it back on is done only on the Setup screen (the CLI refuses it) and takes effect at the next
+  discovery (**Re-run discovery**).
 - **What Claude never sees:** credentials, connection strings or bulk row data. The transfer streams source â†’ target
   inside the local engine; Claude is not in the data path.
 - **Rejected rows** are stored in `<project>/.dbmigrate/state.db` for the final report, so treat the project folder like

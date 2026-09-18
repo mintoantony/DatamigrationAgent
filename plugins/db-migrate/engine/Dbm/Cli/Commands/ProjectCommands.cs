@@ -68,16 +68,20 @@ public sealed class PauseCommand : ICommand
     }
 }
 
-/// <summary>`dbm config sample-values [on|off]` - Ruling 196: show or switch whether the profiles Claude reads carry sample
-/// values (the Setup screen has the same switch).</summary>
+/// <summary>`dbm config sample-values [off]` - Ruling 196: show whether the profiles Claude reads carry sample values, or switch
+/// them off. Ruling 200: switching them back on is a human decision taken on the Setup screen's Privacy card; the CLI, which
+/// Claude itself runs, refuses it.</summary>
 public sealed class ConfigSampleValuesCommand : ICommand
 {
+    public const string OnRefused = "Sample values can be switched back on only by you, on the Setup screen: open the UI "
+                                    + "(dbm ui) and tick \"Send sample values to Claude\" under Privacy.";
+
     public string Name => "config sample-values";
-    public string Help => "Show or switch whether column profiles sent to Claude include sample values: config sample-values [on|off]";
+    public string Help => "Show whether column profiles sent to Claude include sample values, or switch them off: config sample-values [off]";
 
     public Task<int> RunAsync(Args args, CliContext ctx)
     {
-        const string usage = "usage: dbm config sample-values [on|off]";
+        const string usage = "usage: dbm config sample-values [off]";
         bool? on = args.Positionals.FirstOrDefault() switch
         {
             null => null,
@@ -86,6 +90,7 @@ public sealed class ConfigSampleValuesCommand : ICommand
             _ => throw new CliFailure("usage", usage),
         };
         if (args.Positionals.Count > 1) throw new CliFailure("usage", usage);
+        if (on == true) throw new CliFailure("setup_screen_only", OnRefused);
         using var services = ctx.OpenProject();
         if (on is not bool value)
         {

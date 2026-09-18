@@ -144,8 +144,12 @@ public class SampleValuesSettingTests
         Assert.True(off.Exit == 0 && off.Json["sampleValues"]!.GetValue<bool>() == false, off.Out + off.Err);
         Assert.False(show.Out.Contains(Email, StringComparison.Ordinal), "dbm show still prints a sample value after `config sample-values off`: " + show.Out);
         Assert.False(read.Json["sampleValues"]!.GetValue<bool>(), "dbm config sample-values reads on after switching off: " + read.Out);
-        Assert.True(on.Exit == 0 && on.Json["sampleValues"]!.GetValue<bool>(), on.Out + on.Err);
-        Assert.True(project.Services.Project.GetSettings().SampleValues);
+        // Ruling 200: sending real values to Claude again is a human decision, taken on the Setup screen - never from the CLI,
+        // which Claude itself runs.
+        Assert.True(on.Exit == 1 && (string?)on.Json["error"] == "setup_screen_only" && on.Out.Contains("Privacy", StringComparison.Ordinal),
+            "`dbm config sample-values on` must be refused and point to the Setup screen's Privacy card, got exit "
+            + $"{on.Exit}: {on.Out}{on.Err}");
+        Assert.False(project.Services.Project.GetSettings().SampleValues, "`dbm config sample-values on` switched sample values back on");
         Assert.Equal((1, "usage"), (bad.Exit, (string?)bad.Json["error"]));
     }
 }

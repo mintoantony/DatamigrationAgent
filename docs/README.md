@@ -58,7 +58,8 @@ started; after that the connections are locked.
   files and work packets included) and discovery collects none, so nothing Claude reads carries a sample value; it
   still sees null shares, distinct counts, lengths and value patterns, and its analysis and mapping suggestions may be
   less precise. Exports you wrote earlier to `.dbmigrate/exports` keep the values they were written with. Turning it back on takes effect at the
-  next discovery (**Re-run discovery** on Analysis). The same switch: `dbm config sample-values on|off`.
+  next discovery (**Re-run discovery** on Analysis). `dbm config sample-values off` switches them off from the command
+  line; switching them back on is your decision and is done only here.
 
 ## Discovery
 
