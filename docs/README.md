@@ -54,8 +54,9 @@ started; after that the connections are locked.
 - Entra ID: for example `Authentication=Active Directory Default` (uses your `az login` or IDE sign-in) or
   `Active Directory Interactive`, which opens a sign-in window on this machine.
 - **Privacy — Send sample values to Claude** (on by default). On, the column profiles Claude reads include up to 3 real
-  values per text column and its min/max. Off, the values already collected are removed from the project (database
-  files and work packets included) and discovery collects none, so nothing Claude reads carries a sample value; it
+  values per text column and its min/max. Off, the values already collected are removed from the project and its
+  work packets (the state database is overwritten as far as SQLite allows; raw pages freed before the switch can still
+  hold old values until reused) and discovery collects none, so nothing Claude reads carries a sample value; it
   still sees null shares, distinct counts, lengths and value patterns, and its analysis and mapping suggestions may be
   less precise. Exports you wrote earlier to `.dbmigrate/exports` keep the values they were written with. Turning it back on takes effect at the
   next discovery (**Re-run discovery** on Analysis). `dbm config sample-values off` switches them off from the command
