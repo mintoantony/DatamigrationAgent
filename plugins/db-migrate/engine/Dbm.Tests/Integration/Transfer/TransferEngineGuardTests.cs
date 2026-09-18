@@ -561,6 +561,6 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
         Assert.Equal(1, await rig.Tgt.CountAsync("app.Tkey"));
         var bad = Assert.Single(rig.Repo.ErrorRows(runId, "T01"));
         Assert.Equal("{\"At\":\"2020-01-01T10:00:03.6000000\"}", bad.KeyJson);        // the source value, which the operator can find
-        Assert.DoesNotContain("10:00:04", bad.KeyJson);                              // not the datetime2(0) the target rounds it to
+        Assert.DoesNotContain("10:00:04", bad.KeyJson, StringComparison.Ordinal);                              // not the datetime2(0) the target rounds it to
     }
 }
