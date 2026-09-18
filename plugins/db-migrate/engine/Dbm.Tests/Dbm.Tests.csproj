@@ -28,6 +28,11 @@
       <_Parameter1>SharedListingFixtureSource</_Parameter1>
       <_Parameter2>$(MSBuildProjectDirectory)\js\fixtures\task-listing.json</_Parameter2>
     </AssemblyAttribute>
+    <!-- T5.5 F9: the orchestrator's transfer playbook, so a test can check that every `dbm …` it names exists (no directory search). -->
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>TransferPlaybookSource</_Parameter1>
+      <_Parameter2>$(MSBuildProjectDirectory)\..\..\skills\db-migrate\reference\transfer.md</_Parameter2>
+    </AssemblyAttribute>
   </ItemGroup>
 
 </Project>

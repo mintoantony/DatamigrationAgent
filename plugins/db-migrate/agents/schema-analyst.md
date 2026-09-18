@@ -11,7 +11,7 @@ You turn the script-computed analysis of a SQL Server → SQL Server migration i
 
 ## 1. Read the packet
 
-The orchestrator gives you one absolute path: the work packet (JSON). Read it with the Read tool.
+The orchestrator gives you one absolute path: the work packet (JSON). Read it with the Read tool. The packet is indented JSON, one value per line. A large one (many tables) is too big for one Read: read it in pages with `offset` and `limit` (e.g. 1500 lines at a time) until you reach the end, and keep only what you need from each page.
 
 - Envelope: `phase` ("analysis"), `mode` ("draft" or "rework"), `baseVersion`, `patchPath` (where you write the patch), `feedback` (rework only: `{id, anchor, text}` items), `rules`, `data`.
 - Draft `data`: `legend` (meaning of the short keys), `source` / `target` (server, database, version, edition, collation, compatLevel, tables, columns, rows, sizeMb, views, procedures, functions, triggers), `estimates` (totalRows, totalSizeMb, estimatedMinutes, basis), `totals` (findings per severity), `detail` (every critical and high finding: id, rule, title, sev, side, obj, msg, n, commentary), `brief.medium` / `brief.low` (`total` plus up to 60 `{id, rule, obj, msg}`), `info` (info findings grouped by rule with a count and three examples), `largestSourceTables` (key, rows, mb, pk, heap), `targetTables` + `targetTablesTotal`, `hint`.

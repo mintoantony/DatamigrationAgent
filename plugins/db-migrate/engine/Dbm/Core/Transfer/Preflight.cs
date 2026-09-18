@@ -10,12 +10,31 @@ using Microsoft.Data.SqlClient;
 namespace Dbm.Core.Transfer;
 
 /// <summary>One line of the execute-screen checklist. <see cref="Ok"/> false with severity "error" blocks the run; "warning" does not.</summary>
-public sealed record PreflightCheck(string Name, bool Ok, string Severity, string Detail);
+public sealed record PreflightCheck(string Name, bool Ok, string Severity, string Detail)
+{
+    /// <summary>
+    /// True for a check this run could not carry out, as opposed to one that ran and found a fault (ruling 139). The two are already
+    /// built apart here - <see cref="Preflight.NotRun"/> against <c>Err</c> - but nothing carried the difference over the wire, so the
+    /// screen had to guess it from the wording, and the engine's own <c>target_probe</c> error ("Some target tables could not be
+    /// checked: …") reads exactly like one. Guessed wrong it draws a failure as "not run", which tells an operator the opposite of
+    /// what the engine found.
+    /// <para>Not nullable, so it is always serialised: a reader sees the <c>false</c> rather than inferring it from a key that is not
+    /// there, which is the same rule <see cref="TransferTotals.TasksWithoutSource"/> follows and the reason nulls are omitted at all.</para>
+    /// </summary>
+    public bool NotRun { get; init; }
+}
 
 public sealed record PreflightResult(int SqlVersion, DateTimeOffset At, List<PreflightCheck> Checks)
 {
     public bool Passed => Checks.All(c => c.Ok || c.Severity != "error");
+
+    /// <summary>Ruling 186: the plan's target tables that already hold rows, as counted by this checklist. A new run into any of them
+    /// needs Truncate target first or a confirmation naming them (<see cref="TransferService.StartAsync"/>). Always serialised.</summary>
+    public List<NonEmptyTarget> NonEmptyTargets { get; init; } = [];
 }
+
+/// <param name="Keyless">No primary key and no unique index: nothing in the target refuses a row loaded a second time.</param>
+public sealed record NonEmptyTarget(string Target, long Rows, bool Keyless);
 
 public sealed record ApprovedPlan(int Version, SqlPlanPayload Plan);
 
@@ -43,6 +62,7 @@ public static class Preflight
         ArgumentNullException.ThrowIfNull(s);
         ArgumentNullException.ThrowIfNull(options);
         var checks = new List<PreflightCheck>();
+        var nonEmptyTargets = new List<NonEmptyTarget>();
         PhaseRow phase;
         ApprovedPlan? approved;
         try
@@ -114,7 +134,7 @@ public static class Preflight
             {
                 try
                 {
-                    checks.AddRange(await TargetChecksAsync(tgt, approved.Plan, options, ct));
+                    checks.AddRange(await TargetChecksAsync(tgt, approved.Plan, options, ct, nonEmptyTargets));
                 }
                 catch (Exception ex) when (ex is SqlException or InvalidOperationException or TimeoutException)
                 {
@@ -142,6 +162,7 @@ public static class Preflight
                 try
                 {
                     checks.Add(await SourceEstimateAsync(src, approved.Plan, ct));
+                    if (await ChunkKeyCheckAsync(src, approved.Plan, ct) is { } keys) checks.Add(keys);
                 }
                 catch (Exception ex) when (ex is SqlException or FormatException or InvalidCastException or InvalidOperationException
                                               or TimeoutException)
@@ -174,7 +195,10 @@ public static class Preflight
             if (tgt is not null) await tgt.DisposeAsync();
         }
         return new PreflightResult(approved.Version, Clock.Now(),
-            checks.Select(c => c with { Detail = Scrubbed(c.Detail, secrets) }).ToList());
+            checks.Select(c => c with { Detail = Scrubbed(c.Detail, secrets) }).ToList())
+        {
+            NonEmptyTargets = nonEmptyTargets,
+        };
     }
 
     /// <summary>
@@ -199,7 +223,7 @@ public static class Preflight
     /// check at all.</para>
     /// </summary>
     public static async Task<List<PreflightCheck>> TargetChecksAsync(SqlConnection tgt, SqlPlanPayload plan, TransferOptions options,
-        CancellationToken ct)
+        CancellationToken ct, List<NonEmptyTarget>? nonEmptyTargets = null)
     {
         ArgumentNullException.ThrowIfNull(tgt);
         ArgumentNullException.ThrowIfNull(plan);
@@ -213,6 +237,7 @@ public static class Preflight
         var noAlter = new List<string>();
         var noTruncate = new List<string>();
         var nonEmpty = new List<string>();
+        var keylessNonEmpty = new List<string>();
         var probeErrors = new List<string>();        // "app.X: <server message>" - what the target_probe check reports
         var permFailed = new List<string>();         // tables whose permission probe never answered
         var permFailedIdentity = new List<string>();
@@ -254,7 +279,13 @@ public static class Preflight
             try
             {
                 long rows = await TargetOps.CountTargetAsync(tgt, target, ct);
-                if (rows > 0) nonEmpty.Add($"{target} ({rows.ToString("N0", CultureInfo.InvariantCulture)})");
+                if (rows > 0)
+                {
+                    nonEmpty.Add($"{target} ({rows.ToString("N0", CultureInfo.InvariantCulture)})");
+                    bool keyless = !await HasUniqueKeyAsync(tgt, target, ct);
+                    if (keyless) keylessNonEmpty.Add(target);
+                    nonEmptyTargets?.Add(new NonEmptyTarget(target, rows, keyless));
+                }
             }
             catch (Exception ex) when (ex is SqlException or TimeoutException)
             {
@@ -310,14 +341,54 @@ public static class Preflight
         checks.Add(nonEmpty.Count == 0 ? Ok("target_rows", "All target tables that could be counted are empty." + skippedRows)
             : options.TruncateTarget ? Ok("target_rows", "Will be emptied first: " + string.Join(", ", nonEmpty) + "." + skippedRows)
             : new PreflightCheck("target_rows", false, "warning",
-                "Target tables already contain rows: " + string.Join(", ", nonEmpty)
-                + ". Loading may hit duplicate keys; consider 'Truncate target first'." + skippedRows));
+                "Target tables already contain rows: " + string.Join(", ", nonEmpty) + "."
+                + (keylessNonEmpty.Count > 0
+                    ? " No primary key or unique index on " + string.Join(", ", keylessNonEmpty)
+                      + ": rows will be loaded again — duplicates, nothing refuses them."
+                    : "")
+                + (keylessNonEmpty.Count < nonEmpty.Count
+                    ? " Tables with a key reject rows whose keys are already there (skipped and logged, or the run stops)."
+                    : "")
+                + " A new run needs 'Truncate target first', or a confirmation naming these tables." + skippedRows));
 
         // The faults themselves, named, as an error: the verdicts above have each said which tables they could not cover, but the
         // reason lives here, and without it the operator is told what was not checked and never why.
         if (probeErrors.Count > 0)
             checks.Add(Err("target_probe", "Some target tables could not be checked: " + string.Join("; ", probeErrors) + "."));
         return checks;
+    }
+
+    /// <summary>
+    /// Ruling 190 (re-review N-1): the plan's target tables that hold rows <b>now</b>, counted live for the new-run guard at Start -
+    /// never read from a cached pre-flight, which can predate a run that filled them. A table that does not exist is skipped (the
+    /// pre-flight's target_tables check blocks the run on its own). SQL faults propagate: the caller refuses the start.
+    /// </summary>
+    public static async Task<List<NonEmptyTarget>> NonEmptyTargetsAsync(SqlConnection tgt, SqlPlanPayload plan, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(tgt);
+        ArgumentNullException.ThrowIfNull(plan);
+        var list = new List<NonEmptyTarget>();
+        var targets = TransferEngine.PlanOrder(plan).Select(id => plan.Tasks[id].Target).Distinct(StringComparer.OrdinalIgnoreCase);
+        foreach (var target in targets)
+        {
+            await using (var cmd = new SqlCommand("SELECT CASE WHEN OBJECT_ID(@t, N'U') IS NULL THEN 0 ELSE 1 END", tgt))
+            {
+                cmd.Parameters.Add(new SqlParameter("@t", SqlDbType.NVarChar, 600) { Value = SqlQuote.TableKey(target) });
+                if (Convert.ToInt32(await cmd.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture) == 0) continue;
+            }
+            long rows = await TargetOps.CountTargetAsync(tgt, target, ct);
+            if (rows > 0) list.Add(new NonEmptyTarget(target, rows, !await HasUniqueKeyAsync(tgt, target, ct)));
+        }
+        return list;
+    }
+
+    /// <summary>A primary key or any unique index: something in the target that refuses a row loaded twice.</summary>
+    private static async Task<bool> HasUniqueKeyAsync(SqlConnection tgt, string target, CancellationToken ct)
+    {
+        await using var cmd = new SqlCommand(
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(@t, N'U') AND is_unique = 1) THEN 1 ELSE 0 END", tgt);
+        cmd.Parameters.Add(new SqlParameter("@t", SqlDbType.NVarChar, 600) { Value = SqlQuote.TableKey(target) });
+        return Convert.ToInt32(await cmd.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture) == 1;
     }
 
     private static string Clause(string why, IEnumerable<string> names)
@@ -373,6 +444,66 @@ public static class Preflight
             detail + " Could not count: " + string.Join("; ", faulted.Concat(noNumber)) + ".");
     }
 
+    /// <summary>The generator's own single-table shape: <c>SELECT …\nFROM [schema].[table] AS s</c>, optionally <c>\nWHERE (…)</c>. Its
+    /// key is the source table's primary key or unique index, so it is unique by construction.</summary>
+    private static readonly System.Text.RegularExpressions.Regex SingleTable = new(
+        @"\sFROM\s+\[[^\]]+\]\.\[[^\]]+\]\s+AS\s+s(\s+WHERE\s+\(.*\))?\s*$",
+        System.Text.RegularExpressions.RegexOptions.Singleline | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    /// <summary>True when the task's key columns are not guaranteed unique by the generator: a hand-edited task, or a FROM that joins.</summary>
+    public static bool NeedsKeyProbe(TaskPlan task)
+    {
+        ArgumentNullException.ThrowIfNull(task);
+        return task.KeyColumns.Count > 0 && (task.Custom || !SingleTable.IsMatch(task.SourceQuery ?? ""));
+    }
+
+    /// <summary>
+    /// Ruling 188 (final review M-1). Keyset chunking pages with <c>key &gt; @last</c>, so a key that repeats in the source query loses
+    /// the rows sharing the last key of a chunk - reported as a MISMATCH only after the whole run. For every task whose query is not
+    /// the generator's single-table shape, a bounded probe (<c>TOP 1 … GROUP BY keys HAVING COUNT_BIG(*) &gt; 1</c>) finds one repeated
+    /// key before the run starts. A repeat is an error naming the task and the key; a probe that cannot run is an error too (ruling
+    /// 120: an unverifiable check must not leave the gate saying "go"). Null when no task needs probing.
+    /// </summary>
+    public static async Task<PreflightCheck?> ChunkKeyCheckAsync(SqlConnection src, SqlPlanPayload plan, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(src);
+        ArgumentNullException.ThrowIfNull(plan);
+        var probed = TransferEngine.PlanOrder(plan).Where(id => NeedsKeyProbe(plan.Tasks[id])).ToList();
+        if (probed.Count == 0) return null;
+        var repeated = new List<string>();
+        var failed = new List<string>();
+        foreach (var id in probed)
+        {
+            var task = plan.Tasks[id];
+            string keys = string.Join(", ", task.KeyColumns.Select(SqlQuote.Ident));
+            string sql = $"SELECT TOP (1) {keys}, COUNT_BIG(*) FROM (\n{task.SourceQuery.TrimEnd().TrimEnd(';')}\n) AS q "
+                         + $"GROUP BY {keys} HAVING COUNT_BIG(*) > 1";
+            try
+            {
+                await using var cmd = new SqlCommand(sql, src) { CommandTimeout = 300 };
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                if (!await r.ReadAsync(ct)) continue;
+                var values = task.KeyColumns.Select((k, i) => $"{k}={(r.IsDBNull(i) ? "NULL" : Convert.ToString(r.GetValue(i), CultureInfo.InvariantCulture))}");
+                long n = r.GetInt64(task.KeyColumns.Count);
+                repeated.Add($"{id} ({task.Target}): key {string.Join(", ", values)} appears {n.ToString("N0", CultureInfo.InvariantCulture)} times");
+            }
+            catch (Exception ex) when (ex is SqlException or InvalidOperationException or TimeoutException)
+            {
+                failed.Add($"{id} ({task.Target}): {Describe(ex)}");
+            }
+        }
+        if (repeated.Count > 0)
+            return Err("chunk_keys", "The chunk key repeats in the source query, so rows sharing a key at a chunk boundary would be skipped: "
+                                     + string.Join("; ", repeated) + ". Make the key unique (add the joined table's key to the task's key "
+                                     + "columns) or remove the join that repeats rows, in the SQL phase."
+                                     + (failed.Count > 0 ? " Could not be checked: " + string.Join("; ", failed) + "." : ""));
+        if (failed.Count > 0)
+            return NotRun("chunk_keys", "Not checked whether the chunk key is unique in the source query: " + string.Join("; ", failed)
+                                        + ". A repeated key would lose rows at chunk boundaries.", causeIsAlreadyAnError: false);
+        return Ok("chunk_keys", $"The chunk key is unique in the source query of {string.Join(", ", probed)} (not the generator's "
+                                + "single-table shape, so it was checked).");
+    }
+
     private static async Task<SqlConnection?> TryOpenAsync(string name, string? cs, List<PreflightCheck> checks, IReadOnlyList<string> secrets,
         CancellationToken ct)
     {
@@ -412,5 +543,5 @@ public static class Preflight
     /// catch a changed schema and never ran must not leave that bit saying "go".</para>
     /// </summary>
     private static PreflightCheck NotRun(string name, string detail, bool causeIsAlreadyAnError) =>
-        new(name, false, causeIsAlreadyAnError ? "warning" : "error", detail);
+        new(name, false, causeIsAlreadyAnError ? "warning" : "error", detail) { NotRun = true };
 }

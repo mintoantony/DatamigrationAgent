@@ -59,6 +59,28 @@ public sealed class ReportingTests
             FinalReportBuilder.Summary(report));
     }
 
+    /// <summary>Ruling 186 (open item 27): over a target that already held rows the counts balance rows added - a doubled keyless table
+    /// balances too - so the headline says what was compared instead of an unqualified "validated".</summary>
+    [Fact]
+    public void A_target_that_was_not_empty_before_the_run_is_named_in_the_headline_instead_of_validated()
+    {
+        var run = new TransferRunRow(1, 3, RunStatus.Completed, new TransferOptions { ErrorMode = "skip" }, T0, null, null);
+        var tasks = new List<TransferTaskRow>
+        {
+            Row("T01", "app.Customers", 1000, 1000, 0, new TaskValidation(true, 1000, 0, 0, 1000, [], "disabled"), 4),
+            Row("T02", "app.AuditEvents", 5000, 5000, 0, new TaskValidation(true, 5000, 0, 5000, 10000, [], "target table was not empty before the run"), 6)
+                with { RowsBefore = 5000 },
+        };
+
+        var report = FinalReportBuilder.Build(run, RunStatus.Completed, tasks, _ => [], T0.AddSeconds(10));
+        string headline = FinalReportBuilder.Summary(report);
+
+        Assert.True(headline == "Transferred 6,000 of 6,000 rows into 2 tables in 10s; target tables were not empty before this run; counts compare rows added.",
+            "headline over a target that already held rows: " + headline);
+        Assert.Contains(report.Notes, n => n.StartsWith("Target tables were not empty before this run: app.AuditEvents (5,000).", StringComparison.Ordinal));
+        Assert.DoesNotContain(report.Notes, n => n.Contains("Row counts validated", StringComparison.Ordinal));
+    }
+
     [Fact]
     public void Mismatches_are_called_out_in_notes_and_summary()
     {
@@ -467,6 +489,39 @@ public sealed class ReportingTests
         Assert.Equal("cannot connect as ***", Preflight.Scrubbed("cannot connect as hunter2xyz", ["hunter2xyz"]));
         Assert.Contains("removed", Preflight.Scrubbed("", []));
         Assert.False(string.IsNullOrWhiteSpace(Preflight.Scrubbed("   ", ["hunter2xyz"])));
+    }
+
+    /// <summary>
+    /// Ruling 139 (T5.6 fix round 1). A check the run could not carry out and a check that ran and found a fault are built apart here
+    /// - <c>NotRun(...)</c> against <c>Err(...)</c> - but nothing carried the difference to the screen, which guessed it from the
+    /// wording and got the engine's own <c>target_probe</c> error wrong. The flag is what the screen reads now, so it has to be set in
+    /// exactly one builder: on every check that did not run, and on no check that did.
+    /// </summary>
+    [Fact]
+    public async Task A_check_that_could_not_be_carried_out_is_flagged_and_a_check_that_failed_is_not()
+    {
+        using var svc = new XferServices();
+        var s = svc.Services;
+        s.Artifacts.Add(PhaseName.Sql, 1, Json.Serialize(new SqlPlanPayload
+        {
+            Order = ["T01"],
+            Tasks = { ["T01"] = new TaskPlan { Target = "app.A", SourceQuery = "SELECT 1 AS [X]", CountSql = "SELECT COUNT_BIG(*)" } },
+        }), "script", null);
+        s.Phases.SetCurrentVersion(PhaseName.Sql, 1);
+        s.Phases.SetApproved(PhaseName.Sql, 1, null);
+        // No connections saved: the two connection checks fail outright, and everything behind them cannot be carried out.
+
+        var result = await Preflight.RunAsync(s, new TransferOptions(), default);
+
+        Assert.False(Check(result, "source_connection").NotRun);          // it ran; it found no connection
+        Assert.False(Check(result, "target_connection").NotRun);
+        Assert.True(Check(result, "schema_drift").NotRun);                // these could not run at all
+        Assert.True(Check(result, "target_checks").NotRun);
+        Assert.True(Check(result, "estimated_rows").NotRun);
+        Assert.All(result.Checks.Where(c => c.Ok), c => Assert.False(c.NotRun));
+        // Always serialised, so the screen reads a false rather than inferring it from a key that is not there.
+        Assert.Contains("\"notRun\":true", Json.Serialize(Check(result, "target_checks")));
+        Assert.Contains("\"notRun\":false", Json.Serialize(Check(result, "source_connection")));
     }
 
     private static PreflightCheck Check(PreflightResult result, string name) => result.Checks.Single(c => c.Name == name);

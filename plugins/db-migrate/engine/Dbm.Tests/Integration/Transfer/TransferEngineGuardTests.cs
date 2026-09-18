@@ -157,12 +157,15 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
     }
 
     /// <summary>
-    /// Harm: a chunk in which every row fails the same way is a broken load, not N bad rows. Treated as rows to skip it would empty
-    /// a customer's table into error_row and report the run as "completed with 8 rejected", which reads like a data-quality finding
-    /// rather than the plan defect it is.
+    /// Ruling 147 (and 164, which moved this test): a chunk whose every row fails alike on a CHECK is N rejected rows, not a broken
+    /// load, because a constraint violation is the server's verdict on each row's values. Before 147 this test asserted the opposite -
+    /// that the task fails - and skip mode then failed real migrations over a chunk of genuinely bad rows (task 5.7, F1).
+    /// <para>What 147 gives up is recorded as open item 30, not fixed here: a CHECK that no source row can satisfy is really a plan
+    /// defect, and it now ends as a completed run with the whole table rejected. It is loud rather than silent - every row is in
+    /// error_row naming the constraint - but nothing yet calls the "everything rejected" task out as such.</para>
     /// </summary>
     [Fact]
-    public async Task A_chunk_whose_every_row_fails_alike_fails_the_task_even_in_skip_mode()
+    public async Task A_chunk_whose_every_row_breaks_one_check_completes_with_every_row_rejected()
     {
         await using var rig = await RigAsync(One(TaskOf("app.Uni",
             "SELECT s.[Id] AS [Id], s.[Qty] AS [Qty], s.[Id] AS [__k0] FROM [dbo].[Uni] AS s", ["__k0"],
@@ -171,11 +174,12 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
 
         var outcome = await rig.Engine.RunAsync(runId, new TransferControl(), default);
 
-        Assert.Equal(RunStatus.Failed, outcome.Status);
-        Assert.Equal(TransferTaskStatus.Failed, rig.Repo.Task(runId, "T01")!.Status);
-        Assert.Contains("CK_Uni_Qty", rig.Repo.Task(runId, "T01")!.Error);
+        Assert.True(outcome.Status == RunStatus.Completed, $"the run ended {outcome.Status}: {outcome.Error}");
+        Assert.Equal(TransferTaskStatus.Done, rig.Repo.Task(runId, "T01")!.Status);
         Assert.Equal(0, await rig.Tgt.CountAsync("app.Uni"));
-        Assert.Equal(0, rig.Repo.ErrorRowCount(runId, "T01"));
+        var rejected = rig.Repo.ErrorRows(runId, "T01", 100);
+        Assert.Equal(8, rejected.Count);                                               // every one of dbo.Uni's 8 source rows
+        Assert.All(rejected, e => Assert.Contains("CK_Uni_Qty", e.Error, StringComparison.Ordinal));
     }
 
     /// <summary>

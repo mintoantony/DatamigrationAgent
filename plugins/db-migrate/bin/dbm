@@ -1,13 +1,25 @@
 #!/bin/sh
 # db-migrate launcher (macOS, Linux, Git Bash on Windows).
-# Runs engine/dist/Dbm.dll with the installed .NET runtime; builds it once when missing (needs the .NET SDK).
-# Exit codes: 3 = runtime missing, 4 = engine not built / build failed; otherwise the engine's own exit code.
+# Runs engine/dist/Dbm.dll with the installed .NET runtime; builds it when missing, when DBM_REBUILD=1, or when
+# engine/dist/VERSION no longer matches plugin.json (needs the .NET SDK).
+# Exit codes: 3 = runtime missing, 4 = engine not built / build failed and there is no previous build to run;
+# otherwise the engine's own exit code.
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(dirname -- "$here")
+# Git Bash/MSYS: hand dotnet a Windows-form path (D:/...). A /d/... path reaches it only through MSYS's automatic
+# argument conversion, which MSYS_NO_PATHCONV=1 or MSYS2_ARG_CONV_EXCL turn off - dotnet then cannot find Dbm.dll.
+if command -v cygpath >/dev/null 2>&1; then root=$(cygpath -m "$root"); fi
 engine="$root/engine"
 dll="$engine/dist/Dbm.dll"
+manifest="$root/.claude-plugin/plugin.json"
+# One lock for every builder of engine/dist: both launchers and both engine/release.* scripts. It is a directory
+# holding an `owner` file; it counts as abandoned once the directory itself is older than lock_stale_minutes.
+lock="$engine/.build.lock"
+lock_owner="sh-$$"
+lock_stale_minutes=15
+failure=""
 
 install_help() {
   echo "Install the ASP.NET Core Runtime 8 (or later), then open a new terminal:" >&2
@@ -17,6 +29,97 @@ install_help() {
     MINGW* | MSYS* | CYGWIN*) echo "  Windows: winget install Microsoft.DotNet.AspNetCore.8" >&2 ;;
     *) echo "  See https://dotnet.microsoft.com/download/dotnet/8.0" >&2 ;;
   esac
+}
+
+plugin_version() {
+  sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" 2>/dev/null | head -n 1
+}
+
+dist_version() {
+  if [ -f "$engine/dist/VERSION" ]; then tr -d ' \r\n' < "$engine/dist/VERSION"; fi
+}
+
+# The publish output carries ~75 MB of native files db-migrate never loads: MSAL's WAM broker (SqlClient's Entra modes
+# use MSAL's managed/browser path, not the broker) and runtimes for platforms this plugin does not target. Removing
+# them keeps the committed engine/dist near 30 MB. Keep engine/release.* in sync with this list.
+prune_natives() {
+  target="$1/runtimes"
+  [ -d "$target" ] || return 0
+  for rid in browser browser-wasm maccatalyst-x64 maccatalyst-arm64 linux-armel linux-mips64 linux-ppc64le \
+    linux-s390x linux-musl-s390x linux-riscv64 linux-musl-riscv64 linux-x86; do
+    rm -rf "$target/$rid"
+  done
+  find "$target" -type f -name '*msalruntime*' -delete
+}
+
+# Why this is needed: the plugin ships a built engine/dist, so an update that changes plugin.json leaves a stale dist
+# behind in a checkout that has the SDK. Publishing into a per-process dist.tmp.<pid> and swapping keeps the old build
+# usable if anything fails (on Windows a running server keeps its DLLs locked, so the rename is the only safe way to
+# replace them). Returns 0 with the new build in place, or sets $failure and returns 1 with engine/dist as it was.
+build_engine() {
+  echo "dbm: building the engine ($reason, about a minute)..." >&2
+  if [ -f "$dll" ]; then dotnet "$dll" stop >/dev/null 2>&1 || true; fi
+  tmp="$engine/dist.tmp.$$"
+  old="$engine/dist.old.$$"
+  rm -rf "$tmp"
+  # Compile from scratch, as engine/release.* do: publish would otherwise reuse an earlier Release compile in obj/
+  # together with its PDB, and the build would differ from the committed one.
+  rm -rf "$engine/Dbm/obj/Release" "$engine/Dbm/bin/Release"
+  # -o reaches MSBuild as a property value, where ',' and ';' separate values (ruling 189): escape them, and '%' first.
+  # sed, not ${var//x/y}: that is bash-only and dies with "Bad substitution" where /bin/sh is dash (Debian, Ubuntu).
+  tmp_arg=$(printf '%s' "$tmp" | sed 's/%/%25/g; s/,/%2C/g; s/;/%3B/g')
+  if ! dotnet publish "$engine/Dbm/Dbm.csproj" -c Release -o "$tmp_arg" --nologo -v q \
+      "-p:Version=${version:-0.0.0}" -p:DebugType=none -p:UseAppHost=false >&2; then
+    rm -rf "$tmp"
+    failure="engine build failed (see the messages above)"
+    return 1
+  fi
+  if ! { prune_natives "$tmp" && printf '%s' "${version:-0.0.0}" > "$tmp/VERSION"; }; then
+    rm -rf "$tmp"
+    failure="engine build could not be finished (pruning or writing VERSION failed)"
+    return 1
+  fi
+  if [ -d "$engine/dist" ] && ! mv "$engine/dist" "$old" 2>/dev/null; then
+    rm -rf "$tmp"
+    failure="engine/dist is in use by a running dbm server - run 'dbm stop' in that project folder to let the update through"
+    return 1
+  fi
+  # The old build is already out of the way here, so a failing swap must put it back (the twin of dbm.cmd's
+  # :build_no_swap). The message claims it is back only when the move-back actually worked.
+  if ! mv "$tmp" "$engine/dist" 2>/dev/null; then
+    rm -rf "$tmp"
+    if [ -d "$old" ] && ! mv "$old" "$engine/dist" 2>/dev/null; then
+      failure="engine/dist could not be replaced, and the previous build could not be put back: it is in $old - rename it to dist"
+    else
+      failure="engine/dist could not be replaced"
+    fi
+    return 1
+  fi
+  rm -rf "$old" 2>/dev/null || true
+  return 0
+}
+
+# Staleness is judged by the lock's own age, never by how long this process has waited: a build that runs longer
+# than the wait must keep its lock. Only a lock whose owner file names this process is ever released by it.
+acquire_lock() {
+  announced=0
+  while ! mkdir "$lock" 2>/dev/null; do
+    if [ "$announced" = 0 ]; then
+      echo "dbm: waiting for another engine build to finish (engine/.build.lock)..." >&2
+      announced=1
+    fi
+    if [ -n "$(find "$lock" -maxdepth 0 -mmin +"$lock_stale_minutes" 2>/dev/null)" ]; then
+      echo "dbm: removing engine/.build.lock, older than $lock_stale_minutes minutes (a build that crashed)." >&2
+      rm -rf "$lock"
+      continue
+    fi
+    sleep 1
+  done
+  printf '%s' "$lock_owner" > "$lock/owner"
+}
+
+release_lock() {
+  if [ "$(cat "$lock/owner" 2>/dev/null || true)" = "$lock_owner" ]; then rm -rf "$lock"; fi
 }
 
 if ! command -v dotnet >/dev/null 2>&1; then
@@ -39,18 +142,42 @@ if [ "${1:-}" = "doctor" ]; then
   done
 fi
 
-if [ ! -f "$dll" ] || [ "${DBM_REBUILD:-}" = "1" ]; then
+version=$(plugin_version)
+installed=$(dist_version)
+reason=""
+if [ ! -f "$dll" ]; then
+  reason="engine/dist is missing"
+elif [ "${DBM_REBUILD:-}" = "1" ]; then
+  reason="rebuild requested"
+elif [ -n "$version" ] && [ "$installed" != "$version" ]; then
+  reason="engine/dist ${installed:-without VERSION} differs from plugin.json $version"
+fi
+
+if [ -n "$reason" ]; then
   if dotnet --list-sdks 2>/dev/null | grep -q .; then
-    echo "dbm: building the engine (first run, about a minute)..." >&2
-    if ! dotnet publish "$engine/Dbm/Dbm.csproj" -c Release -o "$engine/dist" --nologo -v q >&2; then
-      echo "dbm: engine build failed (see the messages above)." >&2
-      exit 4
+    acquire_lock
+    trap 'release_lock' EXIT
+    trap 'exit 130' INT TERM
+    installed=$(dist_version)   # another launcher may have built it while we waited for the lock
+    if [ ! -f "$dll" ] || [ "${DBM_REBUILD:-}" = "1" ] || { [ -n "$version" ] && [ "$installed" != "$version" ]; }; then
+      if ! build_engine; then
+        if [ ! -f "$dll" ]; then
+          echo "dbm: $failure." >&2
+          exit 4
+        fi
+        # A failed rebuild must not take away the build that still works; it is retried on the next command.
+        previous=$(dist_version)
+        echo "dbm: warning: $failure; running the previous engine/dist ${previous:-without VERSION} instead." >&2
+      fi
     fi
-  else
+    release_lock
+    trap - EXIT INT TERM
+  elif [ ! -f "$dll" ]; then
     echo "dbm: engine not built ($dll is missing) and no .NET SDK is installed to build it." >&2
     echo "     Install the .NET 8 SDK or use a release of the plugin that ships engine/dist." >&2
     exit 4
   fi
+  # A stale dist without an SDK still runs; `dbm doctor` reports the mismatch.
 fi
 
 exec dotnet "$dll" "$@"

@@ -47,10 +47,29 @@ public static class StateView
                 ["tgt"] = Connection(s, Side.Tgt),
             },
             ["drift"] = new JsonObject { ["src"] = false, ["tgt"] = false },
-            ["transfer"] = null,
+            ["transfer"] = Transfer(s),
         };
         foreach (var extend in Extenders) extend(state, view);
         return view;
+    }
+
+    /// <summary>
+    /// Ruling 185: what the review and setup screens need to offer Reopen, Re-run discovery and Edit after a run - the latest run's id
+    /// and status, and <c>changesLocked</c>, the sentence that says why the plan cannot change now (absent when it can). The screens
+    /// route a failed run through the server, which cancels it first, so a failed run does not lock them.
+    /// </summary>
+    private static JsonObject Transfer(DbmServices s)
+    {
+        var run = s.Db.Query("SELECT id, status FROM transfer_run ORDER BY id DESC LIMIT 1",
+            r => (Id: r.GetInt64(0), Status: r.GetString(1))).Select(r => ((long, string)?)r).FirstOrDefault();
+        var o = new JsonObject();
+        if (run is { } latest)
+        {
+            o["runId"] = latest.Item1;
+            o["runStatus"] = latest.Item2;
+        }
+        if (s.Workflow.UpstreamLock(failedRunWillBeCancelled: true) is { } locked) o["changesLocked"] = locked;
+        return o;
     }
 
     private static JsonObject Connection(DbmServices s, Side side)

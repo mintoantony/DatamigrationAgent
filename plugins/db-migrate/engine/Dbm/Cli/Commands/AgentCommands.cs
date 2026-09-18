@@ -21,6 +21,9 @@ public sealed class NextCommand : ICommand
         await ServerControl.EnsureRunningAsync(ws);
         using var services = ctx.OpenServices(ws);
         services.Project.TouchAgent();
+        // Ruling 183: a run that completed while the workflow was never told (a crash in that window, or a finisher that threw) is
+        // finished here, so the orchestrator is not left answering "await/transfer" for a transfer that has ended.
+        Dbm.Core.Transfer.RunFinisher.Reconcile(services);
         return Output.Ok(ctx, services.Workflow.Next());
     }
 }
@@ -130,6 +133,8 @@ public sealed class ArtifactCommand : ICommand
         var payload = JsonNode.Parse(artifact.PayloadJson)!;
 
         var pointer = args.Opt("path");
+        // Git Bash rewrites an argument that starts with '/' into a Windows path, so the playbooks drop the slash.
+        if (pointer is not null && !pointer.StartsWith('/')) pointer = "/" + pointer;
         if (pointer is null)
             return Task.FromResult(Output.Ok(ctx, new { phase, version, author = artifact.Author, summary = artifact.Summary, payload }));
 

@@ -61,8 +61,9 @@ public static class CoreEndpoints
         api.MapPost("/connections/{side}", async (string side, HttpContext http) =>
         {
             var which = ParseSide(side);
-            if (s.Phases.Get(PhaseName.Transfer).Status != PhaseStatus.Pending)
-                return ApiResults.Error(StatusCodes.Status409Conflict, "locked", "Connections cannot change after the transfer has started.");
+            // Ruling 185: the same rule as reopen - before the first run, or after a completed, cancelled or failed one.
+            if (s.Workflow.UpstreamLock(failedRunWillBeCancelled: true) is { } locked)
+                return ApiResults.Error(StatusCodes.Status409Conflict, "locked", "The connections cannot change: " + locked);
             var cs = await ReadConnectionStringAsync(http);
             ServerMeta meta;
             try
@@ -73,6 +74,8 @@ public static class CoreEndpoints
             {
                 return ApiResults.Error(StatusCodes.Status400BadRequest, "connection_failed", Redactor.Scrub(ex.Message, Redactor.SecretsOf(cs)));
             }
+            // Before the save: a failed run's PostSql has to run against the target it loaded into, not the new one.
+            await CancelFailedRunAsync(state, $"the {(which == Side.Src ? "source" : "target")} connection was changed", http.RequestAborted);
             s.Connections.Save(which, cs, meta);
             s.Sink.Publish("state_changed", new { phase = PhaseName.Setup, status = s.Phases.Get(PhaseName.Setup).Status });
             s.Workflow.OnConnectionsSaved();
@@ -145,9 +148,15 @@ public static class CoreEndpoints
             }
         });
 
-        api.MapPost("/phase/{phase}/reopen", (string phase) =>
+        // Ruling 185: allowed before the first run and after a completed, cancelled or failed one. A failed run is cancelled first -
+        // through Cancel's own door, so the plan's PostSql restores what its PreSql disabled - and only once the reopen itself is known
+        // to be allowed, so a refused reopen never costs the operator their failed run.
+        api.MapPost("/phase/{phase}/reopen", async (string phase, CancellationToken ct) =>
         {
-            s.Workflow.Reopen(ParsePhase(phase));
+            var p = ParsePhase(phase);
+            if (s.Workflow.WhyNotReopen(p, failedRunWillBeCancelled: true) is { } why) throw new WorkflowException(why);
+            await CancelFailedRunAsync(state, $"{p.Text()} was reopened", ct);
+            s.Workflow.Reopen(p);
             return ApiResults.Ok();
         });
 
@@ -290,6 +299,21 @@ public static class CoreEndpoints
 
     private static object View(ArtifactRow a) =>
         new { version = a.Version, author = a.Author, summary = a.Summary, createdAt = a.CreatedAt, payload = JsonNode.Parse(a.PayloadJson) };
+
+    /// <summary>Ruling 185: a failed latest run is cancelled (PostSql and all) before an upstream change; a no-op otherwise. A refusal
+    /// keeps its own code as a 409.</summary>
+    internal static async Task CancelFailedRunAsync(WebState state, string why, CancellationToken ct)
+    {
+        if (state.Transfer is not { } transfer) return;
+        try
+        {
+            await transfer.CancelFailedRunAsync(why, ct);
+        }
+        catch (Dbm.Core.Transfer.TransferException ex)
+        {
+            throw new ApiException(StatusCodes.Status409Conflict, ex.Code, ex.Message);
+        }
+    }
 
     private static PhaseName ParsePhase(string text) =>
         Phases.TryParse(text, out var p) ? p : throw new ApiException(StatusCodes.Status404NotFound, "unknown_phase", $"Unknown phase '{text}'.");

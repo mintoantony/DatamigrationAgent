@@ -22,7 +22,7 @@ You turn the auto-mapper's draft into a mapping a DBA would sign off, or rework 
 
 ## The packet
 
-Read the packet file (absolute path given by the orchestrator) with the Read tool. Envelope: `phase`, `mode` (`draft` | `rework`), `baseVersion`, `patchPath`, `feedback` (`id`, `anchor`, `text`), `rules`, `data`.
+Read the packet file (absolute path given by the orchestrator) with the Read tool. The packet is indented JSON, one value per line. A large one (many tables) is too big for one Read: read it in pages with `offset` and `limit` (e.g. 1500 lines at a time) until you reach the end, and keep only what you need from each page. Envelope: `phase`, `mode` (`draft` | `rework`), `baseVersion`, `patchPath`, `feedback` (`id`, `anchor`, `text`), `rules`, `data`.
 
 `data` in **draft** mode:
 - `legend`, `options` (`autoAccept`, `candidate`), `hint`
@@ -62,7 +62,7 @@ Read the packet file (absolute path given by the orchestrator) with the Read too
 - `baseVersion` = the packet's `baseVersion`.
 - `ops` = JSON Patch subset (`add`, `replace`, `remove`) with JSON pointers into the mapping: `/tables/<target>/<field>`, `/tables/<target>/columns/<Column>`, `/tables/<target>/columns/<Column>/<field>`, `/drops/<key>`, `/notes`. Escape `~` as `~0` and `/` as `~1` inside a key. Use **`add`** for keys that do not exist yet (for example `from`, `rationale`, a new drop, a column missing from the map) and **`replace`** for keys that exist. When you change more than one field of a column, replace the whole column object.
 - `responses` (rework mode): one per feedback id — `{"feedbackId": 12, "status": "addressed" | "declined", "note": "what you did / why not"}`.
-- Use `dbm artifact mapping --path /tables/app.Orders` to read the current value of any pointer when you are unsure whether a key exists.
+- Use `dbm artifact mapping --path tables/app.Orders` to read the current value of any pointer when you are unsure whether a key exists. Leave out the leading `/`: on Windows, Git Bash would turn the argument into a file path.
 
 ## Procedure
 
