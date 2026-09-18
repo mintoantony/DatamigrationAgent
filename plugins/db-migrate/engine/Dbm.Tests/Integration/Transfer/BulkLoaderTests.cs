@@ -498,8 +498,16 @@ public sealed class BulkLoaderTests
         Assert.NotEqual(0, (int)(await probe.ExecuteScalarAsync())!);
     }
 
+    /// <summary>
+    /// Ruling 147, over a real server: a chunk of nothing but FK orphans is N rejected rows, not a broken load. The exception chain is
+    /// what decides it, and this is the only test that drives the real one - measured on SQL Server 2025, an FK conflict out of
+    /// SqlBulkCopy is a <c>SqlException</c> whose <c>Errors</c> hold 547 (class 16) followed by the informational 3621 (class 0),
+    /// "The statement has been terminated.".
+    /// <para><b>Harm:</b> with the whole chunk failed instead, skip mode is not skip mode - on the C15 sample pair the two orphan order
+    /// lines are the last two rows of the table, so at ChunkSize 500 they are a chunk of their own and the migration failed.</para>
+    /// </summary>
     [Fact]
-    public async Task A_chunk_whose_every_row_fails_with_the_same_error_fails_the_task_instead_of_rejecting_every_row()
+    public async Task A_chunk_of_nothing_but_constraint_violations_is_rejected_rows_not_a_broken_load()
     {
         var (db, conn) = await OpenAsync();
         await using var dbScope = db;
@@ -509,13 +517,43 @@ public sealed class BulkLoaderTests
         TransferException? failure = null;
         await using (var scope = await TxScope.BeginAsync(conn, default))
         {
-            try { outcome = await loader.LoadAsync(scope, Rows(8, (i, v) => v[1] = 99), true, null, default); }
+            try { outcome = await loader.LoadAsync(scope, Rows(2, (i, v) => v[1] = 99), true, null, default); }
             catch (TransferException ex) { failure = ex; }
+            await scope.RollbackAsync();
+        }
+        Assert.True(failure is null, $"two orphan rows failed the task: {failure?.Code} {failure?.Message}");
+        Assert.Equal(2, outcome!.Failed.Count);
+        Assert.Equal(0, outcome.Loaded);
+        Assert.All(outcome.Failed, f => Assert.Contains("FK_C_P", f.Error, StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The other side of ruling 147, with the same two rows: what is not a constraint violation still fails the task. A binding to a
+    /// target column that does not exist is refused by SqlBulkCopy itself, as an InvalidOperationException with no SqlError at all, so
+    /// it carries no row-fault verdict and H2 keeps it. (No shape is given to this loader, so CheckBindings cannot catch it first -
+    /// which is exactly the case H2 was built for.)
+    /// </summary>
+    [Fact]
+    public async Task A_chunk_that_fails_alike_on_a_plan_defect_still_fails_the_task()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        var task = TaskFor();
+        task.Columns = [new("Id", "id"), new("Pid", "pid"), new("Qty", "qty"), new("Note", "nonexistent_col")];
+        var loader = new BulkLoader(task, new TransferOptions { ErrorMode = "skip" });
+        ChunkOutcome? outcome = null;
+        TransferException? failure = null;
+        await using (var scope = await TxScope.BeginAsync(conn, default))
+        {
+            try { outcome = await loader.LoadAsync(scope, Rows(2, (i, v) => v[1] = 99), true, null, default); }
+            catch (TransferException ex) { failure = ex; }
+            await scope.RollbackAsync();
         }
         // Harm: a customer's whole table shredded into error rows and the run reported as "completed with N rejected".
-        Assert.True(outcome is null, $"every row failed for the same reason, and the chunk still reported {outcome?.Failed.Count} rejected rows");
+        Assert.True(outcome is null, $"a plan defect was reported as {outcome?.Failed.Count} rejected rows");
         Assert.Equal("bad_task", failure?.Code);
-        Assert.Contains("FK_C_P", failure!.Message, StringComparison.Ordinal);
+        Assert.Contains("nonexistent_col", failure!.Message, StringComparison.Ordinal);
     }
 
     [Fact]
