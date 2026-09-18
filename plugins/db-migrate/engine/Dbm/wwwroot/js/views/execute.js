@@ -396,13 +396,15 @@
     }
     if (run.status === 'completed') {
       const notes = run.notes && run.notes.length;
+      // Open item 32: the step is named as the stepper labels it, so the two can never disagree again.
+      const report = DBM.phaseTitle ? DBM.phaseTitle('complete') : 'Report';
       return h('div', { class: 'exe-banner ' + (notes ? 'is-warn' : 'is-ok'), role: 'status' },
         h('strong', {}, notes ? 'Transfer completed, with notes. ' : 'Transfer completed. '),
         notes ? 'Read the notes below before you treat this run as clean.'
-          : 'Validation finished — open Report in the stepper for the final report.',
+          : 'Validation finished — open ' + report + ' in the stepper for the final report.',
         // Ruling 185: the way to another run is through the plan.
         h('div', { class: 'small muted' }, 'To run again with a changed plan, reopen Analysis, Mapping or SQL; once SQL is approved '
-          + 'again, Execute starts a new run and this run’s report stays on the Report screen.'));
+          + 'again, Execute starts a new run and this run’s report stays on the ' + report + ' screen.'));
     }
     if (run.status === 'failed') {
       const failed = d.tasks.filter(function (t) { return t.status === 'failed'; });

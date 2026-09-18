@@ -461,3 +461,15 @@ test('the cancelled banner says what a new run does and how to avoid duplicates 
   assert.ok(/cannot be resumed/.test(banner) && /Truncate target first/.test(banner) && /rows twice/.test(banner),
     'the cancelled banner still invites a plain new run: ' + banner);
 });
+
+/* Open item 32: the completed-run banner sends the operator to the stepper step by the name the stepper shows. */
+test('the completed-run banner names the final-report step exactly as the stepper labels it', async () => {
+  const m = await mount(runningView({
+    active: false, canStart: false,
+    run: Object.assign({}, runningView().run, { status: 'completed', endedAt: '2026-09-17T09:12:30+00:00', notes: [] }),
+  }));
+  const banner = D.text(D.query(m.root, '.exe-banner'));
+  const label = globalThis.DBM.phaseTitle('complete');
+  assert.ok(banner.includes('open ' + label + ' in the stepper') && banner.includes('on the ' + label + ' screen'),
+    'the banner must point at the stepper step "' + label + '" (the label the stepper shows), but it says: ' + banner);
+});
