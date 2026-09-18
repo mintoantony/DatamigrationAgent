@@ -8,8 +8,9 @@
  * visible to a test instead of only to a screen reader. Keep it minimal, and keep the browser pass: a stub that drifts from real
  * DOM semantics passes a test the browser would fail.
  *
- * mapping-edits.test.cjs (T3.5) carries its own private fake DOM. It is not touched here: sharing one would mean editing another
- * task's 690-line test file after review, for no coverage this round needs.
+ * Open item 25: this is the suite's one DOM stub. mapping-edits.test.cjs (T3.5) used to carry a private fake DOM of its own, whose
+ * classList did nothing and whose `disabled` never followed the attribute; it now installs this one. A third stub is how fidelity
+ * drifts - extend this file instead.
  */
 
 /** Boolean content attributes whose IDL property the browser keeps in step with the attribute. */
@@ -154,6 +155,8 @@ function install() {
   globalThis.location = { hash: '', search: '' };
   globalThis.history = { replaceState() {} };
   globalThis.addEventListener = () => {};
+  globalThis.scrollY = 0;
+  globalThis.scrollTo = () => {};
   globalThis.requestAnimationFrame = (fn) => frames.push(fn);
   globalThis.cancelAnimationFrame = () => {};
   if (!globalThis.localStorage) {
