@@ -96,27 +96,51 @@ exit /b 0
 
 rem Staleness is judged by the lock's own age, never by how long this process has waited: a build that runs longer
 rem than the wait must keep its lock. Only a lock whose owner file names this process is ever released by it.
+rem When the lock's age cannot be read (powershell missing, or blocked by AppLocker/WDAC), the waiter falls back to its
+rem own count, so an abandoned lock is still broken eventually: after DBM_LOCK_STALE_MINUTES x 60 one-second waits.
 :acquire_lock
 set "DBM_ANNOUNCED="
+set /a DBM_WAITED=0
+set /a DBM_WAIT_LIMIT=DBM_LOCK_STALE_MINUTES*60
 :acquire_lock_loop
 mkdir "%DBM_LOCK%" 2>nul && goto acquire_lock_owned
 if not defined DBM_ANNOUNCED >&2 echo dbm: waiting for another engine build to finish - engine\.build.lock...
 set "DBM_ANNOUNCED=1"
-call :lock_is_stale && goto acquire_lock_break
+call :lock_is_stale
+if errorlevel 2 goto acquire_lock_age_unknown
+if not errorlevel 1 goto acquire_lock_break
+goto acquire_lock_sleep
+:acquire_lock_age_unknown
+if %DBM_WAITED% GEQ %DBM_WAIT_LIMIT% goto acquire_lock_break_by_wait
+:acquire_lock_sleep
+set /a DBM_WAITED+=1
+set /a DBM_WAIT_MOD=DBM_WAITED %% 60
+if %DBM_WAIT_MOD% EQU 0 >&2 echo dbm: still waiting for engine\.build.lock - at least %DBM_WAITED% s so far...
 ping -n 2 127.0.0.1 >nul
 goto acquire_lock_loop
 :acquire_lock_break
 >&2 echo dbm: removing engine\.build.lock, older than %DBM_LOCK_STALE_MINUTES% minutes - a build that crashed.
 rd /s /q "%DBM_LOCK%" 2>nul
 goto acquire_lock_loop
+:acquire_lock_break_by_wait
+>&2 echo dbm: removing engine\.build.lock after waiting %DBM_LOCK_STALE_MINUTES% minutes - its age cannot be read because powershell did not run.
+rd /s /q "%DBM_LOCK%" 2>nul
+set /a DBM_WAITED=0
+goto acquire_lock_loop
 :acquire_lock_owned
 >"%DBM_LOCK%\owner" <nul set /p "=%DBM_LOCK_OWNER%"
 exit /b 0
 
-rem Exit 0 when the lock directory is at least DBM_LOCK_STALE_MINUTES old; cmd has no minute-level file age of its own.
+rem Exit 0 = the lock directory is at least DBM_LOCK_STALE_MINUTES old, 1 = it is younger (or already gone),
+rem 2 = cannot tell. cmd has no minute-level file age of its own, so this asks powershell, whose "younger" answer is a
+rem distinctive 3: a powershell that cannot start - 9009 when missing, 1 or another code when blocked - is never
+rem mistaken for "younger".
 :lock_is_stale
-powershell -NoProfile -NonInteractive -Command "try { $age = ((Get-Date) - (Get-Item -LiteralPath $env:DBM_LOCK -Force -ErrorAction Stop).LastWriteTime).TotalMinutes; if ($age -ge [double]$env:DBM_LOCK_STALE_MINUTES) { exit 0 } } catch { }; exit 1" >nul 2>nul
-exit /b %ERRORLEVEL%
+powershell -NoProfile -NonInteractive -Command "try { $age = ((Get-Date) - (Get-Item -LiteralPath $env:DBM_LOCK -Force -ErrorAction Stop).LastWriteTime).TotalMinutes; if ($age -ge [double]$env:DBM_LOCK_STALE_MINUTES) { exit 0 } } catch { }; exit 3" >nul 2>nul
+set "DBM_PS_EXIT=%ERRORLEVEL%"
+if "%DBM_PS_EXIT%"=="0" exit /b 0
+if "%DBM_PS_EXIT%"=="3" exit /b 1
+exit /b 2
 
 :release_lock
 set "DBM_LOCK_HOLDER="
