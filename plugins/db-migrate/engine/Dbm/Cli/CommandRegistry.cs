@@ -37,6 +37,7 @@ public static class CommandRegistry
         new TransferStatusCommand(),  // T5.5
         new DemoCommand(),            // T6.1
         new ExportCommand(),          // T6.1
+        new ConfigSampleValuesCommand(),   // sweep, ruling 196
         // Later milestones append their commands below this line.
     ];
 }

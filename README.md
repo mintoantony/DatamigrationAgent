@@ -206,6 +206,7 @@ unless noted: exit code 0 on success, and 1 with `{"error":"<code>","message":"â
 | `dbm status` | Project, phase, status, next action, UI URL |
 | `dbm next` / `dbm await [--timeout s]` | The orchestrator's next action; block until it changes (`0` = no timeout, the default) |
 | `dbm pause` / `dbm resume` | Pause or resume agent work |
+| `dbm config sample-values [on\|off]` | Show or switch whether the column profiles Claude reads include sample values (see Security) |
 | `dbm discover [--inline]` | Extract and profile both catalogs, rebuild the vector index |
 | `dbm search <query> [--side src\|tgt] [--kind table\|column] [-k n] [--json]` | Vector search over both catalogs (text output unless `--json`) |
 | `dbm show <schema.table[.column]\|F001> [--side src\|tgt] [--json]` | Compact view of a table, column or finding |
@@ -231,8 +232,12 @@ unless noted: exit code 0 on success, and 1 with `{"error":"<code>","message":"â
   which prints them with any password replaced by `***`) or anything sent to Claude. The one way a secret could reach
   the chat is you typing it there â€” so never do, not even for the demo.
 - **What Claude sees:** schema metadata (names, types, keys, row counts, sizes), column profiles (null share, distinct
-  ratio, lengths, value patterns and a few sample values while the project's `SampleValues` setting is on, which is the
-  default; v1 has no switch for it in the UI), rule findings, the mapping, the SQL plan and your feedback.
+  ratio, lengths, value patterns and a few sample values while the project's sample-values setting is on, which is the
+  default), rule findings, the mapping, the SQL plan and your feedback. Switch sample values off under **Privacy** on the
+  Setup screen or with `dbm config sample-values off`: the sample values and text min/max already collected are removed
+  from the project, so no work packet and no `dbm show` carries any, and later discoveries collect none. Claude still sees
+  the statistics and patterns, so its analysis and mapping suggestions may be less precise. Switching it back on takes
+  effect at the next discovery (**Re-run discovery**).
 - **What Claude never sees:** credentials, connection strings or bulk row data. The transfer streams source â†’ target
   inside the local engine; Claude is not in the data path.
 - **Rejected rows** are stored in `<project>/.dbmigrate/state.db` for the final report, so treat the project folder like

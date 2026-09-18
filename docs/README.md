@@ -53,11 +53,16 @@ started; after that the connections are locked.
 - A certificate error on Test: add `TrustServerCertificate=True` for test servers, or install the server's CA certificate.
 - Entra ID: for example `Authentication=Active Directory Default` (uses your `az login` or IDE sign-in) or
   `Active Directory Interactive`, which opens a sign-in window on this machine.
+- **Privacy — Send sample values to Claude** (on by default). On, the column profiles Claude reads include up to 3 real
+  values per text column and its min/max. Off, the values already collected are removed from the project and discovery
+  collects none, so nothing Claude reads carries a sample value; it still sees null shares, distinct counts, lengths and
+  value patterns, and its analysis and mapping suggestions may be less precise. Turning it back on takes effect at the
+  next discovery (**Re-run discovery** on Analysis). The same switch: `dbm config sample-values on|off`.
 
 ## Discovery
 
 Runs by itself: extracts both catalogs, profiles the columns (null share, distinct values, lengths, value patterns,
-sample values), builds the search index and records a schema fingerprint per database. Nothing to do; large databases
+sample values unless you switched them off in Setup), builds the search index and records a schema fingerprint per database. Nothing to do; large databases
 take a few minutes. On failure the error is shown with a **Retry** button — fix the cause first (usually permissions).
 
 ## Analysis

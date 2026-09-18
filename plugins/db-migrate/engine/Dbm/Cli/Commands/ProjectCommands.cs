@@ -68,6 +68,40 @@ public sealed class PauseCommand : ICommand
     }
 }
 
+/// <summary>`dbm config sample-values [on|off]` - Ruling 196: show or switch whether the profiles Claude reads carry sample
+/// values (the Setup screen has the same switch).</summary>
+public sealed class ConfigSampleValuesCommand : ICommand
+{
+    public string Name => "config sample-values";
+    public string Help => "Show or switch whether column profiles sent to Claude include sample values: config sample-values [on|off]";
+
+    public Task<int> RunAsync(Args args, CliContext ctx)
+    {
+        const string usage = "usage: dbm config sample-values [on|off]";
+        bool? on = args.Positionals.FirstOrDefault() switch
+        {
+            null => null,
+            "on" => true,
+            "off" => false,
+            _ => throw new CliFailure("usage", usage),
+        };
+        if (args.Positionals.Count > 1) throw new CliFailure("usage", usage);
+        using var services = ctx.OpenProject();
+        if (on is not bool value)
+        {
+            var current = services.Project.GetSettings().SampleValues;
+            return Task.FromResult(Output.Ok(ctx, new
+            {
+                sampleValues = current,
+                note = current ? SampleValuesSetting.OnNote : SampleValuesSetting.OffNote,
+            }));
+        }
+        var change = SampleValuesSetting.Set(services, value);
+        services.Sink.Publish("state_changed", new { phase = PhaseName.Setup, status = services.Phases.Get(PhaseName.Setup).Status });
+        return Task.FromResult(Output.Ok(ctx, change));
+    }
+}
+
 /// <summary>`dbm resume`.</summary>
 public sealed class ResumeCommand : ICommand
 {

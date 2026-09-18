@@ -22,6 +22,7 @@ public static class CoreEndpoints
     private sealed record ConnectionBody(string? ConnectionString);
     private sealed record FeedbackBody(string? Anchor, string? Text);
     private sealed record ApproveBody(int? Version);
+    private sealed record SettingsBody(bool? SampleValues);
 
     public static void Map(IEndpointRouteBuilder app, WebState state)
     {
@@ -81,6 +82,17 @@ public static class CoreEndpoints
             s.Sink.Publish("state_changed", new { phase = PhaseName.Setup, status = s.Phases.Get(PhaseName.Setup).Status });
             s.Workflow.OnConnectionsSaved();
             return ApiResults.Json(new { ok = true, meta });
+        });
+
+        // Ruling 196 (open item 33): the Setup screen's sample-values switch, {"sampleValues": true|false}.
+        api.MapPost("/settings", async (HttpContext http) =>
+        {
+            var body = await ApiResults.ReadAsync<SettingsBody>(http.Request);
+            if (body.SampleValues is not bool on)
+                throw new ApiException(StatusCodes.Status400BadRequest, "bad_request", "sampleValues (true or false) is required.");
+            var change = SampleValuesSetting.Set(s, on);
+            s.Sink.Publish("state_changed", new { phase = PhaseName.Setup, status = s.Phases.Get(PhaseName.Setup).Status });
+            return ApiResults.Json(change);
         });
 
         api.MapGet("/artifact/{phase}", (string phase) =>

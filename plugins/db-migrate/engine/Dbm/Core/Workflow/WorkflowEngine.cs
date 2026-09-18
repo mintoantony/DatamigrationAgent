@@ -199,6 +199,8 @@ public sealed class WorkflowEngine(DbmServices services)
 
         if (phase == PhaseName.Discovery)
         {
+            // Ruling 196: a discovery that started while sample values were on may finish after they were switched off.
+            if (!services.Project.GetSettings().SampleValues) SampleValuesSetting.Scrub(services);
             var version = row.CurrentVersion ?? 0;
             if (draftPayload is not null) version = StoreArtifact(phase, draftPayload, "script", summary);
             services.Phases.SetApproved(phase, version, CatalogFingerprint());

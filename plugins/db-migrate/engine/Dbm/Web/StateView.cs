@@ -22,6 +22,7 @@ public static class StateView
                 ["name"] = project.Name,
                 ["paused"] = project.Paused,
                 ["agentOnline"] = state.Presence.Online,
+                ["sampleValues"] = s.Project.GetSettings().SampleValues,   // Ruling 196: the Setup screen's switch
             },
             ["phases"] = Json.ToNode(s.Phases.All().Select(p => new
             {
