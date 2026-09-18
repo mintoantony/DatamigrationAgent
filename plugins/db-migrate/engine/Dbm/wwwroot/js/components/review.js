@@ -9,6 +9,22 @@
   var drawerState = null;      // {kind: 'feedback'|'history', anchor, label, text, from, to}
   var payloadCache = {};       // "phase:version" → payload
 
+  /**
+   * THIRD copy of the sql:<taskId>:<line> grammar (open item 9, Ruling 203), after C# SqlModule.ParseAnchor and DBM.sqlView.parseAnchor.
+   * It cannot delegate to the view's parser: an analysis or mapping export ships this file without views/sql.js. So it is held to
+   * the same shared fixture (Dbm.Tests/js/fixtures/task-listing.json, anchor-label.test.cjs). Split on the LAST ':', non-empty task id
+   * (it may contain ':'), line = plain ASCII digits whose value is 1..2147483647. → {task, line} or null.
+   */
+  function sqlAnchor(anchor) {
+    if (anchor.indexOf('sql:') !== 0) return null;
+    var rest = anchor.slice(4);
+    var colon = rest.lastIndexOf(':');
+    var digits = rest.slice(colon + 1);
+    if (colon <= 0 || !/^[0-9]+$/.test(digits)) return null;
+    var line = Number(digits);
+    return line >= 1 && line <= 2147483647 ? { task: rest.slice(0, colon), line: line } : null;
+  }
+
   /** Human label for a feedback anchor (C5 anchor grammar). */
   DBM.anchorLabel = function (anchor, fallback) {
     if (!anchor) return fallback || 'General';
@@ -21,7 +37,7 @@
     if ((m = /^tablemap:(.+)$/.exec(anchor))) return 'Mapping of ' + m[1];
     if ((m = /^colmap:(.+)$/.exec(anchor))) return 'Column mapping ' + m[1];
     if ((m = /^task:(.+)$/.exec(anchor))) return 'Task ' + m[1];
-    if ((m = /^sql:([^:]+):(\d+)$/.exec(anchor))) return 'Task ' + m[1] + ', line ' + m[2];
+    if ((m = sqlAnchor(anchor))) return 'Task ' + m.task + ', line ' + m.line;
     return fallback || anchor;
   };
 

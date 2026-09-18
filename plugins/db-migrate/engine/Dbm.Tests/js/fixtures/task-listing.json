@@ -1,5 +1,5 @@
 {
-  "about": "Shared by Unit/SqlGen/TaskListingMirrorTests.cs (C# TaskListing.Build, SqlModule.ParseAnchor) and js/sql-view.test.cjs (DBM.sqlView.listing, parseAnchor). Each side asserts the SAME expected values, so a drift in either implementation fails that side's suite. Add a case here, never to one side only. The 'globalCard' array pins the OTHER numbering rule (the global pre/post card); see 'globalCardAbout'.",
+  "about": "Shared by Unit/SqlGen/TaskListingMirrorTests.cs (C# TaskListing.Build, SqlModule.ParseAnchor), js/sql-view.test.cjs (DBM.sqlView.listing, parseAnchor) and js/anchor-label.test.cjs (DBM.anchorLabel in components/review.js, the third copy of the anchor grammar: its 'anchors' cases only). Each side asserts the SAME expected values, so a drift in either implementation fails that side's suite. Add a case here, never to one side only. The 'globalCard' array pins the OTHER numbering rule (the global pre/post card); see 'globalCardAbout'.",
   "listing": [
     {
       "name": "sample Addresses task: line 9 is FROM",
