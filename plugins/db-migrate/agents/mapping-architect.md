@@ -62,7 +62,7 @@ Read the packet file (absolute path given by the orchestrator) with the Read too
 - `baseVersion` = the packet's `baseVersion`.
 - `ops` = JSON Patch subset (`add`, `replace`, `remove`) with JSON pointers into the mapping: `/tables/<target>/<field>`, `/tables/<target>/columns/<Column>`, `/tables/<target>/columns/<Column>/<field>`, `/drops/<key>`, `/notes`. Escape `~` as `~0` and `/` as `~1` inside a key. Use **`add`** for keys that do not exist yet (for example `from`, `rationale`, a new drop, a column missing from the map) and **`replace`** for keys that exist. When you change more than one field of a column, replace the whole column object.
 - `responses` (rework mode): one per feedback id — `{"feedbackId": 12, "status": "addressed" | "declined", "note": "what you did / why not"}`.
-- Use `dbm artifact mapping --path /tables/app.Orders` to read the current value of any pointer when you are unsure whether a key exists.
+- Use `dbm artifact mapping --path tables/app.Orders` to read the current value of any pointer when you are unsure whether a key exists. Leave out the leading `/`: on Windows, Git Bash would turn the argument into a file path.
 
 ## Procedure
 

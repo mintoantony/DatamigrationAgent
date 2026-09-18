@@ -22,7 +22,7 @@ Read the packet file named in your prompt. The packet is indented JSON, one valu
 - `work` — tasks you must handle, in full: `sourceQuery`, `stagingDdl`, `mergeSql`, `preSql`, `postSql`, `errors`,
   `warnings`, `cols`, `keys`, `paths` (JSON pointers for your patch), `tableMap` (the approved mapping) and
   `targetColumns`.
-- `others` — tasks that are fine, summarised. `dbm artifact sql --path /tasks/<id>` prints one in full if you need it.
+- `others` — tasks that are fine, summarised. `dbm artifact sql --path tasks/<id>` prints one in full if you need it (no leading `/`: on Windows, Git Bash would turn it into a file path).
 - `context` (rework) — per feedback id: the anchored task in full; for `sql:<task>:<line>` anchors also `line`,
   `section` and a numbered `listing` where `>>` marks the commented line.
 

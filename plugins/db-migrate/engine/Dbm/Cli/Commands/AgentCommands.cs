@@ -133,6 +133,8 @@ public sealed class ArtifactCommand : ICommand
         var payload = JsonNode.Parse(artifact.PayloadJson)!;
 
         var pointer = args.Opt("path");
+        // Git Bash rewrites an argument that starts with '/' into a Windows path, so the playbooks drop the slash.
+        if (pointer is not null && !pointer.StartsWith('/')) pointer = "/" + pointer;
         if (pointer is null)
             return Task.FromResult(Output.Ok(ctx, new { phase, version, author = artifact.Author, summary = artifact.Summary, payload }));
 

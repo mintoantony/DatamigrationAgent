@@ -8,6 +8,9 @@ set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(dirname -- "$here")
+# Git Bash/MSYS: hand dotnet a Windows-form path (D:/...). A /d/... path reaches it only through MSYS's automatic
+# argument conversion, which MSYS_NO_PATHCONV=1 or MSYS2_ARG_CONV_EXCL turn off - dotnet then cannot find Dbm.dll.
+if command -v cygpath >/dev/null 2>&1; then root=$(cygpath -m "$root"); fi
 engine="$root/engine"
 dll="$engine/dist/Dbm.dll"
 manifest="$root/.claude-plugin/plugin.json"
@@ -63,7 +66,8 @@ build_engine() {
   # together with its PDB, and the build would differ from the committed one.
   rm -rf "$engine/Dbm/obj/Release" "$engine/Dbm/bin/Release"
   # -o reaches MSBuild as a property value, where ',' and ';' separate values (ruling 189): escape them, and '%' first.
-  tmp_arg="${tmp//%/%25}"; tmp_arg="${tmp_arg//,/%2C}"; tmp_arg="${tmp_arg//;/%3B}"
+  # sed, not ${var//x/y}: that is bash-only and dies with "Bad substitution" where /bin/sh is dash (Debian, Ubuntu).
+  tmp_arg=$(printf '%s' "$tmp" | sed 's/%/%25/g; s/,/%2C/g; s/;/%3B/g')
   if ! dotnet publish "$engine/Dbm/Dbm.csproj" -c Release -o "$tmp_arg" --nologo -v q \
       "-p:Version=${version:-0.0.0}" -p:DebugType=none -p:UseAppHost=false >&2; then
     rm -rf "$tmp"

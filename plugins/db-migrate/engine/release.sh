@@ -176,7 +176,8 @@ rm -rf "$engine/Dbm/obj/Release" "$engine/Dbm/bin/Release"
 # so the time a checkout happened would reach the committed dist (ruling 189). Pin it.
 find "$engine/Dbm/wwwroot" -type f -exec env TZ=UTC touch -t 200001010000.00 {} +
 # -o reaches MSBuild as a property value, where ',' and ';' separate values (ruling 189): escape them, and '%' first.
-tmp_arg="${tmp//%/%25}"; tmp_arg="${tmp_arg//,/%2C}"; tmp_arg="${tmp_arg//;/%3B}"
+# sed, not ${var//x/y}: that is bash-only and dies with "Bad substitution" where /bin/sh is dash (Debian, Ubuntu).
+tmp_arg=$(printf '%s' "$tmp" | sed 's/%/%25/g; s/,/%2C/g; s/;/%3B/g')
 dotnet publish "$engine/Dbm/Dbm.csproj" -c Release -o "$tmp_arg" --nologo \
   "-p:Version=$version" -p:DebugType=none -p:UseAppHost=false || die "dotnet publish failed"
 [ "$keep_all_runtimes" = 1 ] || prune_natives "$tmp"
