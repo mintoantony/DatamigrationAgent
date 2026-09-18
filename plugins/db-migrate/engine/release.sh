@@ -124,6 +124,20 @@ release_lock() {
   if [ "$(cat "$lock/owner" 2>/dev/null || true)" = "$lock_owner" ]; then rm -rf "$lock"; fi
 }
 
+# Removes the dist.tmp.<id> (~30 MB) of a publish that crashed and the dist.old.<id> of a swap that crashed. Under the
+# build lock, and only entries older than the lock's stale age, for the reasons given in bin/dbm's sweep_abandoned; a
+# dist.old.<id> is kept while engine/dist is missing. Keep bin/dbm, bin/dbm.cmd and release.ps1 in sync with this.
+sweep_abandoned() {
+  find "$engine" -maxdepth 1 -type d \( -name 'dist.tmp.*' -o -name 'dist.old.*' \) -mmin +"$lock_stale_minutes" 2>/dev/null |
+    while IFS= read -r leftover; do
+      case "$leftover" in
+        */dist.old.*) [ -f "$dist/Dbm.dll" ] || continue ;;
+      esac
+      echo "release: removing engine/${leftover##*/}, left behind by a build that crashed." >&2
+      rm -rf "$leftover" 2>/dev/null || true
+    done
+}
+
 # The version inside the db-migrate entry of marketplace.json; empty when the entry has no version field.
 marketplace_version() {
   if command -v node >/dev/null 2>&1; then
@@ -164,6 +178,7 @@ fi
 acquire_lock
 trap 'rm -rf "$tmp"; release_lock' EXIT
 trap 'exit 130' INT TERM
+sweep_abandoned
 
 if [ -f "$dist/Dbm.dll" ]; then dotnet "$dist/Dbm.dll" stop >/dev/null 2>&1 || true; fi
 

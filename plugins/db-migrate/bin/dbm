@@ -52,6 +52,23 @@ prune_natives() {
   find "$target" -type f -name '*msalruntime*' -delete
 }
 
+# A publish that crashed (killed, power cut) leaves its dist.tmp.<id> (~30 MB) behind, and a swap that crashed its
+# dist.old.<id>; nothing else ever removes them. Runs under the build lock, so no other build is using one - except a
+# build whose lock was broken as stale, which is why only entries older than the lock's own stale age go. The ids are
+# not all process ids (dbm.cmd uses %RANDOM%, release.ps1 a GUID), so age is the one test every builder can apply.
+# A dist.old.<id> is kept while engine/dist is missing: then it may be the previous build a failed swap-back names.
+# Keep engine/release.* and bin/dbm.cmd in sync with this.
+sweep_abandoned() {
+  find "$engine" -maxdepth 1 -type d \( -name 'dist.tmp.*' -o -name 'dist.old.*' \) -mmin +"$lock_stale_minutes" 2>/dev/null |
+    while IFS= read -r leftover; do
+      case "$leftover" in
+        */dist.old.*) [ -f "$dll" ] || continue ;;
+      esac
+      echo "dbm: removing engine/${leftover##*/}, left behind by a build that crashed." >&2
+      rm -rf "$leftover" 2>/dev/null || true
+    done
+}
+
 # Why this is needed: the plugin ships a built engine/dist, so an update that changes plugin.json leaves a stale dist
 # behind in a checkout that has the SDK. Publishing into a per-process dist.tmp.<pid> and swapping keeps the old build
 # usable if anything fails (on Windows a running server keeps its DLLs locked, so the rename is the only safe way to
@@ -59,6 +76,7 @@ prune_natives() {
 build_engine() {
   echo "dbm: building the engine ($reason, about a minute)..." >&2
   if [ -f "$dll" ]; then dotnet "$dll" stop >/dev/null 2>&1 || true; fi
+  sweep_abandoned
   tmp="$engine/dist.tmp.$$"
   old="$engine/dist.old.$$"
   rm -rf "$tmp"

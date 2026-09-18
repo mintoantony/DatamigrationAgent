@@ -169,6 +169,7 @@ call :read_dist_version
 if exist "%DBM_DLL%" if not "%DBM_REBUILD%"=="1" if defined DBM_PLUGIN_VERSION if "%DBM_DIST_VERSION%"=="%DBM_PLUGIN_VERSION%" exit /b 0
 >&2 echo dbm: building the engine - %DBM_REASON% - about a minute...
 if exist "%DBM_DLL%" dotnet "%DBM_DLL%" stop >nul 2>&1
+call :sweep_abandoned
 set "DBM_TMP=%DBM_ENGINE%\dist.tmp.%RANDOM%%RANDOM%"
 if exist "%DBM_TMP%" rd /s /q "%DBM_TMP%"
 rem Compile from scratch, as engine\release.* do: publish would otherwise reuse an earlier Release compile in obj\
@@ -192,6 +193,16 @@ set "DBM_OLD=%DBM_ENGINE%\dist.old.%RANDOM%%RANDOM%"
 if exist "%DBM_ENGINE%\dist" move "%DBM_ENGINE%\dist" "%DBM_OLD%" >nul 2>&1 || goto build_in_use
 move "%DBM_TMP%" "%DBM_ENGINE%\dist" >nul 2>&1 || goto build_no_swap
 rd /s /q "%DBM_OLD%" 2>nul
+exit /b 0
+
+rem A publish that crashed (killed, power cut) leaves its dist.tmp.N (~30 MB) behind, and a swap that crashed its
+rem dist.old.N; nothing else ever removes them. Runs under the build lock, so no other build is using one - except a build
+rem whose lock was broken as stale, which is why only entries older than DBM_LOCK_STALE_MINUTES go. The ids are not all
+rem process ids (here %%RANDOM%%, a GUID in release.ps1), so age is the one test every builder can apply. A dist.old.N is
+rem kept while engine\dist is missing: then it may be the previous build a failed swap-back names. cmd has no file age,
+rem so powershell does it; where powershell cannot run nothing is swept. Keep bin/dbm and engine\release.* in sync.
+:sweep_abandoned
+powershell -NoProfile -NonInteractive -Command "$dll = Join-Path $env:DBM_ENGINE 'dist\Dbm.dll'; Get-ChildItem -LiteralPath $env:DBM_ENGINE -Directory -Force | Where-Object { ($_.Name -like 'dist.tmp.*' -or ($_.Name -like 'dist.old.*' -and (Test-Path -LiteralPath $dll))) -and ((Get-Date) - $_.LastWriteTime).TotalMinutes -ge [double]$env:DBM_LOCK_STALE_MINUTES } | ForEach-Object { 'dbm: removing engine\' + $_.Name + ', left behind by a build that crashed.'; Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }" 1>&2 2>nul
 exit /b 0
 
 rem The publish output carries ~75 MB of native files db-migrate never loads: MSAL's WAM broker - SqlClient's Entra

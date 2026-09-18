@@ -17,7 +17,9 @@ The launcher (`bin/dbm`, `bin/dbm.cmd`) writes plain text to stderr, not JSON:
 
 With the .NET SDK installed the launcher rebuilds `engine/dist` when it is missing, when its `VERSION` differs from
 `plugin.json`, or when asked (`DBM_REBUILD=1`, `dbm doctor --rebuild`). It prints "building the engine (…, about a
-minute)", and "waiting for another engine build to finish" while a second `dbm` builds. When the rebuild fails:
+minute)", and "waiting for another engine build to finish" while a second `dbm` builds. "removing engine/dist.tmp.<id>
+(or dist.old.<id>), left behind by a build that crashed" means it cleared the leftovers of a build killed more than 15
+minutes earlier; nothing to act on. When the rebuild fails:
 
 - **"dbm: warning: <reason>; running the previous engine/dist <version> instead."** — the command ran on the old build
   and its own output follows; nothing is lost and the rebuild is retried on the next command. The reason is one of
