@@ -83,20 +83,31 @@ public static class SampleValuesSetting
         foreach (var side in new[] { Side.Src, Side.Tgt })
         {
             if (services.Catalog.Get(side) is not { } snapshot || services.Catalog.Fingerprint(side) is not { } fingerprint) continue;
-            var before = changed;
-            var tables = snapshot.Tables.Select(t => t with
-            {
-                Columns = t.Columns.Select(c =>
-                {
-                    if (c.Profile is not { } p) return c;
-                    var text = TypeTraits.IsString(c.DataType);
-                    if (p.Samples.Count == 0 && !(text && (p.Min is not null || p.Max is not null))) return c;
-                    changed++;
-                    return c with { Profile = p with { Samples = [], Min = text ? null : p.Min, Max = text ? null : p.Max } };
-                }).ToList(),
-            }).ToList();
-            if (changed > before) services.Catalog.Save(side, snapshot with { Tables = tables }, fingerprint);
+            var (stripped, count) = Strip(snapshot);
+            if (count == 0) continue;
+            services.Catalog.Save(side, stripped, fingerprint);
+            changed += count;
         }
         return changed;
+    }
+
+    /// <summary>The snapshot without sample values (each profile's samples, and a text column's MIN/MAX) and how many columns lost
+    /// some. Structure is untouched, so its fingerprint is the same.</summary>
+    public static (CatalogSnapshot Snapshot, int Columns) Strip(CatalogSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        var changed = 0;
+        var tables = snapshot.Tables.Select(t => t with
+        {
+            Columns = t.Columns.Select(c =>
+            {
+                if (c.Profile is not { } p) return c;
+                var text = TypeTraits.IsString(c.DataType);
+                if (p.Samples.Count == 0 && !(text && (p.Min is not null || p.Max is not null))) return c;
+                changed++;
+                return c with { Profile = p with { Samples = [], Min = text ? null : p.Min, Max = text ? null : p.Max } };
+            }).ToList(),
+        }).ToList();
+        return (changed == 0 ? snapshot : snapshot with { Tables = tables }, changed);
     }
 }
