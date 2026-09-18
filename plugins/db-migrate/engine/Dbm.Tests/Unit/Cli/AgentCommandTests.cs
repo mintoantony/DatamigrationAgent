@@ -93,6 +93,22 @@ public class AgentCommandTests
     }
 
     [Fact]
+    public async Task Artifact_path_without_the_leading_slash_is_the_same_pointer()
+    {
+        // Git Bash rewrites an argument starting with '/' into a Windows path (/tables/x -> C:/Program Files/Git/tables/x),
+        // so the playbooks pass pointers without it (Task 6.4 finding F-2).
+        using var tw = new TestWorkspace();
+        using (var s = FakeServices.Open(tw.Ws)) FakeServices.DriveToAnalysisDraft(s);
+        var factory = FakeServices.Factory();
+
+        var slice = await CliRunner.RunAsync(tw.Ws, factory, "artifact", "analysis", "--path", "items/b");
+
+        Assert.True(slice.Json["error"] is null, $"a pointer without its leading '/' was refused: {slice.Json.ToJsonString()}");
+        Assert.Equal(2, slice.Json["value"]!.GetValue<int>());
+        Assert.Equal("/items/b", slice.Json["path"]!.GetValue<string>());
+    }
+
+    [Fact]
     public async Task Feedback_lists_items_optionally_by_status()
     {
         using var tw = new TestWorkspace();
