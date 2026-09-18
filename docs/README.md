@@ -188,10 +188,19 @@ error:
   still holds what this run committed, so the new run needs **Truncate target first** (with the caution above) or the
   confirmation by name.
 
-**A task that loaded 0 rows is a mapping problem.** Because constraint violations are always per-row rejects, a wrong
-foreign-key or CHECK mapping under *Skip and log bad rows* does not fail the run: it can end *Completed* with every row
-of a table rejected. If a task shows 0 rows loaded and many rejected, do not treat it as bad data — read the rejected
-rows' error, reopen Mapping, fix it and run again with **Truncate target first**, as above.
+**A task that loads nothing is a mapping problem.** Because constraint violations are always per-row rejects, a wrong
+foreign-key or CHECK mapping under *Skip and log bad rows* shows as a task whose rows are all rejected. Once a task's
+first 3 chunks (or its whole source, if it is smaller) have loaded no row at all, the task fails (`bad_task`) with a
+reason that says every row was rejected and names the most common error and its number, and the run stops - rather than
+rejecting the whole table one row at a time. The rejected rows are logged. Usually the fix is to reopen Mapping, fix it
+and run again with **Truncate target first**, as above. If the rows really are bad, **Resume** carries on from the next
+chunk and does not stop the task for this again (a task without a key is rolled back instead, so for it only the fix
+helps). A run that still ends with a task that loaded 0 of its source rows names it in the report's headline ("app.Orders
+loaded 0 of 3,005 rows") instead of saying the row counts were validated.
+
+The exception is a new run into tables that already held rows (see above): when every rejected row of such a table is a
+duplicate key (primary key or unique), those rows were already there, so the task is not stopped and the headline's
+"loaded 0 of N" is expected - it is not a mapping problem. A foreign-key or CHECK error in such a run still stops the task.
 
 **Live view**: overall and per-task progress bars, rows per second, ETA, a throughput sparkline, the rejected-row count
 and a log tail. **Pause** lets every task commit its current chunk and stops; **Resume** continues from the checkpoints,
@@ -213,7 +222,9 @@ key with their error. In the demo with *Skip and log bad rows* you see 8 rejecte
 lines (foreign key), 3 comments longer than the target column (truncation) and 1 zero quantity (CHECK constraint).
 
 Read the report before you call a run clean: a *Completed* run can still carry notes, and a task with 0 rows loaded and
-its rows rejected points at the mapping, not at the data (see *Execute*).
+its rows rejected points at the mapping, not at the data (see *Execute*); the headline names such a task instead of
+saying "validated". The one exception is a run into tables that were not empty (the headline says so) whose rejected
+rows are duplicate keys: those rows were already in the target.
 
 ## Exports
 

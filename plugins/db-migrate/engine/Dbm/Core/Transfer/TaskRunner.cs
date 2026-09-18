@@ -87,6 +87,16 @@ internal sealed class TaskRunner(RunContext rc)
 
     private const string NoKeyTypes = KeyFailedNote + ": the key column types were never read";
 
+    /// <summary>
+    /// Ruling 192 (open item 30): under skip-and-log, a task whose first this-many chunks - or its whole source, if that is fewer
+    /// chunks - loaded no row at all while rejecting rows is failed as <c>bad_task</c>. A constraint violation is a per-row reject
+    /// (ruling 147), so a plan defect that surfaces as one - an FK column bound to the wrong expression, a CHECK no row satisfies -
+    /// otherwise completes with the whole table rejected, one single-row attempt per row, under a headline that reads as success.
+    /// Ruling 201 exempts the re-run Ruling 186 lets a human confirm: a table that held rows before the run, whose rejects are all
+    /// duplicate keys (see <see cref="LoadedNothingReason"/>).
+    /// </summary>
+    internal const int ZeroLoadChunks = 3;
+
     private static readonly AsyncLocal<Action<string, int>?> AfterChunkTransactionHook = new();
 
     /// <summary>
@@ -148,8 +158,8 @@ internal sealed class TaskRunner(RunContext rc)
                 // identity column become a chunk of rejected rows and a table of silently renumbered ids respectively.
                 var loader = new BulkLoader(task, rc.Options, shape);
                 var pass = task.KeyColumns.Count > 0
-                    ? await RunKeyedAsync(id, task, tgt, shape, loader, cp, ct)
-                    : await RunKeylessAsync(id, task, tgt, shape, loader, ct);
+                    ? await RunKeyedAsync(id, task, tgt, shape, loader, cp, row.RowsBefore, ct)
+                    : await RunKeylessAsync(id, task, tgt, shape, loader, row.RowsBefore, ct);
                 if (pass.Status == TransferTaskStatus.Paused)
                 {
                     rc.SetTaskStatus(id, TransferTaskStatus.Paused);
@@ -193,11 +203,12 @@ internal sealed class TaskRunner(RunContext rc)
     }
 
     private async Task<Pass> RunKeyedAsync(string id, TaskPlan task, SqlConnection tgt, TargetShape shape, BulkLoader loader,
-        Checkpoint cp, CancellationToken ct)
+        Checkpoint cp, long? rowsBefore, CancellationToken ct)
     {
         int chunkSize = Math.Max(1, task.ChunkSize ?? rc.Options.ChunkSize);
         KeyValue? last = cp.LastKeyJson is null ? null : KeyCodec.Decode(cp.LastKeyJson);
         IReadOnlyList<KeyType>? types = last?.Types;
+        var rejects = new RejectTally();
         await using var src = await SqlConnect.OpenAsync(rc.SourceCs, ct);
         while (true)
         {
@@ -219,6 +230,9 @@ internal sealed class TaskRunner(RunContext rc)
                 cp = cp with { Done = true };
                 await ControlTable.UpsertAsync(tgt, null, rc.RunId, id, cp, ct);
                 Mirror(id, cp);
+                // The source ended exactly on a chunk boundary: the chunks read were the whole source (ruling 192). A task that already
+                // reached ZeroLoadChunks was judged when that chunk committed, and a resume past that judgement must not be judged again.
+                if (cp.ChunkNo < ZeroLoadChunks) ThrowIfLoadedNothing(id, task.Target, rowsBefore, cp, rejects);
                 return new Pass(TransferTaskStatus.Done, cp);
             }
 
@@ -264,12 +278,20 @@ internal sealed class TaskRunner(RunContext rc)
             });
             rc.Log("info", $"{id} {task.Target}: chunk {cp.ChunkNo} committed ({cp.RowsDone:N0} rows, {cp.RowsError:N0} rejected"
                 + MergeNote(outcome.MergeStatus, outcome.MergeRowsAffected) + ")", persist: false);
+            // Ruling 192, judged after the commit: the rejected rows are recorded, as skip-and-log promised, and the checkpoint is past
+            // them, so Resume carries on from the next chunk (the operator's "these rows really are bad") and never re-judges the same
+            // chunks, while Reopen is the way to fix the plan. A crash (or a hard stop) between chunk K's commit and this line skips
+            // the judgement for good: the resumed segment starts past chunk K and never meets it. That costs the early stop, not data -
+            // the task then runs on as it did before ruling 192, and the report still names it if it loads nothing (review F6).
+            rejects.Add(outcome.Failed);
+            if (cp.ChunkNo == ZeroLoadChunks || (lastChunk && cp.ChunkNo < ZeroLoadChunks))
+                ThrowIfLoadedNothing(id, task.Target, rowsBefore, cp, rejects);
             if (lastChunk) return new Pass(TransferTaskStatus.Done, cp);
         }
     }
 
     private async Task<Pass> RunKeylessAsync(string id, TaskPlan task, SqlConnection tgt, TargetShape shape, BulkLoader loader,
-        CancellationToken ct)
+        long? rowsBefore, CancellationToken ct)
     {
         int chunkSize = Math.Max(1, task.ChunkSize ?? rc.Options.ChunkSize);
         await using var src = await SqlConnect.OpenAsync(rc.SourceCs, ct);
@@ -285,6 +307,13 @@ internal sealed class TaskRunner(RunContext rc)
         long mergedTotal = 0;
         bool mergeCountUnknown = false;
         var errors = new List<ErrorRecord>();
+        var rejects = new RejectTally();
+        async Task GuardAsync()
+        {
+            if (LoadedNothingReason(task.Target, chunks, loaded, rejected, rowsBefore, rejects, null, keyed: false) is not { } why) return;
+            await scope.RollbackAsync();
+            throw new TransferException("bad_task", why);
+        }
         while (true)
         {
             if (rc.Control.Kind is StopKind.Cancel or StopKind.Fail)
@@ -320,8 +349,13 @@ internal sealed class TaskRunner(RunContext rc)
             }
             errors.AddRange(Capture(task, table, outcome.Failed, null));
             rc.Progress.InFlight(id, loaded);
+            rejects.Add(outcome.Failed);
+            // Ruling 192. Nothing of a keyless task is committed before it completes, so the judgement rolls the whole task back: a
+            // resume restarts it from zero and meets the same verdict, and Reopen is the way on.
+            if (chunks == ZeroLoadChunks) await GuardAsync();
             if (n < chunkSize) break;
         }
+        if (chunks < ZeroLoadChunks) await GuardAsync();   // the source ended within the first chunks: that was all of it
         long? merged = mergeStatus == MergeStatus.Ran && !mergeCountUnknown ? mergedTotal : null;
         var done = new Checkpoint(chunks, null, loaded, rejected, true);
         await ControlTable.UpsertAsync(scope.Connection, scope.Tx, rc.RunId, id, done, ct);
@@ -336,6 +370,126 @@ internal sealed class TaskRunner(RunContext rc)
         rc.Log("info", $"{id} {task.Target}: committed in one transaction ({done.RowsDone:N0} rows, {done.RowsError:N0} rejected"
             + MergeNote(mergeStatus, merged) + ")", persist: false);
         return new Pass(TransferTaskStatus.Done, done);
+    }
+
+    /// <summary>The keyed path's judgement (ruling 192), with the task's recorded error rows as the fallback for the rejects this
+    /// segment's tally never saw - a task resumed after a pause, whose earlier chunks were rejected by an earlier segment.</summary>
+    private void ThrowIfLoadedNothing(string id, string target, long? rowsBefore, Checkpoint cp, RejectTally rejects)
+    {
+        var why = LoadedNothingReason(target, cp.ChunkNo, cp.RowsDone, cp.RowsError, rowsBefore, rejects,
+            () => rc.Repo.ErrorRows(rc.RunId, id, (int)Math.Min(cp.RowsError, int.MaxValue)).Select(e => e.Error).ToList(), keyed: true);
+        if (why is not null) throw new TransferException("bad_task", why);
+    }
+
+    /// <summary>
+    /// Ruling 192's verdict on a task's first chunks, or null when they loaded a row or rejected none. The reason says that every row
+    /// was rejected, names the most common error with its number, and says what Resume and Reopen do for this kind of task.
+    /// <para>Ruling 201: also null for the re-run Ruling 186 lets a human confirm - a target table that already held rows
+    /// (<paramref name="rowsBefore"/> above 0) - when every reject is a duplicate key (2627 or 2601): those rows are already there, which
+    /// is what the confirmation said would happen, not a plan defect. The duplicates must be <b>shown</b>: from the segment's tally when
+    /// it covers every reject, otherwise from all of the task's <paramref name="recorded"/> error texts. Anything short of that - a
+    /// reject that is not a duplicate, a recorded text the recogniser does not know, fewer recorded rows than rejects - is judged as
+    /// before. An FK or CHECK reject (547) in a re-run still stops.</para>
+    /// </summary>
+    /// <param name="recorded">The task's recorded error texts, read only when the tally does not cover every reject; null when there
+    /// are none to read (a keyless task records nothing before it completes, and its one segment's tally covers everything).</param>
+    internal static string? LoadedNothingReason(string target, int chunks, long rowsDone, long rowsError, long? rowsBefore,
+        RejectTally rejects, Func<IReadOnlyList<string>>? recorded, bool keyed)
+    {
+        ArgumentNullException.ThrowIfNull(rejects);
+        if (rowsDone != 0 || rowsError <= 0) return null;
+        bool covered = rejects.Rows >= rowsError;
+        IReadOnlyList<string>? texts = covered ? null : recorded?.Invoke();
+        bool textsComplete = texts is not null && texts.Count >= rowsError;
+        if (rowsBefore > 0 && (covered ? rejects.OnlyDuplicateKeys : textsComplete && texts!.All(IsDuplicateKeyText))) return null;
+
+        string first = chunks == 1 ? "the first chunk" : Inv($"the first {chunks} chunks");
+        string common;
+        if (!covered && texts is { Count: > 0 })
+        {
+            // Ruling 192 review F3: the tally is this segment's only; the recorded rows cover the chunks earlier segments rejected. The
+            // number is not recorded, so the sentence names the text.
+            // A duplicate-key message names its own value, so the texts are grouped by what comes before that value (re-review N2),
+            // and one whole text stands for the group.
+            var top = texts.GroupBy(ErrorKind, StringComparer.Ordinal).OrderByDescending(g => g.Count()).First();
+            common = Inv($" The most common recorded error, on {top.Count():N0} of {texts.Count:N0} recorded rows, was: ") + top.First();
+        }
+        else
+        {
+            common = rejects.MostCommon() is { } c
+                ? Inv($" The most common error, on {c.Rows:N0} of {rejects.Rows:N0} rows")
+                  + (rejects.Rows < rowsError ? " rejected since this segment of the run began" : "") + ", was "
+                  + (c.Number is int n ? Inv($"error {n}") : "an error with no server error number") + ": " + c.Text
+                : "";
+        }
+        string way = keyed
+            ? " The rejected rows are recorded. Reopen Mapping or SQL to fix the plan; if these rows really are bad, Resume carries on "
+              + "from the next chunk."
+            : " This task has no key, so it loads in one transaction and nothing of it was kept. Reopen Mapping or SQL to fix the plan.";
+        return "Every row of " + first + " of " + target + Inv($" was rejected ({rowsError:N0} rows) and none loaded, so the plan is the ")
+               + "likelier cause than the data - a column bound to the wrong expression, or a constraint no source row satisfies."
+               + common + way;
+    }
+
+    private static string Inv(FormattableString text) => FormattableString.Invariant(text);
+
+    /// <summary>A recorded error text without the part that names one row's value: SQL Server's duplicate-key message ends with
+    /// " The duplicate key value is (…)", which differs row by row although the error is the same.</summary>
+    internal static string ErrorKind(string text)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        int at = text.IndexOf(" The duplicate key value is", StringComparison.Ordinal);
+        return at < 0 ? text : text[..at];
+    }
+
+    /// <summary>
+    /// Ruling 201's fallback: whether a <b>recorded</b> error text is SQL Server's duplicate-key message - 2627 ("Violation of PRIMARY
+    /// KEY constraint" / "Violation of UNIQUE KEY constraint") or 2601 ("Cannot insert duplicate key row in object"). The error number
+    /// is not recorded, so this reads the English text the server sends at the start of the message. A server that answers in another
+    /// language is not recognised, and its re-run is judged as before - the safe direction.
+    /// </summary>
+    internal static bool IsDuplicateKeyText(string text)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        return text.StartsWith("Violation of PRIMARY KEY constraint ", StringComparison.Ordinal)
+               || text.StartsWith("Violation of UNIQUE KEY constraint ", StringComparison.Ordinal)
+               || text.StartsWith("Cannot insert duplicate key row in object ", StringComparison.Ordinal);
+    }
+
+    /// <summary>The rejected rows of a task's first chunks, counted by error number, with the first text seen for each (ruling 192).</summary>
+    internal sealed class RejectTally
+    {
+        private readonly Dictionary<int, (long Rows, string Text)> _byNumber = [];
+        private (long Rows, string Text)? _noNumber;
+
+        public long Rows { get; private set; }
+
+        /// <summary>Ruling 201: at least one reject, and every one of them a duplicate key (2627 or 2601) by its server error number.</summary>
+        public bool OnlyDuplicateKeys => Rows > 0 && _noNumber is null && _byNumber.Keys.All(n => n is 2627 or 2601);
+
+        public void Add(IEnumerable<RowFailure> failures)
+        {
+            ArgumentNullException.ThrowIfNull(failures);
+            foreach (var f in failures)
+            {
+                Rows++;
+                if (f.ErrorNumber is int n)
+                    _byNumber[n] = _byNumber.TryGetValue(n, out var e) ? (e.Rows + 1, e.Text) : (1, f.Error);
+                else
+                    _noNumber = _noNumber is { } e ? (e.Rows + 1, e.Text) : (1, f.Error);
+            }
+        }
+
+        /// <summary>The error number with the most rows, ties to the lowest number; the rejects with no number win only with strictly
+        /// more rows than every number (a number says more than its absence). Null when nothing was added.</summary>
+        public (int? Number, long Rows, string Text)? MostCommon()
+        {
+            (int? Number, long Rows, string Text)? best = null;
+            foreach (var (n, e) in _byNumber.OrderBy(kv => kv.Key))
+                if (best is null || e.Rows > best.Value.Rows) best = (n, e.Rows, e.Text);
+            if (_noNumber is { } x && (best is null || x.Rows > best.Value.Rows)) best = (null, x.Rows, x.Text);
+            return best;
+        }
     }
 
     /// <summary>

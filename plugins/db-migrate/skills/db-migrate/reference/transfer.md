@@ -10,9 +10,9 @@ see rows or connection strings, and never start a transfer on your own initiativ
 | `await` / `execute` | SQL approved. The human runs pre-flight, picks options, clicks **Execute…**, types the target database name and clicks **Start transfer**. | One line: "SQL approved — open the Execute screen (<Url>) to run pre-flight and start the transfer." Keep `dbm await` running in the background. |
 | `await` / `transfer` | A run is in progress. | Nothing. If the human asks for progress, run `dbm transfer status` once and report one line. Keep `dbm await` in the background; do not poll. |
 | `await` / `transfer_paused` | Paused by the human, or by a server restart (crash recovery turns interrupted runs into paused ones). All committed chunks are safe; the plan's pre-load SQL (e.g. a disabled foreign key) stays in force until the run completes or is cancelled. | One line: "The transfer is paused — resume it from the Execute screen." Resume only when the human asks: `dbm transfer resume`. |
-| `stop` / `transfer_failed` | Stop-on-error rejected a row, a task/script failed, or (under skip-and-log too) a task failed with `bad_task` because every row of a chunk failed alike on a non-constraint error. The plan's pre-load SQL is still in force (Resume expects it); the Execute screen names it. | Run `dbm transfer status`; report the failed task, its target and its error (already redacted) and the matching option below, then end your turn — no `dbm await` after a `stop` (it returns at once). After the human acts, they type `/db-migrate resume`. |
+| `stop` / `transfer_failed` | Stop-on-error rejected a row, a task/script failed, or (under skip-and-log too) a task failed with `bad_task` because every row of a chunk failed alike on a non-constraint error, or because its first 3 chunks (or its whole source, if smaller) loaded no row while rejecting rows. The plan's pre-load SQL is still in force (Resume expects it); the Execute screen names it. | Run `dbm transfer status`; report the failed task, its target and its error (already redacted) and the matching option below, then end your turn — no `dbm await` after a `stop` (it returns at once). After the human acts, they type `/db-migrate resume`. |
 | `stop` / `transfer_cancelled` | The human cancelled. Rows already committed stay in the target. Cancel ran the plan's post-load SQL; the run's notes say, statement by statement, what it restored and what it could not (with the server's text). | Report the `summary`, and any note that says NOT restored. Then end your turn. The human's options: a new run from the Execute screen (it loads every table again, so it needs "Truncate target first" or a confirmation naming the tables that already hold rows — see *Facts*), or reopen Analysis, Mapping or SQL to change the plan first. |
-| `stop` / `complete` | Finished. | Report the one-line summary. If it says "target tables were not empty before this run", the counts compare rows added, not the tables — say so. The final report is stored as a **Complete** artifact (one per completed run): the UI's **Report** step shows it (with a picker for earlier runs' reports), `dbm artifact complete` prints the latest, and `dbm export report` writes the latest as `.dbmigrate/exports/final-report.html`. If any task loaded 0 rows while rejecting rows, say so: that is a mapping problem, not bad data (see *Facts*). To run again with a changed plan, the human reopens Analysis, Mapping or SQL. |
+| `stop` / `complete` | Finished. | Report the one-line summary. If it says "target tables were not empty before this run", the counts compare rows added, not the tables — say so. The final report is stored as a **Complete** artifact (one per completed run): the UI's **Report** step shows it (with a picker for earlier runs' reports), `dbm artifact complete` prints the latest, and `dbm export report` writes the latest as `.dbmigrate/exports/final-report.html`. If the summary names a task that "loaded 0 of N rows" (it then never says "validated"), say so: that is a mapping problem, not bad data (see *Facts*) — unless the summary also says "target tables were not empty before this run" and that task's errors are duplicate keys (PRIMARY KEY / UNIQUE, "Cannot insert duplicate key"): then those rows were already in the target. To run again with a changed plan, the human reopens Analysis, Mapping or SQL. |
 
 ## Commands (all JSON, all go through the local server)
 
@@ -38,6 +38,11 @@ run loaded into — that one is for the human to fix in the UI, never by re-poin
   fix the source data and then `dbm transfer resume` (the failed chunk is retried), or cancel and start a new run with "Skip and log
   bad rows" and "Truncate target first" (the new run starts from the first row; see *Facts*).
 - **`bad_task`:** a permission error → the human grants it and resumes; bad source data → fix it and resume.
+- **`bad_task` "Every row of the first … chunks of <table> was rejected":** the reason names the most common error and its
+  number. Usually a mapping defect (an FK column bound to the wrong expression, a CHECK no row satisfies) → reopen, below. (A
+  re-run into a table that already held rows is not stopped when every reject is a duplicate key — those rows were already
+  there — so this failure in a re-run means some other error, such as a foreign key or CHECK.) The rejected rows are recorded; if the human decides they really are bad rows, Resume carries on from the next chunk and does not
+  judge the task again (a keyless task is rolled back instead, so for it only the reopen helps).
 - **A mapping or SQL defect** (any failure, or a completed run with a whole table rejected): the human reopens Mapping or SQL on its
   review screen. Reopening cancels a failed run first (running its post-load SQL); after the phase is approved again the Execute
   screen starts a **new** run. Reopen is refused while a run is running or paused — pause and cancel it first.
@@ -60,9 +65,15 @@ run loaded into — that one is for the human to fix in the UI, never by re-poin
 - Rejected rows (skip-and-log) are counted per task; the final report lists up to 5 of them per task (key and error, never row
   data) and validates row counts and column checksums.
 - Under skip-and-log, constraint violations (FOREIGN KEY, CHECK, PRIMARY KEY, UNIQUE) are always per-row rejects, even when every
-  row of a chunk fails alike. So a wrong FK or CHECK mapping can end **completed** with a whole table rejected. Treat a task with
-  0 rows loaded and many rejected as a mapping problem, not bad data: the human reopens Mapping (or SQL), fixes it, approves again
-  and starts a new run with "Truncate target first". Never suggest editing the target by hand.
+  row of a chunk fails alike. A wrong FK or CHECK mapping therefore shows as a task whose first chunks reject everything: once its
+  first 3 chunks (or its whole source, if smaller) have loaded no row, the task fails with `bad_task` instead of rejecting the
+  whole table one row at a time. The exception is a re-run into a table that already held rows whose rejects are all duplicate
+  keys (PRIMARY KEY / UNIQUE): those rows were already there, so the task runs on. A task that still ends with 0 rows loaded of a
+  non-empty source (after Resume, or in such a re-run) is named in the report's one-line summary ("app.Orders loaded 0 of 3,005
+  rows"), which then never says "validated". If the summary says "target tables were not empty before this run" and the task's
+  errors are duplicate keys, its rows were already in the target — say that. Otherwise treat it as a mapping problem, not bad
+  data: the human reopens Mapping (or SQL), fixes it, approves again and starts a new run with "Truncate target first". Never
+  suggest editing the target by hand.
 - Checkpoints belong to one run, so a new run starts from the first row. Pre-flight's *Target row counts* line names the target
   tables that already hold rows and which of them have no primary key or unique index ("rows will be loaded again — duplicates").
   A new run into them is refused unless "Truncate target first" is ticked or the start dialog's confirmation names them; keyed
