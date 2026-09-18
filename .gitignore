@@ -12,7 +12,10 @@
 # .NET build output (engine only — plugins/db-migrate/bin/ holds the launchers and must stay tracked)
 plugins/db-migrate/engine/**/bin/
 plugins/db-migrate/engine/**/obj/
-plugins/db-migrate/engine/dist/
+# Transient folders of the launcher/release build swap (engine/dist itself is committed)
+plugins/db-migrate/engine/dist.tmp*/
+plugins/db-migrate/engine/dist.old.*/
+plugins/db-migrate/engine/.build.lock/
 TestResults/
 *.user
 *.suo
