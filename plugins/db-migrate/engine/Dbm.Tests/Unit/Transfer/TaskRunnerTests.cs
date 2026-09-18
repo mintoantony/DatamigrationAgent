@@ -156,4 +156,56 @@ public sealed class TaskRunnerTests
         Assert.Equal(", merge affected 1,234", TaskRunner.MergeNote(MergeStatus.Ran, 1234L));
         Assert.Equal(", the merge ran and reported no row count", TaskRunner.MergeNote(MergeStatus.Ran, null));
     }
+
+    private static TaskRunner.RejectTally Tally(params (int? Number, string Text)[] rejects)
+    {
+        var tally = new TaskRunner.RejectTally();
+        tally.Add(rejects.Select((r, i) => new RowFailure(i, r.Text) { ErrorNumber = r.Number }));
+        return tally;
+    }
+
+    private const string Dup = "Violation of PRIMARY KEY constraint 'PK_P'. Cannot insert duplicate key in object 'app.P'. The duplicate key value is (1).";
+    private const string Fk = "The INSERT statement conflicted with the FOREIGN KEY constraint \"FK_C_P\".";
+
+    /// <summary>
+    /// Ruling 201: the re-run exemption must be <b>shown</b>. With a tally that covers only part of the rejects, the recorded rows decide,
+    /// and only when there are as many of them as rejects and every one reads as a duplicate key. <b>Harm:</b> an exemption taken on
+    /// fewer recorded rows than rejects (ruling 105's crash window) would let an unrecorded FK reject pass as a duplicate.
+    /// </summary>
+    [Fact]
+    public void The_rerun_exemption_needs_every_reject_shown_as_a_duplicate_key()
+    {
+        var partial = Tally((2627, Dup));   // this segment saw 1 of the 3 rejects
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 3, 10, partial, () => [Dup, Dup, Dup], keyed: true) is null,
+            "a re-run whose 3 rejects are all recorded duplicate keys was judged: the recorded rows were not read, or not believed");
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 3, 10, partial, () => [Dup, Dup], keyed: true) is not null,
+            "the re-run exemption was taken on 2 recorded rows for 3 rejects: the unrecorded one was assumed to be a duplicate");
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 3, 10, partial, () => [Dup, Fk, Dup], keyed: true) is not null,
+            "a recorded FK reject was read as a duplicate key");
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 3, 0, Tally((2627, Dup), (2627, Dup), (2627, Dup)), null, keyed: true) is not null,
+            "duplicate keys into a table that was empty before the run were exempted: the exemption is for the confirmed re-run only");
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 2, 10, Tally((2627, Dup), (547, Fk)), null, keyed: true) is not null,
+            "a tally holding a 547 beside duplicates was exempted");
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 2, 10, Tally((2627, Dup), (2601, "x")), null, keyed: true) is null,
+            "a re-run whose tally holds only 2627 and 2601 was judged: the confirmed re-run is stopped over its duplicate keys");
+    }
+
+    [Theory]
+    [InlineData(true, "Violation of UNIQUE KEY constraint 'UQ_P'. Cannot insert duplicate key in object 'app.P'.")]
+    [InlineData(true, "Cannot insert duplicate key row in object 'app.P' with unique index 'IX_P'.")]
+    [InlineData(true, Dup)]
+    [InlineData(false, Fk)]
+    [InlineData(false, "Violation of PRIMARY KEY constraint")]   // not the message, only its prefix without the name
+    public void Only_the_servers_duplicate_key_messages_read_as_duplicates(bool expected, string text)
+        => Assert.True(TaskRunner.IsDuplicateKeyText(text) == expected, $"\"{text}\" was {(expected ? "not " : "")}read as a duplicate key");
+
+    /// <summary>Review F8: the doc says ties go to the lowest number, and a number says more than its absence. <b>Harm:</b> an equal
+    /// count of client-side failures hid the server's error number from the reason.</summary>
+    [Fact]
+    public void A_tie_between_a_number_and_no_number_names_the_number()
+    {
+        var best = Tally((null, "client-side"), (547, Fk)).MostCommon();
+        Assert.True(best?.Number == 547, $"a tie named {(best?.Number is int n ? n.ToString(System.Globalization.CultureInfo.InvariantCulture) : "no number")}, not error 547");
+        Assert.Null(Tally((null, "a"), (null, "b"), (547, Fk)).MostCommon()?.Number);   // strictly more rows still wins
+    }
 }

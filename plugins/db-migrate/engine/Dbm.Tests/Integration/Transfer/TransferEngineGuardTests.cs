@@ -140,7 +140,7 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
         Assert.Equal(RunStatus.Failed, outcome.Status);
         Assert.Equal(0, await rig.Tgt.CountAsync("app.Ident"));                       // nothing was renumbered, because nothing was loaded
         Assert.Equal(0, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(*) FROM app.Ident WHERE Id IN (1, 2, 3, 4)"));
-        Assert.Contains("Id", rig.Repo.Task(runId, "T01")!.Error);
+        Assert.Contains("Id", rig.Repo.Task(runId, "T01")!.Error, StringComparison.Ordinal);
     }
 
     /// <summary>A plan defect is reported as a plan defect naming the column, not as a chunk of individually rejected rows.</summary>
@@ -155,7 +155,7 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
         Assert.Equal(RunStatus.Failed, (await rig.Engine.RunAsync(runId, new TransferControl(), default)).Status);
         Assert.Equal(0, await rig.Tgt.CountAsync("app.Missing"));
         Assert.Equal(0, rig.Repo.ErrorRowCount(runId, "T01"));                        // not 400 error rows blaming the data
-        Assert.Contains("V", rig.Repo.Task(runId, "T01")!.Error);
+        Assert.Contains("V", rig.Repo.Task(runId, "T01")!.Error, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -277,6 +277,73 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
     }
 
     /// <summary>
+    /// Ruling 201's limit: the re-run exemption is for duplicate keys only. A table that held rows before the run and whose rejects
+    /// include an FK or CHECK violation (547) is still stopped - whether every reject is a CHECK, or half of them are duplicates of the
+    /// rows already there. <b>Harm:</b> an exemption keyed on "the target was not empty" alone would let a wrong mapping in a re-run
+    /// shred the table row by row again, which is open item 30 all over.
+    /// </summary>
+    [Theory]
+    [InlineData("s.[V]")]                                                  // every reject a CHECK violation
+    [InlineData("CASE WHEN s.[Id] <= 50 THEN N'ok' ELSE s.[V] END")]       // 1-50 duplicates of the rows already there, 51-100 CHECK
+    public async Task A_rerun_into_a_non_empty_table_still_stops_when_a_reject_is_not_a_duplicate_key(string v)
+    {
+        await using var rig = await RigAsync(One(Okay(v, " WHERE s.[Id] <= 100")));
+        await rig.Tgt.ExecAsync("INSERT app.Okay (Id, V) SELECT TOP (50) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), N'ok' FROM sys.all_objects;");
+        long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 50, ErrorMode = "skip" });
+
+        var outcome = await rig.Engine.RunAsync(runId, new TransferControl(), default);
+
+        Assert.True(outcome.Status == RunStatus.Failed,
+            $"a re-run whose rejects include a CHECK violation ended {outcome.Status}: the re-run exemption covered more than duplicate keys");
+        Assert.True(rig.Repo.Task(runId, "T01")!.Error!.Contains("CK_Okay_V", StringComparison.Ordinal), rig.Repo.Task(runId, "T01")!.Error);
+    }
+
+    /// <summary>
+    /// Ruling 201 across a pause: a re-run of 100 rows into a table that already holds all of them, paused after its first chunk. The
+    /// resumed segment's tally sees only chunk 2's rejects, so the duplicates have to be shown from the task's recorded error rows.
+    /// <b>Harm:</b> judged on the tally alone, a pause would turn the confirmed re-run back into a stopped task.
+    /// </summary>
+    [Fact]
+    public async Task A_paused_rerun_of_duplicates_is_exempt_on_its_recorded_rejects()
+    {
+        await using var rig = await RigAsync(One(Okay("N'ok'", " WHERE s.[Id] <= 100")));
+        await rig.Tgt.ExecAsync("INSERT app.Okay (Id, V) SELECT TOP (100) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), N'ok' FROM sys.all_objects;");
+        long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 50, ErrorMode = "skip" });
+        var control = new TransferControl();
+        control.ChunkCommitted += c => { if (c.ChunkNo == 1) control.RequestPause(); };
+        Assert.Equal(RunStatus.Paused, (await rig.Engine.RunAsync(runId, control, default)).Status);
+
+        var resumed = await rig.Engine.RunAsync(runId, new TransferControl(), default);
+
+        Assert.True(resumed.Status == RunStatus.Completed,
+            $"the paused re-run of duplicates was stopped on resume ({resumed.Status}): {resumed.Error}");
+        var task = rig.Repo.Task(runId, "T01")!;
+        Assert.True(task.RowsDone == 0 && task.RowsError == 100, $"{task.RowsDone} loaded, {task.RowsError} rejected");
+    }
+
+    /// <summary>
+    /// Review F3: the judgement lands in a segment that rejected nothing of its own - 100 bad rows in chunks of 50, paused after chunk
+    /// 2, and the resumed segment's first read is the empty end. The reason still names the error, from the recorded rows.
+    /// <b>Harm:</b> the one sentence that tells the operator what went wrong vanished exactly when a pause came first.
+    /// </summary>
+    [Fact]
+    public async Task A_judgement_after_a_pause_names_the_error_from_the_recorded_rows()
+    {
+        await using var rig = await RigAsync(One(Okay("s.[V]", " WHERE s.[Id] <= 100")));
+        long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 50, ErrorMode = "skip" });
+        var control = new TransferControl();
+        control.ChunkCommitted += c => { if (c.ChunkNo == 2) control.RequestPause(); };
+        Assert.Equal(RunStatus.Paused, (await rig.Engine.RunAsync(runId, control, default)).Status);
+
+        Assert.Equal(RunStatus.Failed, (await rig.Engine.RunAsync(runId, new TransferControl(), default)).Status);
+
+        string error = rig.Repo.Task(runId, "T01")!.Error!;
+        Assert.True(error.Contains("The most common recorded error, on 100 of 100 recorded rows, was: ", StringComparison.Ordinal)
+                    && error.Contains("CK_Okay_V", StringComparison.Ordinal),
+            "the reason for a judgement after a pause does not name the error: " + error);
+    }
+
+    /// <summary>
     /// A keyless task loads in one transaction, so the judgement rolls it back whole: nothing is in the target, nothing is recorded,
     /// and the reason says so. <b>Harm:</b> the keyless path bisects just as slowly, and it would otherwise run to the end of the table.
     /// </summary>
@@ -323,7 +390,7 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
 
         Assert.Equal(RunStatus.Failed, outcome.Status);
         Assert.Equal(200, await rig.Tgt.CountAsync("app.Wide"));                      // 200, not 600
-        Assert.Contains("checkpoint", rig.Repo.Task(runId, "T01")!.Error);
+        Assert.Contains("checkpoint", rig.Repo.Task(runId, "T01")!.Error, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -401,7 +468,7 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
         Assert.Equal(RunStatus.Completed, outcome.Status);
         var refused = Assert.IsType<TransferException>(refusal);
         Assert.Equal("run_in_progress", refused.Code);
-        Assert.Contains($"run {runId}", refused.Message);                                           // and it says which run
+        Assert.Contains($"run {runId}", refused.Message, StringComparison.Ordinal);                                           // and it says which run
     }
 
     /// <summary>

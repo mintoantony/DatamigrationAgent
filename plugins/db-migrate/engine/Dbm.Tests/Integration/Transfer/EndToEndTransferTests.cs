@@ -452,13 +452,13 @@ public sealed class EndToEndTransferTests(SamplePlanFixture fx) : IClassFixture<
     }
 
     /// <summary>
-    /// Added for dispatch item 3 (report F2), restated by rulings 147, 186 and 192. A second run into the target the first one filled,
-    /// with the options the Execute screen offers by default (skip, no truncate). Every row of a keyed table is a duplicate key, which
-    /// since ruling 147 is a per-row reject (2627 is a row fault, so H2 would not fire even if the texts were identical - they are not,
-    /// each names its own value). Ruling 192: a task whose whole source was rejected and nothing loaded is failed as bad_task, naming
-    /// error 2627, so the first segment fails on app.Products - after app.AuditEvents, first in plan order with Parallelism 1, which
-    /// ShopV2 gives no key at all, has nothing to refuse it and has loaded its 5 000 rows a second time. Resume is the operator
-    /// accepting the rejects: app.Products ends Done with everything rejected and nothing added. Both tasks' count comparisons then balance
+    /// Added for dispatch item 3 (report F2), restated by rulings 147, 186, 192 and 201. A second run into the target the first one
+    /// filled, with the options the Execute screen offers by default (skip, no truncate). Every row of a keyed table is a duplicate key,
+    /// which since ruling 147 is a per-row reject (2627 is a row fault, so H2 would not fire even if the texts were identical - they are
+    /// not, each names its own value). Ruling 192's zero-load guard does not stop it: ruling 201 exempts a table that held rows before
+    /// the run when every reject is a duplicate key. So the run completes in one segment: app.Products ends Done with everything
+    /// rejected and nothing added, and app.AuditEvents, which ShopV2 gives no key at all, has nothing to refuse it and loads its 5 000
+    /// rows a second time. Both tasks' count comparisons then balance
     /// as rows added, the checksums are skipped ("target table was not empty before the run"), and the headline says what was compared
     /// and names the table that received nothing, never "validated" (rulings 186, 192).
     /// <para>The second run here is given two of the six tasks - one keyed, one keyless - because that is what the finding is about. The
@@ -468,7 +468,7 @@ public sealed class EndToEndTransferTests(SamplePlanFixture fx) : IClassFixture<
     /// run repeats the first one exactly - that is the supported path, over the whole plan, and it is asserted here too.</para>
     /// </summary>
     [Fact]
-    public async Task Second_run_into_a_non_empty_target_fails_on_the_all_rejected_table_and_resume_doubles_the_keyless_one()
+    public async Task Second_run_into_a_non_empty_target_completes_while_rejecting_everything_and_doubling_the_keyless_table()
     {
         await using var rig = await RigAsync();
         var first = rig.NewEngine();
@@ -497,15 +497,12 @@ public sealed class EndToEndTransferTests(SamplePlanFixture fx) : IClassFixture<
 
         string products = rig.TaskOf("app.Products"), audit = rig.TaskOf("app.AuditEvents");
         var second = new TransferEngine(rig.Svc.Services, Only(fx.Plan(), products, audit), fx.Src.ConnectionString, rig.Tgt.ConnectionString);
-        long secondRun = second.CreateRun(1, new TransferOptions { ErrorMode = "skip", Parallelism = 1 });
-        var failed = await second.RunAsync(secondRun, new TransferControl(), default);
-        Assert.True(failed.Status == RunStatus.Failed, $"a table that took none of its 200 rows did not fail its task: {failed.Status}");
-        string productsError = rig.Repo.Task(secondRun, products)!.Error!;
-        Assert.True(productsError.Contains("Every row of the first chunk of app.Products was rejected (200 rows)", StringComparison.Ordinal)
-                    && productsError.Contains("on 200 of 200 rows, was error 2627", StringComparison.Ordinal),
-            "the failure does not say every row was rejected on error 2627: " + productsError);
-        Assert.Equal(TransferTaskStatus.Done, rig.Repo.Task(secondRun, audit)!.Status);   // first in plan order, so it ran first
-        Assert.Equal(RunStatus.Completed, (await second.RunAsync(secondRun, new TransferControl(), default)).Status);   // Resume
+        long secondRun = second.CreateRun(1, new TransferOptions { ErrorMode = "skip" });
+        var outcome = await second.RunAsync(secondRun, new TransferControl(), default);
+        // Ruling 201: the confirmed re-run is not stopped by ruling 192's guard - app.Products held rows before the run and every one of
+        // its rejects is a duplicate key (2627), which is what the confirmation said would happen.
+        Assert.True(outcome.Status == RunStatus.Completed,
+            $"the confirmed re-run into a non-empty target was stopped over its duplicate keys ({outcome.Status}): {outcome.Error}");
         foreach (var row in rig.Repo.Tasks(secondRun))
         {
             bool keyless = row.TaskId == audit;
