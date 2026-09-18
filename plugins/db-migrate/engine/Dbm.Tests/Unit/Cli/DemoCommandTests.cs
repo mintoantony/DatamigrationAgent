@@ -1,6 +1,7 @@
 using Dbm.Cli.Commands;
 using Dbm.Core;
 using Dbm.Core.Samples;
+using Dbm.Core.State;
 using Dbm.Tests.Support;
 using Microsoft.Data.SqlClient;
 
@@ -58,6 +59,32 @@ public class DemoCommandTests
         Assert.Equal(1, r.Exit);
         Assert.Equal("no_project", r.Json["error"]!.GetValue<string>());
         Assert.False(File.Exists(tw.Ws.StateDbPath), "demo --attach created a project instead of refusing: nothing may be initialised by a refusal.");
+    }
+
+    [Fact]
+    public async Task Demo_attach_after_the_transfer_started_is_locked_before_touching_sql()
+    {
+        using var tw = new TestWorkspace();
+        using (var services = tw.OpenServices()) services.Phases.SetStatus(PhaseName.Transfer, PhaseStatus.Running);
+
+        // As above: a connection attempt would answer sql_error, so "locked" proves the phase check ran first.
+        var r = await CliRunner.RunAsync(tw.Ws, null, "demo", "--server", "Server=nowhere;Connect Timeout=1", "--attach");
+
+        Assert.Equal(1, r.Exit);
+        Assert.Equal("locked", r.Json["error"]!.GetValue<string>());
+        Assert.Contains("transfer has started", r.Json["message"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Demo_against_an_unreachable_server_is_a_sql_error_that_says_nothing_was_touched()
+    {
+        using var tw = new TestWorkspace();
+
+        var r = await CliRunner.RunAsync(tw.Ws, null, "demo", "--server", "Server=nowhere;Connect Timeout=1");
+
+        Assert.Equal(1, r.Exit);
+        Assert.Equal("sql_error", r.Json["error"]!.GetValue<string>());
+        Assert.Contains("No database was created or dropped.", r.Json["message"]!.GetValue<string>());
     }
 
     [Fact]

@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using Dbm.Web;
 
@@ -24,10 +25,11 @@ public sealed class ExportCommand : ICommand
         var info = await ServerControl.EnsureRunningAsync(ws);
 
         using var http = new HttpClient { BaseAddress = new Uri(info.BaseUrl), Timeout = TimeSpan.FromMinutes(5) };
-        using var request = new HttpRequestMessage(HttpMethod.Post, $"/api/export/{Uri.EscapeDataString(what)}");
+        var route = $"/api/export/{Uri.EscapeDataString(what)}";
+        using var request = new HttpRequestMessage(HttpMethod.Post, route);
         request.Headers.Add(TokenGuard.Header, info.Token);
         using var response = await http.SendAsync(request);
-        var body = JsonNode.Parse(await response.Content.ReadAsStringAsync());
+        var body = await ReadJsonObjectAsync(response, $"POST {info.BaseUrl}{route}");
         if (!response.IsSuccessStatusCode)
         {
             throw new CliFailure(body?["error"]?.GetValue<string>() ?? "export_failed",
@@ -38,6 +40,39 @@ public sealed class ExportCommand : ICommand
         var saved = Path.Combine(ws.Root, body["path"]!.GetValue<string>().Replace('/', Path.DirectorySeparatorChar));
         var path = CopyToOut(args.Opt("out"), saved, file);
         return Output.Ok(ctx, new { ok = true, what, file, path, bytes = new FileInfo(path).Length });
+    }
+
+    /// <summary>
+    /// Ruling 158: an answer that is not a JSON object (a proxy's HTML page, some other process on a stale port) is
+    /// `server_error` naming the method, the full URL, the HTTP status and the first 200 characters of the body.
+    /// </summary>
+    private static async Task<JsonObject> ReadJsonObjectAsync(HttpResponseMessage response, string requestLine)
+    {
+        var status = (int)response.StatusCode;
+        string text;
+        try
+        {
+            text = await response.Content.ReadAsStringAsync();
+        }
+        catch (Exception ex) when (ex is HttpRequestException or IOException)
+        {
+            throw new CliFailure("server_error", $"{requestLine} returned HTTP {status}, but its body could not be read: {ex.Message}");
+        }
+
+        JsonNode? node;
+        try
+        {
+            node = JsonNode.Parse(text);
+        }
+        catch (JsonException)
+        {
+            node = null;
+        }
+        if (node is JsonObject body) return body;
+
+        var head = text.Length > 200 ? text[..200] + "…" : text;
+        var kind = node is null ? "a non-JSON body" : "a JSON body that is not an object";
+        throw new CliFailure("server_error", $"{requestLine} returned HTTP {status} with {kind}: '{head}'.");
     }
 
     /// <summary>

@@ -55,7 +55,20 @@ public sealed class DemoCommand : ICommand
         try
         {
             var result = await DemoDatabases.CreateAsync(server, scale, prefix, args.Flag("force"), CancellationToken.None);
-            if (attach) await AttachAsync(ctx, ws!, result, CancellationToken.None);
+            if (attach)
+            {
+                try
+                {
+                    await AttachAsync(ctx, ws!, result, CancellationToken.None);
+                }
+                catch (SqlException ex)
+                {
+                    throw new CliFailure("sql_error", Redactor.Scrub(
+                        $"Created and seeded {result.SourceDatabase} and {result.TargetDatabase}, then failed saving them as this " +
+                        $"project's connections: {ex.Message.Trim().TrimEnd('.')}. Re-run with --force --attach to start over.",
+                        Redactor.SecretsOf(server)));
+                }
+            }
             return Output.Ok(ctx, new
             {
                 ok = true,
@@ -72,8 +85,9 @@ public sealed class DemoCommand : ICommand
         {
             throw new CliFailure("demo_exists", ex.Message);
         }
-        catch (SqlException ex)
+        catch (DemoFailedException ex)
         {
+            // Ruling 157: names both databases, what happened to each, the server's text and the remedy.
             throw new CliFailure("sql_error", Redactor.Scrub(ex.Message, Redactor.SecretsOf(server)));
         }
     }

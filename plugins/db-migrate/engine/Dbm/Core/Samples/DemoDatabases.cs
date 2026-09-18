@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.RegularExpressions;
 using Dbm.Core.Sql;
 using Microsoft.Data.SqlClient;
@@ -10,10 +11,20 @@ public sealed record DemoResult(string SourceDatabase, string SourceConnectionSt
 /// <summary>At least one demo database exists already and --force was not given.</summary>
 public sealed class DemoExistsException(string message) : Exception(message);
 
+/// <summary>A server error part-way through; the message names every step already done, the one that failed and the remedy.</summary>
+public sealed class DemoFailedException(string message, SqlException inner) : Exception(message, inner);
+
 /// <summary>Creates (and drops) the LegacyShop → ShopV2 demo pair from the embedded sample scripts.</summary>
 public static partial class DemoDatabases
 {
     public const string DefaultPrefix = "DbmDemo_";
+
+    /// <summary>
+    /// Test seam, keyed by exact database name: text appended to that database's CREATE DATABASE statement, so a test
+    /// can make one step fail on the server itself (e.g. " COLLATE No_Such_Collation"). Keyed by name like
+    /// ServerControl.SpawnOverrides, so a test only ever affects the databases its own prefix names.
+    /// </summary>
+    internal static readonly ConcurrentDictionary<string, string> CreateDatabaseSuffixOverrides = new(StringComparer.Ordinal);
 
     [GeneratedRegex("^[A-Za-z0-9_]{0,50}$")]
     private static partial Regex PrefixPattern();
@@ -34,33 +45,70 @@ public static partial class DemoDatabases
         if (scale < 1) throw new ArgumentOutOfRangeException(nameof(scale), scale, "scale must be >= 1");
         if (!IsValidPrefix(prefix)) throw new ArgumentException($"Invalid demo prefix '{prefix}'.", nameof(prefix));
         var (source, target) = Names(prefix);
-
-        await using (var master = await SqlConnect.OpenAsync(ForDatabase(serverConnectionString, "master"), ct))
-        {
-            var existing = new List<string>();
-            foreach (var database in new[] { source, target })
-            {
-                if (await ExistsAsync(master, database, ct)) existing.Add(database);
-            }
-            if (existing.Count > 0 && !force)
-            {
-                throw new DemoExistsException($"Database {string.Join(" and ", existing)} already exists. " +
-                    "Re-run with --force to drop and recreate the demo databases, or choose another --prefix.");
-            }
-            SqlConnection.ClearAllPools();   // pooled sessions of a dropped database are dead
-            foreach (var database in existing) await DropOneAsync(master, database, ct);
-            foreach (var database in new[] { source, target })
-            {
-                await ExecuteAsync(master, $"CREATE DATABASE {SqlQuote.Ident(database)};", ct);
-            }
-        }
-
         var sourceCs = ForDatabase(serverConnectionString, source);
         var targetCs = ForDatabase(serverConnectionString, target);
-        await RunScriptAsync(sourceCs, SampleSql.LegacyShopSchema, ct);
-        await RunScriptAsync(sourceCs, SampleSql.Seed(scale), ct);
-        await RunScriptAsync(targetCs, SampleSql.ShopV2Schema, ct);
+
+        // Every step that changed the instance, in order, so a failure can say exactly what it left behind.
+        var done = new List<string>();
+        var step = "connecting to the server";
+        try
+        {
+            await using (var master = await SqlConnect.OpenAsync(ForDatabase(serverConnectionString, "master"), ct))
+            {
+                step = $"checking whether {source} and {target} exist";
+                var existing = new List<string>();
+                foreach (var database in new[] { source, target })
+                {
+                    if (await ExistsAsync(master, database, ct)) existing.Add(database);
+                }
+                if (existing.Count > 0 && !force)
+                {
+                    throw new DemoExistsException($"Database {string.Join(" and ", existing)} already exists. " +
+                        "Re-run with --force to drop and recreate the demo databases, or choose another --prefix.");
+                }
+                SqlConnection.ClearAllPools();   // pooled sessions of a dropped database are dead
+                foreach (var database in existing)
+                {
+                    step = $"dropping {database}";
+                    await DropOneAsync(master, database, ct);
+                    done.Add($"dropped {database}");
+                }
+                foreach (var database in new[] { source, target })
+                {
+                    step = $"creating {database}";
+                    var suffix = CreateDatabaseSuffixOverrides.TryGetValue(database, out var s) ? s : "";
+                    await ExecuteAsync(master, $"CREATE DATABASE {SqlQuote.Ident(database)}{suffix};", ct);
+                    done.Add($"created {database}");
+                }
+            }
+
+            step = $"creating the LegacyShop tables in {source}";
+            await RunScriptAsync(sourceCs, SampleSql.LegacyShopSchema, ct);
+            done.Add($"created the LegacyShop tables in {source}");
+            step = $"seeding {source} at scale {scale}";
+            await RunScriptAsync(sourceCs, SampleSql.Seed(scale), ct);
+            done.Add($"seeded {source}");
+            step = $"creating the ShopV2 tables in {target}";
+            await RunScriptAsync(targetCs, SampleSql.ShopV2Schema, ct);
+        }
+        catch (SqlException ex)
+        {
+            throw new DemoFailedException(FailureMessage(done, step, ex.Message), ex);
+        }
         return new DemoResult(source, sourceCs, target, targetCs);
+    }
+
+    /// <summary>
+    /// "Created X, then failed creating Y: &lt;server text&gt;. Re-run with --force to start over." — every step that
+    /// changed the instance, the step that failed, the server's words and the remedy; or, when nothing had changed
+    /// yet, says so.
+    /// </summary>
+    internal static string FailureMessage(IReadOnlyList<string> done, string step, string serverText)
+    {
+        var reason = serverText.Trim().TrimEnd('.');
+        if (done.Count == 0) return $"Failed {step}: {reason}. No database was created or dropped.";
+        var history = string.Join(", ", done);
+        return $"{char.ToUpperInvariant(history[0])}{history[1..]}, then failed {step}: {reason}. Re-run with --force to start over.";
     }
 
     /// <summary>Drops this prefix's two demo databases when they exist. Never touches any other database.</summary>
