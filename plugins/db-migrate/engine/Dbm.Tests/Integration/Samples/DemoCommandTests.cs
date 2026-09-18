@@ -178,6 +178,79 @@ public sealed class DemoCommandTests : IAsyncLifetime
         Assert.False(await DatabaseExistsAsync(_prefix + "ShopV2"), $"the message says creating {_prefix}ShopV2 failed, but it exists: {message}");
     }
 
+    private static async Task<string> UserAccessAsync(string name)
+    {
+        await using var master = new SqlConnection(SqlTestServer.MasterConnectionString);
+        await master.OpenAsync();
+        await using var cmd = new SqlCommand("SELECT user_access_desc FROM sys.databases WHERE name = @name;", master);
+        cmd.Parameters.AddWithValue("@name", name);
+        return (string)(await cmd.ExecuteScalarAsync())!;
+    }
+
+    /// <summary>
+    /// Runs `dbm demo --force` over an existing pair with the source's DROP DATABASE (run after SET SINGLE_USER has
+    /// succeeded) made to fail on the server, and optionally the SET MULTI_USER that should put it back.
+    /// </summary>
+    private async Task<CliResult> RunForceWithSourceDropFailingAsync(TestWorkspace tw, bool restoreFails)
+    {
+        var source = _prefix + "LegacyShop";
+        DemoDatabases.DropStatementOverrides[source] = "THROW 50000, 'drop refused by the test seam', 1;";
+        if (restoreFails) DemoDatabases.MultiUserStatementOverrides[source] = "THROW 50000, 'restore refused by the test seam', 1;";
+        try
+        {
+            return await CliRunner.RunAsync(tw.Ws, null,
+                "demo", "--server", SqlTestServer.ConnectionString, "--prefix", _prefix, "--force");
+        }
+        finally
+        {
+            DemoDatabases.DropStatementOverrides.TryRemove(source, out _);
+            DemoDatabases.MultiUserStatementOverrides.TryRemove(source, out _);
+        }
+    }
+
+    /// <summary>Open item 34: a DROP that fails after SET SINGLE_USER succeeded must not leave the database single-user.</summary>
+    [Fact]
+    public async Task Demo_force_whose_drop_fails_puts_the_database_back_in_multi_user_mode_and_says_so()
+    {
+        using var tw = new TestWorkspace();
+        AssertOk(await CliRunner.RunAsync(tw.Ws, null, "demo", "--server", SqlTestServer.ConnectionString, "--prefix", _prefix));
+
+        var r = await RunForceWithSourceDropFailingAsync(tw, restoreFails: false);
+
+        Assert.Equal(1, r.Exit);
+        Assert.Equal("sql_error", r.Json["error"]!.GetValue<string>());
+        var message = r.Json["message"]!.GetValue<string>();
+        var access = await UserAccessAsync(_prefix + "LegacyShop");
+        Assert.True(access == "MULTI_USER",
+            $"after the failed DROP, {_prefix}LegacyShop is {access}: demo --force must set it back to MULTI_USER. Message: {message}");
+        var expected = $"Failed dropping {_prefix}LegacyShop: drop refused by the test seam. {_prefix}LegacyShop was set back to " +
+            "multi-user mode. No database was created or dropped.";
+        Assert.True(message == expected,
+            $"the message must name the failed drop and say the database was set back to multi-user mode.\n" +
+            $"expected: {expected}\nactual:   {message}");
+    }
+
+    /// <summary>Open item 34: when putting it back fails too, the message says it is single-user and how to undo it.</summary>
+    [Fact]
+    public async Task Demo_force_whose_drop_and_restore_fail_says_the_database_is_single_user_and_how_to_undo_it()
+    {
+        using var tw = new TestWorkspace();
+        AssertOk(await CliRunner.RunAsync(tw.Ws, null, "demo", "--server", SqlTestServer.ConnectionString, "--prefix", _prefix));
+
+        var r = await RunForceWithSourceDropFailingAsync(tw, restoreFails: true);
+
+        Assert.Equal(1, r.Exit);
+        Assert.Equal("sql_error", r.Json["error"]!.GetValue<string>());
+        var message = r.Json["message"]!.GetValue<string>();
+        Assert.Equal("SINGLE_USER", await UserAccessAsync(_prefix + "LegacyShop"));   // the seam really left it so
+        var expected = $"Failed dropping {_prefix}LegacyShop: drop refused by the test seam. {_prefix}LegacyShop was left in " +
+            $"single-user mode, and setting it back failed: restore refused by the test seam. Undo it with: ALTER DATABASE " +
+            $"[{_prefix}LegacyShop] SET MULTI_USER. No database was created or dropped.";
+        Assert.True(message == expected,
+            $"the message must say the database was left in single-user mode and how to undo it (ALTER DATABASE ... SET MULTI_USER).\n" +
+            $"expected: {expected}\nactual:   {message}");
+    }
+
     /// <summary>
     /// The database boundary, asserted rather than trusted. The bystander is named
     /// "&lt;prefix&gt;LegacyShop_Keep", so its name begins with this test's demo prefix *and* with the demo source

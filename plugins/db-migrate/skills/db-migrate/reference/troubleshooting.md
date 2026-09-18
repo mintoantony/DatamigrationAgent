@@ -182,7 +182,9 @@ and the user types `/db-migrate resume`.
   The message lists every step already taken on the server, then the step that failed and the server's text:
   "Failed <step>: <server text>. No database was created or dropped." when nothing had changed yet, otherwise
   "<Step>, <step>, …, then failed <step>: <server text>. Re-run with --force to start over." (for example "Dropped …,
-  created …, then failed creating …"). With `--attach`, a failure after both databases were seeded says "Created and
+  created …, then failed creating …"). When a `--force` drop fails, the database is put back in multi-user mode and
+  the message says so before its last sentence; if even that fails it says the database "was left in single-user mode"
+  and gives the `ALTER DATABASE [<name>] SET MULTI_USER` that undoes it — relay that statement. With `--attach`, a failure after both databases were seeded says "Created and
   seeded <source> and <target>, then failed saving them as this project's connections: … Re-run with --force --attach
   to start over." Relay the message, then the remedy it names.
 - **`not_found`** (`dbm export`) — the server has no export of that kind; the kinds are `analysis`, `sql`, `sqlpack`,
