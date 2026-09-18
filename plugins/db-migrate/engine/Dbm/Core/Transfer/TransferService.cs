@@ -23,6 +23,10 @@ public sealed record TransferRunView(long Id, int SqlVersion, RunStatus Status, 
     /// into a flag - a completed run with notes is not the same thing as a clean one, and this is the only place the difference shows.
     /// </summary>
     public List<string> Notes { get; init; } = [];
+
+    /// <summary>Ruling 184: the plan's pre-load statements still in force in the target - a paused or failed run keeps them on purpose
+    /// (Resume expects them), and the Execute screen names them. Empty for every other run, and when the plan has none.</summary>
+    public List<string> PreSqlInForce { get; init; } = [];
 }
 
 /// <summary>
@@ -438,11 +442,31 @@ public sealed class TransferService
     }
 
     /// <summary>A paused or failed run: drop the checkpoint table, record it cancelled, tell the workflow.</summary>
+    /// <para>Ruling 184: the plan's PostSql runs first, best effort and statement by statement, so the PreSql a paused or failed run
+    /// left in force (NOCHECK on a cut FK, a disabled trigger) is restored - and each statement's outcome, with the server's own text
+    /// when it failed, replaces the run's "still in force" note.</para>
     private async Task CancelStoppedRunAsync(TransferRunRow run, string? note, CancellationToken ct)
     {
-        if (!run.Options.KeepControlTable) await DropControlTableAsync(ConnectionStrings().Target, ct);
-        _services.Transfers.SetRunStatus(run.Id, RunStatus.Cancelled,
-            note is null ? null : MergeNote(_services.Transfers.GetRun(run.Id)?.SummaryJson, note));
+        string targetCs = ConnectionStrings().Target;
+        var notes = new List<string>();
+        if (note is not null) notes.Add(note);
+        try
+        {
+            var plan = _services.Artifacts.Get(PhaseName.Sql, run.SqlVersion) is { } artifact
+                ? Json.Deserialize<SqlPlanPayload>(artifact.PayloadJson) : null;
+            if (plan is null)
+                notes.Add($"{GlobalSql.RestorePrefix} it could not run, because SQL plan v{run.SqlVersion} of this run is no longer in the "
+                          + "workspace; whatever its pre-load SQL disabled in the target is still disabled.");
+            else
+                notes.AddRange(await GlobalSql.RestoreAsync(targetCs, plan.PostSql, ScrubFor(targetCs), ct));
+        }
+        catch (JsonException ex)
+        {
+            notes.Add($"{GlobalSql.RestorePrefix} it could not run, because SQL plan v{run.SqlVersion} could not be read ({Describe(ex)}); "
+                      + "whatever its pre-load SQL disabled in the target is still disabled.");
+        }
+        if (!run.Options.KeepControlTable) await DropControlTableAsync(targetCs, ct);
+        _services.Transfers.SetRunStatus(run.Id, RunStatus.Cancelled, WithNotes(_services.Transfers.GetRun(run.Id)?.SummaryJson, notes));
         _services.Sink.Publish("transfer_run_changed", new { runId = run.Id, status = EnumText.ToText(RunStatus.Cancelled) });
         _services.Workflow.OnTransferFinished("cancelled", null);
     }
@@ -531,6 +555,7 @@ public sealed class TransferService
             RunError(run), HasStoredReport(run))
         {
             Notes = RunNotes(run),
+            PreSqlInForce = run.Status is RunStatus.Paused or RunStatus.Failed ? GlobalSql.Statements(plan?.PreSql) : [],
         };
         return new TransferView(runView, tasks, totals, active, cannotStart is null, targetDatabase,
             approved?.Version, LastPreflight, new TransferOptions())
@@ -787,6 +812,23 @@ public sealed class TransferService
     {
         ArgumentNullException.ThrowIfNull(note);
         return MergeSummary(summaryJson, note: note);
+    }
+
+    /// <summary>The run's summary with the "PreSql still in force" notes dropped (a cancel has just dealt with them) and
+    /// <paramref name="notes"/> appended; every other key is kept.</summary>
+    internal static string WithNotes(string? summaryJson, IReadOnlyList<string> notes)
+    {
+        var merged = MergeSummary(summaryJson);
+        var node = JsonNode.Parse(merged)!.AsObject();
+        var kept = (node["notes"] as JsonArray ?? []).Select(n => n?.GetValue<string>() ?? "").ToList();
+        node["notes"] = new JsonArray(GlobalSql.WithoutInForce(kept).Concat(notes).Select(n => (JsonNode?)JsonValue.Create(n)).ToArray());
+        return node.ToJsonString(Json.Options);
+    }
+
+    private static Func<string, string> ScrubFor(string cs)
+    {
+        var secrets = Redactor.SecretsOf(cs).ToList();
+        return t => Redactor.Scrub(t, secrets);
     }
 
     /// <summary>

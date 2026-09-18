@@ -394,3 +394,14 @@ test('the pre-flight headline counts what did not run without counting it twice'
   await D.settle();
   assert.equal(D.text(D.query(m.root, '.card-b .badge')), '1 blocking problem, 1 warning, including 1 check that did not run');
 });
+
+test('a failed run names the pre-load statements it leaves in force (ruling 184)', async () => {
+  const stmt = 'ALTER TABLE [app].[Customers] NOCHECK CONSTRAINT [FK_Customers_PrimaryAddress];';
+  const view = runningView({
+    active: false,
+    run: Object.assign({}, runningView().run, { status: 'failed', error: 'T04: boom', notes: [], preSqlInForce: [stmt] }),
+  });
+  const m = await mount(view);
+  const banner = D.query(m.root, '.exe-banner');
+  assert.ok(D.text(banner).indexOf(stmt) >= 0, 'the failed banner does not name what is still in force: ' + D.text(banner));
+});

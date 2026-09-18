@@ -379,17 +379,28 @@
       const failed = d.tasks.filter(function (t) { return t.status === 'failed'; });
       const msg = run.error || (failed.length ? failed[0].taskId + ' ' + failed[0].target + ': ' + failed[0].error : 'See the log.');
       return h('div', { class: 'exe-banner is-err', role: 'alert' }, h('strong', {}, 'Transfer failed. '), msg,
-        h('div', { class: 'small muted' }, 'Resume retries from the last committed checkpoint; Cancel abandons the run.'));
+        h('div', { class: 'small muted' }, 'Resume retries from the last committed checkpoint; Cancel abandons the run.'),
+        inForce(run));
     }
     if (run.status === 'paused') {
       return h('div', { class: 'exe-banner is-warn', role: 'status' }, h('strong', {}, 'Paused. '),
-        'Committed chunks are safe; Resume continues exactly where each task stopped.');
+        'Committed chunks are safe; Resume continues exactly where each task stopped.', inForce(run));
     }
     if (run.status === 'cancelled') {
       return h('div', { class: 'exe-banner', role: 'status' }, h('strong', {}, 'Cancelled. '),
         'Rows already committed remain in the target. You can start a new run below.');
     }
     return null;
+  }
+
+  /** Ruling 184: the plan's pre-load statements a paused or failed run keeps in force in the target, named - Resume expects them,
+   *  and only Cancel (which runs the post-load SQL) or a completed run undoes them. */
+  function inForce(run) {
+    const list = run.preSqlInForce || [];
+    if (!list.length) return null;
+    return h('div', { class: 'stack-sm exe-inforce' },
+      h('div', { class: 'small' }, 'Still in force in the target (the plan’s pre-load SQL; Resume expects it, Cancel restores it):'),
+      h('ul', { class: 'small mono' }, ...list.map(function (s) { return h('li', { class: 'wrap-anywhere' }, s); })));
   }
 
   /** The run's own notes, word for word and in order: a control table that was not ours, rows counted but never recorded, a
@@ -439,7 +450,8 @@
   function confirmCancel() {
     DBM.components.modal({
       title: 'Cancel this run?',
-      body: h('p', {}, 'Running tasks stop after their current chunk. Rows already committed stay in the target and the run cannot be resumed.'),
+      body: h('p', {}, 'Running tasks stop after their current chunk. Rows already committed stay in the target and the run cannot be resumed. '
+        + 'The plan’s post-load SQL then runs to re-enable what its pre-load SQL disabled; the run’s notes say what was restored.'),
       confirmText: 'Cancel run',
       danger: true,
     }).then(function (ok) { if (ok) act('cancel'); });
