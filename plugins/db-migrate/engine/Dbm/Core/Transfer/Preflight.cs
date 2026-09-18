@@ -358,6 +358,30 @@ public static class Preflight
         return checks;
     }
 
+    /// <summary>
+    /// Ruling 190 (re-review N-1): the plan's target tables that hold rows <b>now</b>, counted live for the new-run guard at Start -
+    /// never read from a cached pre-flight, which can predate a run that filled them. A table that does not exist is skipped (the
+    /// pre-flight's target_tables check blocks the run on its own). SQL faults propagate: the caller refuses the start.
+    /// </summary>
+    public static async Task<List<NonEmptyTarget>> NonEmptyTargetsAsync(SqlConnection tgt, SqlPlanPayload plan, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(tgt);
+        ArgumentNullException.ThrowIfNull(plan);
+        var list = new List<NonEmptyTarget>();
+        var targets = TransferEngine.PlanOrder(plan).Select(id => plan.Tasks[id].Target).Distinct(StringComparer.OrdinalIgnoreCase);
+        foreach (var target in targets)
+        {
+            await using (var cmd = new SqlCommand("SELECT CASE WHEN OBJECT_ID(@t, N'U') IS NULL THEN 0 ELSE 1 END", tgt))
+            {
+                cmd.Parameters.Add(new SqlParameter("@t", SqlDbType.NVarChar, 600) { Value = SqlQuote.TableKey(target) });
+                if (Convert.ToInt32(await cmd.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture) == 0) continue;
+            }
+            long rows = await TargetOps.CountTargetAsync(tgt, target, ct);
+            if (rows > 0) list.Add(new NonEmptyTarget(target, rows, !await HasUniqueKeyAsync(tgt, target, ct)));
+        }
+        return list;
+    }
+
     /// <summary>A primary key or any unique index: something in the target that refuses a row loaded twice.</summary>
     private static async Task<bool> HasUniqueKeyAsync(SqlConnection tgt, string target, CancellationToken ct)
     {

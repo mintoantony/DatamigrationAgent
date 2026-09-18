@@ -111,6 +111,9 @@ public sealed class TransferService
     private TransferControl? _control;
     private TransferOptions? _preflightOptions;
     private PreflightResult? _lastPreflight;
+    /// <summary>Ruling 190: the workflow and run state the cached pre-flight was taken in (<see cref="WorkflowStamp"/>). A run created
+    /// since, or a Transfer reset by Reopen, Rediscover or a reconnect, changes it and the cache is not reused.</summary>
+    private string? _preflightStamp;
 
     public TransferService(DbmServices services) => _services = services ?? throw new ArgumentNullException(nameof(services));
 
@@ -202,6 +205,7 @@ public sealed class TransferService
         // line about a transfer nobody asked to check.
         var normalized = options.Normalized();
         PreflightResult result;
+        string? stamp = WorkflowStamp();
         try
         {
             result = MalformedPlanResult() ?? await Preflight.RunAsync(_services, normalized, ct);
@@ -214,6 +218,7 @@ public sealed class TransferService
         {
             _lastPreflight = result;
             _preflightOptions = normalized;
+            _preflightStamp = stamp;
         }
         return result;
     }
@@ -280,23 +285,30 @@ public sealed class TransferService
 
             PreflightResult? pre;
             TransferOptions? preOptions;
+            string? preStamp;
             lock (_lock)
             {
                 pre = _lastPreflight;
                 preOptions = _preflightOptions;
+                preStamp = _preflightStamp;
             }
             // Structural, not reference: both sides are normalised copies, so a reference test would re-run the checklist every time
             // and a missing test would start a run on a checklist taken for different options against a target that has since changed.
             if (restart || pre is null || !pre.Passed || pre.SqlVersion != approved.Version || Clock.Now() - pre.At > PreflightMaxAge
-                || preOptions != options)
+                || preOptions != options || preStamp is null || preStamp != WorkflowStamp())
                 pre = await PreflightAsync(options, ct);
             if (!pre.Passed)
                 throw new TransferException("preflight_failed", "Pre-flight checks failed.",
                     pre.Checks.Where(c => !c.Ok && c.Severity == "error").Select(c => $"{c.Name}: {c.Detail}").ToList());
-            EnsureNonEmptyTargetsConfirmed(pre, options, confirmNonEmpty);
+            // Ruling 190: counted live, never from the cached pre-flight (which can predate a run that filled these tables).
+            if (!options.TruncateTarget)
+                EnsureNonEmptyTargetsConfirmed(await LiveNonEmptyTargetsAsync(tgtCs, approved.Plan, ct), confirmNonEmpty);
 
             var engine = new TransferEngine(_services, approved.Plan, srcCs, tgtCs);
             long runId = engine.CreateRun(approved.Version, options);
+            // Ruling 190: a checklist taken before this run says nothing about the target after it - never reused for another start.
+            // (The new run id changes WorkflowStamp too; the result itself stays readable as LastPreflight for the screen.)
+            lock (_lock) _preflightStamp = null;
             await EnsureNoOtherRunnerAsync(runId, tgtCs, ct);
             if (!restart) _services.Workflow.OnTransferStarted();
             Launch(engine, runId, srcCs, tgtCs, RunOrigin.Created);
@@ -581,20 +593,54 @@ public sealed class TransferService
     /// deliberate act: Truncate target first, or a confirmation that names every non-empty table. Resume is not affected: it continues
     /// from checkpoints and loads nothing twice.
     /// </summary>
-    private static void EnsureNonEmptyTargetsConfirmed(PreflightResult pre, TransferOptions options, IReadOnlyCollection<string>? confirmed)
+    private static void EnsureNonEmptyTargetsConfirmed(IReadOnlyList<NonEmptyTarget> nonEmpty, IReadOnlyCollection<string>? confirmed)
     {
-        if (options.TruncateTarget || pre.NonEmptyTargets.Count == 0) return;
+        if (nonEmpty.Count == 0) return;
         var named = new HashSet<string>(confirmed ?? [], StringComparer.OrdinalIgnoreCase);
-        var unconfirmed = pre.NonEmptyTargets.Where(t => !named.Contains(t.Target)).ToList();
+        var unconfirmed = nonEmpty.Where(t => !named.Contains(t.Target)).ToList();
         if (unconfirmed.Count == 0) return;
-        var keyless = pre.NonEmptyTargets.Where(t => t.Keyless).Select(t => t.Target).ToList();
+        var keyless = nonEmpty.Where(t => t.Keyless).Select(t => t.Target).ToList();
         throw new TransferException("target_not_empty",
             "Target tables already hold rows, and a new run loads every table from the start"
             + (keyless.Count > 0 ? $": {string.Join(", ", keyless)} {(keyless.Count == 1 ? "has" : "have")} no primary key or unique index, "
                                    + "so rows will be loaded again — duplicates" : "")
             + ". Choose 'Truncate target first', or confirm loading into the non-empty tables by name.",
-            pre.NonEmptyTargets.Select(t => $"{t.Target}: {t.Rows.ToString("N0", System.Globalization.CultureInfo.InvariantCulture)} rows"
+            nonEmpty.Select(t => $"{t.Target}: {t.Rows.ToString("N0", System.Globalization.CultureInfo.InvariantCulture)} rows"
                                             + (t.Keyless ? " (no key: rows will be loaded again — duplicates)" : " (keyed: repeated keys are rejected)")).ToList());
+    }
+
+    /// <summary>Ruling 190: the plan's non-empty target tables right now. A count that cannot be made refuses the start - "could not
+    /// look" is not "empty".</summary>
+    private async Task<List<NonEmptyTarget>> LiveNonEmptyTargetsAsync(string targetCs, SqlGen.SqlPlanPayload plan, CancellationToken ct)
+    {
+        try
+        {
+            await using var conn = await SqlConnect.OpenAsync(targetCs, ct);
+            return await Preflight.NonEmptyTargetsAsync(conn, plan, ct);
+        }
+        catch (Exception ex) when (ex is SqlException or InvalidOperationException or TimeoutException)
+        {
+            throw new TransferException("preflight_failed", "The target tables could not be counted before the start, so it is unknown "
+                                                            + "whether this run would load into tables that already hold rows: "
+                                                            + TransferFailure.Describe(ex, t => Redactor.Scrub(t, Redactor.SecretsOf(targetCs).ToList())));
+        }
+    }
+
+    /// <summary>Ruling 190: the latest run's id and the Transfer and Ready phases' last change. Null when it cannot be read.</summary>
+    private string? WorkflowStamp()
+    {
+        try
+        {
+            long? run = _services.Db.Scalar<long?>("SELECT MAX(id) FROM transfer_run");
+            var transfer = _services.Phases.Get(PhaseName.Transfer);
+            var ready = _services.Phases.Get(PhaseName.Ready);
+            return string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                $"{run}|{EnumText.ToText(transfer.Status)}|{transfer.UpdatedAt:O}|{EnumText.ToText(ready.Status)}|{ready.UpdatedAt:O}");
+        }
+        catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or KeyNotFoundException)
+        {
+            return null;
+        }
     }
 
     /// <summary>

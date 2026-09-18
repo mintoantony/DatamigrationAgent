@@ -103,6 +103,67 @@ public sealed class NewRunGuardTests(EngineSourceFixture fx) : IClassFixture<Eng
         Assert.Contains("row counts validated", svc.Services.Artifacts.Latest(PhaseName.Complete)!.Summary);
     }
 
+    /// <summary>
+    /// Ruling 190 (re-review N-1). Start reused a passing pre-flight under 15 minutes old for the same options and SQL version, and
+    /// the guard read its non-empty list - taken while the target was still empty. After a completed run, Reopen SQL and approve the
+    /// same version, a plain Start loaded app.Log (keyless) a second time. The guard now counts the plan's tables live at Start.
+    /// </summary>
+    [Fact]
+    public async Task A_new_run_after_complete_and_reopen_is_refused_even_inside_the_pre_flight_window()
+    {
+        await using var tgt = await TempDatabase.CreateAsync("dbm_guard_tgt");
+        await tgt.ExecAsync(TransferEngineTests.TargetSchema);
+        using var tw = new TestWorkspace();
+        await using var server = await WebTestServer.StartAsync(tw.Ws, ws =>
+        {
+            var opened = DbmServices.Open(ws);
+            if (!opened.Project.Exists()) opened.Project.Init("guard");
+            return opened;
+        });
+        var s = server.Services;
+        await PrepareAsync(s, fx.Src.ConnectionString, tgt);
+
+        var (pre, _) = await server.SendAsync(HttpMethod.Post, "/api/transfer/preflight", new { options = Skip });
+        Assert.Equal(HttpStatusCode.OK, pre);
+        var (first, firstBody) = await server.SendAsync(HttpMethod.Post, "/api/transfer/start", new { options = Skip, confirmTarget = tgt.Name });
+        Assert.True(first == HttpStatusCode.OK, firstBody?.ToJsonString());
+        await Wait.UntilAsync(() => s.Phases.Get(PhaseName.Complete).Status == PhaseStatus.Approved, 60_000);
+        Assert.Equal(700, await tgt.CountAsync("app.Log"));
+        s.Workflow.Reopen(PhaseName.Sql);
+        s.Workflow.Approve(PhaseName.Sql);                                              // the same SQL version, well inside 15 minutes
+
+        var (status, body) = await server.SendAsync(HttpMethod.Post, "/api/transfer/start", new { options = Skip, confirmTarget = tgt.Name });
+
+        Assert.True(status == HttpStatusCode.Conflict && (string?)body?["error"] == "target_not_empty",
+            $"a plain Start after a completed run and a reopen answered {(int)status}: {body?.ToJsonString()} - app.Log (no key) is loaded a second time");
+        Assert.Equal(1, s.Transfers.Latest()!.Id);                                     // refused before a run row exists
+        Assert.Equal(700, await tgt.CountAsync("app.Log"));
+        // The cached checklist was not reused either: the start re-ran pre-flight, and the screen now shows the tables as non-empty.
+        var shown = (await server.GetJsonAsync("/api/transfer"))["preflight"]!["nonEmptyTargets"]!.AsArray();
+        Assert.True(shown.Any(t => (string?)t!["target"] == "app.Log"),
+            "the start reused the pre-flight taken before run 1, which still says the target is empty: " + shown.ToJsonString());
+    }
+
+    /// <summary>Ruling 190, the live half: rows that reach a target table after a passing pre-flight - with nothing in the workflow
+    /// changing - are still seen by the guard at Start.</summary>
+    [Fact]
+    public async Task Rows_written_after_the_pre_flight_are_counted_at_start()
+    {
+        await using var tgt = await TempDatabase.CreateAsync("dbm_guard_tgt");
+        await tgt.ExecAsync(TransferEngineTests.TargetSchema);
+        using var svc = new XferServices();
+        await PrepareAsync(svc.Services, fx.Src.ConnectionString, tgt);
+        var service = new TransferService(svc.Services);
+        Assert.Empty((await service.PreflightAsync(Skip, default)).NonEmptyTargets);
+        await tgt.ExecAsync("INSERT app.Log (Msg) VALUES (N'written by someone else');");
+
+        var refused = await Record.ExceptionAsync(() => service.StartAsync(Skip, tgt.Name, default));
+
+        Assert.True(refused is TransferException { Code: "target_not_empty" },
+            "a row written after the pre-flight was not seen at Start: " + (refused?.Message ?? "the run started"));
+        Assert.Null(svc.Services.Transfers.Latest());
+    }
+
     [Fact]
     public async Task The_api_refuses_with_a_409_code_the_screen_shows_and_accepts_the_named_confirmation()
     {
