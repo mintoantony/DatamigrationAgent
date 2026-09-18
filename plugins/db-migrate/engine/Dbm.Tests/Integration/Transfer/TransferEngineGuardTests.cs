@@ -53,6 +53,8 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
         CREATE TABLE app.Uni (Id int NOT NULL PRIMARY KEY, Qty int NOT NULL CONSTRAINT CK_Uni_Qty CHECK (Qty < 0));
         CREATE TABLE app.Missing (Id int NOT NULL PRIMARY KEY);
         CREATE TABLE app.Tkey (At datetime2(0) NOT NULL PRIMARY KEY, Qty int NOT NULL CONSTRAINT CK_Tkey_Qty CHECK (Qty > 0));
+        CREATE TABLE app.Okay (Id int NOT NULL PRIMARY KEY, V nvarchar(20) NOT NULL CONSTRAINT CK_Okay_V CHECK (V = N'ok'));
+        CREATE TABLE app.FlatOkay (V nvarchar(20) NOT NULL CONSTRAINT CK_FlatOkay_V CHECK (V = N'ok'));
         """;
 
     private sealed class Rig(XferServices svc, TempDatabase tgt, TransferEngine engine) : IAsyncDisposable
@@ -158,28 +160,143 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
 
     /// <summary>
     /// Ruling 147 (and 164, which moved this test): a chunk whose every row fails alike on a CHECK is N rejected rows, not a broken
-    /// load, because a constraint violation is the server's verdict on each row's values. Before 147 this test asserted the opposite -
-    /// that the task fails - and skip mode then failed real migrations over a chunk of genuinely bad rows (task 5.7, F1).
-    /// <para>What 147 gives up is recorded as open item 30, not fixed here: a CHECK that no source row can satisfy is really a plan
-    /// defect, and it now ends as a completed run with the whole table rejected. It is loud rather than silent - every row is in
-    /// error_row naming the constraint - but nothing yet calls the "everything rejected" task out as such.</para>
+    /// load - every row is recorded with its own reason. Ruling 192 (open item 30) then judges the task: its whole source (one chunk,
+    /// fewer than <see cref="TaskRunner.ZeroLoadChunks"/>) loaded nothing, so a CHECK no row satisfies fails the task as bad_task,
+    /// naming the error and its number, instead of completing under a headline that reads as success. Resume is the operator's "these
+    /// rows really are bad": the chunk is already committed, so the resumed task finishes Done without loading or recording anything
+    /// twice. At chunk size 4 the 8 rows are two full chunks and the source ends on the boundary, so the end is seen by an empty read.
     /// </summary>
-    [Fact]
-    public async Task A_chunk_whose_every_row_breaks_one_check_completes_with_every_row_rejected()
+    [Theory]
+    [InlineData(100, "the first chunk")]
+    [InlineData(4, "the first 2 chunks")]
+    public async Task A_check_no_source_row_satisfies_fails_the_task_and_resume_accepts_the_rejects(int chunkSize, string first)
     {
         await using var rig = await RigAsync(One(TaskOf("app.Uni",
             "SELECT s.[Id] AS [Id], s.[Qty] AS [Qty], s.[Id] AS [__k0] FROM [dbo].[Uni] AS s", ["__k0"],
             [("Id", "Id"), ("Qty", "Qty")])));
-        long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 100, ErrorMode = "skip" });
+        long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = chunkSize, ErrorMode = "skip" });
 
         var outcome = await rig.Engine.RunAsync(runId, new TransferControl(), default);
 
-        Assert.True(outcome.Status == RunStatus.Completed, $"the run ended {outcome.Status}: {outcome.Error}");
-        Assert.Equal(TransferTaskStatus.Done, rig.Repo.Task(runId, "T01")!.Status);
+        Assert.True(outcome.Status == RunStatus.Failed,
+            $"a task whose every source row was rejected ended {outcome.Status} instead of failing as a plan defect: {outcome.Error}");
+        var task = rig.Repo.Task(runId, "T01")!;
+        Assert.Equal(TransferTaskStatus.Failed, task.Status);
+        Assert.True(task.Error!.Contains($"Every row of {first} of app.Uni was rejected (8 rows)", StringComparison.Ordinal)
+                    && task.Error.Contains("error 547", StringComparison.Ordinal) && task.Error.Contains("CK_Uni_Qty", StringComparison.Ordinal),
+            "the failure does not say every row was rejected and name the error with its number: " + task.Error);
         Assert.Equal(0, await rig.Tgt.CountAsync("app.Uni"));
         var rejected = rig.Repo.ErrorRows(runId, "T01", 100);
-        Assert.Equal(8, rejected.Count);                                               // every one of dbo.Uni's 8 source rows
-        Assert.All(rejected, e => Assert.Contains("CK_Uni_Qty", e.Error, StringComparison.Ordinal));
+        Assert.Equal(8, rejected.Count);                                               // every one of dbo.Uni's 8 source rows, recorded
+        Assert.All(rejected, e => Assert.True(e.Error.Contains("CK_Uni_Qty", StringComparison.Ordinal), e.Error));
+
+        var resumed = await rig.Engine.RunAsync(runId, new TransferControl(), default);
+        Assert.True(resumed.Status == RunStatus.Completed,
+            $"Resume did not carry on past the judgement (it ended {resumed.Status}: {resumed.Error}), so rows that really are bad can "
+            + "never be accepted");
+        task = rig.Repo.Task(runId, "T01")!;
+        Assert.Equal(TransferTaskStatus.Done, task.Status);
+        Assert.Equal(8, task.RowsError);
+        Assert.Equal(8, rig.Repo.ErrorRowCount(runId, "T01"));                         // nothing recorded twice
+    }
+
+    private static TaskPlan Okay(string vExpression, string where = "") => TaskOf("app.Okay",
+        $"SELECT s.[Id] AS [Id], {vExpression} AS [V], s.[Id] AS [__k0] FROM [dbo].[Wide] AS s{where}", ["__k0"], [("Id", "Id"), ("V", "V")]);
+
+    /// <summary>
+    /// Ruling 192 at its bound: 400 source rows in chunks of 50, and a CHECK no row satisfies. The task is failed once the first
+    /// <see cref="TaskRunner.ZeroLoadChunks"/> chunks have loaded nothing - 150 rows bisected and recorded - rather than after all eight.
+    /// <b>Harm</b> (5.7 review F1): the whole table single-row bisected, ~76 rows/s, a day and a half for 10 M rows, then a completed run.
+    /// </summary>
+    [Fact]
+    public async Task A_task_whose_first_three_chunks_load_nothing_stops_there()
+    {
+        await using var rig = await RigAsync(One(Okay("s.[V]")));
+        long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 50, ErrorMode = "skip" });
+
+        var outcome = await rig.Engine.RunAsync(runId, new TransferControl(), default);
+
+        Assert.True(outcome.Status == RunStatus.Failed,
+            $"a task whose first 3 chunks loaded nothing ended {outcome.Status}: every one of its 400 rows was bisected and rejected");
+        var task = rig.Repo.Task(runId, "T01")!;
+        Assert.True(task.RowsError == 150 && rig.Repo.ErrorRowCount(runId, "T01") == 150,
+            $"the task went on past its first 3 empty chunks: {task.RowsError} rows rejected, {rig.Repo.ErrorRowCount(runId, "T01")} recorded "
+            + "(expected 150 of the 400, then a failed task)");
+        Assert.True(task.Error!.StartsWith("Every row of the first 3 chunks of app.Okay was rejected (150 rows) and none loaded",
+            StringComparison.Ordinal), task.Error);
+        Assert.Contains("on 150 of 150 rows, was error 547", task.Error, StringComparison.Ordinal);
+        Assert.Contains("Resume carries on from the next chunk", task.Error, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The guard counts the first chunks as a whole, and only them. A task whose first chunk rejects everything but whose second loads a
+    /// row is data, not a plan defect, and runs to the end; and after a legitimately all-rejecting start, Resume goes on to load the rest
+    /// without judging the task again. <b>Harm:</b> a guard that re-judged on resume, or judged any later run of rejected chunks, would
+    /// fail a correct migration the operator had already accepted.
+    /// </summary>
+    [Fact]
+    public async Task Only_the_first_chunks_together_are_judged_and_resume_loads_the_rest()
+    {
+        // Rows 1-50 and 101-150 bad, 51-100 good: chunk 2 loads, so nothing is judged.
+        await using (var rig = await RigAsync(One(Okay("CASE WHEN s.[Id] BETWEEN 51 AND 100 OR s.[Id] > 150 THEN N'ok' ELSE s.[V] END"))))
+        {
+            long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 50, ErrorMode = "skip" });
+            var outcome = await rig.Engine.RunAsync(runId, new TransferControl(), default);
+            Assert.True(outcome.Status == RunStatus.Completed,
+                $"a task whose second chunk loaded rows was failed as if it had loaded nothing: {outcome.Error}");
+            Assert.Equal(300, await rig.Tgt.CountAsync("app.Okay"));
+        }
+
+        // Rows 1-200 bad (the first four chunks), 201-400 good: judged once, after chunk 3. Resume rejects chunk 4 as well - still
+        // nothing loaded - and must not judge again; then it loads the other 200.
+        await using (var rig = await RigAsync(One(Okay("CASE WHEN s.[Id] > 200 THEN N'ok' ELSE s.[V] END"))))
+        {
+            long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 50, ErrorMode = "skip" });
+            var first = await rig.Engine.RunAsync(runId, new TransferControl(), default);
+            Assert.True(first.Status == RunStatus.Failed, $"a task whose first 3 chunks loaded nothing ended {first.Status}");
+            var resumed = await rig.Engine.RunAsync(runId, new TransferControl(), default);
+            Assert.True(resumed.Status == RunStatus.Completed,
+                $"Resume after the judgement did not load the rest (it ended {resumed.Status}: {resumed.Error})");
+            Assert.Equal(200, await rig.Tgt.CountAsync("app.Okay"));
+            var task = rig.Repo.Task(runId, "T01")!;
+            Assert.True(task.RowsDone == 200 && task.RowsError == 200 && rig.Repo.ErrorRowCount(runId, "T01") == 200,
+                $"after resume: {task.RowsDone} loaded, {task.RowsError} rejected, {rig.Repo.ErrorRowCount(runId, "T01")} recorded");
+        }
+
+        // Exactly three full chunks, all bad: judged at chunk 3; the resume's first read is empty, and that end must not judge again.
+        await using (var rig = await RigAsync(One(Okay("s.[V]", " WHERE s.[Id] <= 150"))))
+        {
+            long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 50, ErrorMode = "skip" });
+            var first = await rig.Engine.RunAsync(runId, new TransferControl(), default);
+            Assert.True(first.Status == RunStatus.Failed, $"a task whose 3 chunks loaded nothing ended {first.Status}");
+            var resumed = await rig.Engine.RunAsync(runId, new TransferControl(), default);
+            Assert.True(resumed.Status == RunStatus.Completed,
+                $"Resume was judged again at the end of the source (it ended {resumed.Status}: {resumed.Error})");
+            Assert.Equal(150, rig.Repo.Task(runId, "T01")!.RowsError);
+        }
+    }
+
+    /// <summary>
+    /// A keyless task loads in one transaction, so the judgement rolls it back whole: nothing is in the target, nothing is recorded,
+    /// and the reason says so. <b>Harm:</b> the keyless path bisects just as slowly, and it would otherwise run to the end of the table.
+    /// </summary>
+    [Theory]
+    [InlineData("", "the first 3 chunks", "150")]
+    [InlineData(" WHERE s.[Id] <= 30", "the first chunk", "30")]   // the whole source is one short chunk
+    public async Task A_keyless_task_whose_first_three_chunks_load_nothing_is_rolled_back_and_failed(string where, string first, string rows)
+    {
+        await using var rig = await RigAsync(One(TaskOf("app.FlatOkay", $"SELECT s.[V] AS [V] FROM [dbo].[Wide] AS s{where}", [], [("V", "V")])));
+        long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 50, ErrorMode = "skip" });
+
+        var outcome = await rig.Engine.RunAsync(runId, new TransferControl(), default);
+        Assert.True(outcome.Status == RunStatus.Failed,
+            $"a keyless task whose first chunks loaded nothing ended {outcome.Status}: every row bisected and rejected");
+        var task = rig.Repo.Task(runId, "T01")!;
+        Assert.True(task.Error!.StartsWith($"Every row of {first} of app.FlatOkay was rejected ({rows} rows)", StringComparison.Ordinal)
+                    && task.Error.Contains("has no key", StringComparison.Ordinal),
+            "the keyless task was not failed after its first 3 empty chunks: " + task.Error);
+        Assert.Equal(0, await rig.Tgt.CountAsync("app.FlatOkay"));
+        Assert.Equal(0, rig.Repo.ErrorRowCount(runId, "T01"));
     }
 
     /// <summary>

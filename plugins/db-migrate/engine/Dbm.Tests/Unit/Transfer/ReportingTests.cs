@@ -81,6 +81,37 @@ public sealed class ReportingTests
         Assert.DoesNotContain(report.Notes, n => n.Contains("Row counts validated", StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// Ruling 192 (open item 30). A task that loaded none of a non-empty source balances its counts - 3 005 source, 3 005 rejected,
+    /// 0 added - so "row counts validated" was true to the letter over a table that received nothing. <b>Harm:</b> the 5.7 reviewer's
+    /// wrong FK mapping completed under "row counts validated, checksums 23/23 matched" with two tables empty.
+    /// </summary>
+    [Fact]
+    public void A_task_that_loaded_nothing_of_a_non_empty_source_is_named_in_the_headline_instead_of_validated()
+    {
+        var run = new TransferRunRow(1, 3, RunStatus.Completed, new TransferOptions { ErrorMode = "skip" }, T0, null, null);
+        var tasks = new List<TransferTaskRow>
+        {
+            Row("T01", "app.Customers", 1000, 1000, 0, new TaskValidation(true, 1000, 0, 0, 1000, [new ChecksumResult("Email", true, 5, 5)], null), 4),
+            Row("T02", "app.Orders", 3005, 0, 3005, new TaskValidation(true, 3005, 3005, 0, 0, [], "rows were rejected"), 6),
+            Row("T03", "app.Empty", 0, 0, 0, new TaskValidation(true, 0, 0, 0, 0, [], null), 1),   // an empty source is not "loaded nothing"
+        };
+        var report = FinalReportBuilder.Build(run, RunStatus.Completed, tasks, _ => [], T0.AddSeconds(10));
+        string headline = FinalReportBuilder.Summary(report);
+
+        Assert.True(headline == "Transferred 1,000 of 4,005 rows into 3 tables in 10s (3,005 rejected); app.Orders loaded 0 of 3,005 rows, "
+                               + "checksums 1/1 matched.",
+            "headline over a task that loaded nothing: " + headline);
+        Assert.DoesNotContain(report.Notes, n => n.Contains("validated for all", StringComparison.Ordinal));
+        Assert.Contains(report.Notes, n => n.StartsWith("app.Orders loaded 0 of 3,005 source rows (3,005 rejected).", StringComparison.Ordinal));
+
+        // Beside a mismatch the word "validated" is already gone; the task is still named.
+        var mixed = tasks.Select(t => t.TaskId == "T01" ? t with { ValidationJson = Json.Serialize(new TaskValidation(false, 1000, 0, 0, 999, [], "disabled")) } : t).ToList();
+        string mixedHeadline = FinalReportBuilder.Summary(FinalReportBuilder.Build(run, RunStatus.Completed, mixed, _ => [], T0.AddSeconds(10)));
+        Assert.True(mixedHeadline.Contains("row counts MISMATCH; app.Orders loaded 0 of 3,005 rows", StringComparison.Ordinal),
+            "a task that loaded nothing is not named beside a mismatch: " + mixedHeadline);
+    }
+
     [Fact]
     public void Mismatches_are_called_out_in_notes_and_summary()
     {

@@ -87,6 +87,14 @@ internal sealed class TaskRunner(RunContext rc)
 
     private const string NoKeyTypes = KeyFailedNote + ": the key column types were never read";
 
+    /// <summary>
+    /// Ruling 192 (open item 30): under skip-and-log, a task whose first this-many chunks - or its whole source, if that is fewer
+    /// chunks - loaded no row at all while rejecting rows is failed as <c>bad_task</c>. A constraint violation is a per-row reject
+    /// (ruling 147), so a plan defect that surfaces as one - an FK column bound to the wrong expression, a CHECK no row satisfies -
+    /// otherwise completes with the whole table rejected, one single-row attempt per row, under a headline that reads as success.
+    /// </summary>
+    internal const int ZeroLoadChunks = 3;
+
     private static readonly AsyncLocal<Action<string, int>?> AfterChunkTransactionHook = new();
 
     /// <summary>
@@ -198,6 +206,7 @@ internal sealed class TaskRunner(RunContext rc)
         int chunkSize = Math.Max(1, task.ChunkSize ?? rc.Options.ChunkSize);
         KeyValue? last = cp.LastKeyJson is null ? null : KeyCodec.Decode(cp.LastKeyJson);
         IReadOnlyList<KeyType>? types = last?.Types;
+        var rejects = new RejectTally();
         await using var src = await SqlConnect.OpenAsync(rc.SourceCs, ct);
         while (true)
         {
@@ -219,6 +228,9 @@ internal sealed class TaskRunner(RunContext rc)
                 cp = cp with { Done = true };
                 await ControlTable.UpsertAsync(tgt, null, rc.RunId, id, cp, ct);
                 Mirror(id, cp);
+                // The source ended exactly on a chunk boundary: the chunks read were the whole source (ruling 192). A task that already
+                // reached ZeroLoadChunks was judged when that chunk committed, and a resume past that judgement must not be judged again.
+                if (cp.ChunkNo < ZeroLoadChunks) ThrowIfLoadedNothing(task.Target, cp.ChunkNo, cp.RowsDone, cp.RowsError, rejects, keyed: true);
                 return new Pass(TransferTaskStatus.Done, cp);
             }
 
@@ -264,6 +276,12 @@ internal sealed class TaskRunner(RunContext rc)
             });
             rc.Log("info", $"{id} {task.Target}: chunk {cp.ChunkNo} committed ({cp.RowsDone:N0} rows, {cp.RowsError:N0} rejected"
                 + MergeNote(outcome.MergeStatus, outcome.MergeRowsAffected) + ")", persist: false);
+            // Ruling 192, judged after the commit: the rejected rows are recorded, as skip-and-log promised, and the checkpoint is past
+            // them, so Resume carries on from the next chunk (the operator's "these rows really are bad") and never re-judges the same
+            // chunks, while Reopen is the way to fix the plan.
+            rejects.Add(outcome.Failed);
+            if (cp.ChunkNo == ZeroLoadChunks || (lastChunk && cp.ChunkNo < ZeroLoadChunks))
+                ThrowIfLoadedNothing(task.Target, cp.ChunkNo, cp.RowsDone, cp.RowsError, rejects, keyed: true);
             if (lastChunk) return new Pass(TransferTaskStatus.Done, cp);
         }
     }
@@ -285,6 +303,13 @@ internal sealed class TaskRunner(RunContext rc)
         long mergedTotal = 0;
         bool mergeCountUnknown = false;
         var errors = new List<ErrorRecord>();
+        var rejects = new RejectTally();
+        async Task GuardAsync()
+        {
+            if (LoadedNothingReason(task.Target, chunks, loaded, rejected, rejects, keyed: false) is not { } why) return;
+            await scope.RollbackAsync();
+            throw new TransferException("bad_task", why);
+        }
         while (true)
         {
             if (rc.Control.Kind is StopKind.Cancel or StopKind.Fail)
@@ -320,8 +345,13 @@ internal sealed class TaskRunner(RunContext rc)
             }
             errors.AddRange(Capture(task, table, outcome.Failed, null));
             rc.Progress.InFlight(id, loaded);
+            rejects.Add(outcome.Failed);
+            // Ruling 192. Nothing of a keyless task is committed before it completes, so the judgement rolls the whole task back: a
+            // resume restarts it from zero and meets the same verdict, and Reopen is the way on.
+            if (chunks == ZeroLoadChunks) await GuardAsync();
             if (n < chunkSize) break;
         }
+        if (chunks < ZeroLoadChunks) await GuardAsync();   // the source ended within the first chunks: that was all of it
         long? merged = mergeStatus == MergeStatus.Ran && !mergeCountUnknown ? mergedTotal : null;
         var done = new Checkpoint(chunks, null, loaded, rejected, true);
         await ControlTable.UpsertAsync(scope.Connection, scope.Tx, rc.RunId, id, done, ct);
@@ -336,6 +366,67 @@ internal sealed class TaskRunner(RunContext rc)
         rc.Log("info", $"{id} {task.Target}: committed in one transaction ({done.RowsDone:N0} rows, {done.RowsError:N0} rejected"
             + MergeNote(mergeStatus, merged) + ")", persist: false);
         return new Pass(TransferTaskStatus.Done, done);
+    }
+
+    private static void ThrowIfLoadedNothing(string target, int chunks, long rowsDone, long rowsError, RejectTally rejects, bool keyed)
+    {
+        if (LoadedNothingReason(target, chunks, rowsDone, rowsError, rejects, keyed) is { } why) throw new TransferException("bad_task", why);
+    }
+
+    /// <summary>
+    /// Ruling 192's verdict on a task's first chunks, or null when they loaded a row or rejected none. The reason says that every row
+    /// was rejected, names the most common error with its number, and says what Resume and Reopen do for this kind of task.
+    /// </summary>
+    internal static string? LoadedNothingReason(string target, int chunks, long rowsDone, long rowsError, RejectTally rejects, bool keyed)
+    {
+        ArgumentNullException.ThrowIfNull(rejects);
+        if (rowsDone != 0 || rowsError <= 0) return null;
+        string first = chunks == 1 ? "the first chunk" : Inv($"the first {chunks} chunks");
+        string common = rejects.MostCommon() is { } c
+            ? Inv($" The most common error, on {c.Rows:N0} of {rejects.Rows:N0} rows")
+              + (rejects.Rows < rowsError ? " rejected since this segment of the run began" : "") + ", was "
+              + (c.Number is int n ? Inv($"error {n}") : "an error with no server error number") + ": " + c.Text
+            : "";
+        string way = keyed
+            ? " The rejected rows are recorded. Reopen Mapping or SQL to fix the plan; if these rows really are bad, Resume carries on "
+              + "from the next chunk."
+            : " This task has no key, so it loads in one transaction and nothing of it was kept. Reopen Mapping or SQL to fix the plan.";
+        return "Every row of " + first + " of " + target + Inv($" was rejected ({rowsError:N0} rows) and none loaded, so the plan is the ")
+               + "likelier cause than the data - a column bound to the wrong expression, or a constraint no source row satisfies."
+               + common + way;
+    }
+
+    private static string Inv(FormattableString text) => FormattableString.Invariant(text);
+
+    /// <summary>The rejected rows of a task's first chunks, counted by error number, with the first text seen for each (ruling 192).</summary>
+    internal sealed class RejectTally
+    {
+        private readonly Dictionary<int, (long Rows, string Text)> _byNumber = [];
+        private (long Rows, string Text)? _noNumber;
+
+        public long Rows { get; private set; }
+
+        public void Add(IEnumerable<RowFailure> failures)
+        {
+            ArgumentNullException.ThrowIfNull(failures);
+            foreach (var f in failures)
+            {
+                Rows++;
+                if (f.ErrorNumber is int n)
+                    _byNumber[n] = _byNumber.TryGetValue(n, out var e) ? (e.Rows + 1, e.Text) : (1, f.Error);
+                else
+                    _noNumber = _noNumber is { } e ? (e.Rows + 1, e.Text) : (1, f.Error);
+            }
+        }
+
+        /// <summary>The error number with the most rows (null for "no number"), ties to the lowest number; null when nothing was added.</summary>
+        public (int? Number, long Rows, string Text)? MostCommon()
+        {
+            (int? Number, long Rows, string Text)? best = _noNumber is { } x ? (null, x.Rows, x.Text) : null;
+            foreach (var (n, e) in _byNumber.OrderBy(kv => kv.Key))
+                if (best is null || e.Rows > best.Value.Rows) best = (n, e.Rows, e.Text);
+            return best;
+        }
     }
 
     /// <summary>

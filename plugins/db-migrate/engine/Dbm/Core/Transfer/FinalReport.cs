@@ -133,6 +133,14 @@ public static class FinalReportBuilder
         string counts = anyMismatch ? "row counts MISMATCH" : anyUnconfirmed ? "row counts NOT CONFIRMED" : "row counts validated";
         if (NonEmptyBefore(report))
             counts = anyMismatch || anyUnconfirmed ? counts + " (" + NotEmptyBefore + ")" : NotEmptyBefore;
+        // Ruling 192: counts that balance over a table that received nothing - every row rejected - are not a validation of anything,
+        // and "validated" over it is the green light open item 30 was about. Such tasks are named in place of the word.
+        var nothing = LoadedNothing(report.Tasks);
+        if (nothing.Count > 0)
+        {
+            string named = string.Join(", ", nothing.Select(t => $"{t.Target} loaded 0 of {N(t.RowsSource!.Value)} rows"));
+            counts = counts == "row counts validated" ? named : counts + "; " + named;
+        }
         return $"Transferred {N(report.RowsLoaded)} {of} {N(report.RowsSource)} rows into {tables} {(tables == 1 ? "table" : "tables")} "
                + $"in {duration}{rejected}; {counts}{checks}.";
     }
@@ -141,6 +149,13 @@ public static class FinalReportBuilder
     public const string NotEmptyBefore = "target tables were not empty before this run; counts compare rows added";
 
     public static bool NonEmptyBefore(FinalReport report) => report.Tasks.Any(t => t.RowsBefore > 0);
+
+    /// <summary>Ruling 192: the tasks that loaded no row of a source that had rows. A report never calls such a run "validated".</summary>
+    public static IReadOnlyList<TaskReport> LoadedNothing(IEnumerable<TaskReport> tasks)
+    {
+        ArgumentNullException.ThrowIfNull(tasks);
+        return tasks.Where(t => t.RowsLoaded == 0 && t.RowsSource > 0).ToList();
+    }
 
     public static string Dur(double seconds)
     {
@@ -244,9 +259,15 @@ public static class FinalReportBuilder
         if (before.Count > 0)
             notes.Add("Target tables were not empty before this run: " + string.Join(", ", before) + ". Their row counts compare the rows "
                       + "this run added against the source, not the table's contents; a table with no key can hold its rows twice.");
+        var nothing = LoadedNothing(tasks);
+        foreach (var t in nothing)
+            notes.Add($"{t.Target} loaded 0 of {N(t.RowsSource!.Value)} source rows ({N(t.RowsError)} rejected). A table that received "
+                      + "nothing is not validated by counts that balance: when every row is rejected, the mapping or SQL is the likelier "
+                      + "cause than the data - read the rejected rows' errors.");
         if (mismatch.Count == 0 && notCompared.Count == 0 && notValidated.Count == 0 && tasks.Count > 0)
             notes.Add(before.Count > 0 ? $"Row counts balance for all {tasks.Count} tasks as rows added."
-                                       : $"Row counts validated for all {tasks.Count} tasks.");
+                      : nothing.Count > 0 ? $"Row counts balance for all {tasks.Count} tasks, but {nothing.Count} of them loaded nothing."
+                      : $"Row counts validated for all {tasks.Count} tasks.");
 
         var badSums = tasks.SelectMany(t => t.Checksums.Where(c => !c.Match).Select(c => $"{t.Target}.{c.Column}")).ToList();
         if (badSums.Count > 0) notes.Add("Column checksums differ for: " + string.Join(", ", badSums) + ".");
