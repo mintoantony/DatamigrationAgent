@@ -13,11 +13,16 @@
   committed dist can silently lag the committed source. Rebuild and commit engine/dist as the LAST STEP before any
   version bump and before any merge to main: change the source, then run this script, then commit dist in that order.
   If you merge engine source changes to main without re-running this, every user without a .NET SDK runs the old code.
+.PARAMETER Check
+  Runs only the release gates (contents, machine path, PDB entry) against an existing build folder, for example
+  plugins/db-migrate/engine/dist, and exits: nothing is built or replaced.
 .EXAMPLE
   pwsh plugins/db-migrate/engine/release.ps1
+.EXAMPLE
+  pwsh plugins/db-migrate/engine/release.ps1 -Check plugins/db-migrate/engine/dist
 #>
 [CmdletBinding()]
-param([switch]$SkipTests, [switch]$KeepAllRuntimes)
+param([switch]$SkipTests, [switch]$KeepAllRuntimes, [string]$Check)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -46,6 +51,53 @@ function Remove-UnusedNatives([string]$Root) {
 $engine = $PSScriptRoot
 $pluginRoot = Split-Path -Parent $engine
 $repoRoot = Split-Path -Parent (Split-Path -Parent $pluginRoot)
+
+# True when the file's bytes contain $Needle (case-insensitive). Latin-1 maps every byte to one char, and dropping the
+# NULs makes UTF-16LE text (.NET user strings) searchable too, so one search covers both encodings.
+function Test-BinaryContains([string]$File, [string]$Needle) {
+    $text = [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($File)).Replace("`0", '')
+    return $text.IndexOf($Needle, [StringComparison]::OrdinalIgnoreCase) -ge 0
+}
+
+# The release gates, asserted rather than eyeballed, run against a build BEFORE it replaces engine/dist:
+#  1. no symbol file, native host or settings file that could carry a connection string;
+#  2. no file holds this checkout's absolute path (in either separator style): a builder's path must never ship, and
+#     its presence means the bytes depend on where the checkout sits (Ruling 180);
+#  3. Dbm.dll holds no ".pdb" at all: a CodeView debug entry, even a path-mapped one, means the compile was reused from
+#     an earlier Release build with symbols instead of the clean DebugType=none compile this script makes.
+function Assert-ReleaseGates([string]$Dir) {
+    $all = @(Get-ChildItem -LiteralPath $Dir -Recurse -File)
+    $forbidden = @($all | Where-Object {
+            $ForbiddenExtensions -contains $_.Extension.ToLowerInvariant() -or $_.Name -like 'appsettings.*.json'
+        } | ForEach-Object { [IO.Path]::GetRelativePath($Dir, $_.FullName) })
+    if ($forbidden.Count -gt 0) {
+        throw ("the build must not contain symbol files, native hosts or environment settings, found: " + ($forbidden -join ', '))
+    }
+    Write-Host '  no .pdb, .exe, .user, .suo, .mdb or appsettings.*.json'
+
+    $needles = @($repoRoot, ($repoRoot -replace '\\', '/')) | Select-Object -Unique
+    $leaks = @(foreach ($file in $all) {
+            foreach ($needle in $needles) {
+                if (Test-BinaryContains $file.FullName $needle) { "$([IO.Path]::GetRelativePath($Dir, $file.FullName)) contains $needle" }
+            }
+        })
+    if ($leaks.Count -gt 0) { throw ("the build carries this checkout's path: " + ($leaks -join '; ')) }
+    Write-Host "  no file contains the checkout path ($repoRoot)"
+
+    $dll = Join-Path $Dir 'Dbm.dll'
+    if (-not (Test-Path -LiteralPath $dll)) { throw "the build has no Dbm.dll: $dll" }
+    if (Test-BinaryContains $dll '.pdb') {
+        throw 'Dbm.dll has a PDB (CodeView) debug entry: it was not compiled from scratch with DebugType=none'
+    }
+    Write-Host '  Dbm.dll has no PDB (CodeView) entry'
+}
+
+if ($Check) {
+    Write-Host "== release gates on $Check"
+    Assert-ReleaseGates (Resolve-Path -LiteralPath $Check).Path
+    Write-Host '  all release gates pass'
+    exit 0
+}
 $manifest = Join-Path $pluginRoot '.claude-plugin/plugin.json'
 $dist = Join-Path $engine 'dist'
 $tmp = Join-Path $engine "dist.tmp.$PID"
@@ -105,7 +157,9 @@ if (Test-Path $marketplace) {
         throw "marketplace.json lists db-migrate $($entry.version) but plugin.json says $version"
     }
 }
-$propsVersion = ([xml](Get-Content -Raw (Join-Path $engine 'Directory.Build.props'))).Project.PropertyGroup.Version
+# XPath, not .Project.PropertyGroup.Version: the props file has more than one PropertyGroup (the Release one carries no
+# Version), and StrictMode rejects member access on a group that lacks it.
+$propsVersion = ([xml](Get-Content -Raw (Join-Path $engine 'Directory.Build.props'))).SelectSingleNode('/Project/PropertyGroup/Version').InnerText
 if ($propsVersion -ne $version) { throw "Directory.Build.props has <Version>$propsVersion</Version> but plugin.json says $version" }
 
 if (-not $SkipTests) {
@@ -129,6 +183,12 @@ try {
 
     Write-Host '== publish'
     if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+    # Compile from scratch: publish would otherwise reuse a Release compile already in obj/ (this script's own
+    # `dotnet test -c Release` makes one) together with its PDB, whatever DebugType is passed here.
+    foreach ($stale in @('Dbm/obj/Release', 'Dbm/bin/Release')) {
+        $path = Join-Path $engine $stale
+        if (Test-Path -LiteralPath $path) { Remove-Item -Recurse -Force -LiteralPath $path }
+    }
     Invoke-Checked 'dotnet publish' {
         dotnet publish (Join-Path $engine 'Dbm/Dbm.csproj') -c Release -o $tmp --nologo `
             "-p:Version=$version" -p:DebugType=none -p:UseAppHost=false
@@ -136,16 +196,10 @@ try {
     if (-not $KeepAllRuntimes) { Remove-UnusedNatives $tmp }
     Set-Content -Path (Join-Path $tmp 'VERSION') -Value $version -NoNewline
 
-    # Both gates run against the new build BEFORE it replaces engine/dist, so a failed release leaves dist as it was.
-    # Asserted, not eyeballed: nothing in a committed dist may be a symbol file, a native host or a settings file.
-    Write-Host '== contents check'
-    $forbidden = @(Get-ChildItem $tmp -Recurse -File | Where-Object {
-            $ForbiddenExtensions -contains $_.Extension.ToLowerInvariant() -or $_.Name -like 'appsettings.*.json'
-        } | ForEach-Object { [IO.Path]::GetRelativePath($tmp, $_.FullName) })
-    if ($forbidden.Count -gt 0) {
-        throw ("the build must not contain symbol files, native hosts or environment settings, found: " + ($forbidden -join ', '))
-    }
-    Write-Host '  no .pdb, .exe, .user, .suo, .mdb or appsettings.*.json'
+    # The gates and the smoke test run against the new build BEFORE it replaces engine/dist, so a failed release leaves
+    # dist as it was.
+    Write-Host '== release gates'
+    Assert-ReleaseGates $tmp
 
     Write-Host '== smoke test'
     $versionOut = (& dotnet (Join-Path $tmp 'Dbm.dll') version) -join ' '

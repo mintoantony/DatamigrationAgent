@@ -59,6 +59,9 @@ build_engine() {
   tmp="$engine/dist.tmp.$$"
   old="$engine/dist.old.$$"
   rm -rf "$tmp"
+  # Compile from scratch, as engine/release.* do: publish would otherwise reuse an earlier Release compile in obj/
+  # together with its PDB, and the build would differ from the committed one.
+  rm -rf "$engine/Dbm/obj/Release" "$engine/Dbm/bin/Release"
   if ! dotnet publish "$engine/Dbm/Dbm.csproj" -c Release -o "$tmp" --nologo -v q \
       "-p:Version=${version:-0.0.0}" -p:DebugType=none -p:UseAppHost=false >&2; then
     rm -rf "$tmp"
