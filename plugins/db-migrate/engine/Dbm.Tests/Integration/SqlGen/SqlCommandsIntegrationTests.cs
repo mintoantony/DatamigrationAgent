@@ -30,5 +30,16 @@ public sealed class SqlCommandsIntegrationTests
         Assert.NotNull(check.Json["taskErrors"]!["T05"]);
         Assert.Equal([SqlValidator.SingleTaskGlobalWarning], check.Json["globalWarnings"]!.AsArray().Select(n => (string?)n));
         Assert.DoesNotContain("Integrated Security", check.Out, StringComparison.OrdinalIgnoreCase);
+
+        // Open item 17: a patch whose only defect is a bare carriage return compiles on the server (SQL Server reads the CR as a line
+        // break), so live validation alone says ok. Step 1 of the playbook must still refuse it, as step 2 (apply --dry-run) does.
+        var version = project.Services.Phases.Get(PhaseName.Sql).CurrentVersion!.Value;
+        var patchPath = Path.Combine(project.Root, "cr-patch.json");
+        File.WriteAllText(patchPath, "{\"phase\":\"sql\",\"baseVersion\":" + version
+            + ",\"ops\":[{\"op\":\"add\",\"path\":\"/tasks/T05/preSql/-\",\"value\":\"-- note\\rUPDATE STATISTICS app.Orders\"}]}");
+        var cr = await CliRunner.RunAsync(project.Ws, null, "sql", "validate", "--patch", patchPath);
+        Assert.True(cr.Exit == 1, "sql validate --patch green-lit a bare carriage return: " + cr.Out);
+        Assert.False((bool)cr.Json["ok"]!);
+        Assert.Contains(cr.Json["taskErrors"]!["T05"]!.AsArray(), e => ((string?)e)!.Contains(SqlValidator.BareCarriageReturnMarker, StringComparison.Ordinal));
     }
 }

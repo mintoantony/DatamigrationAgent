@@ -48,7 +48,9 @@ public sealed class SqlGenCommand : ICommand
 }
 
 /// <summary><c>dbm sql validate [--task T04] [--patch file]</c>: validates the current sql version (optionally with a patch applied
-/// in memory) against the live databases and prints the ValidationReport; exit 1 when it is not ok. Nothing is stored.</summary>
+/// in memory) against the live databases and prints the ValidationReport; exit 1 when it is not ok. Nothing is stored.
+/// Bare carriage returns are added as errors by the offline scan (open item 17); without connections the command still reports them,
+/// with the "live validation skipped" line as its globalWarnings, and refuses as <c>not_ready</c> only when there is nothing to say.</summary>
 public sealed class SqlValidateCommand : ICommand
 {
     public string Name => "sql validate";
@@ -89,11 +91,17 @@ public sealed class SqlValidateCommand : ICommand
         {
             throw new CliFailure("bad_payload", ex.Message);
         }
-        if (!SqlPlanSource.CanValidate(services))
-            throw new CliFailure("not_ready", "Both connections and the target catalog are needed to validate.");
-
-        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
-        var report = await SqlPlanSource.ValidateLiveAsync(services, plan, args.Opt("task"), cts.Token);
+        // Open item 17: the bare-CR scan is offline and runs on every call, so this command agrees with `apply --dry-run` about the
+        // rule sql-engineer.md teaches - and says so even when live validation cannot run.
+        var skipped = SqlPlanSource.SkippedWarning(services);
+        ValidationReport? live = null;
+        if (skipped is null)
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+            live = await SqlPlanSource.ValidateLiveAsync(services, plan, args.Opt("task"), cts.Token);
+        }
+        var report = SqlValidator.WithBareCarriageReturns(live, plan, args.Opt("task"), skipped ?? "")
+            ?? throw new CliFailure("not_ready", "Both connections and the target catalog are needed to validate.");
         return Output.Write(ctx, new
         {
             ok = report.Ok,
