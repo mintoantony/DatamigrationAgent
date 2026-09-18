@@ -188,6 +188,10 @@ chunk and does not stop the task for this again (a task without a key is rolled 
 helps). A run that still ends with a task that loaded 0 of its source rows names it in the report's headline ("app.Orders
 loaded 0 of 3,005 rows") instead of saying the row counts were validated.
 
+The exception is a new run into tables that already held rows (see above): when every rejected row of such a table is a
+duplicate key (primary key or unique), those rows were already there, so the task is not stopped and the headline's
+"loaded 0 of N" is expected - it is not a mapping problem. A foreign-key or CHECK error in such a run still stops the task.
+
 **Live view**: overall and per-task progress bars, rows per second, ETA, a throughput sparkline, the rejected-row count
 and a log tail. **Pause** lets every task commit its current chunk and stops; **Resume** continues from the checkpoints,
 also after a failure, a crash or a reboot; **Cancel run** stops for good, and rows already committed stay in the target.
@@ -209,7 +213,8 @@ lines (foreign key), 3 comments longer than the target column (truncation) and 1
 
 Read the report before you call a run clean: a *Completed* run can still carry notes, and a task with 0 rows loaded and
 its rows rejected points at the mapping, not at the data (see *Execute*); the headline names such a task instead of
-saying "validated".
+saying "validated". The one exception is a run into tables that were not empty (the headline says so) whose rejected
+rows are duplicate keys: those rows were already in the target.
 
 ## Exports
 
