@@ -65,6 +65,8 @@
       var reviewable = (row.status === 'awaiting_review' || row.status === 'reworking' || row.status === 'approved') && row.currentVersion != null;
       return custom && reviewable ? custom : DBM.views.pending;
     }
+    // Ruling 185: after a reopen, Complete is pending again but its earlier runs' reports are still there to read.
+    if (row.name === 'complete' && custom && row.currentVersion != null) return custom;
     return custom && row.status !== 'pending' && row.status !== 'stale' ? custom : DBM.views.pending;
   }
 

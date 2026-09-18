@@ -66,17 +66,43 @@ public sealed class WorkflowEngine(DbmServices services)
         return new NextAction("stop", Reason: "complete", Summary: summary ?? "Migration complete.");
     }
 
+    /// <summary>What a run that stopped leaves the operator to choose from (ruling 185) - the orchestrator relays it word for word.</summary>
+    public const string ReopenHint = "To change the plan instead, reopen Analysis, Mapping or SQL on its review screen; after it is approved "
+                                     + "again, Execute starts a new run.";
+
     private NextAction TransferAction(string url)
     {
-        var status = services.Db.Scalar<string>("SELECT status FROM transfer_run ORDER BY id DESC LIMIT 1");
+        var latest = services.Db.Query("SELECT id, status, summary_json FROM transfer_run ORDER BY id DESC LIMIT 1",
+            r => (Id: r.GetInt64(0), Status: r.GetString(1), Summary: r.IsDBNull(2) ? null : r.GetString(2))).FirstOrDefault();
         const string phase = "transfer";
-        return status switch
+        return latest.Status switch
         {
             "paused" => new NextAction("await", Reason: "transfer_paused", Phase: phase, Url: url),
-            "failed" => new NextAction("stop", Reason: "transfer_failed", Phase: phase, Summary: "The transfer failed; see the Execute screen.", Url: url),
-            "cancelled" => new NextAction("stop", Reason: "transfer_cancelled", Phase: phase, Summary: "The transfer was cancelled.", Url: url),
+            "failed" => new NextAction("stop", Reason: "transfer_failed", Phase: phase, Url: url, Summary:
+                $"Transfer run {latest.Id} failed{ErrorOf(latest.Summary)}. On the Execute screen: Resume continues from the last "
+                + "checkpoints; Cancel abandons the run and restores what the plan's pre-load SQL disabled; a new run loads every "
+                + "table again. " + ReopenHint + " Reopening cancels the failed run first."),
+            "cancelled" => new NextAction("stop", Reason: "transfer_cancelled", Phase: phase, Url: url, Summary:
+                $"Transfer run {latest.Id} was cancelled; rows it committed stay in the target. A new run from the Execute screen loads "
+                + "every table again: choose Truncate target first, or confirm loading into the tables that already hold rows. "
+                + ReopenHint),
             _ => new NextAction("await", Reason: "transfer", Phase: phase, Url: url),
         };
+    }
+
+    private static string ErrorOf(string? summaryJson)
+    {
+        if (summaryJson is null) return "";
+        try
+        {
+            var error = JsonNode.Parse(summaryJson)?["error"]?.GetValue<string>();
+            if (string.IsNullOrWhiteSpace(error)) return "";
+            return ": " + (error.Length > 400 ? error[..400] + "…" : error);
+        }
+        catch (Exception ex) when (ex is System.Text.Json.JsonException or InvalidOperationException or FormatException)
+        {
+            return "";
+        }
     }
 
     private NextAction AgentAction(PhaseRow row, PacketMode mode, bool writePacket)
@@ -124,19 +150,22 @@ public sealed class WorkflowEngine(DbmServices services)
     public void OnConnectionsSaved() => services.Db.InTransaction(() =>
     {
         if (!services.Connections.Has(Side.Src) || !services.Connections.Has(Side.Tgt)) return;
-        EnsureTransferPending("Connections cannot change after the transfer has started.");
+        EnsureUpstreamOpen("The connections cannot change");
         SetStatus(PhaseName.Setup, PhaseStatus.Approved);
-        foreach (var later in Order.Where(p => p > PhaseName.Discovery)) MarkStale(later);
+        foreach (var later in Order.Where(p => p > PhaseName.Discovery && p <= PhaseName.Ready)) MarkStale(later);
+        ResetTransfer();
         StartJob(PhaseName.Discovery);
     });
 
-    /// <summary>Re-extract both catalogs; Analysis..Ready become stale. Only while Transfer is pending.</summary>
+    /// <summary>Re-extract both catalogs; Analysis..Ready become stale. Before the first run, or after a completed or cancelled one
+    /// (ruling 185).</summary>
     public void Rediscover() => services.Db.InTransaction(() =>
     {
-        EnsureTransferPending("Re-discovery is not possible after the transfer has started.");
+        EnsureUpstreamOpen("Discovery cannot run again");
         if (services.Phases.Get(PhaseName.Setup).Status != PhaseStatus.Approved)
             throw new WorkflowException("Save both connections before running discovery.");
         foreach (var later in Order.Where(p => p > PhaseName.Discovery && p <= PhaseName.Ready)) MarkStale(later);
+        ResetTransfer();
         StartJob(PhaseName.Discovery);
     });
 
@@ -304,18 +333,63 @@ public sealed class WorkflowEngine(DbmServices services)
         }
     });
 
-    /// <summary>approved → awaiting_review at the approved version; later phases up to Ready → stale.</summary>
+    /// <summary>
+    /// approved → awaiting_review at the approved version; later phases up to Ready → stale; Transfer and Complete back to pending.
+    /// <para>Ruling 185: allowed before the first run and after a completed or cancelled one - never while a run is running or
+    /// paused. A failed run is cancelled by the caller first (<c>TransferService.CancelFailedRunAsync</c>, which restores the plan's
+    /// PreSql); here it is refused, so no path can leave a failed run's disabled constraints behind in silence. Earlier runs and their
+    /// final reports stay where they are; after re-approval, Execute starts a new run.</para>
+    /// </summary>
     public void Reopen(PhaseName phase) => services.Db.InTransaction(() =>
     {
-        EnsureTransferPending("Phases cannot be reopened after the transfer has started.");
-        if (!Phases.Reviewable.Contains(phase)) throw new WorkflowException($"{phase.Text()} cannot be reopened.");
+        if (WhyNotReopen(phase, failedRunWillBeCancelled: false) is { } why) throw new WorkflowException(why);
         var row = services.Phases.Get(phase);
-        if (row.Status != PhaseStatus.Approved) throw new WorkflowException($"{phase.Text()} is not approved.");
         services.Phases.ClearApproval(phase);
         if (row.ApprovedVersion is int approved) services.Phases.SetCurrentVersion(phase, approved);
         SetStatus(phase, PhaseStatus.AwaitingReview);
         foreach (var later in Order.Where(p => p > phase && p <= PhaseName.Ready)) MarkStale(later);
+        ResetTransfer();
     });
+
+    /// <summary>Why <see cref="Reopen"/> would refuse <paramref name="phase"/> now, or null. With
+    /// <paramref name="failedRunWillBeCancelled"/> a failed latest run does not count against it - the endpoint cancels it first.</summary>
+    public string? WhyNotReopen(PhaseName phase, bool failedRunWillBeCancelled)
+    {
+        if (!Phases.Reviewable.Contains(phase)) return $"{phase.Text()} cannot be reopened.";
+        if (services.Phases.Get(phase).Status != PhaseStatus.Approved) return $"{phase.Text()} is not approved.";
+        return UpstreamLock(failedRunWillBeCancelled) is { } locked ? $"{phase.Text()} cannot be reopened: {locked}" : null;
+    }
+
+    /// <summary>
+    /// Ruling 185: why the plan and the connections cannot change right now, or null when they can - before the first run, and after
+    /// a run that completed or was cancelled. A running or paused run holds the plan it is loading (Pause, then Cancel, first); a failed
+    /// one still has the plan's PreSql in force in the target, which only a cancel restores.
+    /// </summary>
+    public string? UpstreamLock(bool failedRunWillBeCancelled = false)
+    {
+        if (services.Phases.Get(PhaseName.Transfer).Status == PhaseStatus.Pending) return null;
+        (long Id, string Status)? run;
+        try
+        {
+            run = services.Db.Query("SELECT id, status FROM transfer_run ORDER BY id DESC LIMIT 1",
+                r => ((long Id, string Status)?)(r.GetInt64(0), r.GetString(1))).FirstOrDefault();
+        }
+        catch (Microsoft.Data.Sqlite.SqliteException ex)
+        {
+            return "the latest transfer run could not be read (" + ex.Message + ").";
+        }
+        if (run is not { } latest) return "a transfer is starting.";
+        return latest.Status switch
+        {
+            "completed" or "cancelled" => null,
+            "failed" when failedRunWillBeCancelled => null,
+            "failed" => $"transfer run {latest.Id} failed and the plan's pre-load SQL is still in force in the target. Cancel the run "
+                        + "first (Cancel restores what that SQL disabled), or reopen from the review screen, which cancels it for you.",
+            "paused" => $"transfer run {latest.Id} is paused. Cancel it first (Cancel restores what the plan's pre-load SQL disabled), "
+                        + "or resume it to the end.",
+            _ => $"transfer run {latest.Id} is {latest.Status}. Pause it and cancel it first.",
+        };
+    }
 
     public void SetPaused(bool paused) => services.Db.InTransaction(() =>
     {
@@ -386,9 +460,25 @@ public sealed class WorkflowEngine(DbmServices services)
         return version;
     }
 
-    private void EnsureTransferPending(string message)
+    private void EnsureUpstreamOpen(string what)
     {
-        if (services.Phases.Get(PhaseName.Transfer).Status != PhaseStatus.Pending) throw new WorkflowException(message);
+        if (UpstreamLock() is { } why) throw new WorkflowException($"{what}: {why}");
+    }
+
+    /// <summary>
+    /// Ruling 185: after an upstream change following a run, Transfer and Complete go back to pending so the re-approved plan starts a
+    /// new run. Nothing is deleted - the earlier runs, their checkpoints' history and their final reports (Complete artifacts, and
+    /// Complete's current version) stay in the workspace.
+    /// </summary>
+    private void ResetTransfer()
+    {
+        foreach (var phase in new[] { PhaseName.Transfer, PhaseName.Complete })
+        {
+            var row = services.Phases.Get(phase);
+            if (row.Status == PhaseStatus.Pending) continue;
+            services.Phases.ClearApproval(phase);
+            SetStatus(phase, PhaseStatus.Pending);
+        }
     }
 
     /// <summary>"&lt;src&gt;:&lt;tgt&gt;" from the catalog table; null until both sides are discovered.</summary>

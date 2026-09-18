@@ -408,8 +408,41 @@ public sealed class TransferService
         }
         if (run is null || run.Status is not (RunStatus.Paused or RunStatus.Failed))
             throw new TransferException("not_cancellable", "There is no running, paused or failed transfer to cancel.");
+        await CancelStoppedRunAsync(run, null, ct);
+    }
+
+    /// <summary>
+    /// Ruling 185: a failed run is cancelled by a reopen, a re-discovery or a reconnect - through the same door as Cancel, so the
+    /// plan's PostSql runs (ruling 184) before the plan it belongs to is changed. Returns true when it cancelled one; false when the
+    /// latest run is not a failed one (nothing to do). Refused <c>busy</c> while a run is executing in this process.
+    /// </summary>
+    public async Task<bool> CancelFailedRunAsync(string why, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(why);
+        lock (_lock)
+        {
+            if (_active || _starting) throw new TransferException("busy", "A transfer is running; pause and cancel it first.");
+        }
+        TransferRunRow? run;
+        try
+        {
+            run = _services.Transfers.Latest();
+        }
+        catch (JsonException ex)
+        {
+            throw UnreadableRun(ex, "It cannot be cancelled, so the plan cannot be changed under it.");
+        }
+        if (run is not { Status: RunStatus.Failed }) return false;
+        await CancelStoppedRunAsync(run, $"Cancelled because {why}.", ct);
+        return true;
+    }
+
+    /// <summary>A paused or failed run: drop the checkpoint table, record it cancelled, tell the workflow.</summary>
+    private async Task CancelStoppedRunAsync(TransferRunRow run, string? note, CancellationToken ct)
+    {
         if (!run.Options.KeepControlTable) await DropControlTableAsync(ConnectionStrings().Target, ct);
-        _services.Transfers.SetRunStatus(run.Id, RunStatus.Cancelled);
+        _services.Transfers.SetRunStatus(run.Id, RunStatus.Cancelled,
+            note is null ? null : MergeNote(_services.Transfers.GetRun(run.Id)?.SummaryJson, note));
         _services.Sink.Publish("transfer_run_changed", new { runId = run.Id, status = EnumText.ToText(RunStatus.Cancelled) });
         _services.Workflow.OnTransferFinished("cancelled", null);
     }
@@ -1034,6 +1067,12 @@ public sealed class TransferService
                            && run?.Status is RunStatus.Failed or RunStatus.Cancelled;
         var ready = _services.Phases.Get(PhaseName.Ready).Status;
         if (ready == PhaseStatus.AwaitingReview || restartable) return null;
+        // Ruling 185: after a completed run the way to a new one is through the plan, not around it.
+        if (run?.Status == RunStatus.Completed)
+            return $"Run {run.Id} completed. To run the migration again, reopen Analysis, Mapping or SQL on its review screen and approve "
+                   + "it again; Execute then starts a new run.";
+        if (ready is PhaseStatus.Stale or PhaseStatus.Pending)
+            return $"The transfer starts from the Ready step, which is {EnumText.ToText(ready)}: approve the SQL phase (again) first.";
         return $"The transfer starts from the Ready step, which is {EnumText.ToText(ready)}.";
     }
 

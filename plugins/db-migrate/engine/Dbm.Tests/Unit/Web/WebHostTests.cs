@@ -153,7 +153,8 @@ public class WebHostTests
         Assert.False(state["connections"]!["src"]!["saved"]!.GetValue<bool>());
         Assert.False(state["drift"]!["tgt"]!.GetValue<bool>());
         Assert.True(state.AsObject().ContainsKey("transfer"));
-        Assert.Null(state["transfer"]);
+        // Ruling 185: before any run there is no run to name and nothing locks the plan, so the object is empty (nulls are omitted).
+        Assert.Equal("{}", state["transfer"]!.ToJsonString());
     }
 
     [Fact]

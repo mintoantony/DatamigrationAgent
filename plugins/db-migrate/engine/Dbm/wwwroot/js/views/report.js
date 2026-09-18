@@ -72,11 +72,21 @@
 
     const exportBtn = ctx.export ? null
       : h('button', { class: 'btn', type: 'button', on: { click: function (e) { exportReport(e.currentTarget, ctx); } } }, 'Export HTML');
+    // Ruling 185: every run that completed has its own report (one Complete version each); after a reopen and a new run the earlier
+    // ones stay readable here. The export is always the latest.
+    const versions = (ctx && ctx.versions) || [];
+    const picker = ctx.export || versions.length < 2 || !ctx.setVersion ? null
+      : h('select', { class: 'select', 'aria-label': 'Report of which run', on: { change: function (e) { ctx.setVersion(Number(e.target.value)); } } },
+        versions.slice().reverse().map(function (v) {
+          const shown = ctx.artifact && ctx.artifact.version === v.version;
+          return h('option', { value: String(v.version), selected: shown, title: v.summary || '' },
+            'Report ' + v.version + ' · ' + fmtTs(v.createdAt) + (v.version === versions[versions.length - 1].version ? ' (latest)' : ''));
+        }));
     const page = h('div', { class: 'page rep-page' },
       h('div', { class: 'page-h row' },
         h('div', { class: 'stack' }, h('div', { class: 'h1' }, 'Final report'),
           h('div', { class: 'muted small' }, 'Run #' + r.runId + ' · ' + fmtTs(r.startedAt) + ' → ' + fmtTs(r.endedAt))),
-        h('div', { class: 'spacer' }), DBM.components.badge(r.status), exportBtn),
+        h('div', { class: 'spacer' }), picker, DBM.components.badge(r.status), exportBtn),
       h('div', { class: 'grid-kpi' },
         kpi('Rows loaded', X.num(r.rowsLoaded), X.totalText(r.rowsSource, missing) + ' source rows'),
         kpi('Rejected', X.num(r.rowsError),

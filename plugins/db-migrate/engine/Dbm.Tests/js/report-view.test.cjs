@@ -158,3 +158,18 @@ test('the export has no Export button and asks the server for nothing', () => {
   assert.equal(D.queryAll(root, 'button').filter((b) => D.text(b) === 'Export HTML').length, 0);
   assert.equal(kpis(root)[0], 'Rows loaded = 184,497 / of at least 184,500 source rows');
 });
+
+test('after a reopen and a second run, the earlier run\'s report is one choice away (ruling 185)', () => {
+  const picked = [];
+  const versions = [
+    { version: 1, author: 'script', summary: 'Transferred 19,699 of 19,707 rows', createdAt: '2026-09-17T09:12:30+00:00' },
+    { version: 2, author: 'script', summary: 'Transferred 18,699 of 18,707 rows', createdAt: '2026-09-18T10:00:00+00:00' },
+  ];
+  const root = mount(report(), { artifact: { version: 2, payload: report() }, versions: versions, setVersion: (v) => picked.push(v) });
+  const select = D.find(root, (n) => String(n.tagName).toLowerCase() === 'select');
+  assert.ok(select, 'no way to reach the earlier run\'s report from this screen');
+  assert.deepEqual(select.children.map((o) => D.text(o).replace(/ · .*?( \(latest\))?$/, '$1')), ['Report 2 (latest)', 'Report 1']);
+  select.value = '1';
+  select.fire('change', { target: select });
+  assert.deepEqual(picked, [1]);
+});
