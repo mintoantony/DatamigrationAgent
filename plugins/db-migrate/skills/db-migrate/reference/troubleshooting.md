@@ -18,8 +18,8 @@ The launcher (`bin/dbm`, `bin/dbm.cmd`) writes plain text to stderr, not JSON:
 With the .NET SDK installed the launcher rebuilds `engine/dist` when it is missing, when its `VERSION` differs from
 `plugin.json`, or when asked (`DBM_REBUILD=1`, `dbm doctor --rebuild`). It prints "building the engine (…, about a
 minute)", and "waiting for another engine build to finish" while a second `dbm` builds. "removing engine/dist.tmp.<id>
-(or dist.old.<id>), left behind by a build that crashed" means it cleared the leftovers of a build killed more than 15
-minutes earlier; nothing to act on. When the rebuild fails:
+(or dist.old.<id>), left behind by a build that crashed" means it cleared the leftovers of a build that crashed;
+nothing to act on. When the rebuild fails:
 
 - **"dbm: warning: <reason>; running the previous engine/dist <version> instead."** — the command ran on the old build
   and its own output follows; nothing is lost and the rebuild is retried on the next command. The reason is one of
@@ -186,9 +186,10 @@ and the user types `/db-migrate resume`.
   "<Step>, <step>, …, then failed <step>: <server text>. Re-run with --force to start over." (for example "Dropped …,
   created …, then failed creating …"). When a `--force` drop fails, the database is put back in multi-user mode and
   the message says so before its last sentence; if even that fails it says the database "was left in single-user mode"
-  and gives the `ALTER DATABASE [<name>] SET MULTI_USER` that undoes it — relay that statement. With `--attach`, a failure after both databases were seeded says "Created and
-  seeded <source> and <target>, then failed saving them as this project's connections: … Re-run with --force --attach
-  to start over." Relay the message, then the remedy it names.
+  and gives the `ALTER DATABASE [<name>] SET MULTI_USER` that undoes it — relay that statement. With `--attach`, a
+  failure after both databases were seeded says "Created and seeded <source> and <target>, then failed saving them as
+  this project's connections: … Re-run with --force --attach to start over." Relay the message, then the remedy it
+  names.
 - **`not_found`** (`dbm export`) — the server has no export of that kind; the kinds are `analysis`, `sql`, `sqlpack`,
   `report`.
 - **`export_unavailable`** (`dbm export`) — that phase has nothing to export yet (e.g. `report` before a completed run).

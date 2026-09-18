@@ -125,8 +125,10 @@ release_lock() {
 }
 
 # Removes the dist.tmp.<id> (~30 MB) of a publish that crashed and the dist.old.<id> of a swap that crashed. Under the
-# build lock, and only entries older than the lock's stale age, for the reasons given in bin/dbm's sweep_abandoned; a
-# dist.old.<id> is kept while engine/dist is missing. Keep bin/dbm, bin/dbm.cmd and release.ps1 in sync with this.
+# build lock, and only entries older than the lock's stale age (bin/dbm's sweep_abandoned says why). The age test
+# protects a live build's dist.tmp.<id> only: a dist.old.<id> keeps the old dist's mtime after mv, so what protects a
+# live swap is that a dist.old.<id> is kept while engine/dist is missing. Keep bin/dbm, bin/dbm.cmd and release.ps1 in
+# sync with this.
 sweep_abandoned() {
   find "$engine" -maxdepth 1 -type d \( -name 'dist.tmp.*' -o -name 'dist.old.*' \) -mmin +"$lock_stale_minutes" 2>/dev/null |
     while IFS= read -r leftover; do

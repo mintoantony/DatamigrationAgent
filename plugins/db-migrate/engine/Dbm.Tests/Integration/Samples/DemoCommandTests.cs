@@ -251,6 +251,14 @@ public sealed class DemoCommandTests : IAsyncLifetime
         }
     }
 
+    /// <summary>A failed --force drop exits 1 as sql_error, or the assertion prints what the CLI answered instead.</summary>
+    private static void AssertFailedDropIsSqlError(CliResult r)
+    {
+        Assert.True(r.Exit == 1, $"a --force whose DROP fails must exit 1, got exit {r.Exit}: {r.Out}");
+        Assert.True(r.Json["error"]?.GetValue<string>() == "sql_error",
+            $"a --force whose DROP fails must be reported as sql_error with the demo's own message; got: {r.Out}");
+    }
+
     /// <summary>Open item 34: a DROP that fails after SET SINGLE_USER succeeded must not leave the database single-user.</summary>
     [Fact]
     public async Task Demo_force_whose_drop_fails_puts_the_database_back_in_multi_user_mode_and_says_so()
@@ -260,8 +268,7 @@ public sealed class DemoCommandTests : IAsyncLifetime
 
         var r = await RunForceWithSourceDropFailingAsync(tw, restoreFails: false);
 
-        Assert.Equal(1, r.Exit);
-        Assert.Equal("sql_error", r.Json["error"]!.GetValue<string>());
+        AssertFailedDropIsSqlError(r);
         var message = r.Json["message"]!.GetValue<string>();
         var access = await UserAccessAsync(_prefix + "LegacyShop");
         Assert.True(access == "MULTI_USER",
@@ -282,10 +289,12 @@ public sealed class DemoCommandTests : IAsyncLifetime
 
         var r = await RunForceWithSourceDropFailingAsync(tw, restoreFails: true);
 
-        Assert.Equal(1, r.Exit);
-        Assert.Equal("sql_error", r.Json["error"]!.GetValue<string>());
+        AssertFailedDropIsSqlError(r);
         var message = r.Json["message"]!.GetValue<string>();
-        Assert.Equal("SINGLE_USER", await UserAccessAsync(_prefix + "LegacyShop"));   // the seam really left it so
+        var access = await UserAccessAsync(_prefix + "LegacyShop");
+        Assert.True(access == "SINGLE_USER",
+            $"precondition: with the restore made to fail, {_prefix}LegacyShop must still be SINGLE_USER, but it is {access}: " +
+            $"the seam did not take effect. Message: {message}");
         var expected = $"Failed dropping {_prefix}LegacyShop: drop refused by the test seam. {_prefix}LegacyShop was left in " +
             $"single-user mode, and setting it back failed: restore refused by the test seam. Undo it with: ALTER DATABASE " +
             $"[{_prefix}LegacyShop] SET MULTI_USER. No database was created or dropped.";

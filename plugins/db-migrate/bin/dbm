@@ -54,9 +54,11 @@ prune_natives() {
 
 # A publish that crashed (killed, power cut) leaves its dist.tmp.<id> (~30 MB) behind, and a swap that crashed its
 # dist.old.<id>; nothing else ever removes them. Runs under the build lock, so no other build is using one - except a
-# build whose lock was broken as stale, which is why only entries older than the lock's own stale age go. The ids are
-# not all process ids (dbm.cmd uses %RANDOM%, release.ps1 a GUID), so age is the one test every builder can apply.
-# A dist.old.<id> is kept while engine/dist is missing: then it may be the previous build a failed swap-back names.
+# build whose lock was broken as stale. Only entries older than the lock's own stale age go: that protects a live
+# build's dist.tmp.<id> (publish keeps its mtime fresh). It does NOT protect a dist.old.<id>, which keeps the old dist's
+# mtime after mv; what protects a live swap is the next rule: a dist.old.<id> is kept while engine/dist is missing (a
+# swap in progress, or the previous build a failed swap-back names). The ids are not all process ids (dbm.cmd uses
+# %RANDOM%, release.ps1 a GUID), so age is the one test every builder can apply.
 # Keep engine/release.* and bin/dbm.cmd in sync with this.
 sweep_abandoned() {
   find "$engine" -maxdepth 1 -type d \( -name 'dist.tmp.*' -o -name 'dist.old.*' \) -mmin +"$lock_stale_minutes" 2>/dev/null |

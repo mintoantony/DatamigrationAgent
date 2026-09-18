@@ -197,9 +197,11 @@ exit /b 0
 
 rem A publish that crashed (killed, power cut) leaves its dist.tmp.N (~30 MB) behind, and a swap that crashed its
 rem dist.old.N; nothing else ever removes them. Runs under the build lock, so no other build is using one - except a build
-rem whose lock was broken as stale, which is why only entries older than DBM_LOCK_STALE_MINUTES go. The ids are not all
-rem process ids (here %%RANDOM%%, a GUID in release.ps1), so age is the one test every builder can apply. A dist.old.N is
-rem kept while engine\dist is missing: then it may be the previous build a failed swap-back names. cmd has no file age,
+rem whose lock was broken as stale. Only entries older than DBM_LOCK_STALE_MINUTES go: that protects a live build's
+rem dist.tmp.N (publish keeps its mtime fresh). It does NOT protect a dist.old.N, which keeps the old dist's mtime after
+rem move; what protects a live swap is that a dist.old.N is kept while engine\dist is missing (a swap in progress, or the
+rem previous build a failed swap-back names). The ids are not all process ids (here %%RANDOM%%, a GUID in release.ps1),
+rem so age is the one test every builder can apply. cmd has no file age,
 rem so powershell does it; where powershell cannot run nothing is swept. Keep bin/dbm and engine\release.* in sync.
 :sweep_abandoned
 powershell -NoProfile -NonInteractive -Command "$dll = Join-Path $env:DBM_ENGINE 'dist\Dbm.dll'; Get-ChildItem -LiteralPath $env:DBM_ENGINE -Directory -Force | Where-Object { ($_.Name -like 'dist.tmp.*' -or ($_.Name -like 'dist.old.*' -and (Test-Path -LiteralPath $dll))) -and ((Get-Date) - $_.LastWriteTime).TotalMinutes -ge [double]$env:DBM_LOCK_STALE_MINUTES } | ForEach-Object { 'dbm: removing engine\' + $_.Name + ', left behind by a build that crashed.'; Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }" 1>&2 2>nul

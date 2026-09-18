@@ -152,12 +152,14 @@ function Exit-BuildLock {
 }
 
 # Removes the dist.tmp.<id> (~30 MB) of a publish that crashed and the dist.old.<id> of a swap that crashed. Under the
-# build lock, and only entries older than the lock's stale age, for the reasons given in bin/dbm's sweep_abandoned; a
-# dist.old.<id> is kept while engine/dist is missing. Keep bin/dbm, bin/dbm.cmd and release.sh in sync with this.
+# build lock, and only entries older than the lock's stale age (bin/dbm's sweep_abandoned says why). The age test
+# protects a live build's dist.tmp.<id> only: a dist.old.<id> keeps the old dist's mtime after a move, so what protects
+# a live swap is that a dist.old.<id> is kept while engine/dist is missing (tested per folder, at the moment it is
+# judged). Keep bin/dbm, bin/dbm.cmd and release.sh in sync with this.
 function Remove-AbandonedBuilds {
-    $hasDist = Test-Path -LiteralPath (Join-Path $dist 'Dbm.dll')
+    $dll = Join-Path $dist 'Dbm.dll'
     Get-ChildItem -LiteralPath $engine -Directory -Force | Where-Object {
-        ($_.Name -like 'dist.tmp.*' -or ($_.Name -like 'dist.old.*' -and $hasDist)) -and
+        ($_.Name -like 'dist.tmp.*' -or ($_.Name -like 'dist.old.*' -and (Test-Path -LiteralPath $dll))) -and
         ((Get-Date) - $_.LastWriteTime).TotalMinutes -ge $LockStaleMinutes
     } | ForEach-Object {
         Write-Warning "removing engine/$($_.Name), left behind by a build that crashed"
