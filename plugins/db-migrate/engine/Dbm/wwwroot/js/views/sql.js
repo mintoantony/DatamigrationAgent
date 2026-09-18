@@ -81,6 +81,28 @@
 
   function joinStatements(list) { return (list || []).join('\nGO\n'); }
 
+  /* Open item 14, Ruling 205: 1-based lines of `text` (CRLF normalised, as splitStatements reads it) that splitStatements would treat as
+     a GO separator although they sit inside a comment or a string, as DBM.highlight.tokenize reads the whole text (the way SQL Server
+     does: nested block comments, '' escapes). The engine cannot be mirrored here: it has no splitter, and it refuses ANY GO line inside
+     a statement (SqlValidator.GoLine), comment or not, so such a line cannot be stored in any form. The editor names it instead of
+     posting a statement cut in two. */
+  function goSplitHazards(text) {
+    var src = norm(text);
+    var spans = [];
+    var at = 0;
+    DBM.highlight.tokenize(src).forEach(function (tok) {
+      if ((tok.c === 'com' || tok.c === 'str' || tok.c === 'id') && tok.v.indexOf('\n') >= 0) spans.push([at, at + tok.v.length]);
+      at += tok.v.length;
+    });
+    var out = [];
+    var start = 0;
+    src.split('\n').forEach(function (line, i) {
+      if (/^[ \t]*GO[ \t]*$/i.test(line) && spans.some(function (s) { return s[0] < start && start < s[1]; })) out.push(i + 1);
+      start += line.length + 1;
+    });
+    return out;
+  }
+
   /* Ruling 70: a statement list is editable as one text only if splitting its joined text gives back exactly the stored list,
      element for element. Otherwise (a GO line inside a comment or string, a whitespace-only or padded statement, CRLF) a save
      would rewrite statements the user never touched and shift every later line number. */
@@ -571,7 +593,18 @@
 
     function save() {
       if (ui.saving) return;
-      var ops = editOps(id, t, touchedEdits());   // only fields the user typed into; untouched fields are never re-derived
+      var edits = touchedEdits();
+      var hazards = [];
+      fields.forEach(function (f) {
+        if ((f[0] === 'preSql' || f[0] === 'postSql') && Object.prototype.hasOwnProperty.call(edits, f[0])) {
+          goSplitHazards(edits[f[0]]).forEach(function (n) {
+            hazards.push(f[1].split(' · ')[0] + ', line ' + n + ': this GO line is inside a comment or string, so saving would cut the '
+              + 'statement there (a line holding only GO always separates statements). Remove it or change that line, then save.');
+          });
+        }
+      });
+      if (hazards.length) { show(hazards); return; }   // Ruling 205: named before posting; nothing is sent
+      var ops = editOps(id, t, edits);   // only fields the user typed into; untouched fields are never re-derived
       if (!ops.length) { ctx.toast('Nothing changed', 'info'); return; }
       ui.saving = true;
       submit.disabled = true;
@@ -702,6 +735,7 @@
   DBM.sqlView = {
     listing: listing, listingText: listingText, parseAnchor: parseAnchor, sectionBlocks: sectionBlocks, splitStatements: splitStatements,
     joinStatements: joinStatements, cardLines: cardLines, listRoundTrips: listRoundTrips, editOps: editOps, reportSummary: reportSummary,
+    goSplitHazards: goSplitHazards,
     openCommentsByTask: openCommentsByTask,
     diffRows: diffRows,
   };

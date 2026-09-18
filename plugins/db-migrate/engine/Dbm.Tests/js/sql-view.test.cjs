@@ -674,6 +674,38 @@ test('N1: a real edit to one statement of a round-tripping list leaves its sibli
   });
 });
 
+/* Open item 14, Ruling 205 (fallback): the engine has no statement splitter to mirror - it refuses ANY GO line inside a statement,
+   comment or not (SqlValidator.GoLine) - so a GO line typed inside a comment or string cannot be stored in any form. The browser
+   names such a line before posting instead of cutting the statement there. */
+test('goSplitHazards names the GO separator lines that fall inside a comment or a string, and only those', () => {
+  assert.deepEqual(V.goSplitHazards('/* note\nGO\n*/ ALTER X;'), [2], 'a GO line inside a block comment is not named');
+  assert.deepEqual(V.goSplitHazards("SELECT 'a\n  go  \nb';"), [2], 'a GO line inside a string is not named');
+  assert.deepEqual(V.goSplitHazards('/* outer /* inner */\nGO\n*/\nA;\nGO\nB;'), [2], 'nested comment: line 2 inside, line 5 a real separator');
+  assert.deepEqual(V.goSplitHazards('A; -- a line comment ends here\nGO\nB;'), []);
+  assert.deepEqual(V.goSplitHazards('A;\r\nGO\r\nB;'), []);
+  assert.deepEqual(V.goSplitHazards('/* a */\nGO\nB;'), []);
+  assert.deepEqual(V.goSplitHazards(''), []);
+});
+
+test('editor: a GO line typed inside a comment is named before posting, and nothing is sent', async () => {
+  await withFakeDom(async dom => {
+    const s = sampleCtx();
+    const posts = [];
+    s.ctx.api = Object.assign({}, s.ctx.api, { post: (url, b) => { posts.push(b); return new Promise(() => {}); } });
+    editorFor(dom, s, 'T01');
+    type(areaFor(dom, 'Task pre-load'), 'ALTER TABLE [a].[b] NOCHECK CONSTRAINT [c];\nGO\n/* disabled for the load\nGO\n*/ UPDATE STATISTICS [a].[b];');
+    submit(dom);
+    const problems = dom.all(dom.root, n => n.attrs && n.attrs.class === 'sql-edit-problems')[0];
+    assert.equal(posts.length, 0, 'the editor posted a statement list that splits inside a comment: ' + JSON.stringify(posts[0] && posts[0].ops));
+    assert.match(dom.text(problems), /Task pre-load, line 4: this GO line is inside a comment or string/);
+
+    type(areaFor(dom, 'Task pre-load'), 'ALTER TABLE [a].[b] NOCHECK CONSTRAINT [c];\nGO\n/* disabled for the load */ UPDATE STATISTICS [a].[b];');
+    submit(dom);
+    assert.equal(posts.length, 1, 'a clean list is posted');
+    assert.deepEqual(posts[0].ops[0].value, ['ALTER TABLE [a].[b] NOCHECK CONSTRAINT [c];', '/* disabled for the load */ UPDATE STATISTICS [a].[b];']);
+  });
+});
+
 /* F5: the diff compares listings line for line by the TaskListing rule, so a lone CR vs LF (and CR CR LF) is a difference. */
 test('diffRows: lone CR vs LF and CR CR LF are differences, shown with a visible CR', () => {
   const rows = V.diffRows({ sourceQuery: 'a\rb' }, { sourceQuery: 'a\nb' });
