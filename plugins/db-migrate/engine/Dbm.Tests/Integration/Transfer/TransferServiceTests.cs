@@ -203,6 +203,50 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
         Assert.True(view.CanStart);                                                   // or is abandoned for a new run id
     }
 
+    /// <summary>Throws once, on the first event of <paramref name="type"/>; records everything else.</summary>
+    private sealed class ThrowOnceSink(IEventSink inner, string type) : IEventSink
+    {
+        private int _thrown;
+
+        public void Publish(string eventType, object? payload = null, bool persist = true)
+        {
+            if (eventType == type && Interlocked.Exchange(ref _thrown, 1) == 0)
+                throw new InvalidOperationException($"injected fault while publishing {eventType}");
+            inner.Publish(eventType, payload, persist);
+        }
+    }
+
+    /// <summary>
+    /// Ruling 183 (final review I-1), the second half: the finisher itself throws after the engine has recorded the run
+    /// <c>completed</c>. The run must say so in its notes, and the next server start must finish it - one report, Transfer and Complete
+    /// approved - instead of leaving a project that refuses Start, Resume, Cancel and Reopen alike.
+    /// </summary>
+    [Fact]
+    public async Task A_finisher_that_throws_is_recorded_on_the_run_and_retried_on_the_next_start()
+    {
+        await using var rig = await RigAsync();
+        rig.S.Sink = new ThrowOnceSink(rig.Svc.Sink, "artifact_created");
+        long runId = await rig.Service.StartAsync(Skip, rig.Tgt.Name, default);
+        await rig.Service.Current;
+
+        Assert.Equal(RunStatus.Completed, rig.S.Transfers.GetRun(runId)!.Status);
+        Assert.Equal(PhaseStatus.Running, rig.S.Phases.Get(PhaseName.Transfer).Status);   // the wedge the fault leaves
+        Assert.True(rig.Service.View().Run!.Notes.Any(n => n.Contains("recording its outcome in the workflow failed", StringComparison.Ordinal)),
+            "the finisher's fault is not on the run: an operator sees a completed run that never reached Complete and nothing saying why");
+
+        var nextStart = new TransferService(rig.S);   // what WebHost builds on the next server start
+        nextStart.RecoverInterrupted();
+        long? reconciled = nextStart.ReconcileFinished();
+
+        Assert.True(rig.S.Phases.Get(PhaseName.Transfer).Status == PhaseStatus.Approved,
+            "the next start left Transfer " + EnumText.ToText(rig.S.Phases.Get(PhaseName.Transfer).Status) + " over completed run " + runId);
+        Assert.Equal(runId, reconciled);
+        Assert.Equal(PhaseStatus.Approved, rig.S.Phases.Get(PhaseName.Complete).Status);
+        Assert.Single(rig.S.Artifacts.List(PhaseName.Complete));
+        Assert.True(nextStart.View().Run!.HasReport);
+        Assert.Equal("complete", rig.S.Workflow.Next().Reason);
+    }
+
     /// <summary>
     /// Carry-forward 1 / ruling 103. The run lock is the guard behind the service's own: it refuses a second runner when two processes
     /// share a target. That refusal reaches the operator through <see cref="TransferService.StartAsync"/>, so it has to arrive as

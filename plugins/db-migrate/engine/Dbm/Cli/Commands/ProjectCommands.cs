@@ -35,6 +35,7 @@ public sealed class StatusCommand : ICommand
     {
         var ws = ctx.RequireProject();
         using var services = ctx.OpenServices(ws);
+        Dbm.Core.Transfer.RunFinisher.Reconcile(services);   // ruling 183, as in `dbm next`
         var project = services.Project.Get();
         var phases = services.Phases.All();
         var current = phases.FirstOrDefault(p => p.Status != PhaseStatus.Approved) ?? phases[^1];

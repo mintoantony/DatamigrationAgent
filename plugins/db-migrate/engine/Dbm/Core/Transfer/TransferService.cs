@@ -157,6 +157,31 @@ public sealed class TransferService
     }
 
     /// <summary>
+    /// Server start, once, right after <see cref="RecoverInterrupted"/> (ruling 183): a run that completed while the workflow was never
+    /// told - the process died between the two, or <see cref="OnFinished"/> threw - is finished now. Returns the run id it finished,
+    /// or null when there was nothing to reconcile. A fault here is a log line, never a server that will not start: the same
+    /// reconciliation runs again on every <c>dbm next</c> and <c>dbm status</c>.
+    /// </summary>
+    public long? ReconcileFinished()
+    {
+        try
+        {
+            long? runId = RunFinisher.Reconcile(_services);
+            if (runId is long id)
+                _services.Sink.Publish("log", new { level = "warn",
+                    message = $"Transfer run {id} had completed, but the workflow had not recorded it; its final report is stored now." });
+            return runId;
+        }
+        catch (Exception ex)
+        {
+            _services.Sink.Publish("log", new { level = "error",
+                message = "The completed transfer run could not be recorded in the workflow: " + ScrubbedMessage(ex)
+                          + " It is retried on the next server start, dbm next or dbm status." });
+            return null;
+        }
+    }
+
+    /// <summary>
     /// The execute screen's checklist, and <b>the boundary for everything that can go wrong producing one</b> (ruling 123).
     /// <para><c>Preflight.RunAsync</c> never throws for a SQL fault (ruling 119), but it can still throw before it reaches a probe at
     /// all: a connection row that cannot be decrypted (protected under another Windows user), a fault in <c>Redactor.SecretsOf</c>, or
@@ -685,8 +710,29 @@ public sealed class TransferService
             // handled; what is left is the bookkeeping itself - a state database that has gone away under a run that is finishing. It
             // is caught rather than left to fault the background task, because an unobserved faulted task would leave _active true for
             // the life of the process and every later start refused "busy" with no way back.
-            _services.Sink.Publish("log", new { level = "error",
-                message = "Transfer bookkeeping failed: " + TransferFailure.Describe(ex, t => Redactor.Scrub(t, secrets)) });
+            //
+            // Ruling 183: this is also where a finisher that threw lands, after the engine has already recorded the run's own status. The
+            // run records the fault in its notes (best effort - the state database may be the thing that failed), and the next server
+            // start, dbm next or dbm status re-runs the idempotent finish (RunFinisher.Reconcile).
+            string why = TransferFailure.Describe(ex, t => Redactor.Scrub(t, secrets));
+            try
+            {
+                _services.Transfers.UpdateRunSummary(runId, summary => MergeNote(summary,
+                    $"The run ended, but recording its outcome in the workflow failed: {why} It is retried on the next server start, "
+                    + "dbm next or dbm status."));
+            }
+            catch (Exception)
+            {
+                // nothing more can be written; the log line below is what is left
+            }
+            try
+            {
+                _services.Sink.Publish("log", new { level = "error", message = "Transfer bookkeeping failed: " + why });
+            }
+            catch (Exception)
+            {
+                // the sink itself may be what threw
+            }
         }
         finally
         {
@@ -786,26 +832,11 @@ public sealed class TransferService
     /// phase on the strength of it. Storing one for a failed or cancelled run would close the migration over a half-loaded target.
     /// A paused run finishes nothing, so it calls nothing.</para>
     /// </summary>
+    /// <para>Ruling 183: the work is <see cref="RunFinisher.Finish"/>, one idempotent transaction shared with the reconciliation that
+    /// server start, <c>dbm next</c> and <c>dbm status</c> run - so a finisher that throws here is finished by the next of those.</para>
     private void OnFinished(long runId, TransferOutcome outcome)
     {
-        switch (outcome.Status)
-        {
-            case RunStatus.Completed:
-                var run = _services.Transfers.GetRun(runId)!;
-                var report = run.SummaryJson is null ? null : Json.Deserialize<FinalReport>(run.SummaryJson);
-                string summary = report is null ? $"Transfer run {runId} completed." : FinalReportBuilder.Summary(report);
-                int version = Math.Max(1, _services.Artifacts.NextVersion(PhaseName.Complete));
-                _services.Artifacts.Add(PhaseName.Complete, version, run.SummaryJson ?? "{}", "script", summary);
-                _services.Sink.Publish("artifact_created", new { phase = "complete", version, author = "script" });
-                _services.Workflow.OnTransferFinished("completed", version);
-                break;
-            case RunStatus.Failed:
-                _services.Workflow.OnTransferFinished("failed", null);
-                break;
-            case RunStatus.Cancelled:
-                _services.Workflow.OnTransferFinished("cancelled", null);
-                break;
-        }
+        if (outcome.Status is RunStatus.Completed or RunStatus.Failed or RunStatus.Cancelled) RunFinisher.Finish(_services, runId);
     }
 
     // ------------------------------------------------------------------ pre-flight boundary
