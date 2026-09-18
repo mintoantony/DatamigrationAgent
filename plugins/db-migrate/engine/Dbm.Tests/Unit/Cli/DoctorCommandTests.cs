@@ -26,7 +26,7 @@ public class DoctorCommandTests
         Assert.Equal(0, exit);
         var json = JsonNode.Parse(sw.ToString())!;
         Assert.True(json["ok"]!.GetValue<bool>());
-        Assert.Equal(5, json["checks"]!.AsArray().Count);
+        Assert.Equal(8, json["checks"]!.AsArray().Count);   // 5 machine checks + protector, server, dist (T6.2)
         Assert.NotNull(json["checks"]![0]!["detail"]);
     }
 

@@ -14,20 +14,26 @@ public sealed class DoctorCommand : ICommand
     public string Name => "doctor";
     public string Help => "Check runtime, drivers and user profile (--quiet: silent when healthy; --rebuild: launcher rebuilds first)";
 
-    public Task<int> RunAsync(Args args, CliContext ctx)
+    public async Task<int> RunAsync(Args args, CliContext ctx)
     {
         // --rebuild is handled by bin/dbm(.cmd) before this process starts; accepted here so it is not an error.
-        var checks = RunChecks();
+        var quiet = args.Flag("quiet");
+        // T6.2: --quiet runs on every session start, so it skips the check that touches the network.
+        var checks = RunChecks()
+            .Concat(quiet
+                ? DoctorChecks.Quick(AppContext.BaseDirectory)
+                : await DoctorChecks.AllAsync(ctx.Workspace(), AppContext.BaseDirectory, CancellationToken.None))
+            .ToList();
         var ok = checks.All(c => c.Ok);
-        if (args.Flag("quiet"))
+        if (quiet)
         {
-            if (ok) return Task.FromResult(0);
+            if (ok) return 0;
             var problems = string.Join("; ", checks.Where(c => !c.Ok).Select(c => $"{c.Name}: {c.Detail}"));
             ctx.Out.WriteLine($"dbm doctor: {problems}");
-            return Task.FromResult(1);
+            return 1;
         }
-        if (!ok) return Task.FromResult(Output.Write(ctx, new { ok, checks }, 1));
-        return Task.FromResult(Output.Ok(ctx, new { ok, checks }));
+        if (!ok) return Output.Write(ctx, new { ok, checks }, 1);
+        return Output.Ok(ctx, new { ok, checks });
     }
 
     public static IReadOnlyList<Check> RunChecks() =>

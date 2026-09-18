@@ -1,6 +1,7 @@
 #!/bin/sh
 # db-migrate launcher (macOS, Linux, Git Bash on Windows).
-# Runs engine/dist/Dbm.dll with the installed .NET runtime; builds it once when missing (needs the .NET SDK).
+# Runs engine/dist/Dbm.dll with the installed .NET runtime; builds it when missing, when DBM_REBUILD=1, or when
+# engine/dist/VERSION no longer matches plugin.json (needs the .NET SDK).
 # Exit codes: 3 = runtime missing, 4 = engine not built / build failed; otherwise the engine's own exit code.
 set -eu
 
@@ -8,6 +9,8 @@ here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(dirname -- "$here")
 engine="$root/engine"
 dll="$engine/dist/Dbm.dll"
+manifest="$root/.claude-plugin/plugin.json"
+lock="$engine/.build.lock"
 
 install_help() {
   echo "Install the ASP.NET Core Runtime 8 (or later), then open a new terminal:" >&2
@@ -17,6 +20,71 @@ install_help() {
     MINGW* | MSYS* | CYGWIN*) echo "  Windows: winget install Microsoft.DotNet.AspNetCore.8" >&2 ;;
     *) echo "  See https://dotnet.microsoft.com/download/dotnet/8.0" >&2 ;;
   esac
+}
+
+plugin_version() {
+  sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" 2>/dev/null | head -n 1
+}
+
+dist_version() {
+  if [ -f "$engine/dist/VERSION" ]; then tr -d ' \r\n' < "$engine/dist/VERSION"; fi
+}
+
+# The publish output carries ~75 MB of native files db-migrate never loads: MSAL's WAM broker (SqlClient's Entra modes
+# use MSAL's managed/browser path, not the broker) and runtimes for platforms this plugin does not target. Removing
+# them keeps the committed engine/dist near 30 MB. Keep engine/release.* in sync with this list.
+prune_natives() {
+  target="$1/runtimes"
+  [ -d "$target" ] || return 0
+  for rid in browser browser-wasm maccatalyst-x64 maccatalyst-arm64 linux-armel linux-mips64 linux-ppc64le \
+    linux-s390x linux-musl-s390x linux-riscv64 linux-musl-riscv64 linux-x86; do
+    rm -rf "$target/$rid"
+  done
+  find "$target" -type f -name '*msalruntime*' -delete
+}
+
+# Why this is needed: the plugin ships a built engine/dist, so an update that changes plugin.json leaves a stale dist
+# behind in a checkout that has the SDK. Publishing into dist.tmp and swapping keeps the old build usable if anything
+# fails (on Windows a running server keeps its DLLs locked, so the rename is the only safe way to replace them).
+build_engine() {
+  echo "dbm: building the engine ($reason, about a minute)..." >&2
+  if [ -f "$dll" ]; then dotnet "$dll" stop >/dev/null 2>&1 || true; fi
+  rm -rf "$engine/dist.tmp"
+  if ! dotnet publish "$engine/Dbm/Dbm.csproj" -c Release -o "$engine/dist.tmp" --nologo -v q \
+      "-p:Version=${version:-0.0.0}" -p:DebugType=none -p:UseAppHost=false >&2; then
+    rm -rf "$engine/dist.tmp"
+    echo "dbm: engine build failed (see the messages above)." >&2
+    exit 4
+  fi
+  prune_natives "$engine/dist.tmp"
+  printf '%s' "${version:-0.0.0}" > "$engine/dist.tmp/VERSION"
+  old="$engine/dist.old.$$"
+  if [ -d "$engine/dist" ] && ! mv "$engine/dist" "$old" 2>/dev/null; then
+    rm -rf "$engine/dist.tmp"
+    echo "dbm: engine/dist is in use by a running dbm server - run 'dbm stop' in that project folder and retry." >&2
+    exit 4
+  fi
+  # The old build is already out of the way here, so a failing swap must put it back: the twin of dbm.cmd's
+  # :build_no_swap. Without it the user would be left with no engine/dist at all.
+  if ! mv "$engine/dist.tmp" "$engine/dist" 2>/dev/null; then
+    if [ -d "$old" ]; then mv "$old" "$engine/dist" 2>/dev/null || true; fi
+    rm -rf "$engine/dist.tmp"
+    echo "dbm: engine/dist could not be replaced; the previous build is still in place." >&2
+    exit 4
+  fi
+  rm -rf "$old" 2>/dev/null || true
+}
+
+acquire_lock() {
+  waited=0
+  while ! mkdir "$lock" 2>/dev/null; do
+    waited=$((waited + 1))
+    if [ "$waited" -gt 180 ]; then
+      rm -rf "$lock"
+      waited=0
+    fi
+    sleep 1
+  done
 }
 
 if ! command -v dotnet >/dev/null 2>&1; then
@@ -39,18 +107,33 @@ if [ "${1:-}" = "doctor" ]; then
   done
 fi
 
-if [ ! -f "$dll" ] || [ "${DBM_REBUILD:-}" = "1" ]; then
+version=$(plugin_version)
+installed=$(dist_version)
+reason=""
+if [ ! -f "$dll" ]; then
+  reason="engine/dist is missing"
+elif [ "${DBM_REBUILD:-}" = "1" ]; then
+  reason="rebuild requested"
+elif [ -n "$version" ] && [ "$installed" != "$version" ]; then
+  reason="engine/dist ${installed:-without VERSION} differs from plugin.json $version"
+fi
+
+if [ -n "$reason" ]; then
   if dotnet --list-sdks 2>/dev/null | grep -q .; then
-    echo "dbm: building the engine (first run, about a minute)..." >&2
-    if ! dotnet publish "$engine/Dbm/Dbm.csproj" -c Release -o "$engine/dist" --nologo -v q >&2; then
-      echo "dbm: engine build failed (see the messages above)." >&2
-      exit 4
+    acquire_lock
+    trap 'rmdir "$lock" 2>/dev/null || true' EXIT INT TERM
+    installed=$(dist_version)   # another launcher may have built it while we waited for the lock
+    if [ ! -f "$dll" ] || [ "${DBM_REBUILD:-}" = "1" ] || { [ -n "$version" ] && [ "$installed" != "$version" ]; }; then
+      build_engine
     fi
-  else
+    rmdir "$lock" 2>/dev/null || true
+    trap - EXIT INT TERM
+  elif [ ! -f "$dll" ]; then
     echo "dbm: engine not built ($dll is missing) and no .NET SDK is installed to build it." >&2
     echo "     Install the .NET 8 SDK or use a release of the plugin that ships engine/dist." >&2
     exit 4
   fi
+  # A stale dist without an SDK still runs; `dbm doctor` reports the mismatch.
 fi
 
 exec dotnet "$dll" "$@"
