@@ -121,14 +121,15 @@ keep a background `dbm await`. A patch you already hold can still be applied.
 
 Details and options are in `reference/transfer.md`. The short version:
 
-- **`await` / `transfer_paused`** — the user paused the run; **Resume** on the Execute screen continues from the last
-  committed chunk. Keep a background `dbm await`.
+- **`await` / `transfer_paused`** — the run is paused; **Resume** on the Execute screen continues from the last
+  committed chunk. Say "The transfer is paused — resume it from the Execute screen." and keep a background `dbm await`.
 - **`stop` / `transfer_failed`** — the error is on the Execute screen (`dbm transfer status` shows the run). Report the
   remedy in one line and end your turn (no `dbm await`); after the user presses **Resume** they type `/db-migrate
   resume`. **Resume** continues a failed run from each task's last committed checkpoint. Typical causes:
   - row errors with *stop on error*: fix the source data and Resume; or cancel and start a new run with *skip and log*.
-    A new run starts from the first row again, so without *Truncate target first* keyed tables reject every row the
-    cancelled run already loaded and keyless tables are loaded twice (see the truncate caution below);
+    A new run starts from the first row again, so it needs *Truncate target first* (see the truncate caution below) or
+    the start dialog's confirmation naming the tables that already hold rows — keyed tables then reject every row the
+    cancelled run already loaded and keyless tables are loaded twice;
   - a full transaction log on the target: grow it or switch to SIMPLE recovery, then Resume;
   - a dropped connection: Resume;
   - missing `ALTER`/`INSERT` permission on a target table: grant it, then Resume.
@@ -138,13 +139,20 @@ Details and options are in `reference/transfer.md`. The short version:
     and presses Resume;
   - the source data (a value that does not convert or fit): fix the data and Resume;
   - a mapping or SQL defect (invalid column or object, a conversion or truncation the plan itself causes, NULL into
-    NOT NULL): the approved plan cannot change in this project once a transfer has started, so the fix is to cancel
-    and repeat the migration in a new project folder. The target still holds the rows this run committed, so that new
-    run needs *Truncate target first* or a restored target (see the truncate caution).
+    NOT NULL): the user reopens Mapping or SQL on its review screen. The reopen cancels the failed run first (running
+    the plan's post-load SQL); after re-approval the Execute screen starts a new run, which needs *Truncate target
+    first* or the confirmation by name, because the target still holds the rows this run committed.
 - **Truncate caution** — *Truncate target first* deletes **every** row in each target table of the plan, not only rows
   this migration loaded. Recommend it only if those tables hold nothing the user needs to keep; otherwise the target
   must be restored (for example from a backup), never edited by hand. It is the user's decision.
-- **`stop` / `transfer_cancelled`** — the user cancelled; rows already committed stay in the target. Report and end.
+- **`stop` / `transfer_cancelled`** — the user cancelled; rows already committed stay in the target. Cancel ran the
+  plan's post-load SQL: report any run note that says NOT restored (it carries the server's text; the constraint was
+  re-enabled without the check, or is still disabled). Report the `summary` and end.
+- **`target_not_empty`** (from `dbm transfer start` or the Execute button) — a new run would load into target tables
+  that already hold rows; the details say which have no key (their rows would be duplicated). The user ticks
+  *Truncate target first* (truncate caution) or confirms the tables by name in the start dialog.
+- **Reopen refused** ("… cannot be reopened: transfer run N is paused/running") — the run must be cancelled first
+  (Pause, then Cancel); a completed, cancelled or failed run allows it.
 
 ## Connections (the user fixes these in the Setup screen)
 

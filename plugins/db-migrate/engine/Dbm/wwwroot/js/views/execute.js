@@ -31,6 +31,7 @@
     target_rows: 'Target row counts',
     estimated_rows: 'Estimated volume',
     keyless_tasks: 'Tasks without a key',
+    chunk_keys: 'Chunk keys unique',
   };
 
   const LOG_LIMIT = 200;          // lines kept in memory
