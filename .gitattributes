@@ -3,10 +3,11 @@ plugins/db-migrate/bin/dbm text eol=lf
 *.sh text eol=lf
 *.cmd text eol=crlf
 
-# Inputs of the committed build (open items 28/40, ruling 189): Dbm.dll embeds the sample SQL and engine/dist copies
-# wwwroot, so their bytes must not depend on core.autocrlf. LF everywhere, on every checkout.
+# Inputs of the committed build (open items 28/40, ruling 189): Dbm.dll embeds the sample SQL, schema.sql, synonyms.json
+# and every multi-line string literal of its C# source, and engine/dist copies wwwroot and synonyms.json, so their bytes
+# must not depend on core.autocrlf. LF everywhere, on every checkout.
 plugins/db-migrate/samples/**/*.sql text eol=lf
-plugins/db-migrate/engine/Dbm/wwwroot/** text eol=lf
+plugins/db-migrate/engine/Dbm/** text eol=lf
 
 # Committed build output: never convert line endings, never diff.
 plugins/db-migrate/engine/dist/** binary
