@@ -17,13 +17,16 @@ public static class ScriptPack
     /// <summary>Heading over the plan's stored <see cref="SqlPlanSource.SkippedPrefix"/> line(s), which follow verbatim.</summary>
     const string NotValidatedTitle = "WARNING: NOT VALIDATED - no database checked this plan";
     const string MismatchTitle ="WARNING: this pack does not match the plan's execution order";
-    /// <summary>Heading over the plan's stored plan-level <see cref="SqlPlanPayload.Errors"/>, which follow verbatim. Task-level errors
-    /// have their own place (the task file's "Errors (last validation)" header); without this block a plan-level error — a bare carriage
-    /// return in a global statement, a connection that failed — would reach the DBA nowhere at all.</summary>
+    /// <summary>Open item 19: the task file's heading over its errors. Not "last validation": Ruling 96 makes the pack derive bare
+    /// carriage returns itself, and those lines come from the export's own check, not from any validation.</summary>
+    const string TaskErrorsHeading = "Errors (validation and export checks)";
+    /// <summary>Heading over the plan's plan-level <see cref="SqlPlanPayload.Errors"/> — stored, plus the ones the export derives — which
+    /// follow verbatim. Task-level errors have their own place (the task file's <see cref="TaskErrorsHeading"/> header); without this
+    /// block a plan-level error — a bare carriage return in a global statement, a connection that failed — would reach the DBA nowhere.</summary>
     const string PlanErrorsTitle = "WARNING: PLAN HAS ERRORS";
     /// <summary>Heading over the ids of the tasks whose own files carry errors. The error text is not repeated here — it lives in each
-    /// task file's "Errors (last validation)" header — but without this line 00_pre.sql cannot say whether the task files hold errors
-    /// at all, and a DBA who opens it alone would read that silence as "none".</summary>
+    /// task file's <see cref="TaskErrorsHeading"/> header — but without this line 00_pre.sql cannot say whether the task files hold
+    /// errors at all, and a DBA who opens it alone would read that silence as "none".</summary>
     static string TaskErrorsTitle(int count) => FormattableString.Invariant($"WARNING: {count} TASK(S) HAVE ERRORS");
 
     /// <summary>The warning lists 00_pre.sql and README.md print, ahead of anything else, in this order. They travel together and in
@@ -170,7 +173,7 @@ public static class ScriptPack
         Comment(sb, $"Chunk size:      {(t.ChunkSize?.ToString(CultureInfo.InvariantCulture) ?? "run default")}");
         Comment(sb, $"Custom SQL:      {(t.Custom ? "yes" : "no")}");
         AppendList(sb, "Warnings", t.Warnings);
-        AppendList(sb, "Errors (last validation)", errors);
+        AppendList(sb, TaskErrorsHeading, errors);
         sb.Append(Rule).Append("\n\n");
 
         if (t.PreSql.Count > 0)
@@ -232,7 +235,7 @@ public static class ScriptPack
         if (notes.PlanErrors.Count > 0)
         {
             sb.Append($"## {PlanErrorsTitle}\n\n")
-              .Append("The last validation recorded these plan-level errors - in the global statements, or in reaching the databases at all.\n")
+              .Append("Validation and the export's own checks recorded these plan-level errors - in the global statements, or in reaching the databases at all.\n")
               .Append("They are listed here because no task file holds them. Do not run this pack as-is.\n\n");
             foreach (var e in notes.PlanErrors) sb.Append("- ").Append(OneLine(e)).Append('\n');
             sb.Append('\n');
@@ -240,8 +243,8 @@ public static class ScriptPack
         if (notes.TaskErrors.Count > 0)
         {
             sb.Append($"## {TaskErrorsTitle(notes.TaskErrors.Count)}\n\n")
-              .Append("These tasks carry errors from the last validation. Each error is listed in that task's own file, under\n")
-              .Append("*Errors (last validation)* in its header. Do not run this pack as-is.\n\n");
+              .Append("These tasks carry errors from validation and the export's own checks. Each error is listed in that task's own file, under\n")
+              .Append($"*{TaskErrorsHeading}* in its header. Do not run this pack as-is.\n\n");
             foreach (var t in notes.TaskErrors) sb.Append("- ").Append(OneLine(t)).Append('\n');
             sb.Append('\n');
         }

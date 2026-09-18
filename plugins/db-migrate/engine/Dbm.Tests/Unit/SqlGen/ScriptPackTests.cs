@@ -48,7 +48,7 @@ public class ScriptPackTests
     }
 
     /// <summary>Ruling 57: a bare-CR error is flagged in the pack exactly as any other stored task error — in the task file's
-    /// "Errors (last validation)" header.</summary>
+    /// "Errors (validation and export checks)" header (open item 19's wording).</summary>
     [Fact]
     public void A_bare_carriage_return_error_is_listed_like_any_other_task_error()
     {
@@ -59,8 +59,8 @@ public class ScriptPackTests
 
         var files = ScriptPack.BuildFiles(plan, "demo").ToDictionary(f => f.Name, f => f.Content);
 
-        Assert.Contains("-- Errors (last validation):\n--   - sourceQuery: Invalid column name 'X'.\n", files["04_app_Addresses.sql"]);
-        Assert.Contains("-- Errors (last validation):\n--   - preSql[0]: bare carriage return at line 1 (SQL Server treats it as a line break; use CRLF or LF)\n",
+        Assert.Contains("-- Errors (validation and export checks):\n--   - sourceQuery: Invalid column name 'X'.\n", files["04_app_Addresses.sql"]);
+        Assert.Contains("-- Errors (validation and export checks):\n--   - preSql[0]: bare carriage return at line 1 (SQL Server treats it as a line break; use CRLF or LF)\n",
             files["05_app_Orders.sql"]);
     }
 
@@ -80,14 +80,20 @@ public class ScriptPackTests
 
         var files = ScriptPack.BuildFiles(plan, "demo");
 
+        // Open item 19: no validation produced these lines (the export derived them), so no heading or body may say one did.
+        foreach (var (name, content) in files)
+            Assert.False(content.Contains("last validation", StringComparison.Ordinal), $"{name} credits the export's derived error lines to \"the last validation\"");
         const string advice = " (SQL Server treats it as a line break; use CRLF or LF)";
         Assert.Contains("-- WARNING: PLAN HAS ERRORS (see README.md)\n--   - preSql[1]: bare carriage return at line 3" + advice + "\n", files[0].Content);
         Assert.Contains("-- WARNING: 1 TASK(S) HAVE ERRORS (see each task file's header)\n--   - T05 (app.Orders): 1 error(s)\n", files[0].Content);
-        Assert.Contains("-- Errors (last validation):\n--   - preSql[0]: bare carriage return at line 1" + advice + "\n",
+        Assert.Contains("-- Errors (validation and export checks):\n--   - preSql[0]: bare carriage return at line 1" + advice + "\n",
             files.Single(f => f.Name == "05_app_Orders.sql").Content);
         var readme = files.Single(f => f.Name == "README.md").Content;
         Assert.Contains("## WARNING: PLAN HAS ERRORS\n\n", readme);
         Assert.Contains("## WARNING: 1 TASK(S) HAVE ERRORS\n\n", readme);
+        Assert.Contains("## WARNING: PLAN HAS ERRORS\n\nValidation and the export's own checks recorded these plan-level errors", readme);
+        Assert.Contains("These tasks carry errors from validation and the export's own checks. Each error is listed in that task's own file, under\n"
+            + "*Errors (validation and export checks)* in its header.", readme);
         // The executable carriage return still ships in the same file as its warning: the pack warns, it does not withhold.
         Assert.Contains(files, f => f.Content.Contains("\rDROP TABLE app.Orders", StringComparison.Ordinal));
 
