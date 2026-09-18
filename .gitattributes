@@ -2,3 +2,6 @@
 plugins/db-migrate/bin/dbm text eol=lf
 *.sh text eol=lf
 *.cmd text eol=crlf
+
+# Committed build output: never convert line endings, never diff.
+plugins/db-migrate/engine/dist/** binary
