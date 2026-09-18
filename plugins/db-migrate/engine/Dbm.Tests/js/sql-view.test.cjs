@@ -457,6 +457,36 @@ test('render: a report for another version than the one shown is not displayed (
   });
 });
 
+/* Open item 13: a revalidation of the same version that fails keeps the earlier verdict, marked as from an earlier check, and says
+   the latest attempt failed - and the next successful check clears that mark. */
+test('render: a failed revalidation of the same version keeps the earlier card, marked as earlier, with the failure', async () => {
+  const clean = { version: 2, ok: true, taskErrors: { T01: [], T02: [] }, taskWarnings: { T01: [], T02: [] }, globalErrors: [], globalWarnings: [] };
+  await withFakeDom(async dom => {
+    const s = await renderValidated(dom, clean);
+    assert.ok(!/earlier check/.test(dom.text(dom.root)), 'a fresh verdict is not marked as earlier');
+
+    const failed = Promise.reject(Object.assign(new Error('The db-migrate server is not reachable.'), { code: 'network' }));
+    failed.catch(() => {});
+    s.ctx.api.post = () => failed;
+    click(dom, t => t === 'Validate live');
+    await failed.catch(() => {});
+    await tick();
+
+    const shown = dom.text(dom.root);
+    assert.ok(shown.includes('Every task and the global statements were checked'), 'the earlier verdict on this same version is kept');
+    assert.ok(/from an earlier check/.test(shown) && /latest validation.*failed/i.test(shown) && shown.includes('not reachable'),
+      'after a failed revalidation of v2 the screen must say the card is from an earlier check and that the latest attempt failed '
+      + '(with why); it shows: ' + shown.slice(0, 400));
+
+    const ok = Promise.resolve(clean);
+    s.ctx.api.post = () => ok;
+    click(dom, t => t === 'Validate live');
+    await ok;
+    await tick();
+    assert.ok(!/earlier check|latest validation.*failed/i.test(dom.text(dom.root)), 'a successful check clears the failure mark');
+  });
+});
+
 /* F2 + F6: leave() resets every piece of view state — the report, the selected task, editing. */
 test('render: leaving and returning shows no report and the default task, whatever was selected before', async () => {
   await withFakeDom(async dom => {
