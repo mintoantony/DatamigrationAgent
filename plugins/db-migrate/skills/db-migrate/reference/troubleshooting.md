@@ -64,8 +64,8 @@ its `detail`. `dbm doctor --quiet` prints nothing when healthy and otherwise one
 
 ## Server and browser
 
-**"The dbm server did not start within 20 s"** (an `internal` error from `dbm init`, `dbm ui`, `dbm await`,
-`dbm export` or `dbm transfer …`):
+**"The dbm server did not start within 20 s"** (an `internal` error from `dbm next`, `dbm init`, `dbm ui`, `dbm await`,
+`dbm discover`, `dbm export` or `dbm transfer …`):
 
 1. Run `dbm stop`, then `dbm ui` again.
 2. If it still fails, read the last 40 lines of `.dbmigrate/server.log` with the Read tool and act on it: "address
@@ -73,8 +73,8 @@ its `detail`. `dbm doctor --quiet` prints nothing when healthy and otherwise one
    access denied → the folder is read-only or on a synced/network drive, so suggest a local folder.
 3. Run `dbm doctor` and report any failing check.
 
-**`unauthorized` (401) in the browser** — the server restarted and issued a new token, so the old tab is dead. Run
-`dbm ui` and give the user the new URL.
+**"This page needs its access link." in the browser** (`unauthorized`, 401) — the server restarted and issued a new
+token, so the old tab is dead. Run `dbm ui` and give the user the new URL.
 
 **`forbidden_host` (403)** — the page was opened through another host name or a proxy. Tell the user to use the exact
 `http://127.0.0.1:<port>/?t=<token>` URL that `dbm ui` prints.
@@ -86,8 +86,10 @@ minutes while Claude has work to do. If you are running, run `dbm next` and cont
 
 **`stop` with reason `job_failed`** — a server job (discover, analyze, automap, sqlgen) failed; `summary` holds the
 error. Common causes: connection or login failure (see *Connections*), missing `VIEW DEFINITION` / read permission on
-the source, or a timeout on a very large database. Tell the user the cause and that **Retry** in the error banner re-runs
-the job, then start a background `dbm await` (it returns when Claude has work again).
+the source, or a timeout on a very large database. Tell the user in one line the cause, that **Retry** in the error banner
+re-runs the job, and that `/db-migrate resume` continues afterwards. Then end your turn. Do **not** start `dbm await`
+after any `stop`: it returns at once while the next action is not `await`, so it would wake you with the same `stop`
+again and again.
 
 **`dbm apply` rejected** (`patch_rejected`, `invalid_patch` or `not_found`, exit 1)
 
@@ -97,8 +99,10 @@ the job, then start a background `dbm await` (it returns when Claude has work ag
 - Any other `patch_rejected` (unknown table or column, bad JSON pointer, a feedback item without a response, SQL
   validation failed), `invalid_patch`, or `not_found` (no patch file): dispatch the same subagent once more with the
   packet plus `The previous patch was rejected: <message>`, then `dbm apply` again.
-- Rejected twice: stop retrying. One line to the user: "The <phase> patch was rejected twice: <short message>. Add
-  clarifying feedback or edit directly in the UI, then press Request changes." Keep a background `dbm await`.
+- Rejected twice: stop retrying. One line to the user: "The <phase> patch was rejected twice: <short message>. Type
+  /db-migrate resume to let Claude try again." Then end your turn, with no `dbm await` (`dbm next` would hand back the
+  same agent work at once). Do not suggest editing or Request changes in the UI: while the phase is drafting or
+  reworking the UI refuses both.
 
 **Approval blocked (409 `blocked` in the UI)** — mapping approval needs every source column mapped or dropped and every
 non-nullable target column without a default filled in. The UI lists the blockers; the user resolves them there.
@@ -119,16 +123,27 @@ Details and options are in `reference/transfer.md`. The short version:
 
 - **`await` / `transfer_paused`** — the user paused the run; **Resume** on the Execute screen continues from the last
   committed chunk. Keep a background `dbm await`.
-- **`stop` / `transfer_failed`** — the error is on the Execute screen (`dbm transfer status` shows the run). Typical: row
-  errors with *stop on error* (fix the source data and Resume, or cancel and start a new run with *skip and log*), a
-  full transaction log on the target (grow it or switch to SIMPLE recovery, then Resume), a dropped connection (Resume
-  continues from the checkpoint), or missing `ALTER`/`INSERT` permission on a target table. Report the remedy in one
-  line, then keep a background `dbm await`.
-- **`bad_task`** in the error — every row of a chunk failed with the same plan-shaped error (invalid column or object,
-  conversion, NULL into NOT NULL, truncation, overflow, permission). That is a mapping or SQL defect, not bad data, even
-  under *skip and log*: the mapping or SQL task it names must be fixed. Once a transfer has started the project's phases
-  cannot be reopened, so tell the user that fixing it means cancelling this run and repeating the migration in a new
-  project folder (with *Truncate target first*). If the error is in the source data instead, fix the data and Resume.
+- **`stop` / `transfer_failed`** — the error is on the Execute screen (`dbm transfer status` shows the run). Report the
+  remedy in one line and end your turn (no `dbm await`); after the user presses **Resume** they type `/db-migrate
+  resume`. **Resume** continues a failed run from each task's last committed checkpoint. Typical causes:
+  - row errors with *stop on error*: fix the source data and Resume; or cancel and start a new run with *skip and log*.
+    A new run starts from the first row again, so without *Truncate target first* keyed tables reject every row the
+    cancelled run already loaded and keyless tables are loaded twice (see the truncate caution below);
+  - a full transaction log on the target: grow it or switch to SIMPLE recovery, then Resume;
+  - a dropped connection: Resume;
+  - missing `ALTER`/`INSERT` permission on a target table: grant it, then Resume.
+- **`bad_task`** in the error — every row of a chunk failed with the same non-constraint error. Split by what the error
+  says:
+  - a permission error (e.g. `INSERT` or `ALTER` denied): nothing in the plan is wrong — the user grants the permission
+    and presses Resume;
+  - the source data (a value that does not convert or fit): fix the data and Resume;
+  - a mapping or SQL defect (invalid column or object, a conversion or truncation the plan itself causes, NULL into
+    NOT NULL): the approved plan cannot change in this project once a transfer has started, so the fix is to cancel
+    and repeat the migration in a new project folder. The target still holds the rows this run committed, so that new
+    run needs *Truncate target first* or a restored target (see the truncate caution).
+- **Truncate caution** — *Truncate target first* deletes **every** row in each target table of the plan, not only rows
+  this migration loaded. Recommend it only if those tables hold nothing the user needs to keep; otherwise the target
+  must be restored (for example from a backup), never edited by hand. It is the user's decision.
 - **`stop` / `transfer_cancelled`** — the user cancelled; rows already committed stay in the target. Report and end.
 
 ## Connections (the user fixes these in the Setup screen)
@@ -145,12 +160,15 @@ Never ask for the connection string. Match the error text the user or the job re
 | `AADSTS...`, `DefaultAzureCredential failed` | Entra sign-in failed. `Active Directory Default` uses an existing `az login` / IDE sign-in; service principals need `Authentication=Active Directory Service Principal;User Id=<app id>;Password=<secret>`; `Managed Identity` works only on an Azure host. |
 | `(localdb)`, `error: 50` | LocalDB is Windows-only and per user: `sqllocaldb start MSSQLLocalDB` in a terminal. |
 
-After the user saves a corrected connection the engine re-runs discovery by itself; keep a background `dbm await`.
+After the user saves a corrected connection the engine re-runs discovery by itself. If you are waiting on an `await`
+action, your background `dbm await` wakes when there is work; after a `stop` (e.g. `job_failed`) you have ended your turn
+and the user types `/db-migrate resume`.
 
 ## Demo and exports
 
 - **`demo_exists`** — the demo databases exist already. Re-run with `--force` (drops and recreates exactly those two
-  databases) or choose another `--prefix`.
+  databases — ask the user first: anything in them is lost, also for any other project folder that uses them) or
+  choose another `--prefix`.
 - **`locked`** (`dbm demo --attach`) — this project already started a transfer; run the demo in a new, empty folder.
 - **`sql_error`** (`dbm demo`) — usually the login on `--server` cannot connect or lacks `CREATE DATABASE` (`dbcreator`).
   The message lists every step already taken on the server, then the step that failed and the server's text:

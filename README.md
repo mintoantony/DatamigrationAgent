@@ -100,8 +100,14 @@ CHECK constraint, an FK cycle, a trigger).
    ```
 
    For a local SQL Server use `--server "Server=localhost;Integrated Security=true;TrustServerCertificate=true"`.
+   Only give Claude a string like these, with Windows authentication and no secret in it. If the server needs a SQL
+   login, run `dbm demo --server "…" --attach` yourself in a terminal outside Claude Code, in the project folder — not
+   with `!` in Claude Code, whose command and output land in the conversation — so the password never reaches the chat.
+   `dbm` is on the PATH only inside Claude Code, so first ask Claude for the launcher's full path (it holds no secret);
+   in PowerShell or cmd use the `dbm.cmd` next to it.
    `--attach` saves both connections into the project, so there is nothing to paste. Useful flags: `--force` (drop and
-   recreate exactly those two demo databases), `--prefix Team_` (other names), `--scale 10` (ten times the rows).
+   recreate exactly those two demo databases — anything in them is lost), `--prefix Team_` (other names), `--scale 10`
+   (ten times the rows).
    Without `--attach`, `dbm demo` only prints the two connection strings, with any password replaced by `***`; with SQL
    authentication you would have to put the password back in yourself (in the browser, never in the chat), so prefer
    `--attach`, which saves the real strings encrypted.
@@ -113,8 +119,10 @@ CHECK constraint, an FK cycle, a trigger).
    orders, their 2 order lines, 3 comments too long for the target column and 1 zero-quantity line. They are wrong on
    purpose, to show how bad rows are captured.
 
-Afterwards, drop the two demo databases, e.g.
-`sqlcmd -S "(localdb)\MSSQLLocalDB" -E -Q "DROP DATABASE DbmDemo_LegacyShop; DROP DATABASE DbmDemo_ShopV2"`.
+Afterwards, run `/db-migrate stop` (or `dbm stop` in the project folder) so the local server releases its connections,
+then drop the two demo databases, e.g.
+`sqlcmd -S "(localdb)\MSSQLLocalDB" -E -Q "DROP DATABASE DbmDemo_LegacyShop; DROP DATABASE DbmDemo_ShopV2"`
+(with `--prefix`, use your prefix instead of `DbmDemo_`).
 
 ## Using it on real databases
 
@@ -210,7 +218,9 @@ unless noted: exit code 0 on success, and 1 with `{"error":"<code>","message":"�
   `.dbmigrate/server.json`.
 - **Connection strings** are entered in the browser (or saved by `dbm demo --attach`) and encrypted at rest: DPAPI for
   the current user on Windows, AES-GCM with a key in `~/.dbmigrate/key` (mode 600) elsewhere. They are masked after
-  saving and never appear in logs, events, work packets, exports, CLI output or anything sent to Claude.
+  saving and never appear in logs, events, work packets, exports, CLI output (except `dbm demo` without `--attach`,
+  which prints them with any password replaced by `***`) or anything sent to Claude. The one way a secret could reach
+  the chat is you typing it there — so never do, not even for the demo.
 - **What Claude sees:** schema metadata (names, types, keys, row counts, sizes), column profiles (null share, distinct
   ratio, lengths, value patterns and a few sample values while the project's `SampleValues` setting is on, which is the
   default; v1 has no switch for it in the UI), rule findings, the mapping, the SQL plan and your feedback.
@@ -227,13 +237,13 @@ unless noted: exit code 0 on success, and 1 with `{"error":"<code>","message":"�
 | `dbm: 'dotnet' was not found` or `ASP.NET Core Runtime 8 or later is required` (exit 3) | Install the runtime with the command above, then restart Claude Code. |
 | `engine not built ... no .NET SDK` (exit 4) | `claude plugin update db-migrate@db-migrate`, then restart Claude Code. |
 | `dbm: warning: … running the previous engine/dist … instead` | A rebuild of the engine failed and your command ran on the previous build; it is retried next time. If the reason is `engine/dist is in use by a running dbm server`, run `dbm stop` in the other project folder whose server uses this engine. |
-| `engine build failed` or `engine/dist could not be replaced` (exit 4) | There was no previous build to fall back to. Run the command again; for a build failure, `dotnet build plugins/db-migrate/engine/Dbm.sln` shows the compiler errors. |
+| `engine build failed` or `engine/dist could not be replaced` (exit 4) | There was no previous build to fall back to. If the message says the previous build "is in <folder> - rename it to dist", rename that folder to `engine/dist`. Otherwise run the command again; for a build failure, `dotnet build plugins/db-migrate/engine/Dbm.sln` shows the compiler errors. |
 | Session start shows `db-migrate: …` | The health check found a problem; the message names it (see `dbm doctor` below). Claude sees it too. |
 | The browser did not open | Run `/db-migrate ui` (or `dbm ui`) and open the printed `http://127.0.0.1:<port>/?t=<token>` URL. |
-| "Unauthorized" in the browser | The server restarted with a new token: run `dbm ui` for a fresh link. |
+| "This page needs its access link." in the browser | The server restarted with a new token: run `/db-migrate ui` (or `dbm ui`) for a fresh link. |
 | "Agent offline" banner | No Claude session is running the loop: type `/db-migrate resume`. |
 | A connection test fails with a certificate error | Add `TrustServerCertificate=True` (test servers) or install the server's CA certificate. |
-| `demo_exists` | Add `--force` to recreate the two demo databases, or use another `--prefix`. |
+| `demo_exists` | Add `--force` to recreate the two demo databases (anything in them is lost), or use another `--prefix`. |
 | Anything else | Claude reads `plugins/db-migrate/skills/db-migrate/reference/troubleshooting.md` when a command fails; you can read it too. |
 
 `dbm doctor` prints a health report as JSON, eight checks: runtime, ASP.NET Core, SqlClient, SQLite, user profile,

@@ -40,10 +40,13 @@ side; when both are saved, discovery starts automatically. **Change** replaces a
 started; after that the connections are locked.
 
 - Connection strings are encrypted on your machine and masked after saving. Don't paste them into the Claude chat.
-- To try the tool without your own databases, ask Claude to run
-  `dbm demo --server "<your server>" --attach` (see the README). Without `--attach` the command only prints the two
-  connection strings with any password replaced by `***`; with SQL authentication you must put the password back in
-  here yourself, so `--attach` is the easier way.
+- To try the tool without your own databases, use the demo (see the README). With Windows authentication (a
+  connection string without a password) you can ask Claude to run `dbm demo --server "<your server>" --attach`. If the
+  server needs a SQL login, run that command yourself in a terminal outside Claude Code — not with `!` in Claude Code,
+  whose command and output land in the conversation — so the password never reaches the chat (ask Claude for the
+  launcher's full path first: `dbm` is on the PATH only inside Claude Code). Without `--attach` the
+  command only prints the two connection strings with any password replaced by `***`, and you would have to put the
+  password back in here yourself, so `--attach` is the easier way.
 - A certificate error on Test: add `TrustServerCertificate=True` for test servers, or install the server's CA certificate.
 - Entra ID: for example `Authentication=Active Directory Default` (uses your `az login` or IDE sign-in) or
   `Active Directory Interactive`, which opens a sign-in window on this machine.
@@ -108,6 +111,7 @@ that needs reasoning (splits, merges, lookups, T-SQL transforms).
 - The SQL is validated against the real databases (compiled without executing, result-set shape, target column
   compatibility); errors and warnings appear per task.
 - Click a line number to comment on that line, and use the version diff to see exactly what Claude changed.
+- **Direct editing**: edit a task's SQL yourself; **Save as new version** creates a version authored by you.
 - **Download script pack** gives the plan as `.sql` files plus a README for a DBA review.
 
 **What to do:** read every task with warnings or custom SQL, comment where needed, approve.
@@ -133,7 +137,7 @@ that needs reasoning (splits, merges, lookups, T-SQL transforms).
    | Chunk size (rows) | 100 000 | rows per committed chunk (tasks with LOB columns use 5 000) |
    | Parallel tasks | 4 | tasks loaded at the same time; a task starts once the tables it depends on are loaded |
    | When a row is rejected | Stop at the first bad row | **Stop at the first bad row** = the chunk is rolled back and its task stops; **Skip and log bad rows** = bad rows are isolated, recorded and skipped |
-   | Truncate target first | off | empties each target table before loading |
+   | Truncate target first | off | deletes **every** row in each target table of the plan before loading — also rows that were never this migration's |
    | Validate column checksums | on | per-column checksum comparison for tables that were empty before the run |
    | Table lock | off | bulk-load with `TABLOCK`: faster, but blocks other users of the target |
    | Fire target triggers | off | let target triggers run during the bulk insert |
@@ -143,21 +147,29 @@ that needs reasoning (splits, merges, lookups, T-SQL transforms).
 
 **Loading into a target that already has rows.** Pre-flight only *warns* about non-empty target tables. Tables with a
 key reject the duplicates as row errors, but a table without a key is loaded again and its rows double — and the row
-count validation still passes, because it counts the rows added by this run. If you are re-running a migration, tick
-**Truncate target first** unless you really mean to append.
+count validation still passes, because it counts the rows added by this run. The same applies to a new run after a
+cancelled or failed one: checkpoints belong to one run, so a new run starts from the first row again. If you are
+re-running a migration, tick **Truncate target first** — but only if the target tables hold nothing you need to keep,
+because it deletes every row in them, not only this migration's. Otherwise the target has to be restored (for example
+from a backup); never edit it by hand.
 
 **Rejected rows under *Skip and log bad rows*.** Constraint violations (foreign key, CHECK, primary key or unique) are
 always skipped and logged row by row, even when every row of a chunk fails alike. But when every row of a chunk (of more
-than one row) fails with the same error that points at the plan itself — an invalid column or object, a conversion,
-NULL into NOT NULL, truncation, overflow or a permission — the task fails (`bad_task`) instead, because that is a
-mapping or SQL defect rather than bad data. The mapping and SQL phases cannot be reopened once a transfer has started,
-so fixing it means cancelling the run and repeating the migration in a new project folder (with **Truncate target
-first**).
+than one row) fails with the same other error, the task fails (`bad_task`) and the run stops. What to do depends on the
+error:
+
+- **A permission error** (e.g. `INSERT` or `ALTER` denied): nothing in the plan is wrong. Grant the permission and press
+  **Resume**; the run continues from its checkpoints.
+- **Bad source data** (a value that does not convert or fit): fix the data and press **Resume**.
+- **A mapping or SQL defect** (an invalid column or object, a conversion or truncation the plan itself causes, NULL
+  into NOT NULL): the mapping and SQL phases cannot be reopened once a transfer has started, so fixing it means
+  cancelling the run and repeating the migration in a new project folder. The target still holds what this run
+  committed, so the new run needs **Truncate target first** (with the caution above) or a restored target.
 
 **A task that loaded 0 rows is a mapping problem.** Because constraint violations are always per-row rejects, a wrong
 foreign-key or CHECK mapping under *Skip and log bad rows* does not fail the run: it can end *Completed* with every row
 of a table rejected. If a task shows 0 rows loaded and many rejected, do not treat it as bad data — read the rejected
-rows' error, fix the mapping (in a new project folder, as above) and load again.
+rows' error and fix the mapping in a new project folder, as above (a completed run allows no new run in this project).
 
 **Live view**: overall and per-task progress bars, rows per second, ETA, a throughput sparkline, the rejected-row count
 and a log tail. **Pause** lets every task commit its current chunk and stops; **Resume** continues from the checkpoints,
@@ -196,6 +208,9 @@ Every export is saved under `.dbmigrate/exports/` as well, and none of them cont
 - **Resume** continues immediately when the Claude session is still open. Otherwise type `/db-migrate resume` in any new
   session in the same folder; the engine knows where to continue.
 - While Claude waits for you, its session holds a background `dbm await` task. Anything that gives Claude work again —
-  approving, requesting changes, resuming, reopening — completes that command and Claude continues on its own. If your
+  approving, requesting changes, resuming, reopening — completes that command and Claude continues on its own.
+- When Claude reports a failure (a job failed, the transfer failed or was cancelled, a draft was rejected twice) it
+  ends its turn instead of waiting. After you have fixed the cause and pressed **Retry** or **Resume**, type
+  `/db-migrate resume`. If your
   Claude surface does not wake up, tell Claude to continue once and it switches to a foreground wait for the rest of the
   session.
