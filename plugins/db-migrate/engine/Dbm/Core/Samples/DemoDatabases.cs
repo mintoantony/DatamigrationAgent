@@ -26,6 +26,17 @@ public static partial class DemoDatabases
     /// </summary>
     internal static readonly ConcurrentDictionary<string, string> CreateDatabaseSuffixOverrides = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// Test seams, keyed by exact database name like <see cref="CreateDatabaseSuffixOverrides"/>: the statement run in
+    /// place of that database's DROP DATABASE (after SET SINGLE_USER has succeeded), and in place of the ALTER DATABASE
+    /// ... SET MULTI_USER that puts it back when the drop fails. A test sets them to a THROW to make that one step fail
+    /// on the server.
+    /// </summary>
+    internal static readonly ConcurrentDictionary<string, string> DropStatementOverrides = new(StringComparer.Ordinal);
+
+    /// <inheritdoc cref="DropStatementOverrides"/>
+    internal static readonly ConcurrentDictionary<string, string> MultiUserStatementOverrides = new(StringComparer.Ordinal);
+
     [GeneratedRegex("^[A-Za-z0-9_]{0,50}$")]
     private static partial Regex PrefixPattern();
 
@@ -91,6 +102,10 @@ public static partial class DemoDatabases
             step = $"creating the ShopV2 tables in {target}";
             await RunScriptAsync(targetCs, SampleSql.ShopV2Schema, ct);
         }
+        catch (DropFailedException ex)
+        {
+            throw new DemoFailedException(FailureMessage(done, step, ex.Drop.Message, ex.Note), ex.Drop);
+        }
         catch (SqlException ex)
         {
             throw new DemoFailedException(FailureMessage(done, step, ex.Message), ex);
@@ -101,14 +116,16 @@ public static partial class DemoDatabases
     /// <summary>
     /// "Created X, then failed creating Y: &lt;server text&gt;. Re-run with --force to start over." — every step that
     /// changed the instance, the step that failed, the server's words and the remedy; or, when nothing had changed
-    /// yet, says so.
+    /// yet, says so. <paramref name="note"/> (a sentence about the state the failed step left behind) goes before the
+    /// closing sentence.
     /// </summary>
-    internal static string FailureMessage(IReadOnlyList<string> done, string step, string serverText)
+    internal static string FailureMessage(IReadOnlyList<string> done, string step, string serverText, string? note = null)
     {
         var reason = serverText.Trim().TrimEnd('.');
-        if (done.Count == 0) return $"Failed {step}: {reason}. No database was created or dropped.";
+        var state = note is null ? "" : note + " ";
+        if (done.Count == 0) return $"Failed {step}: {reason}. {state}No database was created or dropped.";
         var history = string.Join(", ", done);
-        return $"{char.ToUpperInvariant(history[0])}{history[1..]}, then failed {step}: {reason}. Re-run with --force to start over.";
+        return $"{char.ToUpperInvariant(history[0])}{history[1..]}, then failed {step}: {reason}. {state}Re-run with --force to start over.";
     }
 
     /// <summary>Drops this prefix's two demo databases when they exist. Never touches any other database.</summary>
@@ -131,10 +148,43 @@ public static partial class DemoDatabases
         return await cmd.ExecuteScalarAsync(ct) is not (null or DBNull);
     }
 
-    private static Task DropOneAsync(SqlConnection master, string database, CancellationToken ct)
+    /// <summary>
+    /// SET SINGLE_USER (to end every other session), then DROP. When the DROP fails the database is still there, so it
+    /// is put back in MULTI_USER mode before the failure is reported (open item 34): a demo database nobody else can
+    /// open would otherwise outlive the error unannounced. The <see cref="DropFailedException"/> says whether that worked.
+    /// </summary>
+    private static async Task DropOneAsync(SqlConnection master, string database, CancellationToken ct)
     {
         var ident = SqlQuote.Ident(database);
-        return ExecuteAsync(master, $"ALTER DATABASE {ident} SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE {ident};", ct);
+        await ExecuteAsync(master, $"ALTER DATABASE {ident} SET SINGLE_USER WITH ROLLBACK IMMEDIATE;", ct);
+        try
+        {
+            await ExecuteAsync(master, DropStatementOverrides.TryGetValue(database, out var d) ? d : $"DROP DATABASE {ident};", ct);
+        }
+        catch (SqlException dropFailed)
+        {
+            var restore = MultiUserStatementOverrides.TryGetValue(database, out var m) ? m : $"ALTER DATABASE {ident} SET MULTI_USER;";
+            string note;
+            try
+            {
+                // Not ct: a cancelled command must still get its database back.
+                await ExecuteAsync(master, restore, CancellationToken.None);
+                note = $"{database} was set back to multi-user mode.";
+            }
+            catch (SqlException restoreFailed)
+            {
+                note = $"{database} was left in single-user mode, and setting it back failed: " +
+                    $"{restoreFailed.Message.Trim().TrimEnd('.')}. Undo it with: ALTER DATABASE {ident} SET MULTI_USER.";
+            }
+            throw new DropFailedException(dropFailed, note);
+        }
+    }
+
+    /// <summary>A DROP DATABASE that failed after SET SINGLE_USER; <see cref="Note"/> says which mode the database is in.</summary>
+    internal sealed class DropFailedException(SqlException drop, string note) : Exception($"{drop.Message.Trim().TrimEnd('.')}. {note}", drop)
+    {
+        public SqlException Drop { get; } = drop;
+        public string Note { get; } = note;
     }
 
     private static async Task ExecuteAsync(SqlConnection conn, string sql, CancellationToken ct)

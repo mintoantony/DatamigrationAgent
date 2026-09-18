@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using Dbm.Cli.Commands;
 using Dbm.Core;
 using Dbm.Core.Samples;
 using Dbm.Core.Sql;
@@ -140,6 +141,48 @@ public sealed class DemoCommandTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// Open item 31: --attach failing after both databases are created and seeded (the target's probe is pointed at a
+    /// database that does not exist, so the server itself refuses it) names both databases, the server's text and
+    /// the remedy, and saves neither connection.
+    /// </summary>
+    [Fact]
+    public async Task Demo_attach_that_fails_saving_the_connections_names_what_it_created_and_the_remedy()
+    {
+        using var tw = new TestWorkspace();
+        using var services = tw.OpenServices();   // makes the folder a project, as --attach requires
+        var target = _prefix + "ShopV2";
+        var missing = _prefix + "NoSuchDb";
+        // Connect Retry Count=0: SqlClient treats error 4060 as transient and would retry after 10 s.
+        DemoCommand.ProbeConnectionStringOverrides[target] = new SqlConnectionStringBuilder(
+            DemoDatabases.ForDatabase(SqlTestServer.ConnectionString, missing)) { ConnectRetryCount = 0 }.ConnectionString;
+        CliResult r;
+        try
+        {
+            r = await CliRunner.RunAsync(tw.Ws, null, "demo", "--server", SqlTestServer.ConnectionString, "--prefix", _prefix, "--attach");
+        }
+        finally
+        {
+            DemoCommand.ProbeConnectionStringOverrides.TryRemove(target, out _);
+        }
+
+        Assert.True(r.Exit == 1, $"expected the probe of {missing} to fail the attach, got exit {r.Exit}: {r.Out}");
+        Assert.True(r.Json["error"]?.GetValue<string>() == "sql_error",
+            $"a failed save of the demo connections must be reported as sql_error with the demo's own message; got: {r.Out}");
+        var message = r.Json["message"]!.GetValue<string>();
+        var head = $"Created and seeded {_prefix}LegacyShop and {_prefix}ShopV2, then failed saving them as this project's connections: ";
+        const string tail = ". Re-run with --force --attach to start over.";
+        Assert.True(message.StartsWith(head, StringComparison.Ordinal),
+            $"the message must name both databases as created and seeded and say saving the connections failed; it said: {message}");
+        Assert.True(message.Contains(missing, StringComparison.Ordinal),
+            $"the message must carry the server's own text, which names {missing}; it said: {message}");
+        Assert.True(message.EndsWith(tail, StringComparison.Ordinal),
+            $"the message must end with the remedy '{tail.TrimStart('.', ' ')}'; it said: {message}");
+        Assert.Equal(1000, await ScalarAsync(SourceCs, "SELECT COUNT_BIG(*) FROM dbo.CUST"));   // "created and seeded" is true
+        Assert.False(services.Connections.Has(Side.Src), $"the message says saving failed, but the source connection was saved: {message}");
+        Assert.False(services.Connections.Has(Side.Tgt), $"the message says saving failed, but the target connection was saved: {message}");
+    }
+
+    /// <summary>
     /// Ruling 157: a failure after the first database exists names both databases, what happened to each, the
     /// server's own text and the remedy. The target's CREATE DATABASE is made to fail on the server itself.
     /// </summary>
@@ -176,6 +219,88 @@ public sealed class DemoCommandTests : IAsyncLifetime
             message);
         Assert.EndsWith(". Re-run with --force to start over.", message);
         Assert.False(await DatabaseExistsAsync(_prefix + "ShopV2"), $"the message says creating {_prefix}ShopV2 failed, but it exists: {message}");
+    }
+
+    private static async Task<string> UserAccessAsync(string name)
+    {
+        await using var master = new SqlConnection(SqlTestServer.MasterConnectionString);
+        await master.OpenAsync();
+        await using var cmd = new SqlCommand("SELECT user_access_desc FROM sys.databases WHERE name = @name;", master);
+        cmd.Parameters.AddWithValue("@name", name);
+        return (string)(await cmd.ExecuteScalarAsync())!;
+    }
+
+    /// <summary>
+    /// Runs `dbm demo --force` over an existing pair with the source's DROP DATABASE (run after SET SINGLE_USER has
+    /// succeeded) made to fail on the server, and optionally the SET MULTI_USER that should put it back.
+    /// </summary>
+    private async Task<CliResult> RunForceWithSourceDropFailingAsync(TestWorkspace tw, bool restoreFails)
+    {
+        var source = _prefix + "LegacyShop";
+        DemoDatabases.DropStatementOverrides[source] = "THROW 50000, 'drop refused by the test seam', 1;";
+        if (restoreFails) DemoDatabases.MultiUserStatementOverrides[source] = "THROW 50000, 'restore refused by the test seam', 1;";
+        try
+        {
+            return await CliRunner.RunAsync(tw.Ws, null,
+                "demo", "--server", SqlTestServer.ConnectionString, "--prefix", _prefix, "--force");
+        }
+        finally
+        {
+            DemoDatabases.DropStatementOverrides.TryRemove(source, out _);
+            DemoDatabases.MultiUserStatementOverrides.TryRemove(source, out _);
+        }
+    }
+
+    /// <summary>A failed --force drop exits 1 as sql_error, or the assertion prints what the CLI answered instead.</summary>
+    private static void AssertFailedDropIsSqlError(CliResult r)
+    {
+        Assert.True(r.Exit == 1, $"a --force whose DROP fails must exit 1, got exit {r.Exit}: {r.Out}");
+        Assert.True(r.Json["error"]?.GetValue<string>() == "sql_error",
+            $"a --force whose DROP fails must be reported as sql_error with the demo's own message; got: {r.Out}");
+    }
+
+    /// <summary>Open item 34: a DROP that fails after SET SINGLE_USER succeeded must not leave the database single-user.</summary>
+    [Fact]
+    public async Task Demo_force_whose_drop_fails_puts_the_database_back_in_multi_user_mode_and_says_so()
+    {
+        using var tw = new TestWorkspace();
+        AssertOk(await CliRunner.RunAsync(tw.Ws, null, "demo", "--server", SqlTestServer.ConnectionString, "--prefix", _prefix));
+
+        var r = await RunForceWithSourceDropFailingAsync(tw, restoreFails: false);
+
+        AssertFailedDropIsSqlError(r);
+        var message = r.Json["message"]!.GetValue<string>();
+        var access = await UserAccessAsync(_prefix + "LegacyShop");
+        Assert.True(access == "MULTI_USER",
+            $"after the failed DROP, {_prefix}LegacyShop is {access}: demo --force must set it back to MULTI_USER. Message: {message}");
+        var expected = $"Failed dropping {_prefix}LegacyShop: drop refused by the test seam. {_prefix}LegacyShop was set back to " +
+            "multi-user mode. No database was created or dropped.";
+        Assert.True(message == expected,
+            $"the message must name the failed drop and say the database was set back to multi-user mode.\n" +
+            $"expected: {expected}\nactual:   {message}");
+    }
+
+    /// <summary>Open item 34: when putting it back fails too, the message says it is single-user and how to undo it.</summary>
+    [Fact]
+    public async Task Demo_force_whose_drop_and_restore_fail_says_the_database_is_single_user_and_how_to_undo_it()
+    {
+        using var tw = new TestWorkspace();
+        AssertOk(await CliRunner.RunAsync(tw.Ws, null, "demo", "--server", SqlTestServer.ConnectionString, "--prefix", _prefix));
+
+        var r = await RunForceWithSourceDropFailingAsync(tw, restoreFails: true);
+
+        AssertFailedDropIsSqlError(r);
+        var message = r.Json["message"]!.GetValue<string>();
+        var access = await UserAccessAsync(_prefix + "LegacyShop");
+        Assert.True(access == "SINGLE_USER",
+            $"precondition: with the restore made to fail, {_prefix}LegacyShop must still be SINGLE_USER, but it is {access}: " +
+            $"the seam did not take effect. Message: {message}");
+        var expected = $"Failed dropping {_prefix}LegacyShop: drop refused by the test seam. {_prefix}LegacyShop was left in " +
+            $"single-user mode, and setting it back failed: restore refused by the test seam. Undo it with: ALTER DATABASE " +
+            $"[{_prefix}LegacyShop] SET MULTI_USER. No database was created or dropped.";
+        Assert.True(message == expected,
+            $"the message must say the database was left in single-user mode and how to undo it (ALTER DATABASE ... SET MULTI_USER).\n" +
+            $"expected: {expected}\nactual:   {message}");
     }
 
     /// <summary>

@@ -169,12 +169,19 @@ call :read_dist_version
 if exist "%DBM_DLL%" if not "%DBM_REBUILD%"=="1" if defined DBM_PLUGIN_VERSION if "%DBM_DIST_VERSION%"=="%DBM_PLUGIN_VERSION%" exit /b 0
 >&2 echo dbm: building the engine - %DBM_REASON% - about a minute...
 if exist "%DBM_DLL%" dotnet "%DBM_DLL%" stop >nul 2>&1
+call :sweep_abandoned
 set "DBM_TMP=%DBM_ENGINE%\dist.tmp.%RANDOM%%RANDOM%"
 if exist "%DBM_TMP%" rd /s /q "%DBM_TMP%"
 rem Compile from scratch, as engine\release.* do: publish would otherwise reuse an earlier Release compile in obj\
 rem together with its PDB, and the build would differ from the committed one.
 if exist "%DBM_ENGINE%\Dbm\obj\Release" rd /s /q "%DBM_ENGINE%\Dbm\obj\Release"
 if exist "%DBM_ENGINE%\Dbm\bin\Release" rd /s /q "%DBM_ENGINE%\Dbm\bin\Release"
+rem Static web assets record each wwwroot file's last-write time as Last-Modified in Dbm.staticwebassets.endpoints.json,
+rem so the time a checkout happened would reach engine\dist and git would show it modified (ruling 189, open item 42).
+rem Pin it exactly as engine\release.* do. cmd cannot set a file time, so powershell does; where it cannot run, the
+rem build still works and only that one file differs from the committed dist.
+set "DBM_WWWROOT=%DBM_ENGINE%\Dbm\wwwroot"
+powershell -NoProfile -NonInteractive -Command "$t = [DateTime]::new(2000, 1, 1, 0, 0, 0, [DateTimeKind]::Utc); Get-ChildItem -LiteralPath $env:DBM_WWWROOT -Recurse -File | ForEach-Object { $_.LastWriteTimeUtc = $t }" >nul 2>nul
 set "DBM_BUILD_VERSION=%DBM_PLUGIN_VERSION%"
 if not defined DBM_BUILD_VERSION set "DBM_BUILD_VERSION=0.0.0"
 call :msbuild_path
@@ -186,6 +193,18 @@ set "DBM_OLD=%DBM_ENGINE%\dist.old.%RANDOM%%RANDOM%"
 if exist "%DBM_ENGINE%\dist" move "%DBM_ENGINE%\dist" "%DBM_OLD%" >nul 2>&1 || goto build_in_use
 move "%DBM_TMP%" "%DBM_ENGINE%\dist" >nul 2>&1 || goto build_no_swap
 rd /s /q "%DBM_OLD%" 2>nul
+exit /b 0
+
+rem A publish that crashed (killed, power cut) leaves its dist.tmp.N (~30 MB) behind, and a swap that crashed its
+rem dist.old.N; nothing else ever removes them. Runs under the build lock, so no other build is using one - except a build
+rem whose lock was broken as stale. Only entries older than DBM_LOCK_STALE_MINUTES go: that protects a live build's
+rem dist.tmp.N (publish keeps its mtime fresh). It does NOT protect a dist.old.N, which keeps the old dist's mtime after
+rem move; what protects a live swap is that a dist.old.N is kept while engine\dist is missing (a swap in progress, or the
+rem previous build a failed swap-back names). The ids are not all process ids (here %%RANDOM%%, a GUID in release.ps1),
+rem so age is the one test every builder can apply. cmd has no file age,
+rem so powershell does it; where powershell cannot run nothing is swept. Keep bin/dbm and engine\release.* in sync.
+:sweep_abandoned
+powershell -NoProfile -NonInteractive -Command "$dll = Join-Path $env:DBM_ENGINE 'dist\Dbm.dll'; Get-ChildItem -LiteralPath $env:DBM_ENGINE -Directory -Force | Where-Object { ($_.Name -like 'dist.tmp.*' -or ($_.Name -like 'dist.old.*' -and (Test-Path -LiteralPath $dll))) -and ((Get-Date) - $_.LastWriteTime).TotalMinutes -ge [double]$env:DBM_LOCK_STALE_MINUTES } | ForEach-Object { 'dbm: removing engine\' + $_.Name + ', left behind by a build that crashed.'; Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }" 1>&2 2>nul
 exit /b 0
 
 rem The publish output carries ~75 MB of native files db-migrate never loads: MSAL's WAM broker - SqlClient's Entra

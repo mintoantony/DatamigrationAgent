@@ -151,6 +151,22 @@ function Exit-BuildLock {
     }
 }
 
+# Removes the dist.tmp.<id> (~30 MB) of a publish that crashed and the dist.old.<id> of a swap that crashed. Under the
+# build lock, and only entries older than the lock's stale age (bin/dbm's sweep_abandoned says why). The age test
+# protects a live build's dist.tmp.<id> only: a dist.old.<id> keeps the old dist's mtime after a move, so what protects
+# a live swap is that a dist.old.<id> is kept while engine/dist is missing (tested per folder, at the moment it is
+# judged). Keep bin/dbm, bin/dbm.cmd and release.sh in sync with this.
+function Remove-AbandonedBuilds {
+    $dll = Join-Path $dist 'Dbm.dll'
+    Get-ChildItem -LiteralPath $engine -Directory -Force | Where-Object {
+        ($_.Name -like 'dist.tmp.*' -or ($_.Name -like 'dist.old.*' -and (Test-Path -LiteralPath $dll))) -and
+        ((Get-Date) - $_.LastWriteTime).TotalMinutes -ge $LockStaleMinutes
+    } | ForEach-Object {
+        Write-Warning "removing engine/$($_.Name), left behind by a build that crashed"
+        Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $version = (Get-Content -Raw $manifest | ConvertFrom-Json).version
 if ([string]::IsNullOrWhiteSpace($version)) { throw "No version in $manifest" }
 if ($version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') { throw "plugin.json version '$version' is not SemVer (x.y.z[-pre])" }
@@ -183,6 +199,7 @@ if (-not $SkipTests) {
 
 Enter-BuildLock
 try {
+    Remove-AbandonedBuilds
     if (Test-Path (Join-Path $dist 'Dbm.dll')) {
         & dotnet (Join-Path $dist 'Dbm.dll') stop *> $null   # best effort: frees the DLLs if a server runs from this dist
     }
