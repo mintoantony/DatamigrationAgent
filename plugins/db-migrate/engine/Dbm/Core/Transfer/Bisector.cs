@@ -2,6 +2,14 @@ namespace Dbm.Core.Transfer;
 
 public sealed record LoadAttempt(bool Ok, string? Error = null, bool Doomed = false)
 {
+    /// <summary>
+    /// True when the server's answer was a verdict on the rows' own values rather than on the load: a constraint violation (ruling
+    /// 147). It exists for exactly one decision - H2's, below - because "every attempt failed with the same text" means two opposite
+    /// things depending on it. False for anything that is not clearly a constraint violation, including a failure that carried no
+    /// server error at all, so H2 keeps everything it had unless something says otherwise.
+    /// </summary>
+    public bool RowFault { get; init; }
+
     public static readonly LoadAttempt Success = new(true);
 }
 
@@ -9,9 +17,13 @@ public sealed record RowFailure(int Row, string Error);
 
 public sealed record BisectResult(IReadOnlyList<int> Loaded, IReadOnlyList<RowFailure> Failed)
 {
-    /// <summary>Set only when every row of the chunk was attempted on its own, every one of them failed, nothing loaded, and every
-    /// attempt carried this one error text. Data is not uniformly bad; a plan is — so the caller fails the task with this text rather
-    /// than reporting a whole chunk of rejected rows (H2). Null whenever a row loaded, a text differed, or rows went unattempted.</summary>
+    /// <summary>Set only when every row of the chunk was attempted on its own, every one of them failed, nothing loaded, every attempt
+    /// carried this one error text, and that error was <b>not</b> a constraint violation. A load that fails alike on anything else - an
+    /// invalid column, a broken MergeSql, a conversion, a truncation, NULL into NOT NULL - is a broken plan, so the caller fails the task
+    /// with this text rather than reporting a whole chunk of rejected rows (H2). A chunk whose rows all fail alike on a FOREIGN KEY,
+    /// CHECK, PRIMARY KEY or UNIQUE constraint is N individually bad rows - the server judged each row's values against a rule - and
+    /// comes back as N rejected rows, however identical the message (ruling 147). Null whenever a row loaded, a text differed, rows went
+    /// unattempted, or the uniform error was a row fault.</summary>
     public string? UniformError { get; init; }
 }
 
@@ -41,6 +53,7 @@ public static class Bisector
 
         string? uniformText = null;   // the error text every attempt so far has carried
         bool uniform = true;          // ... and nothing at all has loaded
+        bool uniformRowFault = true;  // ... and every one of those attempts was a constraint violation (ruling 147)
         int failedRows = 0;
 
         var stack = new Stack<int[]>();
@@ -69,6 +82,9 @@ public static class Bisector
             string text = TextOf(attempt.Error);
             if (uniformText is null) uniformText = text;
             else if (!string.Equals(uniformText, text, StringComparison.Ordinal)) uniform = false;
+            // Only for the verdict at the end, never for the short-cut above: a chunk of alike rejects still wastes every multi-row
+            // attempt, so skipping them stays right. One attempt that is not a row fault keeps H2 - the stricter reading wins.
+            uniformRowFault &= attempt.RowFault;
 
             if (attempt.Doomed)
             {
@@ -92,7 +108,7 @@ public static class Bisector
         }
         loaded.Sort();
         bool everyRowFailedAlike = uniform && uniformText is not null && loaded.Count == 0 && failed.Count == rowCount;
-        return new BisectResult(loaded, failed) { UniformError = everyRowFailedAlike ? uniformText : null };
+        return new BisectResult(loaded, failed) { UniformError = everyRowFailedAlike && !uniformRowFault ? uniformText : null };
     }
 
     private static void Halve(Stack<int[]> stack, int[] segment)
