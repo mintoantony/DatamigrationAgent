@@ -148,6 +148,20 @@ if exist "%DBM_LOCK%\owner" set /p DBM_LOCK_HOLDER=<"%DBM_LOCK%\owner"
 if "%DBM_LOCK_HOLDER%"=="%DBM_LOCK_OWNER%" rd /s /q "%DBM_LOCK%" 2>nul
 exit /b 0
 
+rem -o reaches MSBuild as a property value, where "," and ";" separate values (ruling 189, open item 41): DBM_TMP_ARG is
+rem DBM_TMP with them escaped as %%2C and %%3B. Delayed expansion only inside, and only when there is something to escape,
+rem so a path with ! is not touched.
+:msbuild_path
+set "DBM_TMP_ARG=%DBM_TMP%"
+set "DBM_TMP_PLAIN=%DBM_TMP:,=%"
+set "DBM_TMP_PLAIN=%DBM_TMP_PLAIN:;=%"
+if "%DBM_TMP_PLAIN%"=="%DBM_TMP%" exit /b 0
+setlocal EnableDelayedExpansion
+set "DBM_X=!DBM_TMP:,=%%2C!"
+set "DBM_X=!DBM_X:;=%%3B!"
+for /f "delims=" %%p in ("!DBM_X!") do endlocal & set "DBM_TMP_ARG=%%p"
+exit /b 0
+
 rem Publishes into a per-process dist.tmp.N and swaps it in. Returns 0 with the new build in place, or sets
 rem DBM_FAILURE and returns 1 with engine\dist as it was.
 :build_engine
@@ -163,7 +177,8 @@ if exist "%DBM_ENGINE%\Dbm\obj\Release" rd /s /q "%DBM_ENGINE%\Dbm\obj\Release"
 if exist "%DBM_ENGINE%\Dbm\bin\Release" rd /s /q "%DBM_ENGINE%\Dbm\bin\Release"
 set "DBM_BUILD_VERSION=%DBM_PLUGIN_VERSION%"
 if not defined DBM_BUILD_VERSION set "DBM_BUILD_VERSION=0.0.0"
-dotnet publish "%DBM_ENGINE%\Dbm\Dbm.csproj" -c Release -o "%DBM_TMP%" --nologo -v q -p:Version=%DBM_BUILD_VERSION% -p:DebugType=none -p:UseAppHost=false 1>&2
+call :msbuild_path
+dotnet publish "%DBM_ENGINE%\Dbm\Dbm.csproj" -c Release -o "%DBM_TMP_ARG%" --nologo -v q -p:Version=%DBM_BUILD_VERSION% -p:DebugType=none -p:UseAppHost=false 1>&2
 if errorlevel 1 goto build_failed
 call :prune_natives
 <nul set /p "=%DBM_BUILD_VERSION%" >"%DBM_TMP%\VERSION"
