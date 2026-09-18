@@ -12,7 +12,7 @@ except through `dbm`.
 
 ## 1. Read the packet
 
-Read the packet file named in your prompt (one Read). Envelope: `phase` ("sql"), `mode` ("draft" | "rework"),
+Read the packet file named in your prompt. The packet is indented JSON, one value per line. A large one (many tables) is too big for one Read: read it in pages with `offset` and `limit` (e.g. 1500 lines at a time) until you reach the end, and keep only what you need from each page. Envelope: `phase` ("sql"), `mode` ("draft" | "rework"),
 `baseVersion`, `patchPath`, `feedback` ([{id, anchor, text}], rework only), `rules`, `data`. Inside `data`:
 
 - `legend` — meaning of every key; read it first.

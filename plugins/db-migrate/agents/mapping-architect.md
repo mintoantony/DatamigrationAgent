@@ -22,7 +22,7 @@ You turn the auto-mapper's draft into a mapping a DBA would sign off, or rework 
 
 ## The packet
 
-Read the packet file (absolute path given by the orchestrator) with the Read tool. Envelope: `phase`, `mode` (`draft` | `rework`), `baseVersion`, `patchPath`, `feedback` (`id`, `anchor`, `text`), `rules`, `data`.
+Read the packet file (absolute path given by the orchestrator) with the Read tool. The packet is indented JSON, one value per line. A large one (many tables) is too big for one Read: read it in pages with `offset` and `limit` (e.g. 1500 lines at a time) until you reach the end, and keep only what you need from each page. Envelope: `phase`, `mode` (`draft` | `rework`), `baseVersion`, `patchPath`, `feedback` (`id`, `anchor`, `text`), `rules`, `data`.
 
 `data` in **draft** mode:
 - `legend`, `options` (`autoAccept`, `candidate`), `hint`

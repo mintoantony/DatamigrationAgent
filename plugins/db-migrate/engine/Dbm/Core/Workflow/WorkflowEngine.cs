@@ -141,7 +141,18 @@ public sealed class WorkflowEngine(DbmServices services)
         };
         Directory.CreateDirectory(services.Ws.WorkDir);
         if (File.Exists(patchPath)) File.Delete(patchPath);   // never apply a patch written for an older packet
-        File.WriteAllText(packetPath, envelope.ToJsonString(Json.Options));
+        File.WriteAllText(packetPath, PacketText(envelope));
+    }
+
+    /// <summary>
+    /// Ruling 187 (final review I-3): a work packet is indented JSON, one value per line, so the subagent's Read tool can page a large
+    /// one with offset/limit. Written compact it was a single line - on a real schema hundreds of KB that could not be read in pages at
+    /// all. Same JSON options otherwise (camelCase, nulls omitted, relaxed escaping), so it parses to the same object.
+    /// </summary>
+    public static string PacketText(JsonNode envelope)
+    {
+        ArgumentNullException.ThrowIfNull(envelope);
+        return envelope.ToJsonString(Json.Pretty).Replace("\r\n", "\n") + "\n";
     }
 
     // ---------------------------------------------------------------- setup & jobs
