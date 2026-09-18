@@ -135,6 +135,48 @@ public sealed class BisectorTests
         Assert.Equal(HopelessTarget.Error, r.UniformError);
     }
 
+    /// <summary>Every attempt fails alike, and the failure is the server's verdict on one row's values (ruling 147).</summary>
+    private sealed class RowFaultTarget(bool rowFault) : IBisectTarget
+    {
+        public const string Error = "The INSERT statement conflicted with the FOREIGN KEY constraint \"FK_C_P\".";
+
+        public Task<LoadAttempt> TryLoadAsync(IReadOnlyList<int> rows, CancellationToken ct)
+            => Task.FromResult(new LoadAttempt(false, Error) { RowFault = rowFault });
+
+        public Task RestartAsync(CancellationToken ct) => Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Ruling 147. A constraint violation is the server judging one row's values against a rule, so a chunk of nothing but those is N
+    /// bad rows however identical the message - and H2 must not fail the task over them.
+    /// <para><b>Harm:</b> without the row-fault exclusion the task was failed for N individually bad rows. On the C15 sample pair that is
+    /// not hypothetical: the two lines of the orphan orders are the last two rows of app.OrderLines, so at ChunkSize 500 they are a chunk
+    /// of their own, and skip mode failed the migration instead of rejecting them.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_chunk_of_nothing_but_constraint_violations_is_rejected_rows_not_a_broken_load()
+    {
+        var r = await Bisector.RunAsync(8, new RowFaultTarget(rowFault: true), false, default);
+        // A UniformError here is what BulkLoader turns into bad_task, so it is named for what it would do rather than for the property.
+        Assert.True(r.UniformError is null,
+            $"the task was failed for {r.Failed.Count} individually bad rows (H2 read their constraint violation as a broken load): {r.UniformError}");
+        Assert.Equal(Enumerable.Range(0, 8), r.Failed.Select(f => f.Row));
+        Assert.All(r.Failed, f => Assert.Equal(RowFaultTarget.Error, f.Error));
+        Assert.Empty(r.Loaded);
+    }
+
+    /// <summary>
+    /// The other side of ruling 147, so the fix cannot over-reach: the same shape of failure that is <b>not</b> a row fault - a plan
+    /// defect, a broken MergeSql, a target column that is not there - still fails the task, which is what H2 exists for.
+    /// </summary>
+    [Fact]
+    public async Task A_chunk_that_fails_alike_on_anything_but_a_constraint_still_fails_the_task()
+    {
+        var r = await Bisector.RunAsync(8, new RowFaultTarget(rowFault: false), false, default);
+        Assert.Equal(RowFaultTarget.Error, r.UniformError);
+        Assert.Equal(8, r.Failed.Count);
+    }
+
     [Fact]
     public async Task Failed_reload_after_restart_throws()
     {

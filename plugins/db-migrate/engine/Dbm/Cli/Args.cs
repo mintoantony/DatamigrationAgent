@@ -13,6 +13,7 @@ public sealed class Args
     {
         "quiet", "rebuild", "dry-run", "no-browser", "json", "human", "inline", "help", "force", "detached",
         "skip-errors", "truncate",   // T5.5: `--truncate --yes-target X` must not read "X" as the value of --truncate
+        "attach",                    // T6.1: `--attach` must not read the next token as its value
     };
 
     private readonly List<string> _positionals = new();
