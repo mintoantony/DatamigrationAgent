@@ -15,7 +15,7 @@ report or an error.
 - NEVER ask for, accept, print or repeat a connection string. Connections are entered only in the browser UI — or, for
   the sample databases, `dbm demo --server "<string the user gave you>" --attach`, only if it holds no password
   (Windows authentication). With a password, the user runs it in a terminal outside Claude Code (not `!`); give them
-  the path from `command -v dbm`.
+  the path from `p=$(command -v dbm); cygpath -w "$p.cmd" 2>/dev/null || echo "$p"` (Windows form on Windows).
 - Do not read `.dbmigrate/state.db`, `server.json` or work packets yourself — subagents read their packet.
 - Do not edit artifacts yourself; changes come only from subagent patches applied with `dbm apply`.
 - When a `dbm` command fails (non-zero exit, or `{"error":...}`), read `reference/troubleshooting.md` next to this file

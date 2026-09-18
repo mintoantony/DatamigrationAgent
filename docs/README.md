@@ -42,7 +42,8 @@ started; after that the connections are locked.
 - Connection strings are encrypted on your machine and masked after saving. Don't paste them into the Claude chat.
 - To try the tool without your own databases, use the demo (see the README). With Windows authentication (a
   connection string without a password) you can ask Claude to run `dbm demo --server "<your server>" --attach`. If the
-  server needs a SQL login, run that command yourself in a terminal outside Claude Code — not with `!` in Claude Code,
+  server needs a SQL login, run that command yourself in a terminal outside Claude Code, in the project folder (which
+  `--attach` needs) — not with `!` in Claude Code,
   whose command and output land in the conversation — so the password never reaches the chat (ask Claude for the
   launcher's full path first: `dbm` is on the PATH only inside Claude Code). Without `--attach` the
   command only prints the two connection strings with any password replaced by `***`, and you would have to put the
@@ -208,9 +209,9 @@ Every export is saved under `.dbmigrate/exports/` as well, and none of them cont
 - **Resume** continues immediately when the Claude session is still open. Otherwise type `/db-migrate resume` in any new
   session in the same folder; the engine knows where to continue.
 - While Claude waits for you, its session holds a background `dbm await` task. Anything that gives Claude work again —
-  approving, requesting changes, resuming, reopening — completes that command and Claude continues on its own.
-- When Claude reports a failure (a job failed, the transfer failed or was cancelled, a draft was rejected twice) it
-  ends its turn instead of waiting. After you have fixed the cause and pressed **Retry** or **Resume**, type
-  `/db-migrate resume`. If your
+  approving, requesting changes, resuming, reopening — completes that command and Claude continues on its own. If your
   Claude surface does not wake up, tell Claude to continue once and it switches to a foreground wait for the rest of the
   session.
+- When Claude reports a failure (a job failed, the transfer failed or was cancelled, a draft was rejected twice) it
+  ends its turn instead of waiting. After you have fixed the cause and pressed **Retry** or **Resume**, type
+  `/db-migrate resume`.
