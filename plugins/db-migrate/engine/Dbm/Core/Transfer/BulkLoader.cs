@@ -377,6 +377,9 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options, TargetSha
     /// 2627) followed by 3621, "The statement has been terminated.", at severity class 0. Class 0-10 is an informational message, not an
     /// error, and counting it would make every constraint violation fail the rule - the fix would do nothing at all. So messages at
     /// class 10 or below are left out, and the rule is otherwise applied exactly as ruled.</para>
+    /// <para>Ruling 165: the rule is about error numbers, and 3621 is not an error - it is the informational trailer SQL Server appends
+    /// to a terminated statement, at class 0. That is the whole reason for the class filter, and removing it fails the real-server tests
+    /// (<c>BulkLoaderTests</c> and <c>EndToEndTransferTests</c>) with the old whole-chunk <c>bad_task</c>.</para>
     /// </summary>
     internal static bool IsRowFault(Exception ex) => IsRowFault(ErrorNumbers(ex));
 
@@ -385,12 +388,20 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options, TargetSha
     internal static List<int> ErrorNumbers(Exception ex)
     {
         ArgumentNullException.ThrowIfNull(ex);
-        var numbers = new List<int>();
+        var messages = new List<(int Number, byte Class)>();
         for (var e = ex; e is not null; e = e.InnerException)
             if (e is SqlException sql)
-                foreach (SqlError error in sql.Errors)
-                    if (error.Class > 10) numbers.Add(error.Number);
-        return numbers;
+                foreach (SqlError error in sql.Errors) messages.Add((error.Number, error.Class));
+        return ErrorNumbers(messages);
+    }
+
+    /// <summary>The class filter on its own, so it can be tested without a server: the numbers of the messages above class 10 (errors),
+    /// in order. Class 0-10 is informational - 3621 "The statement has been terminated." at class 0 rides along with every constraint
+    /// violation - and is dropped (ruling 165).</summary>
+    internal static List<int> ErrorNumbers(IEnumerable<(int Number, byte Class)> messages)
+    {
+        ArgumentNullException.ThrowIfNull(messages);
+        return messages.Where(m => m.Class > 10).Select(m => m.Number).ToList();
     }
 
     /// <summary>The exception's message plus its inner messages (SqlBulkCopy puts the reason, e.g. the truncation, in the inner one);

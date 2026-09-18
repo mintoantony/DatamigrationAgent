@@ -32,4 +32,31 @@ public sealed class BulkLoaderClassifierTests
     /// </summary>
     [Fact]
     public void An_attempt_with_no_server_error_is_not_a_row_fault() => Assert.False(BulkLoader.IsRowFault([]));
+
+    /// <summary>
+    /// Ruling 165, the class filter. What SQL Server 2025 actually sends for an FK conflict out of SqlBulkCopy, measured: 547 at class
+    /// 16, then 3621 "The statement has been terminated." at class 0. 3621 is informational, not an error, so it is not among the
+    /// numbers the rule sees. <b>Harm:</b> counted, it makes every constraint violation fail the rule, and ruling 147 does nothing.
+    /// </summary>
+    [Theory]
+    [InlineData(547, (byte)16)]    // FK / CHECK
+    [InlineData(2627, (byte)14)]   // PK / UNIQUE
+    public void The_informational_trailer_on_a_constraint_violation_is_not_counted_as_an_error(int number, byte errorClass)
+    {
+        var numbers = BulkLoader.ErrorNumbers([(number, errorClass), (3621, (byte)0)]);
+        Assert.True(numbers.SequenceEqual([number]),
+            $"the class filter let informational messages through ({string.Join(", ", numbers)}), so a constraint violation is no "
+            + "longer a row fault and H2 fails the task again");
+        Assert.True(BulkLoader.IsRowFault(numbers));
+    }
+
+    /// <summary>The filter drops only informational messages: a real error beside a constraint violation still reaches the rule and
+    /// still keeps H2.</summary>
+    [Fact]
+    public void An_error_beside_a_constraint_violation_is_still_counted()
+    {
+        var numbers = BulkLoader.ErrorNumbers([(547, (byte)16), (207, (byte)16), (3621, (byte)0)]);
+        Assert.Equal([547, 207], numbers);
+        Assert.False(BulkLoader.IsRowFault(numbers));
+    }
 }
