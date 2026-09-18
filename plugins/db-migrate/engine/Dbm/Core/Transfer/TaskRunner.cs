@@ -409,8 +409,10 @@ internal sealed class TaskRunner(RunContext rc)
         {
             // Ruling 192 review F3: the tally is this segment's only; the recorded rows cover the chunks earlier segments rejected. The
             // number is not recorded, so the sentence names the text.
-            var top = texts.GroupBy(t => t, StringComparer.Ordinal).OrderByDescending(g => g.Count()).First();
-            common = Inv($" The most common recorded error, on {top.Count():N0} of {texts.Count:N0} recorded rows, was: ") + top.Key;
+            // A duplicate-key message names its own value, so the texts are grouped by what comes before that value (re-review N2),
+            // and one whole text stands for the group.
+            var top = texts.GroupBy(ErrorKind, StringComparer.Ordinal).OrderByDescending(g => g.Count()).First();
+            common = Inv($" The most common recorded error, on {top.Count():N0} of {texts.Count:N0} recorded rows, was: ") + top.First();
         }
         else
         {
@@ -430,6 +432,15 @@ internal sealed class TaskRunner(RunContext rc)
     }
 
     private static string Inv(FormattableString text) => FormattableString.Invariant(text);
+
+    /// <summary>A recorded error text without the part that names one row's value: SQL Server's duplicate-key message ends with
+    /// " The duplicate key value is (…)", which differs row by row although the error is the same.</summary>
+    internal static string ErrorKind(string text)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+        int at = text.IndexOf(" The duplicate key value is", StringComparison.Ordinal);
+        return at < 0 ? text : text[..at];
+    }
 
     /// <summary>
     /// Ruling 201's fallback: whether a <b>recorded</b> error text is SQL Server's duplicate-key message - 2627 ("Violation of PRIMARY

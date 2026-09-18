@@ -188,6 +188,24 @@ public sealed class TaskRunnerTests
             "a tally holding a 547 beside duplicates was exempted");
         Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 2, 10, Tally((2627, Dup), (2601, "x")), null, keyed: true) is null,
             "a re-run whose tally holds only 2627 and 2601 was judged: the confirmed re-run is stopped over its duplicate keys");
+        // Re-review N1: a reject with no server number (a client-side failure) is not shown to be a duplicate, alone or beside one.
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 1, 10, Tally((null, "client-side truncation")), null, keyed: true) is not null,
+            "a re-run whose only reject carried no error number was exempted as if it were a duplicate key");
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 2, 10, Tally((2627, Dup), (null, "x")), null, keyed: true) is not null,
+            "a re-run with a reject that carried no error number beside a duplicate was exempted: the unnumbered reject was assumed a duplicate");
+    }
+
+    /// <summary>
+    /// Re-review N2: the recorded-row fallback groups duplicate-key texts by the error, not by the value each one names. <b>Harm:</b>
+    /// 100 duplicate rejects read "on 1 of 100 recorded rows", which says the opposite of what happened.
+    /// </summary>
+    [Fact]
+    public void The_recorded_rows_fallback_counts_duplicates_of_different_values_as_one_error()
+    {
+        string Row(int k) => $"Violation of PRIMARY KEY constraint 'PK_P'. Cannot insert duplicate key in object 'app.P'. The duplicate key value is ({k}).";
+        string? why = TaskRunner.LoadedNothingReason("app.P", 2, 0, 3, 0, Tally((2627, Row(3))), () => [Row(1), Row(2), Row(3)], keyed: true);
+        Assert.True(why is not null && why.Contains("The most common recorded error, on 3 of 3 recorded rows, was: " + Row(1), StringComparison.Ordinal),
+            "three duplicate keys of different values were not counted as one error: " + why);
     }
 
     [Theory]
