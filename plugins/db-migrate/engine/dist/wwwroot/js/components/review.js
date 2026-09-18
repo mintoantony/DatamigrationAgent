@@ -30,6 +30,16 @@
     return !t || t.status === 'pending';
   }
 
+  /** Ruling 185: the server's own sentence for why the plan cannot change now, or null when it can - before the first run and after
+   *  a completed, cancelled or failed one (a failed run is cancelled by the reopen). An older server without state.transfer falls back
+   *  to the pre-185 rule. */
+  function changesLocked(ctx) {
+    var t = ctx.state && ctx.state.transfer;
+    if (t && typeof t === 'object') return t.changesLocked || null;
+    return transferPending(ctx) ? null : 'The transfer has started.';
+  }
+  R.changesLocked = changesLocked;
+
   function counts(ctx) {
     var c = { draft: 0, open: 0, all: ctx.feedback.length };
     ctx.feedback.forEach(function (f) { if (c[f.status] != null) c[f.status]++; });
@@ -74,9 +84,15 @@
     changesBtn.addEventListener('click', function () { requestChanges(ctx, changesBtn, n.draft); });
 
     var reopenBtn = null;
-    if (row.status === 'approved' && REVIEWABLE[ctx.phase] && transferPending(ctx) && !window.DBM_EXPORT) {
-      reopenBtn = h('button', { type: 'button', class: 'btn btn-sm' }, 'Reopen');
-      reopenBtn.addEventListener('click', function () { reopen(ctx, reopenBtn); });
+    if (row.status === 'approved' && REVIEWABLE[ctx.phase] && !window.DBM_EXPORT) {
+      var locked = changesLocked(ctx);
+      if (!locked) {
+        reopenBtn = h('button', { type: 'button', class: 'btn btn-sm' }, 'Reopen');
+        reopenBtn.addEventListener('click', function () { reopen(ctx, reopenBtn); });
+      } else {
+        // A Reopen the server would refuse is shown disabled with its reason, never simply missing.
+        reopenBtn = h('button', { type: 'button', class: 'btn btn-sm', disabled: true, title: locked }, 'Reopen');
+      }
     }
 
     return h('div', { class: 'review-bar' },
@@ -143,11 +159,21 @@
       .filter(function (p) { return REVIEWABLE[p.name] && p.name !== ctx.phase && p.status !== 'pending'; })
       .filter(function (p) { return ctx.state.phases.indexOf(p) > ctx.state.phases.map(function (x) { return x.name; }).indexOf(ctx.phase); })
       .map(function (p) { return DBM.phaseTitle(p.name); });
+    var t = (ctx.state && ctx.state.transfer) || {};
+    var text = later.length
+      ? 'You can edit and re-approve it. ' + later.join(' and ') + ' will be marked stale and must be approved again.'
+      : 'You can add feedback and approve it again.';
+    // Ruling 185: what happens to the run that is already there, said before the operator confirms.
+    if (t.runStatus === 'failed') {
+      text += ' Transfer run #' + t.runId + ' failed: reopening cancels it first, which runs the plan’s post-load SQL to re-enable '
+        + 'what its pre-load SQL disabled. Rows it committed stay in the target.';
+    } else if (t.runStatus === 'completed' || t.runStatus === 'cancelled') {
+      text += ' Transfer run #' + t.runId + ' (' + t.runStatus + ') and its report stay as they are; once SQL is approved again, '
+        + 'Execute starts a new run.';
+    }
     C.modal({
       title: 'Reopen ' + DBM.phaseTitle(ctx.phase) + '?',
-      body: later.length
-        ? 'You can edit and re-approve it. ' + later.join(' and ') + ' will be marked stale and must be approved again.'
-        : 'You can add feedback and approve it again.',
+      body: text,
       confirmText: 'Reopen',
     }).then(function (ok) {
       if (!ok) return;
