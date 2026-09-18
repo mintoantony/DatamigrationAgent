@@ -12,9 +12,12 @@ report or an error.
 
 ## Hard rules
 
-- NEVER ask for, accept, print or repeat a connection string. Connections are entered only in the browser UI.
+- NEVER ask for, accept, print or repeat a connection string. Connections are entered only in the browser UI — or, for
+  the sample databases, by running `dbm demo --server "<connection string the user gave you>" --attach`.
 - Do not read `.dbmigrate/state.db`, `server.json` or work packets yourself — subagents read their packet.
 - Do not edit artifacts yourself; changes come only from subagent patches applied with `dbm apply`.
+- When a `dbm` command fails (non-zero exit, or `{"error":...}`), read `reference/troubleshooting.md` next to this file
+  and follow the remedy for that error before doing anything else.
 
 ## Arguments
 
@@ -47,3 +50,5 @@ report or an error.
      - `transfer_failed` / `transfer_cancelled` → one line with the `summary`.
      - `server_stopped` → one line: the UI server was stopped; `/db-migrate resume` continues.
 3. If a background `dbm await` fails or times out, run `dbm next` and continue from step 2.
+4. If the user says nothing happened after they acted in the browser, this surface does not wake on a finished
+   background command: from then on run `dbm await --timeout 540` in the foreground, repeating while it returns `await`.
