@@ -59,8 +59,9 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options, TargetSha
     /// whose source column is not in <paramref name="rows"/>, a binding in <see cref="TargetShape.NormalizedPrefix"/>'s namespace, a
     /// staging binding with no #stg column, and — when a shape was given — a binding to a column the target does not have or to an
     /// identity column while <c>IdentityInsert</c> is off. So does a chunk in which every row failed on its own with one identical error,
-    /// which is a broken load rather than a chunk of individually bad rows (H2); a chunk of one row is exempt, because with one row there
-    /// is nothing to tell the two apart. A direct task carrying a <c>MergeSql</c> is refused too: the direct path never runs one.
+    /// which is a broken load rather than a chunk of individually bad rows (H2) - unless that error is a constraint violation, which is
+    /// the server's verdict on each row and comes back as rejected rows (ruling 147); a chunk of one row is exempt, because with one row
+    /// there is nothing to tell the two apart. A direct task carrying a <c>MergeSql</c> is refused too: the direct path never runs one.
     /// A <paramref name="scope"/> whose transaction has already ended is refused as <c>tx_ended</c>, and
     /// one whose session state an earlier chunk could not restore as <c>session_state</c>; neither loads a row, empty chunk or not.
     /// XACT_ABORT is OFF for the duration of the load (a server-side row error must stay undoable by savepoint) and the connection's prior
@@ -134,8 +135,11 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options, TargetSha
     private bool Staging => string.Equals(_task.Mode, "staging_merge", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>A whole chunk failing one identical way is a broken load, not N bad rows: fail the task, which is recoverable and says
-    /// why, rather than shredding a customer's table into error rows and reporting "completed with N rejected". A genuinely uniform data
-    /// fault fails the task too; the message says exactly what the rows failed on.</summary>
+    /// why, rather than shredding a customer's table into error rows and reporting "completed with N rejected". Which failures reach
+    /// here is <see cref="BisectResult.UniformError"/>'s rule (ruling 147): an invalid column or object, a broken MergeSql, a conversion,
+    /// a truncation, NULL into NOT NULL, a permission - and any failure that carried no server error - fail the task; a chunk whose rows
+    /// all fail alike on a FOREIGN KEY, CHECK, PRIMARY KEY or UNIQUE constraint does not, because each of those is the server's verdict on
+    /// one row's values, and it comes back as rejected rows. The message says exactly what the rows failed on.</summary>
     private TransferException WholeChunkFailed(int rowCount, string error)
     {
         string unbound = _shape is null
@@ -349,6 +353,46 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options, TargetSha
         return await cmd.ExecuteNonQueryAsync(ct);
     }
 
+    /// <summary>
+    /// The server errors that are a verdict on one row's values against a rule (ruling 147): 547 (FOREIGN KEY or CHECK conflict), 2627
+    /// (PRIMARY KEY or UNIQUE constraint) and 2601 (duplicate key in a unique index). Nothing else is here on purpose - 515, NULL into
+    /// NOT NULL, most of all: an unmapped NOT NULL column is a plan defect, and read as a row fault it would shred a table into rejects.
+    /// </summary>
+    internal static readonly IReadOnlySet<int> RowFaultErrors = new HashSet<int> { 547, 2627, 2601 };
+
+    /// <summary>
+    /// Ruling 147's rule, and nothing but the rule: at least one error, and every one of them a constraint violation. No numbers is
+    /// false - a failure that carried no server error is a client-side or a non-SQL fault, and "nothing said otherwise" must never read
+    /// as "the rows are individually bad", or H2 would switch off for all of them.
+    /// </summary>
+    internal static bool IsRowFault(IReadOnlyList<int> errorNumbers)
+    {
+        ArgumentNullException.ThrowIfNull(errorNumbers);
+        return errorNumbers.Count > 0 && errorNumbers.All(RowFaultErrors.Contains);
+    }
+
+    /// <summary>
+    /// Whether a failed attempt was a row fault: the rule applied to the numbers of every server <b>error</b> anywhere in the chain.
+    /// <para>"Error" is load-bearing. Measured on SQL Server 2025, every constraint violation out of SqlBulkCopy arrives as 547 (or
+    /// 2627) followed by 3621, "The statement has been terminated.", at severity class 0. Class 0-10 is an informational message, not an
+    /// error, and counting it would make every constraint violation fail the rule - the fix would do nothing at all. So messages at
+    /// class 10 or below are left out, and the rule is otherwise applied exactly as ruled.</para>
+    /// </summary>
+    internal static bool IsRowFault(Exception ex) => IsRowFault(ErrorNumbers(ex));
+
+    /// <summary>The numbers of the server errors (class above 10) in <paramref name="ex"/> and every inner exception; empty when the
+    /// chain holds no SqlException at all, as SqlBulkCopy's client-side truncation and NULL checks do not.</summary>
+    internal static List<int> ErrorNumbers(Exception ex)
+    {
+        ArgumentNullException.ThrowIfNull(ex);
+        var numbers = new List<int>();
+        for (var e = ex; e is not null; e = e.InnerException)
+            if (e is SqlException sql)
+                foreach (SqlError error in sql.Errors)
+                    if (error.Class > 10) numbers.Add(error.Number);
+        return numbers;
+    }
+
     /// <summary>The exception's message plus its inner messages (SqlBulkCopy puts the reason, e.g. the truncation, in the inner one);
     /// never blank: falls back to the exception type name.</summary>
     internal static string Describe(Exception ex)
@@ -400,13 +444,14 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options, TargetSha
             }
             catch (Exception ex) when ((ex is SqlException or InvalidOperationException) && !ct.IsCancellationRequested)
             {
+                bool rowFault = IsRowFault(ex);         // ruling 147: a constraint violation is N bad rows, never a broken load
                 if (saved && await scope.XactStateAsync(ct) == 1)
                 {
                     scope.Tx.Rollback(SavepointName);   // V1/V2
                     Report(_confirmed);                 // the attempt's rows are gone again: never leave the caller counting them
-                    return new LoadAttempt(false, Describe(ex));
+                    return new LoadAttempt(false, Describe(ex)) { RowFault = rowFault };
                 }
-                return new LoadAttempt(false, Describe(ex), Doomed: true);   // V3
+                return new LoadAttempt(false, Describe(ex), Doomed: true) { RowFault = rowFault };   // V3
             }
         }
 

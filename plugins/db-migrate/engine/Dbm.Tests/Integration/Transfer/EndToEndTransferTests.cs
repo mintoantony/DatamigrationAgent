@@ -65,15 +65,14 @@ public sealed class EndToEndTransferTests(SamplePlanFixture fx) : IClassFixture<
     private const long TotalLoadedRows = TotalSourceRows - 8;
 
     /// <summary>
-    /// The chunk size the pause, resume and crash cases run at. It is 700 and not a rounder number for one reason, and the reason is a
-    /// defect rather than a preference: 9 002 = 18 x 500 + <b>2</b>, so at 500 the last chunk of app.OrderLines holds exactly the two
-    /// orphan lines, every row of it is rejected with a byte-identical FK message, and <see cref="Bisector"/>'s H2 rule ("data is not
-    /// uniformly bad; a plan is") fails the whole task in skip mode. At 700 no chunk of either table is wholly bad
-    /// (9 002 = 12 x 700 + 602, 3 005 = 4 x 700 + 205), so these cases test pausing, resuming and recovering instead of re-testing
-    /// that. The defect itself is pinned, at 500, by
-    /// <see cref="A_chunk_whose_every_row_is_rejected_alike_fails_the_task_even_in_skip_mode"/>.
+    /// The chunk size the pause, resume and crash cases run at - the brief's own 500, restored by ruling 147. It is the number that
+    /// found the defect: 9 002 = 18 x 500 + <b>2</b>, so the last chunk of app.OrderLines is exactly the two orphan lines, every row of
+    /// it is rejected with a byte-identical FK message, and until 147 <see cref="Bisector"/>'s H2 rule read that as a broken load and
+    /// failed the migration in skip mode. A constraint violation is now the server's verdict on one row, so the chunk is two rejected
+    /// rows and these cases test pausing, resuming and recovering. The boundary itself is held by
+    /// <see cref="A_whole_chunk_of_alike_constraint_rejects_completes_with_those_rows_rejected"/>.
     /// </summary>
-    private const int ChunkedSize = 700;
+    private const int ChunkedSize = 500;
 
     /// <summary>
     /// The eight rows the C15 fixture plants, by key and by reason. Eight rejects with the wrong eight rows would satisfy a count, so
@@ -356,30 +355,34 @@ public sealed class EndToEndTransferTests(SamplePlanFixture fx) : IClassFixture<
     }
 
     /// <summary>
-    /// A FINDING pinned as a test, not a behaviour anybody designed (see the task 5.7 report, F1). <see cref="Bisector"/>'s H2 rule
-    /// says that when every row of a chunk has been attempted on its own, every one has failed, nothing has loaded and every attempt
-    /// carried one identical error text, the load is broken rather than the rows - so the task fails instead of rejecting them. On the
-    /// C15 pair that premise is false: the two rows that must be rejected on FK_OrderLines_Orders are the last two rows of
-    /// app.OrderLines in key order, 9 002 = 18 x 500 + 2, and the FK message names no key value, so at ChunkSize 500 the final chunk is
-    /// two rows that fail alike. Skip mode then fails the run instead of skipping them. The numbers below are what it actually does.
-    /// <para>The three chunked cases above therefore run at <see cref="ChunkedSize"/>. Nothing in the product was changed for this.</para>
+    /// Ruling 147, end to end and at the chunk size that found the defect. The two rows that must be rejected on
+    /// FK_OrderLines_Orders are the last two rows of app.OrderLines in key order and 9 002 = 18 x 500 + 2, so the final chunk holds
+    /// nothing but them, and the FK message names no key value so the two texts are identical. That used to satisfy H2 ("data is not
+    /// uniformly bad; a plan is") and fail the whole migration in skip mode: run failed, app.OrderLines left at 8 999 with the chunk
+    /// rolled back, and only one of the three rejected rows ever recorded. It now completes, and this holds the boundary:
+    /// <b>8 999 rows in the target, 3 000 orders, 8 rejects, and the two orphan lines among them by key.</b>
     /// </summary>
     [Fact]
-    public async Task A_chunk_whose_every_row_is_rejected_alike_fails_the_task_even_in_skip_mode()
+    public async Task A_whole_chunk_of_alike_constraint_rejects_completes_with_those_rows_rejected()
     {
         await using var rig = await RigAsync();
+        string linesTask = rig.TaskOf("app.OrderLines");
         var engine = rig.NewEngine();
         long runId = engine.CreateRun(1, new TransferOptions { ErrorMode = "skip", ChunkSize = 500 });
         var outcome = await engine.RunAsync(runId, new TransferControl(), default);
 
-        Assert.Equal(RunStatus.Failed, outcome.Status);
-        var lines = rig.Repo.Task(runId, rig.TaskOf("app.OrderLines"))!;
-        Assert.Equal(TransferTaskStatus.Failed, lines.Status);
-        Assert.Contains("Every one of the 2 rows in this chunk", lines.Error);
-        Assert.Contains("FK_OrderLines_Orders", lines.Error);
-        Assert.Equal(8999, await rig.Tgt.CountAsync("[app].[OrderLines]"));   // chunks 1-18 committed; the 2-row chunk rolled back
-        Assert.Equal(3000, await rig.Tgt.CountAsync("[app].[Orders]"));       // Orders survives: its five bad rows do not fail alike
-        Assert.Single(rig.Repo.ErrorRows(runId, lines.TaskId, 100));          // only the QTY = 0 row was recorded; the two are lost to the rollback
+        Assert.True(outcome.Status == RunStatus.Completed, $"the run ended {outcome.Status}: {outcome.Error}");
+        Assert.Equal(8999, await rig.Tgt.CountAsync("[app].[OrderLines]"));
+        Assert.Equal(3000, await rig.Tgt.CountAsync("[app].[Orders]"));
+        Assert.Equal(8, rig.Repo.ErrorRows(runId, null, 1000).Count);
+        // Counted rows are not the same claim as the right rows: this compares every bound column of every loaded line against the
+        // source by key, with only the three planted OrderLines keys left out, so 8 999 is proven rather than counted.
+        Assert.Equal(0, await RowDiffAsync(rig, linesTask));
+        AssertTheEightRejects(rig, runId);
+        var lines = rig.Repo.Task(runId, linesTask)!;
+        Assert.Equal(TransferTaskStatus.Done, lines.Status);
+        Assert.Equal(3, lines.RowsError);
+        Assert.Equal(8999, lines.RowsDone);
     }
 
     /// <summary>
@@ -406,16 +409,21 @@ public sealed class EndToEndTransferTests(SamplePlanFixture fx) : IClassFixture<
         Assert.Equal(RunStatus.Completed, (await first.RunAsync(firstRun, new TransferControl(), default)).Status);
         await AssertExactOutcomeAsync(rig, firstRun);
 
-        // Pre-flight warns, names the tables and their row counts, and is not a check that failed to run.
+        // Ruling 148: this is the gate, and it is the only one. The engine below is driven directly and bypasses it, so it is asserted
+        // here instead - the check does not pass, it is a check that ran rather than one that did not (ruling 139), and it names the
+        // tables that already hold rows. The run is not blocked: target_rows is a warning, and PreflightResult.Passed only falls to
+        // false on an error, which is the whole of open item 27.
         await using (var tgt = await SqlConnect.OpenAsync(rig.Tgt.ConnectionString, default))
         {
-            var rows = (await Preflight.TargetChecksAsync(tgt, rig.Plan, new TransferOptions { ErrorMode = "skip" }, default))
-                .Single(c => c.Name == "target_rows");
+            var checks = await Preflight.TargetChecksAsync(tgt, rig.Plan, new TransferOptions { ErrorMode = "skip" }, default);
+            var rows = checks.Single(c => c.Name == "target_rows");
             Assert.False(rows.Ok);
             Assert.False(rows.NotRun);
             Assert.Equal("warning", rows.Severity);
+            Assert.Contains("app.Orders", rows.Detail);
             Assert.Contains("app.AuditEvents (5,000)", rows.Detail);
             Assert.Contains("Truncate target first", rows.Detail);
+            Assert.True(new PreflightResult(1, Clock.Now(), checks.ToList()).Passed);   // a warning does not stop the run
         }
 
         string products = rig.TaskOf("app.Products"), audit = rig.TaskOf("app.AuditEvents");
