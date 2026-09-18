@@ -255,7 +255,7 @@
   // Only fields the user typed into are in drafts.values (the input handler records them), so opening the editor dirties nothing
   // and an untouched field is never re-derived from its textarea (which would normalise a CR or re-split statements on GO).
   function freshUi() {
-    return { selected: null, editing: null, editor: null, drafts: null, diff: null, report: null, busy: false, saving: false, forVersion: undefined, heldWarned: false };
+    return { selected: null, editing: null, editor: null, drafts: null, diff: null, report: null, reportFailure: null, busy: false, saving: false, forVersion: undefined, heldWarned: false };
   }
   var ui = freshUi();
   var mounted = null;
@@ -318,6 +318,7 @@
       ui.busy = false;
       if (!mounted) return;   // the view was left while validating
       var toast = mounted.ctx.toast || ctx.toast;
+      ui.reportFailure = null;
       if (!reportFits(report)) {
         ui.report = null;
         rerender();
@@ -334,6 +335,9 @@
       else toast('Validation found ' + plural(s.errors, 'error'), 'err');
     }).catch(function (e) {
       ui.busy = false;
+      // Open item 13: the verdict still on screen came from an earlier check of this same version (a verdict on another version
+      // never survives, see reportFits); it stays, marked as earlier, next to why the latest attempt failed.
+      ui.reportFailure = ui.report && reportFits(ui.report) ? errorText(e, 'Validation failed') : null;
       rerender();
       ctx.toast(errorText(e, 'Validation failed'), 'err');
     });
@@ -384,15 +388,20 @@
       ]));
     });
     var badge = REPORT_BADGE[s.state];
-    return el('section', { class: 'card sql-report is-' + s.state, 'aria-live': 'polite' }, [
+    var failure = ui.reportFailure;
+    return el('section', { class: 'card sql-report is-' + s.state + (failure ? ' is-earlier' : ''), 'aria-live': 'polite' }, [
       el('div', { class: 'card-h row row-wrap' }, [
         el('h3', { class: 'h3' }, ['Live validation' + (r.version != null ? ' · v' + r.version : '')]),
         el('span', { class: 'badge ' + badge[0] }, [badge[1]]),
+        failure ? el('span', { class: 'badge st-stale' }, ['from an earlier check']) : null,
         s.errors || s.warnings ? el('span', { class: 'small muted' }, [plural(s.errors, 'error') + ', ' + plural(s.warnings, 'warning')]) : null,
         el('span', { class: 'spacer' }),
-        el('button', { class: 'btn btn-ghost btn-sm', type: 'button', on: { click: function () { ui.report = null; rerender(); } } }, ['Dismiss']),
+        el('button', { class: 'btn btn-ghost btn-sm', type: 'button', on: { click: function () { ui.report = null; ui.reportFailure = null; rerender(); } } }, ['Dismiss']),
       ]),
-      el('div', { class: 'card-b' }, [s.state === 'clean'
+      el('div', { class: 'card-b' }, [failure ? el('p', { class: 'sql-count-err sql-report-failure' }, [
+        'The latest validation of ' + (r.version != null ? 'v' + r.version : 'this version') + ' failed: ' + failure
+        + ' The result below is from an earlier check of this same version.',
+      ]) : null, s.state === 'clean'
         ? el('p', { class: 'muted' }, ['Every task and the global statements were checked: no errors or warnings.'])
         : el('ul', { class: 'sql-msgs sql-report-list' }, rows)]),
     ]);
@@ -635,7 +644,7 @@
     mounted = { root: root, ctx: ctx };
     var plan = payloadOf(ctx);
     var version = versionOf(ctx);
-    if (ui.forVersion !== version) { discard(); ui.diff = null; ui.report = null; ui.forVersion = version; }
+    if (ui.forVersion !== version) { discard(); ui.diff = null; ui.report = null; ui.reportFailure = null; ui.forVersion = version; }
     if (!canEdit(ctx)) discard();
     clear(root);
 

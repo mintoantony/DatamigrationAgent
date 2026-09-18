@@ -115,7 +115,7 @@ public class WorkflowNextTests
         FakeServices.DriveToReview(s, PhaseName.Sql);
 
         Assert.Equal(new NextAction("await", Reason: "review", Phase: "sql", Url: ""), s.Workflow.Next());
-        s.Workflow.Approve(PhaseName.Sql);
+        s.ApproveCurrent(PhaseName.Sql);
         Assert.Equal(new NextAction("await", Reason: "execute", Phase: "ready", Url: ""), s.Workflow.Next());
     }
 
@@ -129,7 +129,7 @@ public class WorkflowNextTests
         using var tw = new TestWorkspace();
         using var s = FakeServices.Open(tw.Ws);
         FakeServices.DriveToReview(s, PhaseName.Sql);
-        s.Workflow.Approve(PhaseName.Sql);
+        s.ApproveCurrent(PhaseName.Sql);
         s.Workflow.OnTransferStarted();
         // No engine method yet drives transfer_run rows (that lands with T5.1); this insert is the only way to reach it.
         s.Db.Execute("INSERT INTO transfer_run (sql_version, status, options_json) VALUES (1, 'completed', '{}'), (1, $Status, '{}')",
@@ -146,7 +146,7 @@ public class WorkflowNextTests
         using var tw = new TestWorkspace();
         using var s = FakeServices.Open(tw.Ws);
         FakeServices.DriveToReview(s, PhaseName.Sql);
-        s.Workflow.Approve(PhaseName.Sql);
+        s.ApproveCurrent(PhaseName.Sql);
         s.Workflow.OnTransferStarted();
         s.Artifacts.Add(PhaseName.Complete, 0, "{}", "script", "Migrated 12,000 rows; 8 rejected.");
         s.Workflow.OnTransferFinished("completed", 0);

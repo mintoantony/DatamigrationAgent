@@ -24,6 +24,23 @@ public sealed class AgentPresence(DbmServices services, Broadcaster? broadcaster
         }
     }
 
+    /// <summary>Ruling 197: while the CLI touch keeps the agent online, the instant that stops (agent_seen_at + <see cref="SeenWindow"/>);
+    /// null otherwise. Nothing is published when it passes, so /api/state carries it and the UI refreshes once at that instant.</summary>
+    public DateTimeOffset? SeenUntil
+    {
+        get
+        {
+            try
+            {
+                return services.Project.Get().AgentSeenAt is { } seen && Clock.Now() - seen < SeenWindow ? seen + SeenWindow : null;
+            }
+            catch (InvalidOperationException)
+            {
+                return null;
+            }
+        }
+    }
+
     public IDisposable Enter()
     {
         if (Interlocked.Increment(ref _open) == 1) broadcaster?.Publish("agent_presence", new { online = true }, persist: false);

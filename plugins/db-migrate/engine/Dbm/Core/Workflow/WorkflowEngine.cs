@@ -9,9 +9,15 @@ public sealed record ApplyResult(bool Ok, int? Version, List<string> Errors, Lis
     public static ApplyResult Fail(params string[] errors) => new(false, null, errors.ToList(), []);
 }
 
-public sealed class WorkflowException(string message, IReadOnlyList<string>? details = null) : Exception(message)
+public sealed class WorkflowException(string message, IReadOnlyList<string>? details = null, string? code = null) : Exception(message)
 {
+    /// <summary>Ruling 194: the version an approve named is no longer the phase's current version.</summary>
+    public const string StaleVersion = "stale_version";
+
     public IReadOnlyList<string> Details { get; } = details ?? [];
+
+    /// <summary>A machine-readable reason the API answers with, or null for the endpoint's own default code.</summary>
+    public string? Code { get; } = code;
 }
 
 /// <summary>Owns every phase transition (see the transition table in 00-overview.md C5). All mutations are transactional.</summary>
@@ -193,6 +199,8 @@ public sealed class WorkflowEngine(DbmServices services)
 
         if (phase == PhaseName.Discovery)
         {
+            // Ruling 196: a discovery that started while sample values were on may finish after they were switched off.
+            if (!services.Project.GetSettings().SampleValues) SampleValuesSetting.Scrub(services);
             var version = row.CurrentVersion ?? 0;
             if (draftPayload is not null) version = StoreArtifact(phase, draftPayload, "script", summary);
             services.Phases.SetApproved(phase, version, CatalogFingerprint());
@@ -318,13 +326,41 @@ public sealed class WorkflowEngine(DbmServices services)
         SetStatus(phase, PhaseStatus.Reworking);
     });
 
-    /// <summary>Throws WorkflowException(details = blockers). Records approved_fingerprint = "&lt;src&gt;:&lt;tgt&gt;".</summary>
-    public void Approve(PhaseName phase) => services.Db.InTransaction(() =>
+    /// <summary>
+    /// Ruling 195 (open item 37): the human takes over a phase Claude is drafting or reworking - typically one whose patch was
+    /// rejected twice, which leaves the orchestrator stopped and the UI without direct edits or Request changes. The phase goes back
+    /// to awaiting_review on its current version; open feedback stays open (a later Request changes sends it again); Next() then
+    /// awaits the human. The pending agent work is discarded by the status alone: <see cref="ApplyPatch"/> accepts a patch only
+    /// while drafting or reworking, so a patch delivered afterwards is refused. The caller refuses this while an agent may be
+    /// applying (the web endpoint uses <c>AgentPresence.Online</c>).
+    /// </summary>
+    public void TakeOver(PhaseName phase) => services.Db.InTransaction(() =>
+    {
+        if (!Phases.Reviewable.Contains(phase)) throw new WorkflowException($"{phase.Text()} cannot be taken over.");
+        var row = services.Phases.Get(phase);
+        if (row.Status is not (PhaseStatus.Drafting or PhaseStatus.Reworking))
+            throw new WorkflowException($"{phase.Text()} is {EnumText.ToText(row.Status)}; only a phase Claude is drafting or reworking can be taken over.");
+        if (row.CurrentVersion is not int version) throw new WorkflowException($"{phase.Text()} has no version to review yet.");
+        SetStatus(phase, PhaseStatus.AwaitingReview);
+        Publish("log", new
+        {
+            level = "info",
+            message = $"You took over {phase.Text()}: Claude's pending {(row.Status == PhaseStatus.Drafting ? "first draft" : "rework")} was "
+                      + $"discarded and v{version} awaits your review.",
+        });
+    });
+
+    /// <summary>Throws WorkflowException(details = blockers). Records approved_fingerprint = "&lt;src&gt;:&lt;tgt&gt;".
+    /// <para>Ruling 194 (open item 1): <paramref name="seenVersion"/> is the version the reviewer saw. Unless it is still the current
+    /// version the approval is refused with <see cref="WorkflowException.StaleVersion"/> - checked here, inside the transaction that
+    /// approves, so a version stored a moment earlier can never be signed off by a screen that never displayed it.</para></summary>
+    public void Approve(PhaseName phase, int seenVersion) => services.Db.InTransaction(() =>
     {
         if (!Phases.Reviewable.Contains(phase)) throw new WorkflowException($"{phase.Text()} is not approved from a review screen.");
         var row = services.Phases.Get(phase);
         if (row.Status != PhaseStatus.AwaitingReview)
             throw new WorkflowException($"{phase.Text()} is {EnumText.ToText(row.Status)}; only a phase awaiting review can be approved.");
+        EnsureCurrentVersion(phase, seenVersion);
         if (!services.Modules.TryGetValue(phase, out var module))
             throw new WorkflowException($"No module is registered for phase {phase.Text()}.");
 
@@ -343,6 +379,23 @@ public sealed class WorkflowEngine(DbmServices services)
             case PhaseName.Sql: SetStatus(PhaseName.Ready, PhaseStatus.AwaitingReview); break;
         }
     });
+
+    /// <summary>Ruling 194: throws <see cref="WorkflowException.StaleVersion"/> unless <paramref name="seenVersion"/> is the phase's
+    /// current version. <see cref="Approve"/> runs it in its own transaction; the approve endpoint also runs it first, so a stale
+    /// screen is told to reload before any slower approval guard runs.</summary>
+    public void EnsureCurrentVersion(PhaseName phase, int seenVersion)
+    {
+        var current = services.Phases.Get(phase).CurrentVersion;
+        if (current == seenVersion) return;
+        if (current is null || seenVersion > current)   // nothing newer arrived: the screen named a version that is not current
+            throw new WorkflowException(
+                $"v{seenVersion} is not the current version ({(current is int c ? $"v{c}" : "none")}) - reload and review it.",
+                null, WorkflowException.StaleVersion);
+        throw new WorkflowException(
+            $"You approved v{seenVersion} of {phase.Text()}, but its current version is "
+            + (current is int v ? $"v{v}" : "(none)") + ". A newer version arrived - review it first.",
+            null, WorkflowException.StaleVersion);
+    }
 
     /// <summary>
     /// approved → awaiting_review at the approved version; later phases up to Ready → stale; Transfer and Complete back to pending.

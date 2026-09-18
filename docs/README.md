@@ -30,7 +30,9 @@ to let Claude continue …**.
 - **Top bar** — project name, the *Agent online* / *Agent offline* indicator, **Pause / Resume**, and the theme switch.
 - **Review bar** (on Analysis, Mapping and SQL) — the version picker, **Feedback** and **History**, which open the right
   drawer: the feedback thread for the current phase (your items and Claude's responses) and the version history with a
-  diff between any two versions.
+  diff between any two versions. **Approve** signs off the version on your screen and nothing else: if a newer version
+  arrived meanwhile (Claude's, or an edit from another tab), approval is refused with *A newer version arrived — review
+  it first* and the page reloads to show it.
 
 ## Setup
 
@@ -51,11 +53,19 @@ started; after that the connections are locked.
 - A certificate error on Test: add `TrustServerCertificate=True` for test servers, or install the server's CA certificate.
 - Entra ID: for example `Authentication=Active Directory Default` (uses your `az login` or IDE sign-in) or
   `Active Directory Interactive`, which opens a sign-in window on this machine.
+- **Privacy — Send sample values to Claude** (on by default). On, the column profiles Claude reads include up to 3 real
+  values per text column and its min/max. Off, the values already collected are removed from the project and its
+  work packets (the state database is overwritten as far as SQLite allows; raw pages freed before the switch can still
+  hold old values until reused) and discovery collects none, so nothing Claude reads carries a sample value; it
+  still sees null shares, distinct counts, lengths and value patterns, and its analysis and mapping suggestions may be
+  less precise. Exports you wrote earlier to `.dbmigrate/exports` keep the values they were written with. Turning it back on takes effect at the
+  next discovery (**Re-run discovery** on Analysis). `dbm config sample-values off` switches them off from the command
+  line; switching them back on is your decision and is done only here.
 
 ## Discovery
 
 Runs by itself: extracts both catalogs, profiles the columns (null share, distinct values, lengths, value patterns,
-sample values), builds the search index and records a schema fingerprint per database. Nothing to do; large databases
+sample values unless you switched them off in Setup), builds the search index and records a schema fingerprint per database. Nothing to do; large databases
 take a few minutes. On failure the error is shown with a **Retry** button — fix the cause first (usually permissions).
 
 ## Analysis
@@ -234,3 +244,11 @@ Every export is saved under `.dbmigrate/exports/` as well, and none of them cont
 - When Claude reports a failure (a job failed, the transfer failed or was cancelled, a draft was rejected twice) it
   ends its turn instead of waiting. After you have fixed the cause and pressed **Retry** or **Resume**, type
   `/db-migrate resume`.
+- **Take over.** While Claude is drafting or reworking a phase you cannot edit it or request changes. If Claude is stuck
+  there (its patch was rejected twice), press **Take over** on that phase: it discards Claude's pending work and puts
+  the phase back to *Awaiting review* on its current version. On Mapping and SQL you can then edit it yourself, approve
+  it or request changes again. Analysis cannot be edited by hand, and an Analysis taken over while Claude was drafting it
+  has no narrative yet, so it cannot be approved: add comments with your guidance and press **Request changes**. Your
+  open comments stay open, and a patch Claude delivers afterwards is refused. The button is disabled while Claude is
+  connected (it may be applying a patch at that moment): wait until Claude has stopped and the page shows *Agent
+  offline* (2 minutes after its last command).

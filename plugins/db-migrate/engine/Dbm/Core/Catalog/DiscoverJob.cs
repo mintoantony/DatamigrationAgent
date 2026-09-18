@@ -31,6 +31,8 @@ public sealed class DiscoverJob : IJobHandler
                 var snapshot = await CatalogExtractor.ExtractAsync(conn, meta, ct);
                 ctx.Log($"{label}: {snapshot.Tables.Count} tables, {snapshot.Tables.Sum(t => t.Columns.Count)} columns extracted");
                 snapshot = await Profiler.ProfileAsync(conn, snapshot, options, message => ctx.Log($"{label}: {message}"), ct);
+                // Ruling 199: the setting may have been switched off since this job read it; a save must never store values then.
+                if (!services.Project.GetSettings().SampleValues) snapshot = SampleValuesSetting.Strip(snapshot).Snapshot;
                 services.Catalog.Save(side, snapshot, Fingerprint.Compute(snapshot));
                 snapshots[side] = snapshot;
             }

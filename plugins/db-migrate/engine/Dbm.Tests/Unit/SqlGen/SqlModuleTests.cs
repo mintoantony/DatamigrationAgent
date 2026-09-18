@@ -545,7 +545,7 @@ public sealed class SqlModuleTests : IDisposable
         Ctx(plan);
         _services.Phases.SetStatus(PhaseName.Sql, PhaseStatus.AwaitingReview);
 
-        var ex = Assert.Throws<WorkflowException>(() => _services.Workflow.Approve(PhaseName.Sql));
+        var ex = Assert.Throws<WorkflowException>(() => _services.ApproveCurrent(PhaseName.Sql));
 
         Assert.NotEqual(PhaseStatus.Approved, _services.Phases.Get(PhaseName.Sql).Status);
         Assert.Contains(CrError("T05", "preSql[0]", 1), ex.Details);
@@ -554,7 +554,7 @@ public sealed class SqlModuleTests : IDisposable
         plan.Tasks["T05"].PreSql[0] = "-- note\r\nDELETE FROM app.Customers";
         Ctx(plan);
         _services.Phases.SetStatus(PhaseName.Sql, PhaseStatus.AwaitingReview);
-        _services.Workflow.Approve(PhaseName.Sql);
+        _services.ApproveCurrent(PhaseName.Sql);
         Assert.Equal(PhaseStatus.Approved, _services.Phases.Get(PhaseName.Sql).Status);
     }
 

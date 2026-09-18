@@ -78,11 +78,11 @@ public class MappingFlowTests
         var draft = AutoMapper.Map(SampleCatalogs.Source(), SampleCatalogs.Target(), Synonyms.Default(), new MatchOptions());
         services.AddMapping(draft, PhaseStatus.AwaitingReview);
 
-        var ex = Assert.Throws<WorkflowException>(() => services.Workflow.Approve(PhaseName.Mapping));
+        var ex = Assert.Throws<WorkflowException>(() => services.ApproveCurrent(PhaseName.Mapping));
         Assert.Contains(ex.Details, d => d.Contains("dbo.ORD_STATUS"));
 
         services.AddMapping(SampleMappings.Approved(), PhaseStatus.AwaitingReview, "human");
-        services.Workflow.Approve(PhaseName.Mapping);
+        services.ApproveCurrent(PhaseName.Mapping);
         Assert.Equal(PhaseStatus.Approved, services.Phases.Get(PhaseName.Mapping).Status);
         Assert.Equal(PhaseStatus.Running, services.Phases.Get(PhaseName.Sql).Status);
     }

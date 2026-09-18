@@ -26,6 +26,7 @@
     view: null,
     ctx: null,
     refreshTimer: null,
+    seenTimer: null,      // Ruling 197: one refresh when the agent-seen window lapses
     loading: null,
   };
 
@@ -106,6 +107,7 @@
     var job = { again: false };
     job.promise = DBM.api.get('/api/state').then(function (state) {
       S.state = state;
+      scheduleSeenExpiry(state);
       var def = defaultPhase(state);
       if (!S.current || !S.picked || S.pickedDefault !== def) {
         if (S.current !== def) S.viewedVersion = null;
@@ -143,6 +145,17 @@
     });
     S.loading = job;
     return job.promise;
+  }
+
+  /** Ruling 197: "Claude is connected" includes "a dbm command ran within the last 120 s", and the server publishes nothing when
+   *  that window lapses. The state names the instant (project.agentSeenUntil); one refresh is scheduled for it - no polling. */
+  function scheduleSeenExpiry(state) {
+    clearTimeout(S.seenTimer);
+    S.seenTimer = null;
+    var until = state && state.project && state.project.agentSeenUntil;
+    var at = until ? Date.parse(until) : NaN;
+    if (isNaN(at)) return;
+    S.seenTimer = setTimeout(function () { S.seenTimer = null; refresh(false); }, Math.max(1000, at - Date.now() + 250));
   }
 
   function scheduleRefresh() {

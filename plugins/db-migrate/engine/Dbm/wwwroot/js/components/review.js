@@ -95,6 +95,8 @@
       }
     }
 
+    var takeOverBtn = R.takeOverButton(ctx);
+
     return h('div', { class: 'review-bar' },
       versions.length ? picker : null,
       C.badge(row.status),
@@ -105,6 +107,7 @@
           C.icon('comment'), 'Feedback' + (n.all ? ' (' + n.all + ')' : '')),
         h('button', { type: 'button', class: 'btn btn-ghost', on: { click: function () { ctx.openHistory(); } } }, C.icon('history'), 'History'),
         reopenBtn,
+        takeOverBtn,
         canReview ? changesBtn : null,
         canReview ? approveBtn : null),
       blocked && canReview ? h('div', { class: 'review-blocked', style: { flexBasis: '100%' } }, C.notice('warn', blocked)) : null,
@@ -123,12 +126,19 @@
       shown && shown.createdAt ? h('span', { class: 'small muted' }, DBM.fmt.ts(shown.createdAt)) : null);
   }
 
+  /** Ruling 194 (open item 1): the approve names the version on screen; the server refuses it (409 stale_version) once a newer
+   *  version exists, and the screen then says so and reloads so the reviewer sees what they would be signing off. */
   function approve(ctx, btn) {
+    var shown = ctx.artifact ? ctx.artifact.version : null;
     C.busy(btn, function () {
-      return ctx.api.post('/api/phase/' + ctx.phase + '/approve').then(function () {
+      return ctx.api.post('/api/phase/' + ctx.phase + '/approve', { version: shown }).then(function () {
         C.toast(DBM.phaseTitle(ctx.phase) + ' approved.', 'ok');
         ctx.refresh();
       }, function (err) {
+        if (err.code === 'stale_version') {
+          C.toast('A newer version arrived — review it first. ' + DBM.phaseTitle(ctx.phase) + ' was not approved.', 'warn');
+          return ctx.refresh();
+        }
         if (err.code === 'blocked' || err.code === 'guard') {
           return C.modal({
             title: 'Not ready to approve',
@@ -180,6 +190,64 @@
       C.busy(btn, function () {
         return ctx.api.post('/api/phase/' + ctx.phase + '/reopen').then(function () { ctx.refresh(); },
           function (err) { C.toast(C.errorText(err), 'err'); });
+      });
+    });
+  }
+
+  /**
+   * Ruling 195 (open item 37): "Take over" on a review phase Claude is drafting or reworking - the way out when its patch was
+   * rejected twice. Null on any other phase. While Claude is connected (state.project.agentOnline, the server's AgentPresence) it
+   * is shown disabled with the reason, because the agent may be applying a patch at that moment; the server refuses it too.
+   */
+  R.takeOverButton = function (ctx) {
+    var row = ctx.phaseRow;
+    if (!row || !REVIEWABLE[ctx.phase] || window.DBM_EXPORT || !ctx.api) return null;
+    if (row.status !== 'drafting' && row.status !== 'reworking') return null;
+    var online = !!(ctx.state && ctx.state.project && ctx.state.project.agentOnline);
+    var why = online
+      ? 'Claude is connected and may be applying a patch right now. Wait until Claude has stopped and the page shows '
+        + 'Agent offline (2 minutes after its last command), then take over.'
+      : 'Discard the pending agent work and edit this version by hand';
+    var btn = h('button', { type: 'button', class: 'btn btn-sm', disabled: online, title: why }, 'Take over');
+    btn.addEventListener('click', function () { takeOver(ctx, btn); });
+    return btn;
+  };
+
+  /** Ruling 198: what the reviewer can do after a take-over, per phase. Analysis has no hand editor, and a drafting Analysis has no
+   *  narrative yet, which blocks its approval - there the way on is comments and Request changes. Continues "... on vN, ". */
+  R.takeOverNext = function (phase, status) {
+    if (phase !== 'analysis') return 'where you can edit it directly, approve it or request changes again.';
+    return 'where you can add comments and press Request changes with your guidance. Analysis cannot be edited by hand'
+      + (status === 'drafting' ? ', and a drafting Analysis cannot be approved until it has a narrative, which only Claude writes.' : '.');
+  };
+
+  /** Ruling 198: the status-screen hint next to Take over. */
+  R.takeOverHint = function (phase, version) {
+    return phase === 'analysis'
+      ? 'Stuck? Take over discards Claude’s pending work so you can review v' + version + ' and send your guidance with Request changes.'
+      : 'Stuck? Take over discards Claude’s pending work so you can review and edit v' + version + ' yourself.';
+  };
+
+  function takeOver(ctx, btn) {
+    var row = ctx.phaseRow;
+    var title = DBM.phaseTitle(ctx.phase);
+    var open = (ctx.feedback || []).filter(function (f) { return f.status === 'open'; }).length;
+    var discarded = row.status === 'drafting'
+      ? 'Claude’s first version of ' + title + ', which is not written yet'
+      : 'Claude’s rework of your ' + open + ' open comment' + (open === 1 ? '' : 's') + ', which is not saved yet';
+    C.modal({
+      title: 'Take over ' + title + '?',
+      body: 'This discards the pending agent work: ' + discarded + '. If Claude delivers that patch later, it is refused. '
+        + title + ' goes back to Awaiting review on v' + row.currentVersion + ', ' + R.takeOverNext(ctx.phase, row.status)
+        + (open ? ' Your open comments stay open.' : ''),
+      confirmText: 'Take over',
+    }).then(function (ok) {
+      if (!ok) return;
+      return C.busy(btn, function () {
+        return ctx.api.post('/api/phase/' + ctx.phase + '/take-over').then(function () {
+          C.toast('You took over ' + title + '.', 'ok');
+          ctx.refresh();
+        }, function (err) { C.toast(C.errorText(err), 'err'); });
       });
     });
   }
