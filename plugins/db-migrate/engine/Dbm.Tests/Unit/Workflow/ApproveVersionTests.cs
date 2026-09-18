@@ -71,9 +71,13 @@ public class ApproveVersionTests
         using var s = FakeServices.Open(tw.Ws);
         FakeServices.DriveToReview(s, phase);
 
-        StaleRefusal(s, phase, seen: 7);
+        var ex = StaleRefusal(s, phase, seen: 7);
 
         Assert.Equal(PhaseStatus.AwaitingReview, s.Phases.Get(phase).Status);
+        // Fix round 1 F5: nothing newer arrived - the reviewer named a version that is not the current one.
+        Assert.True(ex.Message.Contains("v7 is not the current version (v1) - reload and review it", StringComparison.Ordinal)
+                    && !ex.Message.Contains("newer version arrived", StringComparison.Ordinal),
+            "approving v7 while v1 is current must say v7 is not the current version, not that a newer one arrived: " + ex.Message);
     }
 
     [Fact]

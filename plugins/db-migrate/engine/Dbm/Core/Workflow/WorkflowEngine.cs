@@ -387,6 +387,10 @@ public sealed class WorkflowEngine(DbmServices services)
     {
         var current = services.Phases.Get(phase).CurrentVersion;
         if (current == seenVersion) return;
+        if (current is null || seenVersion > current)   // nothing newer arrived: the screen named a version that is not current
+            throw new WorkflowException(
+                $"v{seenVersion} is not the current version ({(current is int c ? $"v{c}" : "none")}) - reload and review it.",
+                null, WorkflowException.StaleVersion);
         throw new WorkflowException(
             $"You approved v{seenVersion} of {phase.Text()}, but its current version is "
             + (current is int v ? $"v{v}" : "(none)") + ". A newer version arrived - review it first.",
