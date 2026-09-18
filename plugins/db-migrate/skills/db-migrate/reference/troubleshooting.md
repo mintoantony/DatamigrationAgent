@@ -14,25 +14,32 @@ The launcher (`bin/dbm`, `bin/dbm.cmd`) writes plain text to stderr, not JSON:
   Nothing else works until then.
 - **exit 4, "engine not built ... and no .NET SDK is installed"** — the plugin copy has no `engine/dist`. Tell the user
   to run `claude plugin update db-migrate@db-migrate` (releases ship the build) or install the .NET 8 SDK, then restart.
-- **exit 4, "engine build failed"** — the launcher tried to build the engine and the compile failed; the previous
-  `engine/dist`, if there was one, is left in place, but this command did not run. Report the first compiler error from
-  the output; suggest `dotnet build plugins/db-migrate/engine/Dbm.sln` to see it in full.
-- **exit 4, "engine/dist is in use by a running dbm server"** — a rebuild could not replace the engine because a `dbm`
-  server of another project folder is running from it. The previous build is untouched, but this command did not run.
-  Tell the user to run `dbm stop` in that project folder, then run the command again.
-- **exit 4, "engine/dist could not be replaced"** — the new build could not be moved into place; the previous build was
-  put back. Run the command again; if it repeats, suggest closing whatever holds files in `engine/` and retrying.
+
+With the .NET SDK installed the launcher rebuilds `engine/dist` when it is missing, when its `VERSION` differs from
+`plugin.json`, or when asked (`DBM_REBUILD=1`, `dbm doctor --rebuild`). It prints "building the engine (…, about a
+minute)", and "waiting for another engine build to finish" while a second `dbm` builds. When the rebuild fails:
+
+- **"dbm: warning: <reason>; running the previous engine/dist <version> instead."** — the command ran on the old build
+  and its own output follows; nothing is lost and the rebuild is retried on the next command. The reason is one of
+  "engine build failed (see the messages above)", "engine build could not be finished (…)", "engine/dist is in use by a
+  running dbm server - run 'dbm stop' in that project folder to let the update through", or "engine/dist could not be
+  replaced". Mention it in one line: for "in
+  use", the user runs `dbm stop` in the other project folder whose server runs from this engine; for "build failed",
+  report the first compiler error (`dotnet build plugins/db-migrate/engine/Dbm.sln` shows it in full).
+- **exit 4, "dbm: <reason>."** — the same failures when there is no previous build to fall back to, so nothing ran.
+  If the message says the previous build "is in <folder> - rename it to dist", tell the user exactly that.
 
 `dbm doctor` prints JSON: `{"ok":…,"checks":[{"name":…,"ok":…,"detail":…}]}` with eight checks (`runtime`,
 `aspnetcore`, `sqlclient`, `sqlite`, `home`, `protector`, `server`, `dist`). Report any check whose `ok` is false, with
-its `detail`. `dbm doctor --quiet` (the session-start hook) prints nothing when healthy and otherwise one line,
-`dbm doctor: <check>: <detail>; …`.
+its `detail`. `dbm doctor --quiet` prints nothing when healthy and otherwise one line per failing check,
+`dbm doctor: <check>: <detail>`. The session-start hook runs it and shows its lines to the user and to you as
+"db-migrate health check at session start"; act on them like the checks below.
 
 - **`protector` false** — connection strings cannot be encrypted or read back. On Windows this needs an interactive user
   profile; elsewhere check `~/.dbmigrate/key` (32 bytes, mode 600). Saved connections may have to be entered again.
-- **`dist` false** — the built engine does not match the plugin version. In a checkout with the .NET SDK the launcher
-  rebuilds by itself on the next command; otherwise tell the user to update the plugin, or (in a development checkout)
-  run `plugins/db-migrate/engine/release.ps1`.
+- **`dist` false** — the built engine does not match the plugin version (or, "cannot check: …", the versions could not
+  be read). Relay the detail: update the plugin (`claude plugin update db-migrate@db-migrate`, then restart Claude Code);
+  with the .NET 8 SDK installed the launcher rebuilds `engine/dist` by itself.
 
 ## CLI errors
 
@@ -42,13 +49,18 @@ its `detail`. `dbm doctor --quiet` (the session-start hook) prints nothing when 
 - **`unknown_command`** — the engine is older or newer than this skill. Run `dbm version` and `dbm doctor`, and tell the
   user to update the plugin (`claude plugin update db-migrate@db-migrate`, then restart Claude Code).
 - **`internal`** — an unexpected engine error. Report the message; `dbm status` shows whether the project is still usable.
-- **`server_error`** — the project's server gave an answer `dbm` could not use (from `dbm await`, or from `dbm export`
-  when the answer was not JSON; the message names the request and the HTTP status). The server is misbehaving or another
-  program answers on its port: run `dbm stop`, then `dbm ui`, then retry. If it recurs, read the last 40 lines of
-  `.dbmigrate/server.log`.
-- **`server_unreachable`** (`dbm await`) — the connection to the server was lost repeatedly. Run `dbm next` and continue;
-  if it recurs, follow *Server and browser* below.
-- **`patch_rejected`, `invalid_patch`** (`dbm apply`) — see *`dbm apply` rejected* below.
+- **`server_error`** — the project's server gave an answer `dbm` could not use: from `dbm await`, "await failed with
+  HTTP <status>"; from `dbm export`, a body that is not a JSON object (the message names the method, the URL, the HTTP
+  status and the first 200 characters of the body). The server is misbehaving or another program answers on its port:
+  run `dbm stop`, then `dbm ui`, then retry. If it recurs, read the last 40 lines of `.dbmigrate/server.log`.
+- **`server_unreachable`** (`dbm await`) — "Lost the connection to the dbm server 3 times; see <server.log path>": the
+  server kept dying or restarting under a waiting `dbm await`. Read the last 40 lines of that log, then run `dbm next`
+  and continue; if the server will not stay up, follow *Server and browser* below.
+- **`invalid_patch`** (`dbm apply`) — the patch file is not a valid patch at all (not JSON, empty, no `phase`, an
+  operation without `op`/`path`); nothing was checked against the project. **`patch_rejected`** (`dbm apply`, exit 1,
+  `{"ok":false,"error":"patch_rejected","message":…,"errors":[…],"warnings":[…]}`) — a well-formed patch that failed
+  validation; `message` is the `errors` joined with "; ". **`not_found`** from `dbm apply` — the patch file does not
+  exist (the subagent did not write it). For all three see *`dbm apply` rejected* below.
 
 ## Server and browser
 
@@ -77,13 +89,14 @@ error. Common causes: connection or login failure (see *Connections*), missing `
 the source, or a timeout on a very large database. Tell the user the cause and that **Retry** in the error banner re-runs
 the job, then start a background `dbm await` (it returns when Claude has work again).
 
-**`dbm apply` rejected** (`patch_rejected`, exit 1)
+**`dbm apply` rejected** (`patch_rejected`, `invalid_patch` or `not_found`, exit 1)
 
-- The message says the base version does not match, or the phase is no longer `drafting`/`reworking`: the human edited
-  or approved meanwhile. Not a failure — run `dbm next` and continue.
-- Validation errors (unknown table or column, bad JSON pointer, a feedback item without a response, SQL validation
-  failed) or `invalid_patch` (the file is not a valid patch): dispatch the same subagent once more with the packet plus
-  `The previous patch was rejected: <message>`, then `dbm apply` again.
+- `patch_rejected` whose message says "baseVersion … does not match the current version", or that the phase is no
+  longer drafting or reworking ("agent patches are accepted only while drafting or reworking"): the human edited or
+  approved meanwhile. Not a failure — run `dbm next` and continue.
+- Any other `patch_rejected` (unknown table or column, bad JSON pointer, a feedback item without a response, SQL
+  validation failed), `invalid_patch`, or `not_found` (no patch file): dispatch the same subagent once more with the
+  packet plus `The previous patch was rejected: <message>`, then `dbm apply` again.
 - Rejected twice: stop retrying. One line to the user: "The <phase> patch was rejected twice: <short message>. Add
   clarifying feedback or edit directly in the UI, then press Request changes." Keep a background `dbm await`.
 
@@ -107,14 +120,15 @@ Details and options are in `reference/transfer.md`. The short version:
 - **`await` / `transfer_paused`** — the user paused the run; **Resume** on the Execute screen continues from the last
   committed chunk. Keep a background `dbm await`.
 - **`stop` / `transfer_failed`** — the error is on the Execute screen (`dbm transfer status` shows the run). Typical: row
-  errors with *stop on error* (fix the data or the mapping and Resume, or cancel and start a new run with *skip and
-  log*), a full transaction log on
-  the target (grow it or switch to SIMPLE recovery, then Resume), a dropped connection (Resume continues from the
-  checkpoint), or missing `ALTER`/`INSERT` permission on a target table. Report the remedy in one line, then keep a
-  background `dbm await`.
+  errors with *stop on error* (fix the source data and Resume, or cancel and start a new run with *skip and log*), a
+  full transaction log on the target (grow it or switch to SIMPLE recovery, then Resume), a dropped connection (Resume
+  continues from the checkpoint), or missing `ALTER`/`INSERT` permission on a target table. Report the remedy in one
+  line, then keep a background `dbm await`.
 - **`bad_task`** in the error — every row of a chunk failed with the same plan-shaped error (invalid column or object,
   conversion, NULL into NOT NULL, truncation, overflow, permission). That is a mapping or SQL defect, not bad data, even
-  under *skip and log*: fix the mapping or SQL task it names, then Resume.
+  under *skip and log*: the mapping or SQL task it names must be fixed. Once a transfer has started the project's phases
+  cannot be reopened, so tell the user that fixing it means cancelling this run and repeating the migration in a new
+  project folder (with *Truncate target first*). If the error is in the source data instead, fix the data and Resume.
 - **`stop` / `transfer_cancelled`** — the user cancelled; rows already committed stay in the target. Report and end.
 
 ## Connections (the user fixes these in the Setup screen)
@@ -139,8 +153,12 @@ After the user saves a corrected connection the engine re-runs discovery by itse
   databases) or choose another `--prefix`.
 - **`locked`** (`dbm demo --attach`) — this project already started a transfer; run the demo in a new, empty folder.
 - **`sql_error`** (`dbm demo`) — usually the login on `--server` cannot connect or lacks `CREATE DATABASE` (`dbcreator`).
-  If the first database was created and the second failed, the message names both databases and what happened to each,
-  and says to re-run with `--force` to start over.
+  The message lists every step already taken on the server, then the step that failed and the server's text:
+  "Failed <step>: <server text>. No database was created or dropped." when nothing had changed yet, otherwise
+  "<Step>, <step>, …, then failed <step>: <server text>. Re-run with --force to start over." (for example "Dropped …,
+  created …, then failed creating …"). With `--attach`, a failure after both databases were seeded says "Created and
+  seeded <source> and <target>, then failed saving them as this project's connections: … Re-run with --force --attach
+  to start over." Relay the message, then the remedy it names.
 - **`not_found`** (`dbm export`) — the server has no export of that kind; the kinds are `analysis`, `sql`, `sqlpack`,
   `report`.
 - **`export_unavailable`** (`dbm export`) — that phase has nothing to export yet (e.g. `report` before a completed run).

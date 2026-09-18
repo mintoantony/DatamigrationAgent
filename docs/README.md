@@ -147,10 +147,17 @@ count validation still passes, because it counts the rows added by this run. If 
 **Truncate target first** unless you really mean to append.
 
 **Rejected rows under *Skip and log bad rows*.** Constraint violations (foreign key, CHECK, primary key or unique) are
-always skipped and logged row by row. But when every row of a chunk fails with the same error that points at the plan
-itself — an invalid column or object, a conversion, NULL into NOT NULL, truncation, overflow or a permission — the task
-fails (`bad_task`) instead, because that is a mapping or SQL defect rather than bad data: fix the mapping or SQL task it
-names, then **Resume**.
+always skipped and logged row by row, even when every row of a chunk fails alike. But when every row of a chunk (of more
+than one row) fails with the same error that points at the plan itself — an invalid column or object, a conversion,
+NULL into NOT NULL, truncation, overflow or a permission — the task fails (`bad_task`) instead, because that is a
+mapping or SQL defect rather than bad data. The mapping and SQL phases cannot be reopened once a transfer has started,
+so fixing it means cancelling the run and repeating the migration in a new project folder (with **Truncate target
+first**).
+
+**A task that loaded 0 rows is a mapping problem.** Because constraint violations are always per-row rejects, a wrong
+foreign-key or CHECK mapping under *Skip and log bad rows* does not fail the run: it can end *Completed* with every row
+of a table rejected. If a task shows 0 rows loaded and many rejected, do not treat it as bad data — read the rejected
+rows' error, fix the mapping (in a new project folder, as above) and load again.
 
 **Live view**: overall and per-task progress bars, rows per second, ETA, a throughput sparkline, the rejected-row count
 and a log tail. **Pause** lets every task commit its current chunk and stops; **Resume** continues from the checkpoints,
@@ -162,6 +169,9 @@ Per task: source rows, rows loaded, rejected rows, duration, rows per second and
 column checksums), plus the run's options and any notes the run recorded. Up to 5 rejected rows per task are listed by
 key with their error. In the demo with *Skip and log bad rows* you see 8 rejected rows: 2 orphan orders and their 2
 lines (foreign key), 3 comments longer than the target column (truncation) and 1 zero quantity (CHECK constraint).
+
+Read the report before you call a run clean: a *Completed* run can still carry notes, and a task with 0 rows loaded and
+its rows rejected points at the mapping, not at the data (see *Execute*).
 
 ## Exports
 

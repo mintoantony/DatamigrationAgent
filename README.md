@@ -56,6 +56,7 @@ version and every piece of feedback is kept; approving locks the version.
 | SQL Server source and target | Both reachable from **your machine**. They may live on different servers; no linked server is needed, because the data streams through the local engine. Developed against SQL Server 2025 and LocalDB. |
 | Permissions | Source: read access plus `VIEW DEFINITION` (and `VIEW DATABASE STATE` for size estimates). Target: `db_datareader`, `db_datawriter` and `db_ddladmin`, or equivalent: `INSERT` and `ALTER` on the target tables (identity insert, constraint `NOCHECK`) plus `CREATE TABLE` for the `dbo.__dbm_checkpoint` control table. |
 | A browser | Any modern browser. The UI has no CDN and works offline. |
+| Windows only: Git for Windows | The plugin's session-start hook runs under `sh`, which Claude Code on Windows takes from Git Bash (the same Git Bash its Bash tool uses). |
 
 Every authentication mode Microsoft.Data.SqlClient supports works verbatim: SQL logins, Windows integrated/Kerberos and
 the Entra ID modes (`Active Directory Default`, `Interactive`, `Integrated`, `Service Principal`, `Device Code Flow`,
@@ -79,8 +80,9 @@ The same from a terminal: `claude plugin marketplace add <git-url-of-this-repo>`
 `claude plugin install db-migrate@db-migrate`. Updates: `claude plugin marketplace update db-migrate` and
 `claude plugin update db-migrate@db-migrate`, then restart Claude Code.
 
-Each session start runs `dbm doctor --quiet`, which is silent when everything is healthy and otherwise prints exactly
-what is wrong (missing runtime, unusable encryption, stale engine build).
+Each session start runs a health check (`dbm doctor --quiet` through the plugin's `hooks/session-start.sh`). It is
+silent when everything is healthy; otherwise it shows you a `db-migrate:` message saying exactly what is wrong (missing
+runtime, unusable encryption, stale engine build) and passes the same text to Claude. It never blocks the session.
 
 ## Quick start with the demo (5 minutes)
 
@@ -224,7 +226,9 @@ unless noted: exit code 0 on success, and 1 with `{"error":"<code>","message":"�
 |---|---|
 | `dbm: 'dotnet' was not found` or `ASP.NET Core Runtime 8 or later is required` (exit 3) | Install the runtime with the command above, then restart Claude Code. |
 | `engine not built ... no .NET SDK` (exit 4) | `claude plugin update db-migrate@db-migrate`, then restart Claude Code. |
-| `engine/dist is in use by a running dbm server` (exit 4) | Run `dbm stop` in the project folder whose server is running, then retry. |
+| `dbm: warning: … running the previous engine/dist … instead` | A rebuild of the engine failed and your command ran on the previous build; it is retried next time. If the reason is `engine/dist is in use by a running dbm server`, run `dbm stop` in the other project folder whose server uses this engine. |
+| `engine build failed` or `engine/dist could not be replaced` (exit 4) | There was no previous build to fall back to. Run the command again; for a build failure, `dotnet build plugins/db-migrate/engine/Dbm.sln` shows the compiler errors. |
+| Session start shows `db-migrate: …` | The health check found a problem; the message names it (see `dbm doctor` below). Claude sees it too. |
 | The browser did not open | Run `/db-migrate ui` (or `dbm ui`) and open the printed `http://127.0.0.1:<port>/?t=<token>` URL. |
 | "Unauthorized" in the browser | The server restarted with a new token: run `dbm ui` for a fresh link. |
 | "Agent offline" banner | No Claude session is running the loop: type `/db-migrate resume`. |
@@ -232,8 +236,9 @@ unless noted: exit code 0 on success, and 1 with `{"error":"<code>","message":"�
 | `demo_exists` | Add `--force` to recreate the two demo databases, or use another `--prefix`. |
 | Anything else | Claude reads `plugins/db-migrate/skills/db-migrate/reference/troubleshooting.md` when a command fails; you can read it too. |
 
-`dbm doctor` prints a health report: runtime, ASP.NET Core, SqlClient, SQLite, user profile, encryption round-trip, this
-project's server and the engine build version.
+`dbm doctor` prints a health report as JSON, eight checks: runtime, ASP.NET Core, SqlClient, SQLite, user profile,
+encryption round-trip, this project's server and whether the engine build matches the plugin version.
+`dbm doctor --quiet` skips the server check, prints nothing when healthy and otherwise one line per failing check.
 
 ## Development
 
@@ -243,7 +248,7 @@ plugins/db-migrate/
   .claude-plugin/plugin.json          plugin manifest
   skills/db-migrate/SKILL.md          the /db-migrate orchestrator loop (+ reference/ playbooks)
   agents/                             schema-analyst, mapping-architect, sql-engineer
-  hooks/hooks.json                    SessionStart → dbm doctor --quiet
+  hooks/                              SessionStart → session-start.sh → dbm doctor --quiet
   bin/dbm, bin/dbm.cmd                launchers (sh; Windows)
   samples/legacyshop-to-shopv2/       LegacyShop → ShopV2 sample pair used by the tests and the demo
   engine/
@@ -272,8 +277,13 @@ docs/                                 user guide; superpowers/specs (design spec
   1. Bump `version` in `plugins/db-migrate/.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json` and
      `<Version>` in `plugins/db-migrate/engine/Directory.Build.props` (the release script checks they agree).
   2. Run `pwsh plugins/db-migrate/engine/release.ps1` (or `sh plugins/db-migrate/engine/release.sh`): unit tests, UI
-     tests, Release publish into `engine/dist`, `VERSION`, smoke test, plugin validation, size summary.
+     tests, Release publish with a `VERSION` file, a contents check (no `.pdb`, `.exe`, `.user`, `.suo`, `.mdb` or
+     `appsettings.*.json`), smoke test, swap into `engine/dist`, plugin validation, size summary.
   3. Commit `engine/dist` and tag with `claude plugin tag plugins/db-migrate --push` (creates `db-migrate--v<version>`).
+
+  `engine/dist` is committed build output and the launcher rebuilds it only when `VERSION` changes, not when the source
+  changes at the same version. Run the release script and commit `engine/dist` as the last step before any version bump
+  or merge to `main`, or users without the .NET SDK run old code.
 
   Teammates update with `claude plugin update db-migrate@db-migrate`.
 
@@ -288,10 +298,10 @@ The implementation plan is under `docs/superpowers/plans/`, one file per milesto
 | M2 Discovery and analysis loop | done |
 | M3 Mapping loop | done |
 | M4 SQL loop and script pack | done |
-| M5 Transfer engine and report | done except the end-to-end test (Task 5.7), which is in review |
-| M6 Packaging, demo, docs | in progress — `dbm demo`/`dbm export`, the release build and these docs |
+| M5 Transfer engine and report | done (including the end-to-end LegacyShop → ShopV2 test) |
+| M6 Packaging, demo, docs | in progress — `dbm demo`/`dbm export`, doctor checks, launchers and release scripts and these docs are done; the committed `engine/dist` build is next |
 
-Each task is implemented and reviewed on its own branch before it reaches `main`.
+As of 2026-09-18. Each task is implemented and reviewed on its own branch before it reaches `main`.
 
 ### Out of scope for v1
 
