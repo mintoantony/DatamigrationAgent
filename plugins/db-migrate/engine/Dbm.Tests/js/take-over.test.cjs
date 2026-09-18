@@ -80,6 +80,52 @@ for (const phase of ['analysis', 'mapping', 'sql']) {
   });
 }
 
+/* Ruling 198 (fix round 1, F2): Analysis has no editor, and a drafting Analysis has no narrative, which blocks its approval. The
+   dialog and the status-screen hint promise hand editing only where it exists. */
+async function dialogBody(phase, status) {
+  const ctx = ctxFor(phase, status, { feedback: status === 'reworking' ? [{ id: 1, status: 'open' }] : [] });
+  let btn;
+  let root = null;
+  if (status === 'drafting') {
+    root = new D.FakeNode('div');
+    DBM.views.pending.render(root, ctx);
+    btn = D.find(root, isTakeOver);
+  } else {
+    btn = D.find(C.reviewBar(ctx), isTakeOver);
+  }
+  const seen = capture(false);
+  try {
+    btn.fire('click');
+    await D.settle();
+  } finally { seen.restore(); }
+  return { body: seen.modals[0].body, hint: root ? D.text(root) : '' };
+}
+
+for (const status of ['drafting', 'reworking']) {
+  test('analysis ' + status + ': Take over never promises hand editing; the way on is Request changes', async () => {
+    const { body, hint } = await dialogBody('analysis', status);
+    const said = body + ' ' + hint;
+    assert.ok(!/edit it directly|edit v\d+ yourself|edit it yourself/.test(said),
+      'Analysis has no editor, yet Take over promises hand editing: ' + said);
+    assert.match(body, /Analysis cannot be edited by hand/);
+    assert.match(body, /Request changes/);
+    if (status === 'drafting') {
+      assert.match(body, /cannot be approved until it has a narrative/,
+        'a drafting Analysis has no narrative, so approval is blocked - the dialog must say so: ' + body);
+    } else {
+      assert.ok(!/until it has a narrative/.test(body), 'a reworked Analysis already has its narrative: ' + body);
+    }
+  });
+}
+
+for (const phase of ['mapping', 'sql']) {
+  test(phase + ' drafting: Take over offers hand editing', async () => {
+    const { body, hint } = await dialogBody(phase, 'drafting');
+    assert.match(body, /edit it directly, approve it or request changes/);
+    assert.match(hint, /edit v3 yourself/);
+  });
+}
+
 test('cancelling the dialog takes nothing over', async () => {
   const ctx = ctxFor('sql', 'reworking');
   const seen = capture(false);

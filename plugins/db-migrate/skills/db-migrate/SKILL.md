@@ -39,7 +39,7 @@ report or an error.
      - If `apply` exits non-zero, dispatch the same subagent once more with the prompt above plus
        `\nThe previous patch was rejected: <errors joined with "; ">`, then `dbm apply <patchPath>` again.
      - If it fails again, tell the user the <phase> patch was rejected twice (short reason): `/db-migrate resume`
-       retries, or **Take over** in the UI to edit it by hand; end your turn.
+       retries, or **Take over** in the UI hands it to them; end your turn.
      Otherwise go back to step 2.
    - `await` → run `dbm await` with the Bash tool's `run_in_background: true`, then end your turn with at most one short line:
      `review` → "Waiting for your review of <phase> in the browser."; `setup` → "Waiting for the connection strings in

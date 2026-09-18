@@ -243,7 +243,9 @@ Every export is saved under `.dbmigrate/exports/` as well, and none of them cont
   `/db-migrate resume`.
 - **Take over.** While Claude is drafting or reworking a phase you cannot edit it or request changes. If Claude is stuck
   there (its patch was rejected twice), press **Take over** on that phase: it discards Claude's pending work and puts
-  the phase back to *Awaiting review* on its current version, where you can edit, approve or request changes again. Your
+  the phase back to *Awaiting review* on its current version. On Mapping and SQL you can then edit it yourself, approve
+  it or request changes again. Analysis cannot be edited by hand, and an Analysis taken over while Claude was drafting it
+  has no narrative yet, so it cannot be approved: add comments with your guidance and press **Request changes**. Your
   open comments stay open, and a patch Claude delivers afterwards is refused. The button is disabled while Claude is
   connected (it may be applying a patch at that moment): wait until Claude has stopped and the page shows *Agent
   offline* (2 minutes after its last command).

@@ -213,6 +213,21 @@
     return btn;
   };
 
+  /** Ruling 198: what the reviewer can do after a take-over, per phase. Analysis has no hand editor, and a drafting Analysis has no
+   *  narrative yet, which blocks its approval - there the way on is comments and Request changes. Continues "... on vN, ". */
+  R.takeOverNext = function (phase, status) {
+    if (phase !== 'analysis') return 'where you can edit it directly, approve it or request changes again.';
+    return 'where you can add comments and press Request changes with your guidance. Analysis cannot be edited by hand'
+      + (status === 'drafting' ? ', and a drafting Analysis cannot be approved until it has a narrative, which only Claude writes.' : '.');
+  };
+
+  /** Ruling 198: the status-screen hint next to Take over. */
+  R.takeOverHint = function (phase, version) {
+    return phase === 'analysis'
+      ? 'Stuck? Take over discards Claude’s pending work so you can review v' + version + ' and send your guidance with Request changes.'
+      : 'Stuck? Take over discards Claude’s pending work so you can review and edit v' + version + ' yourself.';
+  };
+
   function takeOver(ctx, btn) {
     var row = ctx.phaseRow;
     var title = DBM.phaseTitle(ctx.phase);
@@ -223,8 +238,8 @@
     C.modal({
       title: 'Take over ' + title + '?',
       body: 'This discards the pending agent work: ' + discarded + '. If Claude delivers that patch later, it is refused. '
-        + title + ' goes back to Awaiting review on v' + row.currentVersion + ', where you can edit it directly, approve it or '
-        + 'request changes again.' + (open ? ' Your open comments stay open.' : ''),
+        + title + ' goes back to Awaiting review on v' + row.currentVersion + ', ' + R.takeOverNext(ctx.phase, row.status)
+        + (open ? ' Your open comments stay open.' : ''),
       confirmText: 'Take over',
     }).then(function (ok) {
       if (!ok) return;

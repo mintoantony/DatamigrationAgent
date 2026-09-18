@@ -100,13 +100,15 @@ again and again.
   validation failed), `invalid_patch`, or `not_found` (no patch file): dispatch the same subagent once more with the
   packet plus `The previous patch was rejected: <message>`, then `dbm apply` again.
 - Rejected twice: stop retrying. One line to the user: "The <phase> patch was rejected twice: <short message>. Type
-  /db-migrate resume to let Claude try again, or press Take over on the <phase> screen to edit it yourself." Then end
-  your turn, with no `dbm await` (`dbm next` would hand back the same agent work at once). While the phase is drafting or
+  /db-migrate resume to let Claude try again, or press Take over on the <phase> screen <way on>." - where <way on> is
+  "to edit it yourself" for Mapping or SQL, and "to send your guidance with Request changes" for Analysis (Analysis has
+  no hand editor, and a drafting Analysis cannot be approved until Claude has written its narrative). Then end your
+  turn, with no `dbm await` (`dbm next` would hand back the same agent work at once). While the phase is drafting or
   reworking the UI refuses direct edits and Request changes; **Take over** is the way out: it discards the pending agent
   work and puts the phase back to awaiting review on its current version (open comments stay open), after which
-  `dbm next` answers `await`/`review`. The UI refuses it while Claude counts as connected (an open `dbm await`, or a
-  `dbm next`/`dbm await` in the last 2 minutes), so it takes effect only once this turn has ended. A patch applied after
-  a take-over is refused ("agent patches are accepted only while drafting or reworking"): run `dbm next` and continue.
+  `dbm next` answers `await`/`review`. The UI refuses it while Claude counts as connected (an open `dbm await`), and
+  within 2 minutes of Claude's last `dbm next`/`dbm await`; a patch that arrives after a take-over is refused ("agent
+  patches are accepted only while drafting or reworking"): run `dbm next` and continue.
 
 **Approval blocked (409 `blocked` in the UI)** — mapping approval needs every source column mapped or dropped and every
 non-nullable target column without a default filled in. The UI lists the blockers; the user resolves them there.

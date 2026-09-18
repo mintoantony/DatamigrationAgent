@@ -88,8 +88,7 @@
       var hasArtifact = !!ctx.artifact && (status === 'awaiting_review' || status === 'approved' || status === 'reworking');
       var takeOver = !hasArtifact && DBM.review && DBM.review.takeOverButton ? DBM.review.takeOverButton(ctx) : null;
       var takeOverRow = takeOver ? h('div', { class: 'row-wrap' }, takeOver,
-        h('span', { class: 'small muted' }, 'Stuck? Take over discards Claude’s pending work so you can review and edit v'
-          + ctx.phaseRow.currentVersion + ' yourself.')) : null;
+        h('span', { class: 'small muted' }, DBM.review.takeOverHint(ctx.phase, ctx.phaseRow.currentVersion))) : null;
       var jobFailed = !!job && job.status === 'failed';
       var busy = !hasArtifact && !jobFailed && (status === 'running' || status === 'drafting' || status === 'reworking');
 
