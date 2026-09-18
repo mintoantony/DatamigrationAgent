@@ -157,7 +157,7 @@ public class WorkflowTransitionTests
         FakeServices.DriveToReview(s, PhaseName.Analysis);
         FakeServices.SetCatalogFingerprints(s, "s1", "t1");
 
-        s.Workflow.Approve(PhaseName.Analysis);
+        s.ApproveCurrent(PhaseName.Analysis);
 
         var analysis = s.Phases.Get(PhaseName.Analysis);
         Assert.Equal(PhaseStatus.Approved, analysis.Status);
@@ -178,7 +178,7 @@ public class WorkflowTransitionTests
         Assert.Equal(PhaseStatus.Approved, StatusOf(s, PhaseName.Mapping));
         Assert.Equal(PhaseStatus.AwaitingReview, StatusOf(s, PhaseName.Sql));
         Assert.Contains(s.Jobs.Recent(10), j => j.Kind == "sqlgen");
-        s.Workflow.Approve(PhaseName.Sql);
+        s.ApproveCurrent(PhaseName.Sql);
         Assert.Equal(PhaseStatus.Approved, StatusOf(s, PhaseName.Sql));
         Assert.Equal(PhaseStatus.AwaitingReview, StatusOf(s, PhaseName.Ready));
     }
@@ -192,7 +192,7 @@ public class WorkflowTransitionTests
         using var s = FakeServices.Open(tw.Ws, modules);
         FakeServices.DriveToReview(s, PhaseName.Mapping);
 
-        var ex = Assert.Throws<WorkflowException>(() => s.Workflow.Approve(PhaseName.Mapping));
+        var ex = Assert.Throws<WorkflowException>(() => s.ApproveCurrent(PhaseName.Mapping));
 
         Assert.Equal(new[] { "dbo.CUST.FAX_NO is unmapped" }, ex.Details);
         Assert.Equal(PhaseStatus.AwaitingReview, StatusOf(s, PhaseName.Mapping));
@@ -206,9 +206,9 @@ public class WorkflowTransitionTests
         using var s = FakeServices.Open(tw.Ws);
         FakeServices.DriveToAnalysisDraft(s);
 
-        Assert.Throws<WorkflowException>(() => s.Workflow.Approve(PhaseName.Analysis));
-        Assert.Throws<WorkflowException>(() => s.Workflow.Approve(PhaseName.Setup));
-        Assert.Throws<WorkflowException>(() => s.Workflow.Approve(PhaseName.Ready));
+        Assert.Throws<WorkflowException>(() => s.ApproveCurrent(PhaseName.Analysis));
+        Assert.Throws<WorkflowException>(() => s.ApproveCurrent(PhaseName.Setup));
+        Assert.Throws<WorkflowException>(() => s.ApproveCurrent(PhaseName.Ready));
     }
 
     [Fact]
@@ -239,7 +239,7 @@ public class WorkflowTransitionTests
         FakeServices.DriveToReview(s, PhaseName.Sql);
         s.Workflow.Reopen(PhaseName.Mapping);
 
-        s.Workflow.Approve(PhaseName.Mapping);
+        s.ApproveCurrent(PhaseName.Mapping);
 
         Assert.Equal(PhaseStatus.Running, StatusOf(s, PhaseName.Sql));
         Assert.Equal("sqlgen", Assert.Single(s.Jobs.Active()).Kind);
@@ -256,7 +256,7 @@ public class WorkflowTransitionTests
         using var tw = new TestWorkspace();
         using var s = FakeServices.Open(tw.Ws);
         FakeServices.DriveToReview(s, PhaseName.Sql);
-        s.Workflow.Approve(PhaseName.Sql);
+        s.ApproveCurrent(PhaseName.Sql);
 
         s.Workflow.OnTransferStarted();
 
@@ -367,7 +367,7 @@ public class WorkflowTransitionTests
         Assert.Equal(FeedbackStatus.Superseded, superseded.Status);
         Assert.Equal(1, superseded.RespondedVersion);
 
-        s.Workflow.Approve(PhaseName.Analysis);   // reruns Mapping's job with carry-over
+        s.ApproveCurrent(PhaseName.Analysis);   // reruns Mapping's job with carry-over
         FakeServices.CompleteNextJob(s, FakeServices.Draft("mapping redraft"));
         Assert.Equal(PhaseStatus.Drafting, StatusOf(s, PhaseName.Mapping));
         FakeServices.ApplySummary(s, PhaseName.Mapping, "mapping v2");
@@ -384,7 +384,7 @@ public class WorkflowTransitionTests
         using var tw = new TestWorkspace();
         using var s = FakeServices.Open(tw.Ws);
         FakeServices.DriveToReview(s, PhaseName.Sql);
-        s.Workflow.Approve(PhaseName.Sql);
+        s.ApproveCurrent(PhaseName.Sql);
         Assert.Equal(PhaseStatus.AwaitingReview, StatusOf(s, PhaseName.Ready));
         s.Feedback.Add(PhaseName.Ready, 0, null, "note");
 
@@ -403,7 +403,7 @@ public class WorkflowTransitionTests
         s.Workflow.Reopen(PhaseName.Analysis);   // Mapping and Sql become stale
 
         Assert.Equal(PhaseStatus.Stale, StatusOf(s, PhaseName.Mapping));
-        Assert.Throws<WorkflowException>(() => s.Workflow.Approve(PhaseName.Mapping));
+        Assert.Throws<WorkflowException>(() => s.ApproveCurrent(PhaseName.Mapping));
         Assert.Throws<WorkflowException>(() => s.Workflow.RequestChanges(PhaseName.Mapping));
         var edit = s.Workflow.HumanEdit(new Patch("mapping", 1, [], []));
         Assert.False(edit.Ok);

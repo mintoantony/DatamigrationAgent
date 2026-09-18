@@ -21,6 +21,7 @@ public static class CoreEndpoints
 
     private sealed record ConnectionBody(string? ConnectionString);
     private sealed record FeedbackBody(string? Anchor, string? Text);
+    private sealed record ApproveBody(int? Version);
 
     public static void Map(IEndpointRouteBuilder app, WebState state)
     {
@@ -129,22 +130,26 @@ public static class CoreEndpoints
             return ApiResults.Ok();
         });
 
+        // Ruling 194 (open item 1): the body names the version the reviewer saw, {"version": n}. None is 400 version_required; one
+        // that is no longer current is 409 stale_version (before the guards, so a stale screen is told to reload, not about drift).
         api.MapPost("/phase/{phase}/approve", async (string phase, HttpContext http) =>
         {
             var p = ParsePhase(phase);
-            foreach (var guard in ApprovalGuards.All)
-            {
-                var message = await guard(state, p, http.RequestAborted);
-                if (message is not null) return ApiResults.Error(StatusCodes.Status409Conflict, "guard", message);
-            }
+            var seen = await ReadApproveVersionAsync(http);
             try
             {
-                s.Workflow.Approve(p);
+                if (s.Phases.Get(p).Status == PhaseStatus.AwaitingReview) s.Workflow.EnsureCurrentVersion(p, seen);
+                foreach (var guard in ApprovalGuards.All)
+                {
+                    var message = await guard(state, p, http.RequestAborted);
+                    if (message is not null) return ApiResults.Error(StatusCodes.Status409Conflict, "guard", message);
+                }
+                s.Workflow.Approve(p, seen);
                 return ApiResults.Ok();
             }
             catch (WorkflowException ex)
             {
-                return ApiResults.Error(StatusCodes.Status409Conflict, "blocked", ex.Message, ex.Details);
+                return ApiResults.Error(StatusCodes.Status409Conflict, ex.Code ?? "blocked", ex.Message, ex.Details);
             }
         });
 
@@ -313,6 +318,27 @@ public static class CoreEndpoints
         {
             throw new ApiException(StatusCodes.Status409Conflict, ex.Code, ex.Message);
         }
+    }
+
+    /// <summary>Ruling 194: the version an approve names; a missing body, an unreadable one or one without a version is 400
+    /// version_required.</summary>
+    private static async Task<int> ReadApproveVersionAsync(HttpContext http)
+    {
+        const string need = "Approve names the version you reviewed: send {\"version\": n}. Reload the page and approve again.";
+        var text = await ApiResults.ReadTextAsync(http.Request);
+        ApproveBody? body = null;
+        if (!string.IsNullOrWhiteSpace(text))
+        {
+            try
+            {
+                body = Json.Deserialize<ApproveBody>(text);
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                body = null;
+            }
+        }
+        return body?.Version ?? throw new ApiException(StatusCodes.Status400BadRequest, "version_required", need);
     }
 
     private static PhaseName ParsePhase(string text) =>

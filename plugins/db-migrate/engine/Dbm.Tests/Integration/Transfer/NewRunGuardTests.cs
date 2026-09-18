@@ -130,7 +130,7 @@ public sealed class NewRunGuardTests(EngineSourceFixture fx) : IClassFixture<Eng
         await Wait.UntilAsync(() => s.Phases.Get(PhaseName.Complete).Status == PhaseStatus.Approved, 60_000);
         Assert.Equal(700, await tgt.CountAsync("app.Log"));
         s.Workflow.Reopen(PhaseName.Sql);
-        s.Workflow.Approve(PhaseName.Sql);                                              // the same SQL version, well inside 15 minutes
+        s.ApproveCurrent(PhaseName.Sql);                                              // the same SQL version, well inside 15 minutes
 
         var (status, body) = await server.SendAsync(HttpMethod.Post, "/api/transfer/start", new { options = Skip, confirmTarget = tgt.Name });
 

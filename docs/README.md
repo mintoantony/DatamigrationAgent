@@ -30,7 +30,9 @@ to let Claude continue …**.
 - **Top bar** — project name, the *Agent online* / *Agent offline* indicator, **Pause / Resume**, and the theme switch.
 - **Review bar** (on Analysis, Mapping and SQL) — the version picker, **Feedback** and **History**, which open the right
   drawer: the feedback thread for the current phase (your items and Claude's responses) and the version history with a
-  diff between any two versions.
+  diff between any two versions. **Approve** signs off the version on your screen and nothing else: if a newer version
+  arrived meanwhile (Claude's, or an edit from another tab), approval is refused with *A newer version arrived — review
+  it first* and the page reloads to show it.
 
 ## Setup
 

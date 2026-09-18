@@ -29,7 +29,7 @@ public sealed class ReopenAfterRunIntegrationTests
     /// <summary>Approve Mapping as it stands, let the real sqlgen job draft the plan, and approve SQL (Ready then awaits Execute).</summary>
     private static async Task ApproveThroughSqlAsync(DbmServices s)
     {
-        s.Workflow.Approve(PhaseName.Mapping);
+        s.ApproveCurrent(PhaseName.Mapping);
         await new JobRunner(s).RunPendingAsync(CancellationToken.None);
         var sql = s.Phases.Get(PhaseName.Sql);
         Assert.True(sql.Status is PhaseStatus.Drafting or PhaseStatus.AwaitingReview,
@@ -40,7 +40,7 @@ public sealed class ReopenAfterRunIntegrationTests
             var applied = s.Workflow.ApplyPatch(new Patch("sql", sql.CurrentVersion!.Value, [], [], "reviewed, no change"));
             Assert.True(applied.Ok, string.Join("; ", applied.Errors));
         }
-        s.Workflow.Approve(PhaseName.Sql);
+        s.ApproveCurrent(PhaseName.Sql);
         Assert.Equal(PhaseStatus.AwaitingReview, s.Phases.Get(PhaseName.Ready).Status);
     }
 

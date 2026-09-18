@@ -75,6 +75,11 @@ public sealed class FakeJobHandler(string kind, Func<JobContext, JobResult>? run
 /// <summary>Services wired with fakes, plus helpers that drive the workflow without SQL Server.</summary>
 public static class FakeServices
 {
+    /// <summary>Approves <paramref name="phase"/> naming its current version - what a reviewer looking at the latest version sends
+    /// (Ruling 194: every approve names the version it saw).</summary>
+    public static void ApproveCurrent(this DbmServices s, PhaseName phase) =>
+        s.Workflow.Approve(phase, s.Phases.Get(phase).CurrentVersion ?? -1);
+
     public const string SrcConnection = "Server=src-host;Database=Legacy;Integrated Security=true";
     public const string TgtConnection = "Server=tgt-host;Database=ShopV2;Integrated Security=true";
 
@@ -156,7 +161,7 @@ public static class FakeServices
         foreach (var next in new[] { PhaseName.Mapping, PhaseName.Sql })
         {
             if (phase < next) return;
-            s.Workflow.Approve(next == PhaseName.Mapping ? PhaseName.Analysis : PhaseName.Mapping);
+            s.ApproveCurrent(next == PhaseName.Mapping ? PhaseName.Analysis : PhaseName.Mapping);
             CompleteNextJob(s, Draft());
             ApplySummary(s, next, $"{next.Text()} v1");
         }

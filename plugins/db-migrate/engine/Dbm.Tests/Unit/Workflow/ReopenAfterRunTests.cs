@@ -20,7 +20,7 @@ public sealed class ReopenAfterRunTests
     private static long? Drive(DbmServices s, RunState state)
     {
         FakeServices.DriveToReview(s, PhaseName.Sql);
-        s.Workflow.Approve(PhaseName.Sql);
+        s.ApproveCurrent(PhaseName.Sql);
         if (state == RunState.NoRun) return null;
         long runId = s.Transfers.CreateRun(s.Phases.Get(PhaseName.Sql).ApprovedVersion!.Value, new TransferOptions(), [("T01", "app.A")]);
         s.Workflow.OnTransferStarted();

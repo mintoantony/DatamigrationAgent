@@ -123,12 +123,19 @@
       shown && shown.createdAt ? h('span', { class: 'small muted' }, DBM.fmt.ts(shown.createdAt)) : null);
   }
 
+  /** Ruling 194 (open item 1): the approve names the version on screen; the server refuses it (409 stale_version) once a newer
+   *  version exists, and the screen then says so and reloads so the reviewer sees what they would be signing off. */
   function approve(ctx, btn) {
+    var shown = ctx.artifact ? ctx.artifact.version : null;
     C.busy(btn, function () {
-      return ctx.api.post('/api/phase/' + ctx.phase + '/approve').then(function () {
+      return ctx.api.post('/api/phase/' + ctx.phase + '/approve', { version: shown }).then(function () {
         C.toast(DBM.phaseTitle(ctx.phase) + ' approved.', 'ok');
         ctx.refresh();
       }, function (err) {
+        if (err.code === 'stale_version') {
+          C.toast('A newer version arrived — review it first. ' + DBM.phaseTitle(ctx.phase) + ' was not approved.', 'warn');
+          return ctx.refresh();
+        }
         if (err.code === 'blocked' || err.code === 'guard') {
           return C.modal({
             title: 'Not ready to approve',
