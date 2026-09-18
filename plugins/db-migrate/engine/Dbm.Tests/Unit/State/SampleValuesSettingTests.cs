@@ -82,6 +82,38 @@ public class SampleValuesSettingTests
             + $"{packet.Contains(Email, StringComparison.Ordinal)}, a \"samples\" key: {samples})");
     }
 
+    /// <summary>Ruling 199 (fix round 1, F3): the values also sat in old work packets and in the SQLite write-ahead log.</summary>
+    [Fact]
+    public void Turning_it_off_leaves_no_sample_value_in_work_packets_or_the_database_files()
+    {
+        using var project = TempProject.Create();
+        var s = project.Services.WithSampleCatalogs();
+        s.ApproveBefore(PhaseName.Mapping);
+        s.AddMapping(AutoMapper.Map(SampleCatalogs.Source(), SampleCatalogs.Target(), Synonyms.Default(), new MatchOptions()), PhaseStatus.Drafting);
+        var packet = s.Workflow.Next().Packet!;
+        File.WriteAllText(Path.Combine(project.Ws.WorkDir, "mapping-v0-draft.patch.json"), "{}");   // an agent's patch is left alone
+        Assert.Contains(Email, File.ReadAllText(packet));
+
+        SampleValuesSetting.Set(s, on: false);
+
+        var files = Directory.EnumerateFiles(project.Ws.WorkDir, "*.json")
+            .Concat(new[] { project.Ws.StateDbPath, project.Ws.StateDbPath + "-wal" }.Where(File.Exists));
+        var leaks = files.Where(f => Contains(f, Email)).Select(Path.GetFileName).ToList();
+        Assert.True(leaks.Count == 0, $"after switching sample values off, {Email} can still be read from: {string.Join(", ", leaks)}");
+        Assert.False(File.Exists(packet), "the old work packet (written with sample values) must be deleted; dbm next writes it again");
+        Assert.True(File.Exists(Path.Combine(project.Ws.WorkDir, "mapping-v0-draft.patch.json")));
+        Assert.DoesNotContain(Email, File.ReadAllText(s.Workflow.Next().Packet!));
+    }
+
+    /// <summary>The bytes of a file another connection may hold open, searched as UTF-8.</summary>
+    private static bool Contains(string path, string text)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var buffer = new MemoryStream();
+        stream.CopyTo(buffer);
+        return System.Text.Encoding.UTF8.GetString(buffer.ToArray()).Contains(text, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void A_discovery_that_finishes_while_it_is_off_is_cleaned_too()
     {

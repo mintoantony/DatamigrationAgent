@@ -235,7 +235,9 @@ unless noted: exit code 0 on success, and 1 with `{"error":"<code>","message":"â
   ratio, lengths, value patterns and a few sample values while the project's sample-values setting is on, which is the
   default), rule findings, the mapping, the SQL plan and your feedback. Switch sample values off under **Privacy** on the
   Setup screen or with `dbm config sample-values off`: the sample values and text min/max already collected are removed
-  from the project, so no work packet and no `dbm show` carries any, and later discoveries collect none. Claude still sees
+  from the project (the database files and the work packets included), so no work packet and no `dbm show` carries
+  any, and later discoveries collect none. Files you exported earlier to `.dbmigrate/exports` keep the values they
+  were written with. Claude still sees
   the statistics and patterns, so its analysis and mapping suggestions may be less precise. Switching it back on takes
   effect at the next discovery (**Re-run discovery**).
 - **What Claude never sees:** credentials, connection strings or bulk row data. The transfer streams source â†’ target

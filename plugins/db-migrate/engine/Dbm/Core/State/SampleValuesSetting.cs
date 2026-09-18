@@ -15,7 +15,8 @@ public static class SampleValuesSetting
 {
     public const string OffNote = "Sample values are off: the stored catalogs hold none, so work packets and dbm show carry none. "
                                   + "Claude still sees null shares, distinct counts, lengths, value patterns and classes; its analysis "
-                                  + "and mapping suggestions may be less precise.";
+                                  + "and mapping suggestions may be less precise. Files exported earlier to .dbmigrate/exports keep "
+                                  + "the values they were written with.";
 
     public const string OnNote = "Sample values are on. Profiles collected while they were off have none: run discovery again "
                                  + "(Re-run discovery on the Analysis screen, or dbm discover) to collect them.";
@@ -23,11 +24,51 @@ public static class SampleValuesSetting
     public static SampleValuesChange Set(DbmServices services, bool on)
     {
         ArgumentNullException.ThrowIfNull(services);
-        return services.Db.InTransaction(() =>
+        if (on)
         {
-            services.Project.SaveSettings(services.Project.GetSettings() with { SampleValues = on });
-            return new SampleValuesChange(on, on ? 0 : Scrub(services), on ? OnNote : OffNote);
-        });
+            services.Db.InTransaction(() => services.Project.SaveSettings(services.Project.GetSettings() with { SampleValues = true }));
+            return new SampleValuesChange(true, 0, OnNote);
+        }
+
+        // Ruling 199: the catalog rows are rewritten with SQLite's secure_delete on, so the pages that held the old JSON are zeroed
+        // rather than left in the file; the write-ahead log is then checkpointed and truncated, and the work packets written from
+        // the old catalogs are deleted (dbm next writes the current one again). Agent patch files (*.patch.json) are left alone.
+        var db = services.Db;
+        var secure = db.Scalar<long>("PRAGMA secure_delete;");
+        db.Execute("PRAGMA secure_delete = ON;");
+        int scrubbed;
+        try
+        {
+            scrubbed = db.InTransaction(() =>
+            {
+                services.Project.SaveSettings(services.Project.GetSettings() with { SampleValues = false });
+                return Scrub(services);
+            });
+        }
+        finally
+        {
+            if (secure == 0) db.Execute("PRAGMA secure_delete = OFF;");
+        }
+        db.Execute("PRAGMA wal_checkpoint(TRUNCATE);");
+        DeletePackets(services.Ws);
+        return new SampleValuesChange(false, scrubbed, OffNote);
+    }
+
+    private static void DeletePackets(Workspace ws)
+    {
+        if (!Directory.Exists(ws.WorkDir)) return;
+        foreach (var file in Directory.EnumerateFiles(ws.WorkDir, "*.json"))
+        {
+            if (file.EndsWith(".patch.json", StringComparison.OrdinalIgnoreCase)) continue;
+            try
+            {
+                File.Delete(file);
+            }
+            catch (IOException)
+            {
+                // a packet being read right now: the next `dbm next` overwrites it
+            }
+        }
     }
 
     /// <summary>
