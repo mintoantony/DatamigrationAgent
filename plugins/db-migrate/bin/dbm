@@ -2,7 +2,8 @@
 # db-migrate launcher (macOS, Linux, Git Bash on Windows).
 # Runs engine/dist/Dbm.dll with the installed .NET runtime; builds it when missing, when DBM_REBUILD=1, or when
 # engine/dist/VERSION no longer matches plugin.json (needs the .NET SDK).
-# Exit codes: 3 = runtime missing, 4 = engine not built / build failed; otherwise the engine's own exit code.
+# Exit codes: 3 = runtime missing, 4 = engine not built / build failed and there is no previous build to run;
+# otherwise the engine's own exit code.
 set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -10,7 +11,12 @@ root=$(dirname -- "$here")
 engine="$root/engine"
 dll="$engine/dist/Dbm.dll"
 manifest="$root/.claude-plugin/plugin.json"
+# One lock for every builder of engine/dist: both launchers and both engine/release.* scripts. It is a directory
+# holding an `owner` file; it counts as abandoned once the directory itself is older than lock_stale_minutes.
 lock="$engine/.build.lock"
+lock_owner="sh-$$"
+lock_stale_minutes=15
+failure=""
 
 install_help() {
   echo "Install the ASP.NET Core Runtime 8 (or later), then open a new terminal:" >&2
@@ -44,47 +50,67 @@ prune_natives() {
 }
 
 # Why this is needed: the plugin ships a built engine/dist, so an update that changes plugin.json leaves a stale dist
-# behind in a checkout that has the SDK. Publishing into dist.tmp and swapping keeps the old build usable if anything
-# fails (on Windows a running server keeps its DLLs locked, so the rename is the only safe way to replace them).
+# behind in a checkout that has the SDK. Publishing into a per-process dist.tmp.<pid> and swapping keeps the old build
+# usable if anything fails (on Windows a running server keeps its DLLs locked, so the rename is the only safe way to
+# replace them). Returns 0 with the new build in place, or sets $failure and returns 1 with engine/dist as it was.
 build_engine() {
   echo "dbm: building the engine ($reason, about a minute)..." >&2
   if [ -f "$dll" ]; then dotnet "$dll" stop >/dev/null 2>&1 || true; fi
-  rm -rf "$engine/dist.tmp"
-  if ! dotnet publish "$engine/Dbm/Dbm.csproj" -c Release -o "$engine/dist.tmp" --nologo -v q \
-      "-p:Version=${version:-0.0.0}" -p:DebugType=none -p:UseAppHost=false >&2; then
-    rm -rf "$engine/dist.tmp"
-    echo "dbm: engine build failed (see the messages above)." >&2
-    exit 4
-  fi
-  prune_natives "$engine/dist.tmp"
-  printf '%s' "${version:-0.0.0}" > "$engine/dist.tmp/VERSION"
+  tmp="$engine/dist.tmp.$$"
   old="$engine/dist.old.$$"
-  if [ -d "$engine/dist" ] && ! mv "$engine/dist" "$old" 2>/dev/null; then
-    rm -rf "$engine/dist.tmp"
-    echo "dbm: engine/dist is in use by a running dbm server - run 'dbm stop' in that project folder and retry." >&2
-    exit 4
+  rm -rf "$tmp"
+  if ! dotnet publish "$engine/Dbm/Dbm.csproj" -c Release -o "$tmp" --nologo -v q \
+      "-p:Version=${version:-0.0.0}" -p:DebugType=none -p:UseAppHost=false >&2; then
+    rm -rf "$tmp"
+    failure="engine build failed (see the messages above)"
+    return 1
   fi
-  # The old build is already out of the way here, so a failing swap must put it back: the twin of dbm.cmd's
-  # :build_no_swap. Without it the user would be left with no engine/dist at all.
-  if ! mv "$engine/dist.tmp" "$engine/dist" 2>/dev/null; then
-    if [ -d "$old" ]; then mv "$old" "$engine/dist" 2>/dev/null || true; fi
-    rm -rf "$engine/dist.tmp"
-    echo "dbm: engine/dist could not be replaced; the previous build is still in place." >&2
-    exit 4
+  if ! { prune_natives "$tmp" && printf '%s' "${version:-0.0.0}" > "$tmp/VERSION"; }; then
+    rm -rf "$tmp"
+    failure="engine build could not be finished (pruning or writing VERSION failed)"
+    return 1
+  fi
+  if [ -d "$engine/dist" ] && ! mv "$engine/dist" "$old" 2>/dev/null; then
+    rm -rf "$tmp"
+    failure="engine/dist is in use by a running dbm server - run 'dbm stop' in that project folder to let the update through"
+    return 1
+  fi
+  # The old build is already out of the way here, so a failing swap must put it back (the twin of dbm.cmd's
+  # :build_no_swap). The message claims it is back only when the move-back actually worked.
+  if ! mv "$tmp" "$engine/dist" 2>/dev/null; then
+    rm -rf "$tmp"
+    if [ -d "$old" ] && ! mv "$old" "$engine/dist" 2>/dev/null; then
+      failure="engine/dist could not be replaced, and the previous build could not be put back: it is in $old - rename it to dist"
+    else
+      failure="engine/dist could not be replaced"
+    fi
+    return 1
   fi
   rm -rf "$old" 2>/dev/null || true
+  return 0
 }
 
+# Staleness is judged by the lock's own age, never by how long this process has waited: a build that runs longer
+# than the wait must keep its lock. Only a lock whose owner file names this process is ever released by it.
 acquire_lock() {
-  waited=0
+  announced=0
   while ! mkdir "$lock" 2>/dev/null; do
-    waited=$((waited + 1))
-    if [ "$waited" -gt 180 ]; then
+    if [ "$announced" = 0 ]; then
+      echo "dbm: waiting for another engine build to finish (engine/.build.lock)..." >&2
+      announced=1
+    fi
+    if [ -n "$(find "$lock" -maxdepth 0 -mmin +"$lock_stale_minutes" 2>/dev/null)" ]; then
+      echo "dbm: removing engine/.build.lock, older than $lock_stale_minutes minutes (a build that crashed)." >&2
       rm -rf "$lock"
-      waited=0
+      continue
     fi
     sleep 1
   done
+  printf '%s' "$lock_owner" > "$lock/owner"
+}
+
+release_lock() {
+  if [ "$(cat "$lock/owner" 2>/dev/null || true)" = "$lock_owner" ]; then rm -rf "$lock"; fi
 }
 
 if ! command -v dotnet >/dev/null 2>&1; then
@@ -121,12 +147,21 @@ fi
 if [ -n "$reason" ]; then
   if dotnet --list-sdks 2>/dev/null | grep -q .; then
     acquire_lock
-    trap 'rmdir "$lock" 2>/dev/null || true' EXIT INT TERM
+    trap 'release_lock' EXIT
+    trap 'exit 130' INT TERM
     installed=$(dist_version)   # another launcher may have built it while we waited for the lock
     if [ ! -f "$dll" ] || [ "${DBM_REBUILD:-}" = "1" ] || { [ -n "$version" ] && [ "$installed" != "$version" ]; }; then
-      build_engine
+      if ! build_engine; then
+        if [ ! -f "$dll" ]; then
+          echo "dbm: $failure." >&2
+          exit 4
+        fi
+        # A failed rebuild must not take away the build that still works; it is retried on the next command.
+        previous=$(dist_version)
+        echo "dbm: warning: $failure; running the previous engine/dist ${previous:-without VERSION} instead." >&2
+      fi
     fi
-    rmdir "$lock" 2>/dev/null || true
+    release_lock
     trap - EXIT INT TERM
   elif [ ! -f "$dll" ]; then
     echo "dbm: engine not built ($dll is missing) and no .NET SDK is installed to build it." >&2

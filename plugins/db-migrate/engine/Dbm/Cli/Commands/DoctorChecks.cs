@@ -59,30 +59,47 @@ public static class DoctorChecks
         if (!string.Equals(dist.Name, "dist", StringComparison.OrdinalIgnoreCase) || dist.Parent?.Parent is null)
             return new("dist", true, "development build (not engine/dist)");
 
+        // A check that could not run is never ok (T6.2 review F6).
         var manifest = Path.Combine(dist.Parent.Parent.FullName, ".claude-plugin", "plugin.json");
-        if (!File.Exists(manifest)) return new("dist", true, "no plugin.json next to engine/dist");
+        if (!File.Exists(manifest)) return new("dist", false, $"cannot check: no plugin.json at {manifest}");
 
         string? pluginVersion;
         try
         {
             pluginVersion = JsonNode.Parse(File.ReadAllText(manifest))?["version"]?.GetValue<string>();
         }
-        catch (Exception ex) when (ex is JsonException or InvalidOperationException or IOException)
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException or IOException or UnauthorizedAccessException)
         {
-            return new("dist", false, $"plugin.json is unreadable: {ex.Message}");
+            return new("dist", false, $"cannot check: plugin.json is unreadable: {ex.Message}");
         }
-        if (string.IsNullOrWhiteSpace(pluginVersion)) return new("dist", false, "plugin.json has no version");
+        if (string.IsNullOrWhiteSpace(pluginVersion)) return new("dist", false, "cannot check: plugin.json has no version");
 
         var versionFile = Path.Combine(dist.FullName, "VERSION");
-        var distVersion = File.Exists(versionFile) ? File.ReadAllText(versionFile).Trim() : "";
+        string distVersion;
+        try
+        {
+            distVersion = File.ReadAllText(versionFile).Trim();
+        }
+        catch (FileNotFoundException)
+        {
+            distVersion = "";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return new("dist", false, $"cannot check: engine/dist/VERSION is unreadable: {ex.Message}");
+        }
         if (distVersion.Length == 0)
-            return new("dist", false, $"engine/dist has no VERSION file (plugin.json is {pluginVersion}); {Rebuild}");
+            return new("dist", false, $"engine/dist has no VERSION file (plugin.json is {pluginVersion}). {Remedy}");
         return distVersion == pluginVersion
-            ? new("dist", true, $"engine/dist {distVersion} matches plugin.json")
-            : new("dist", false, $"engine/dist is {distVersion} but plugin.json is {pluginVersion}; {Rebuild}");
+            ? new("dist", true, $"engine/dist VERSION {distVersion} matches plugin.json (a source change at the same version is not detected)")
+            : new("dist", false, $"engine/dist is {distVersion} but plugin.json is {pluginVersion}. {Remedy}");
     }
 
-    private const string Rebuild = "rebuild it with engine/release.ps1 (or release.sh), or DBM_REBUILD=1 dbm version";
+    /// <summary>A stale dist reaches doctor only when no .NET SDK is installed (with one, the launcher rebuilds first),
+    /// so the first remedy must work without an SDK, and none may use shell-specific syntax (Ruling 169).</summary>
+    private const string Remedy =
+        "Update the plugin: claude plugin update db-migrate@db-migrate, then restart Claude Code. " +
+        "With the .NET 8 SDK installed the launcher rebuilds engine/dist by itself.";
 
     private static string Hint() => OperatingSystem.IsWindows()
         ? "DPAPI needs an interactive Windows user profile."

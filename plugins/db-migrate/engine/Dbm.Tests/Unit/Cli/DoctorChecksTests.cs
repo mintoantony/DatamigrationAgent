@@ -58,7 +58,7 @@ public class DoctorChecksTests
     {
         var check = DoctorChecks.Protector(() => throw new InvalidOperationException("no key store"));
 
-        Assert.False(check.Ok);
+        Assert.False(check.Ok, "protector check passed although the protector threw: " + check.Detail);
         Assert.Contains("no key store", check.Detail);
     }
 
@@ -67,7 +67,7 @@ public class DoctorChecksTests
     {
         var check = DoctorChecks.Protector(() => new FakeProtector(p => p, p => p));
 
-        Assert.False(check.Ok);
+        Assert.False(check.Ok, "protector check passed over a protector that stores the plaintext: " + check.Detail);
         Assert.Contains("plaintext", check.Detail);
     }
 
@@ -77,7 +77,7 @@ public class DoctorChecksTests
         var check = DoctorChecks.Protector(() => new FakeProtector(
             p => "fake:" + Convert.ToBase64String(Encoding.UTF8.GetBytes(p)), _ => "something else"));
 
-        Assert.False(check.Ok);
+        Assert.False(check.Ok, "protector check passed although decryption returned different text: " + check.Detail);
         Assert.Contains("different text", check.Detail);
     }
 
@@ -151,9 +151,73 @@ public class DoctorChecksTests
 
         var check = DoctorChecks.Dist(MakeDist(tw.Root, "0.4.0", "0.3.0"));
 
-        Assert.False(check.Ok);
+        Assert.False(check.Ok, "dist check passed over a stale VERSION: " + check.Detail);
         Assert.Contains("0.3.0", check.Detail);
         Assert.Contains("0.4.0", check.Detail);
+    }
+
+    [Fact]
+    public void Dist_check_tells_a_user_without_an_sdk_to_update_the_plugin()
+    {
+        using var tw = new TestWorkspace();
+
+        var check = DoctorChecks.Dist(MakeDist(tw.Root, "0.4.0", "0.3.0"));
+
+        // A stale dist is only ever seen by a user with no .NET SDK (with one, the launcher rebuilds first),
+        // so the remedy must work without an SDK and without shell-specific syntax.
+        Assert.Contains("claude plugin update db-migrate@db-migrate", check.Detail);
+        Assert.Contains("restart Claude Code", check.Detail);
+        Assert.DoesNotContain("DBM_REBUILD=", check.Detail);
+    }
+
+    [Fact]
+    public void Dist_check_cannot_pass_without_plugin_json()
+    {
+        using var tw = new TestWorkspace();
+
+        var check = DoctorChecks.Dist(MakeDist(tw.Root, null, "0.3.0"));
+
+        Assert.False(check.Ok, "dist check passed although it could not run (no plugin.json): " + check.Detail);
+        Assert.Contains("cannot check", check.Detail);
+        Assert.Contains("plugin.json", check.Detail);
+    }
+
+    [Fact]
+    public void Dist_check_fails_on_an_unreadable_plugin_json()
+    {
+        using var tw = new TestWorkspace();
+        var dist = MakeDist(tw.Root, "0.3.0", "0.3.0");
+        File.WriteAllText(Path.Combine(tw.Root, "plugin", ".claude-plugin", "plugin.json"), "{ not json");
+
+        var check = DoctorChecks.Dist(dist);
+
+        Assert.False(check.Ok, "dist check passed although plugin.json could not be parsed: " + check.Detail);
+        Assert.Contains("unreadable", check.Detail);
+    }
+
+    [Fact]
+    public void Dist_check_fails_when_VERSION_cannot_be_read()
+    {
+        using var tw = new TestWorkspace();
+        var dist = MakeDist(tw.Root, "0.3.0", null);
+        Directory.CreateDirectory(Path.Combine(dist, "VERSION"));   // reading a directory throws on every OS
+
+        var check = DoctorChecks.Dist(dist);
+
+        Assert.False(check.Ok, "dist check passed although VERSION could not be read: " + check.Detail);
+        Assert.Contains("cannot check", check.Detail);
+        Assert.Contains("VERSION", check.Detail);
+    }
+
+    [Fact]
+    public void Quick_checks_the_dist_for_the_session_start_hook()
+    {
+        using var tw = new TestWorkspace();
+
+        var checks = DoctorChecks.Quick(MakeDist(tw.Root, "0.4.0", "0.3.0"));
+
+        Assert.Equal(new[] { "protector", "dist" }, checks.Select(c => c.Name));
+        Assert.False(checks.Single(c => c.Name == "dist").Ok, "doctor --quiet passed over a stale dist: Quick did not run the dist check");
     }
 
     [Fact]
@@ -163,7 +227,7 @@ public class DoctorChecksTests
 
         var check = DoctorChecks.Dist(MakeDist(tw.Root, "0.4.0", null));
 
-        Assert.False(check.Ok);
+        Assert.False(check.Ok, "dist check passed without a VERSION file: " + check.Detail);
         Assert.Contains("VERSION", check.Detail);
     }
 

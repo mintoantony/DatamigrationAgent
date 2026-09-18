@@ -27,13 +27,20 @@ public sealed class DoctorCommand : ICommand
         var ok = checks.All(c => c.Ok);
         if (quiet)
         {
-            if (ok) return 0;
-            var problems = string.Join("; ", checks.Where(c => !c.Ok).Select(c => $"{c.Name}: {c.Detail}"));
-            ctx.Out.WriteLine($"dbm doctor: {problems}");
-            return 1;
+            var (exit, lines) = QuietReport(checks);
+            foreach (var line in lines) ctx.Out.WriteLine(line);
+            return exit;
         }
         if (!ok) return Output.Write(ctx, new { ok, checks }, 1);
         return Output.Ok(ctx, new { ok, checks });
+    }
+
+    /// <summary>What `doctor --quiet` prints and returns: nothing and 0 when every check passed, otherwise one line per
+    /// failing check and 1. The SessionStart hook passes these lines to Claude as context.</summary>
+    internal static (int Exit, IReadOnlyList<string> Lines) QuietReport(IReadOnlyList<Check> checks)
+    {
+        var failing = checks.Where(c => !c.Ok).Select(c => $"dbm doctor: {c.Name}: {c.Detail}").ToList();
+        return (failing.Count == 0 ? 0 : 1, failing);
     }
 
     public static IReadOnlyList<Check> RunChecks() =>

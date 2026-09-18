@@ -48,12 +48,49 @@ $pluginRoot = Split-Path -Parent $engine
 $repoRoot = Split-Path -Parent (Split-Path -Parent $pluginRoot)
 $manifest = Join-Path $pluginRoot '.claude-plugin/plugin.json'
 $dist = Join-Path $engine 'dist'
-$tmp = Join-Path $engine 'dist.tmp'
+$tmp = Join-Path $engine "dist.tmp.$PID"
 $old = $null
+# The same lock as bin/dbm and bin/dbm.cmd use, so a release and a launcher rebuild never publish at the same time.
+$lock = Join-Path $engine '.build.lock'
+$lockOwner = "release-ps1-$PID"
+$LockStaleMinutes = 15
 
 function Invoke-Checked([string]$What, [scriptblock]$Command) {
     & $Command
     if ($LASTEXITCODE -ne 0) { throw "$What failed (exit code $LASTEXITCODE)" }
+}
+
+# Staleness by the lock's own age, never by how long we waited; only a lock this process owns is released.
+function Enter-BuildLock {
+    $announced = $false
+    while ($true) {
+        try {
+            New-Item -ItemType Directory -Path $lock -ErrorAction Stop | Out-Null
+            break
+        }
+        catch {
+            if ($_.CategoryInfo.Category -ne 'ResourceExists') { throw }
+        }
+        if (-not $announced) {
+            Write-Host 'release: waiting for another engine build to finish (engine/.build.lock)...'
+            $announced = $true
+        }
+        $item = Get-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
+        if ($item -and ((Get-Date) - $item.LastWriteTime).TotalMinutes -ge $LockStaleMinutes) {
+            Write-Warning "removing engine/.build.lock, older than $LockStaleMinutes minutes (a build that crashed)"
+            Remove-Item -LiteralPath $lock -Recurse -Force -ErrorAction SilentlyContinue
+            continue
+        }
+        Start-Sleep -Seconds 1
+    }
+    Set-Content -LiteralPath (Join-Path $lock 'owner') -Value $lockOwner -NoNewline
+}
+
+function Exit-BuildLock {
+    $ownerFile = Join-Path $lock 'owner'
+    if ((Test-Path -LiteralPath $ownerFile) -and (Get-Content -Raw -LiteralPath $ownerFile) -eq $lockOwner) {
+        Remove-Item -LiteralPath $lock -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 $version = (Get-Content -Raw $manifest | ConvertFrom-Json).version
@@ -84,46 +121,70 @@ if (-not $SkipTests) {
     }
 }
 
-if (Test-Path (Join-Path $dist 'Dbm.dll')) {
-    & dotnet (Join-Path $dist 'Dbm.dll') stop *> $null   # best effort: frees the DLLs if a server runs from this dist
-}
+Enter-BuildLock
+try {
+    if (Test-Path (Join-Path $dist 'Dbm.dll')) {
+        & dotnet (Join-Path $dist 'Dbm.dll') stop *> $null   # best effort: frees the DLLs if a server runs from this dist
+    }
 
-Write-Host '== publish'
-if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
-Invoke-Checked 'dotnet publish' {
-    dotnet publish (Join-Path $engine 'Dbm/Dbm.csproj') -c Release -o $tmp --nologo `
-        "-p:Version=$version" -p:DebugType=none -p:UseAppHost=false
-}
-if (-not $KeepAllRuntimes) { Remove-UnusedNatives $tmp }
-Set-Content -Path (Join-Path $tmp 'VERSION') -Value $version -NoNewline
+    Write-Host '== publish'
+    if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+    Invoke-Checked 'dotnet publish' {
+        dotnet publish (Join-Path $engine 'Dbm/Dbm.csproj') -c Release -o $tmp --nologo `
+            "-p:Version=$version" -p:DebugType=none -p:UseAppHost=false
+    }
+    if (-not $KeepAllRuntimes) { Remove-UnusedNatives $tmp }
+    Set-Content -Path (Join-Path $tmp 'VERSION') -Value $version -NoNewline
 
-if (Test-Path $dist) {
-    $old = Join-Path $engine ('dist.old.' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    # Both gates run against the new build BEFORE it replaces engine/dist, so a failed release leaves dist as it was.
+    # Asserted, not eyeballed: nothing in a committed dist may be a symbol file, a native host or a settings file.
+    Write-Host '== contents check'
+    $forbidden = @(Get-ChildItem $tmp -Recurse -File | Where-Object {
+            $ForbiddenExtensions -contains $_.Extension.ToLowerInvariant() -or $_.Name -like 'appsettings.*.json'
+        } | ForEach-Object { [IO.Path]::GetRelativePath($tmp, $_.FullName) })
+    if ($forbidden.Count -gt 0) {
+        throw ("the build must not contain symbol files, native hosts or environment settings, found: " + ($forbidden -join ', '))
+    }
+    Write-Host '  no .pdb, .exe, .user, .suo, .mdb or appsettings.*.json'
+
+    Write-Host '== smoke test'
+    $versionOut = (& dotnet (Join-Path $tmp 'Dbm.dll') version) -join ' '
+    if ($LASTEXITCODE -ne 0 -or $versionOut -notmatch [regex]::Escape($version)) {
+        throw "Smoke test failed: 'dbm version' printed: $versionOut"
+    }
+    Write-Host "  $versionOut"
+
+    if (Test-Path $dist) {
+        $old = Join-Path $engine ('dist.old.' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        try {
+            Move-Item -LiteralPath $dist -Destination $old
+        }
+        catch {
+            throw "engine/dist is in use by a running dbm server. Run 'dbm stop' in each project folder that uses this checkout, then retry."
+        }
+    }
     try {
-        Move-Item -LiteralPath $dist -Destination $old
+        Move-Item -LiteralPath $tmp -Destination $dist
     }
     catch {
-        Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
-        throw "engine/dist is in use by a running dbm server. Run 'dbm stop' in each project folder that uses this checkout, then retry."
+        # The old build is already out of the way, so put it back; claim it is back only when that worked.
+        $why = $_.Exception.Message
+        if ($old -and (Test-Path $old)) {
+            try {
+                Move-Item -LiteralPath $old -Destination $dist
+            }
+            catch {
+                throw "engine/dist could not be replaced ($why), and the previous build could not be put back: it is in $old - rename it to dist."
+            }
+        }
+        throw "engine/dist could not be replaced; the previous build is still in place. $why"
     }
+    if ($old) { Remove-Item -Recurse -Force $old -ErrorAction SilentlyContinue }
 }
-try {
-    Move-Item -LiteralPath $tmp -Destination $dist
+finally {
+    if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
+    Exit-BuildLock
 }
-catch {
-    # The old build is already out of the way, so put it back rather than leave the user with no engine at all.
-    if ($old -and (Test-Path $old)) { Move-Item -LiteralPath $old -Destination $dist -ErrorAction SilentlyContinue }
-    Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
-    throw "engine/dist could not be replaced; the previous build is still in place. $($_.Exception.Message)"
-}
-if ($old) { Remove-Item -Recurse -Force $old -ErrorAction SilentlyContinue }
-
-Write-Host '== smoke test'
-$versionOut = (& dotnet (Join-Path $dist 'Dbm.dll') version) -join ' '
-if ($LASTEXITCODE -ne 0 -or $versionOut -notmatch [regex]::Escape($version)) {
-    throw "Smoke test failed: 'dbm version' printed: $versionOut"
-}
-Write-Host "  $versionOut"
 
 if (Get-Command claude -ErrorAction SilentlyContinue) {
     Write-Host '== plugin validation'
@@ -142,15 +203,6 @@ $files | Sort-Object Length -Descending | Select-Object -First 8 | ForEach-Objec
     Write-Host ('  {0,9:N0} KB  {1}' -f ($_.Length / 1KB), [IO.Path]::GetRelativePath($dist, $_.FullName))
 }
 if ($total -gt 60MB) { Write-Warning 'engine/dist is larger than 60 MB; check for unexpected dependencies before committing.' }
-
-# Asserted, not eyeballed: this is the last gate before these bytes are committed and shipped.
-$forbidden = @($files | Where-Object {
-        $ForbiddenExtensions -contains $_.Extension.ToLowerInvariant() -or $_.Name -like 'appsettings.*.json'
-    } | ForEach-Object { [IO.Path]::GetRelativePath($dist, $_.FullName) })
-if ($forbidden.Count -gt 0) {
-    throw ("engine/dist must not contain symbol files, native hosts or environment settings, found: " + ($forbidden -join ', '))
-}
-Write-Host '  no .pdb, .exe, .user, .suo or appsettings.*.json'
 
 Write-Host ''
 Write-Host "Next: git add -A plugins/db-migrate/engine/dist && git commit -m 'build: release engine $version'" -ForegroundColor Cyan

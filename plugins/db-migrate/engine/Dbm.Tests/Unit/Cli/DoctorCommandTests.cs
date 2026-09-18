@@ -40,4 +40,32 @@ public class DoctorCommandTests
         Assert.Equal(0, exit);
         Assert.Equal("", sw.ToString());
     }
+
+    [Fact]
+    public void Quiet_report_prints_one_line_per_failing_check_and_nothing_else()
+    {
+        var checks = new DoctorCommand.Check[]
+        {
+            new("runtime", true, ".NET 8.0.28"),
+            new("protector", false, "no key store"),
+            new("home", true, "C:\\Users\\me\\.dbmigrate"),
+            new("dist", false, "engine/dist is 0.3.0 but plugin.json is 0.4.0"),
+        };
+
+        var (exit, lines) = DoctorCommand.QuietReport(checks);
+
+        Assert.True(exit != 0, "doctor --quiet exited 0 although two checks failed");
+        Assert.Equal(
+            new[] { "dbm doctor: protector: no key store", "dbm doctor: dist: engine/dist is 0.3.0 but plugin.json is 0.4.0" },
+            lines);
+    }
+
+    [Fact]
+    public void Quiet_report_is_empty_and_exits_0_when_every_check_passes()
+    {
+        var (exit, lines) = DoctorCommand.QuietReport([new("runtime", true, "ok"), new("dist", true, "ok")]);
+
+        Assert.Equal(0, exit);
+        Assert.Empty(lines);
+    }
 }

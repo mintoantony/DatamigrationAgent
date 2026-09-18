@@ -13,9 +13,14 @@ engine=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 plugin_root=$(dirname -- "$engine")
 repo_root=$(dirname -- "$(dirname -- "$plugin_root")")
 manifest="$plugin_root/.claude-plugin/plugin.json"
+marketplace="$repo_root/.claude-plugin/marketplace.json"
 dist="$engine/dist"
-tmp="$engine/dist.tmp"
+tmp="$engine/dist.tmp.$$"
 old="$engine/dist.old.$$"
+# The same lock as bin/dbm and bin/dbm.cmd use, so a release and a launcher rebuild never publish at the same time.
+lock="$engine/.build.lock"
+lock_owner="release-sh-$$"
+lock_stale_minutes=15
 skip_tests=0
 keep_all_runtimes=0
 for arg in "$@"; do
@@ -44,11 +49,53 @@ prune_natives() {
   find "$target" -type f -name '*msalruntime*' -delete
 }
 
+# Staleness by the lock's own age, and only a lock this process owns is released (see bin/dbm).
+acquire_lock() {
+  announced=0
+  while ! mkdir "$lock" 2>/dev/null; do
+    if [ "$announced" = 0 ]; then
+      echo "release: waiting for another engine build to finish (engine/.build.lock)..." >&2
+      announced=1
+    fi
+    if [ -n "$(find "$lock" -maxdepth 0 -mmin +"$lock_stale_minutes" 2>/dev/null)" ]; then
+      echo "release: removing engine/.build.lock, older than $lock_stale_minutes minutes (a build that crashed)." >&2
+      rm -rf "$lock"
+      continue
+    fi
+    sleep 1
+  done
+  printf '%s' "$lock_owner" > "$lock/owner"
+}
+
+release_lock() {
+  if [ "$(cat "$lock/owner" 2>/dev/null || true)" = "$lock_owner" ]; then rm -rf "$lock"; fi
+}
+
+# The version inside the db-migrate entry of marketplace.json; empty when the entry has no version field.
+marketplace_version() {
+  if command -v node >/dev/null 2>&1; then
+    node -e 'const m = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+const p = (m.plugins || []).find(x => x && x.name === "db-migrate");
+process.stdout.write(p && typeof p.version === "string" ? p.version : "");' "$1"
+  else
+    # Without node: the first "version" after a "name": "db-migrate", reset at every closing brace, so the
+    # marketplace's own top-level name (also db-migrate) never pairs with a later entry's version.
+    tr -d '\r' < "$1" | awk '
+      /"name"[[:space:]]*:[[:space:]]*"db-migrate"/ { inside = 1 }
+      inside && /"version"[[:space:]]*:/ { sub(/.*"version"[[:space:]]*:[[:space:]]*"/, ""); sub(/".*/, ""); print; exit }
+      inside && /}/ { inside = 0 }'
+  fi
+}
+
 version=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" | head -n 1)
 [ -n "$version" ] || die "no version in $manifest"
 echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' || die "plugin.json version '$version' is not SemVer (x.y.z[-pre])"
 echo "db-migrate release $version"
 
+if [ -f "$marketplace" ]; then
+  mp_version=$(marketplace_version "$marketplace") || die "cannot read $marketplace"
+  [ -z "$mp_version" ] || [ "$mp_version" = "$version" ] || die "marketplace.json lists db-migrate $mp_version but plugin.json says $version"
+fi
 props_version=$(sed -n 's/.*<Version>\([^<]*\)<\/Version>.*/\1/p' "$engine/Directory.Build.props" | head -n 1)
 [ "$props_version" = "$version" ] || die "Directory.Build.props has <Version>$props_version</Version> but plugin.json says $version"
 
@@ -61,6 +108,10 @@ if [ "$skip_tests" = 0 ]; then
   fi
 fi
 
+acquire_lock
+trap 'rm -rf "$tmp"; release_lock' EXIT
+trap 'exit 130' INT TERM
+
 if [ -f "$dist/Dbm.dll" ]; then dotnet "$dist/Dbm.dll" stop >/dev/null 2>&1 || true; fi
 
 echo "== publish"
@@ -70,23 +121,34 @@ dotnet publish "$engine/Dbm/Dbm.csproj" -c Release -o "$tmp" --nologo \
 [ "$keep_all_runtimes" = 1 ] || prune_natives "$tmp"
 printf '%s' "$version" > "$tmp/VERSION"
 
-if [ -d "$dist" ]; then
-  mv "$dist" "$old" 2>/dev/null || { rm -rf "$tmp"; die "engine/dist is in use by a running dbm server; run 'dbm stop' in each project folder, then retry"; }
-fi
-# The old build is already out of the way here, so a failing swap must put it back rather than leave no engine at all.
-if ! mv "$tmp" "$dist" 2>/dev/null; then
-  if [ -d "$old" ]; then mv "$old" "$dist" 2>/dev/null || true; fi
-  rm -rf "$tmp"
-  die "engine/dist could not be replaced; the previous build is still in place"
-fi
-rm -rf "$old" 2>/dev/null || true
+# Both gates run against the new build BEFORE it replaces engine/dist, so a failed release leaves dist as it was.
+# Asserted, not eyeballed: nothing in a committed dist may be a symbol file, a native host or a settings file that
+# could carry a connection string.
+echo "== contents check"
+forbidden=$(find "$tmp" -type f \( -name '*.pdb' -o -name '*.exe' -o -name '*.user' -o -name '*.suo' \
+  -o -name '*.mdb' -o -name 'appsettings.*.json' \) | sed "s|^$tmp/||" | sort | tr '\n' ' ')
+[ -z "$forbidden" ] || die "the build must not contain symbol files, native hosts or environment settings, found: $forbidden"
+echo "  no .pdb, .exe, .user, .suo, .mdb or appsettings.*.json"
 
 echo "== smoke test"
-version_out=$(dotnet "$dist/Dbm.dll" version) || die "dbm version failed"
+version_out=$(dotnet "$tmp/Dbm.dll" version) || die "dbm version failed"
 case "$version_out" in
   *"$version"*) echo "  $version_out" ;;
   *) die "smoke test failed: dbm version printed: $version_out" ;;
 esac
+
+if [ -d "$dist" ]; then
+  mv "$dist" "$old" 2>/dev/null || die "engine/dist is in use by a running dbm server; run 'dbm stop' in each project folder, then retry"
+fi
+# The old build is already out of the way here, so a failing swap must put it back rather than leave no engine at all.
+if ! mv "$tmp" "$dist" 2>/dev/null; then
+  if [ -d "$old" ] && ! mv "$old" "$dist" 2>/dev/null; then
+    die "engine/dist could not be replaced, and the previous build could not be put back: it is in $old - rename it to dist"
+  fi
+  die "engine/dist could not be replaced; the previous build is still in place"
+fi
+rm -rf "$old" 2>/dev/null || true
+release_lock
 
 if command -v claude >/dev/null 2>&1; then
   echo "== plugin validation"
@@ -104,13 +166,6 @@ find "$dist" -type f -exec du -k {} + | sort -n -r | head -n 8 | while IFS="$(pr
   printf '  %9s KB  %s\n' "$size" "${path#"$dist"/}"
 done
 [ "$kb" -le 61440 ] || echo "warning: engine/dist is larger than 60 MB; check for unexpected dependencies before committing" >&2
-
-# Asserted, not eyeballed: this is the last gate before these bytes are committed and shipped. Nothing in a committed
-# dist may be a symbol file, a native host or a settings file that could carry a connection string.
-forbidden=$(find "$dist" -type f \( -name '*.pdb' -o -name '*.exe' -o -name '*.user' -o -name '*.suo' \
-  -o -name '*.mdb' -o -name 'appsettings.*.json' \) | sed "s|^$dist/||" | sort | tr '\n' ' ')
-[ -z "$forbidden" ] || die "engine/dist must not contain symbol files, native hosts or environment settings, found: $forbidden"
-echo "  no .pdb, .exe, .user, .suo or appsettings.*.json"
 
 echo
 echo "Next: git add -A plugins/db-migrate/engine/dist && git commit -m 'build: release engine $version'"
