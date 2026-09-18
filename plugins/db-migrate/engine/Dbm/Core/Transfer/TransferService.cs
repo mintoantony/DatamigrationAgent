@@ -222,7 +222,10 @@ public sealed class TransferService
     /// Starts a new run (contract C7's start rules) and returns its id; the run itself proceeds in the background on
     /// <see cref="Current"/>.
     /// </summary>
-    public async Task<long> StartAsync(TransferOptions options, string confirmTarget, CancellationToken ct)
+    /// <param name="confirmNonEmpty">Ruling 186: the target tables the operator confirmed loading into although they already hold rows.
+    /// Without Truncate target first, a new run is refused (<c>target_not_empty</c>) unless every non-empty table is named here.</param>
+    public async Task<long> StartAsync(TransferOptions options, string confirmTarget, CancellationToken ct,
+        IReadOnlyCollection<string>? confirmNonEmpty = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         options = options.Normalized();
@@ -290,6 +293,7 @@ public sealed class TransferService
             if (!pre.Passed)
                 throw new TransferException("preflight_failed", "Pre-flight checks failed.",
                     pre.Checks.Where(c => !c.Ok && c.Severity == "error").Select(c => $"{c.Name}: {c.Detail}").ToList());
+            EnsureNonEmptyTargetsConfirmed(pre, options, confirmNonEmpty);
 
             var engine = new TransferEngine(_services, approved.Plan, srcCs, tgtCs);
             long runId = engine.CreateRun(approved.Version, options);
@@ -569,6 +573,29 @@ public sealed class TransferService
     }
 
     // ------------------------------------------------------------------ start / resume guards
+
+    /// <summary>
+    /// Ruling 186 (open item 27). A new run loads every table from the start. Into a table that already holds rows that means
+    /// duplicates wherever nothing refuses them (no primary key, no unique index) and a wall of rejects everywhere else - and one click
+    /// on the default options used to do it, under a report that then said "validated". So a new run into a non-empty target is a
+    /// deliberate act: Truncate target first, or a confirmation that names every non-empty table. Resume is not affected: it continues
+    /// from checkpoints and loads nothing twice.
+    /// </summary>
+    private static void EnsureNonEmptyTargetsConfirmed(PreflightResult pre, TransferOptions options, IReadOnlyCollection<string>? confirmed)
+    {
+        if (options.TruncateTarget || pre.NonEmptyTargets.Count == 0) return;
+        var named = new HashSet<string>(confirmed ?? [], StringComparer.OrdinalIgnoreCase);
+        var unconfirmed = pre.NonEmptyTargets.Where(t => !named.Contains(t.Target)).ToList();
+        if (unconfirmed.Count == 0) return;
+        var keyless = pre.NonEmptyTargets.Where(t => t.Keyless).Select(t => t.Target).ToList();
+        throw new TransferException("target_not_empty",
+            "Target tables already hold rows, and a new run loads every table from the start"
+            + (keyless.Count > 0 ? $": {string.Join(", ", keyless)} {(keyless.Count == 1 ? "has" : "have")} no primary key or unique index, "
+                                   + "so rows will be loaded again — duplicates" : "")
+            + ". Choose 'Truncate target first', or confirm loading into the non-empty tables by name.",
+            pre.NonEmptyTargets.Select(t => $"{t.Target}: {t.Rows.ToString("N0", System.Globalization.CultureInfo.InvariantCulture)} rows"
+                                            + (t.Keyless ? " (no key: rows will be loaded again — duplicates)" : " (keyed: repeated keys are rejected)")).ToList());
+    }
 
     /// <summary>
     /// Ruling 103's lock, asked for before the run is launched instead of only inside <see cref="TransferEngine.RunAsync"/>. A refusal

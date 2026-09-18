@@ -423,6 +423,8 @@ public sealed class EndToEndTransferTests(SamplePlanFixture fx) : IClassFixture<
             Assert.Contains("app.Orders", rows.Detail);
             Assert.Contains("app.AuditEvents (5,000)", rows.Detail);
             Assert.Contains("Truncate target first", rows.Detail);
+            // Ruling 186: the keyless table is named as the one that doubles, not lumped in with "duplicate keys".
+            Assert.Contains("No primary key or unique index on app.AuditEvents: rows will be loaded again — duplicates", rows.Detail);
             Assert.True(new PreflightResult(1, Clock.Now(), checks.ToList()).Passed);   // a warning does not stop the run
         }
 
@@ -445,8 +447,15 @@ public sealed class EndToEndTransferTests(SamplePlanFixture fx) : IClassFixture<
         var refused = Json.Deserialize<FinalReport>(rig.Repo.GetRun(secondRun)!.SummaryJson!);
         Assert.Equal(SourceRows["app.Products"], refused.RowsError);
         Assert.Equal(SourceRows["app.AuditEvents"], refused.RowsLoaded);
-        Assert.Contains(refused.Notes, n => n.Contains("Row counts validated for all 2 tasks", StringComparison.Ordinal));
-        Assert.Contains("row counts validated", FinalReportBuilder.Summary(refused));
+        // Ruling 186: the counts balance as rows ADDED, and the report now says exactly that instead of an unqualified "validated"
+        // over a doubled table.
+        string headline = FinalReportBuilder.Summary(refused);
+        Assert.True(headline.Contains(FinalReportBuilder.NotEmptyBefore, StringComparison.Ordinal) && !headline.Contains("validated", StringComparison.Ordinal),
+            "the headline over a target that was not empty: " + headline);
+        Assert.True(refused.Notes.Any(n => n.StartsWith("Target tables were not empty before this run:", StringComparison.Ordinal)
+                                           && n.Contains("app.AuditEvents (5,000)", StringComparison.Ordinal)),
+            "the report does not say the target was not empty: " + string.Join(" | ", refused.Notes));
+        Assert.DoesNotContain(refused.Notes, n => n.Contains("Row counts validated", StringComparison.Ordinal));
 
         var third = rig.NewEngine();
         long thirdRun = third.CreateRun(1, new TransferOptions { ErrorMode = "skip", TruncateTarget = true });

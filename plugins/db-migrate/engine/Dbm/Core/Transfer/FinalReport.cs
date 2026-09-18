@@ -44,6 +44,10 @@ public sealed record TaskReport(string TaskId, string Target, TransferTaskStatus
     /// <summary>What <see cref="Status"/> means once the run's own status is taken into account - a "paused" task under a cancelled run
     /// was not paused by an operator (5.3 review F9).</summary>
     public string? StatusNote { get; init; }
+
+    /// <summary>Rows the target table held before this run loaded anything (after Truncate target first, when chosen); null when the
+    /// run never counted. Ruling 186: above 0, the row counts compare rows <b>added</b>, not the table.</summary>
+    public long? RowsBefore { get; init; }
 }
 
 /// <summary>
@@ -124,10 +128,19 @@ public static class FinalReportBuilder
         // "of at least": while some task has no source count, the total below it is a floor and must not be offered as the whole.
         string of = report.TasksWithoutSource > 0 ? "of at least" : "of";
         string duration = report.DurationSec is { } d ? Dur(d) : "an unknown time";
-        string counts = anyMismatch ? "MISMATCH" : anyUnconfirmed ? "NOT CONFIRMED" : "validated";
+        // Ruling 186: over a target that already held rows the counts balance rows ADDED - a doubled keyless table balances too - so
+        // the headline must not call that "validated" without saying what was compared.
+        string counts = anyMismatch ? "row counts MISMATCH" : anyUnconfirmed ? "row counts NOT CONFIRMED" : "row counts validated";
+        if (NonEmptyBefore(report))
+            counts = anyMismatch || anyUnconfirmed ? counts + " (" + NotEmptyBefore + ")" : NotEmptyBefore;
         return $"Transferred {N(report.RowsLoaded)} {of} {N(report.RowsSource)} rows into {tables} {(tables == 1 ? "table" : "tables")} "
-               + $"in {duration}{rejected}; row counts {counts}{checks}.";
+               + $"in {duration}{rejected}; {counts}{checks}.";
     }
+
+    /// <summary>Ruling 186's headline wording for a run whose target tables were not empty when it started.</summary>
+    public const string NotEmptyBefore = "target tables were not empty before this run; counts compare rows added";
+
+    public static bool NonEmptyBefore(FinalReport report) => report.Tasks.Any(t => t.RowsBefore > 0);
 
     public static string Dur(double seconds)
     {
@@ -153,6 +166,7 @@ public static class FinalReportBuilder
             ChecksumColumnsNotCompared = v?.ChecksumColumnsNotCompared ?? 0,
             ErrorSamplesNote = ErrorSamplesNote(t.RowsError, samples.Count, errorRowCount?.Invoke(t.TaskId)),
             StatusNote = StatusNote(t.Status, status),
+            RowsBefore = t.RowsBefore,
         };
     }
 
@@ -226,8 +240,13 @@ public static class FinalReportBuilder
         if (notValidated.Count > 0)
             notes.Add("No validation was recorded for: " + string.Join(", ", notValidated)
                       + ". Nothing was checked for these tasks - their row counts and values are unconfirmed.");
+        var before = tasks.Where(t => t.RowsBefore > 0).Select(t => $"{t.Target} ({N(t.RowsBefore!.Value)})").ToList();
+        if (before.Count > 0)
+            notes.Add("Target tables were not empty before this run: " + string.Join(", ", before) + ". Their row counts compare the rows "
+                      + "this run added against the source, not the table's contents; a table with no key can hold its rows twice.");
         if (mismatch.Count == 0 && notCompared.Count == 0 && notValidated.Count == 0 && tasks.Count > 0)
-            notes.Add($"Row counts validated for all {tasks.Count} tasks.");
+            notes.Add(before.Count > 0 ? $"Row counts balance for all {tasks.Count} tasks as rows added."
+                                       : $"Row counts validated for all {tasks.Count} tasks.");
 
         var badSums = tasks.SelectMany(t => t.Checksums.Where(c => !c.Match).Select(c => $"{t.Target}.{c.Column}")).ToList();
         if (badSums.Count > 0) notes.Add("Column checksums differ for: " + string.Join(", ", badSums) + ".");

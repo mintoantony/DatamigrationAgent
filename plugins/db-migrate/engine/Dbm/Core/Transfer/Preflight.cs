@@ -27,7 +27,14 @@ public sealed record PreflightCheck(string Name, bool Ok, string Severity, strin
 public sealed record PreflightResult(int SqlVersion, DateTimeOffset At, List<PreflightCheck> Checks)
 {
     public bool Passed => Checks.All(c => c.Ok || c.Severity != "error");
+
+    /// <summary>Ruling 186: the plan's target tables that already hold rows, as counted by this checklist. A new run into any of them
+    /// needs Truncate target first or a confirmation naming them (<see cref="TransferService.StartAsync"/>). Always serialised.</summary>
+    public List<NonEmptyTarget> NonEmptyTargets { get; init; } = [];
 }
+
+/// <param name="Keyless">No primary key and no unique index: nothing in the target refuses a row loaded a second time.</param>
+public sealed record NonEmptyTarget(string Target, long Rows, bool Keyless);
 
 public sealed record ApprovedPlan(int Version, SqlPlanPayload Plan);
 
@@ -55,6 +62,7 @@ public static class Preflight
         ArgumentNullException.ThrowIfNull(s);
         ArgumentNullException.ThrowIfNull(options);
         var checks = new List<PreflightCheck>();
+        var nonEmptyTargets = new List<NonEmptyTarget>();
         PhaseRow phase;
         ApprovedPlan? approved;
         try
@@ -126,7 +134,7 @@ public static class Preflight
             {
                 try
                 {
-                    checks.AddRange(await TargetChecksAsync(tgt, approved.Plan, options, ct));
+                    checks.AddRange(await TargetChecksAsync(tgt, approved.Plan, options, ct, nonEmptyTargets));
                 }
                 catch (Exception ex) when (ex is SqlException or InvalidOperationException or TimeoutException)
                 {
@@ -186,7 +194,10 @@ public static class Preflight
             if (tgt is not null) await tgt.DisposeAsync();
         }
         return new PreflightResult(approved.Version, Clock.Now(),
-            checks.Select(c => c with { Detail = Scrubbed(c.Detail, secrets) }).ToList());
+            checks.Select(c => c with { Detail = Scrubbed(c.Detail, secrets) }).ToList())
+        {
+            NonEmptyTargets = nonEmptyTargets,
+        };
     }
 
     /// <summary>
@@ -211,7 +222,7 @@ public static class Preflight
     /// check at all.</para>
     /// </summary>
     public static async Task<List<PreflightCheck>> TargetChecksAsync(SqlConnection tgt, SqlPlanPayload plan, TransferOptions options,
-        CancellationToken ct)
+        CancellationToken ct, List<NonEmptyTarget>? nonEmptyTargets = null)
     {
         ArgumentNullException.ThrowIfNull(tgt);
         ArgumentNullException.ThrowIfNull(plan);
@@ -225,6 +236,7 @@ public static class Preflight
         var noAlter = new List<string>();
         var noTruncate = new List<string>();
         var nonEmpty = new List<string>();
+        var keylessNonEmpty = new List<string>();
         var probeErrors = new List<string>();        // "app.X: <server message>" - what the target_probe check reports
         var permFailed = new List<string>();         // tables whose permission probe never answered
         var permFailedIdentity = new List<string>();
@@ -266,7 +278,13 @@ public static class Preflight
             try
             {
                 long rows = await TargetOps.CountTargetAsync(tgt, target, ct);
-                if (rows > 0) nonEmpty.Add($"{target} ({rows.ToString("N0", CultureInfo.InvariantCulture)})");
+                if (rows > 0)
+                {
+                    nonEmpty.Add($"{target} ({rows.ToString("N0", CultureInfo.InvariantCulture)})");
+                    bool keyless = !await HasUniqueKeyAsync(tgt, target, ct);
+                    if (keyless) keylessNonEmpty.Add(target);
+                    nonEmptyTargets?.Add(new NonEmptyTarget(target, rows, keyless));
+                }
             }
             catch (Exception ex) when (ex is SqlException or TimeoutException)
             {
@@ -322,14 +340,30 @@ public static class Preflight
         checks.Add(nonEmpty.Count == 0 ? Ok("target_rows", "All target tables that could be counted are empty." + skippedRows)
             : options.TruncateTarget ? Ok("target_rows", "Will be emptied first: " + string.Join(", ", nonEmpty) + "." + skippedRows)
             : new PreflightCheck("target_rows", false, "warning",
-                "Target tables already contain rows: " + string.Join(", ", nonEmpty)
-                + ". Loading may hit duplicate keys; consider 'Truncate target first'." + skippedRows));
+                "Target tables already contain rows: " + string.Join(", ", nonEmpty) + "."
+                + (keylessNonEmpty.Count > 0
+                    ? " No primary key or unique index on " + string.Join(", ", keylessNonEmpty)
+                      + ": rows will be loaded again — duplicates, nothing refuses them."
+                    : "")
+                + (keylessNonEmpty.Count < nonEmpty.Count
+                    ? " Tables with a key reject rows whose keys are already there (skipped and logged, or the run stops)."
+                    : "")
+                + " A new run needs 'Truncate target first', or a confirmation naming these tables." + skippedRows));
 
         // The faults themselves, named, as an error: the verdicts above have each said which tables they could not cover, but the
         // reason lives here, and without it the operator is told what was not checked and never why.
         if (probeErrors.Count > 0)
             checks.Add(Err("target_probe", "Some target tables could not be checked: " + string.Join("; ", probeErrors) + "."));
         return checks;
+    }
+
+    /// <summary>A primary key or any unique index: something in the target that refuses a row loaded twice.</summary>
+    private static async Task<bool> HasUniqueKeyAsync(SqlConnection tgt, string target, CancellationToken ct)
+    {
+        await using var cmd = new SqlCommand(
+            "SELECT CASE WHEN EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(@t, N'U') AND is_unique = 1) THEN 1 ELSE 0 END", tgt);
+        cmd.Parameters.Add(new SqlParameter("@t", SqlDbType.NVarChar, 600) { Value = SqlQuote.TableKey(target) });
+        return Convert.ToInt32(await cmd.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture) == 1;
     }
 
     private static string Clause(string why, IEnumerable<string> names)

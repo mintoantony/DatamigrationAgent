@@ -106,6 +106,9 @@
       // "of at least": while a task has no source count the total above it is a floor, not a total.
       missing ? DBM.components.notice('warn', missing + (missing === 1 ? ' task has' : ' tasks have')
         + ' no source row count, so the source total above is a floor and the percentages are priced from it.') : null,
+      // Ruling 186: over a target that already held rows the counts compare rows added, not the table.
+      tasks.some(function (t) { return t.rowsBefore > 0; }) ? DBM.components.notice('warn', 'Target tables were not empty before this run; '
+        + 'the row counts compare the rows it added, not the tables\u2019 contents. A table with no key can hold its rows twice.') : null,
       tasksCard(tasks),
       sums.total ? h('div', { class: 'muted small rep-caveat' },
         'Column checksums are sums of per-row BINARY_CHECKSUM values; equal sums do not prove identical rows, because two changed '
