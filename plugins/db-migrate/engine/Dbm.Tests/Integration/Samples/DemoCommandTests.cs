@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using Dbm.Cli.Commands;
 using Dbm.Core;
 using Dbm.Core.Samples;
 using Dbm.Core.Sql;
@@ -137,6 +138,48 @@ public sealed class DemoCommandTests : IAsyncLifetime
             $"demo --attach published no state_changed {{setup, {setupBefore}}} after saving the connections; state_changed events: [{seen}]");
         Assert.True(endpointEvent < approved,
             $"the connections' state_changed must precede the workflow's {{setup, approved}}; state_changed events: [{seen}]");
+    }
+
+    /// <summary>
+    /// Open item 31: --attach failing after both databases are created and seeded (the target's probe is pointed at a
+    /// database that does not exist, so the server itself refuses it) names both databases, the server's text and
+    /// the remedy, and saves neither connection.
+    /// </summary>
+    [Fact]
+    public async Task Demo_attach_that_fails_saving_the_connections_names_what_it_created_and_the_remedy()
+    {
+        using var tw = new TestWorkspace();
+        using var services = tw.OpenServices();   // makes the folder a project, as --attach requires
+        var target = _prefix + "ShopV2";
+        var missing = _prefix + "NoSuchDb";
+        // Connect Retry Count=0: SqlClient treats error 4060 as transient and would retry after 10 s.
+        DemoCommand.ProbeConnectionStringOverrides[target] = new SqlConnectionStringBuilder(
+            DemoDatabases.ForDatabase(SqlTestServer.ConnectionString, missing)) { ConnectRetryCount = 0 }.ConnectionString;
+        CliResult r;
+        try
+        {
+            r = await CliRunner.RunAsync(tw.Ws, null, "demo", "--server", SqlTestServer.ConnectionString, "--prefix", _prefix, "--attach");
+        }
+        finally
+        {
+            DemoCommand.ProbeConnectionStringOverrides.TryRemove(target, out _);
+        }
+
+        Assert.True(r.Exit == 1, $"expected the probe of {missing} to fail the attach, got exit {r.Exit}: {r.Out}");
+        Assert.True(r.Json["error"]?.GetValue<string>() == "sql_error",
+            $"a failed save of the demo connections must be reported as sql_error with the demo's own message; got: {r.Out}");
+        var message = r.Json["message"]!.GetValue<string>();
+        var head = $"Created and seeded {_prefix}LegacyShop and {_prefix}ShopV2, then failed saving them as this project's connections: ";
+        const string tail = ". Re-run with --force --attach to start over.";
+        Assert.True(message.StartsWith(head, StringComparison.Ordinal),
+            $"the message must name both databases as created and seeded and say saving the connections failed; it said: {message}");
+        Assert.True(message.Contains(missing, StringComparison.Ordinal),
+            $"the message must carry the server's own text, which names {missing}; it said: {message}");
+        Assert.True(message.EndsWith(tail, StringComparison.Ordinal),
+            $"the message must end with the remedy '{tail.TrimStart('.', ' ')}'; it said: {message}");
+        Assert.Equal(1000, await ScalarAsync(SourceCs, "SELECT COUNT_BIG(*) FROM dbo.CUST"));   // "created and seeded" is true
+        Assert.False(services.Connections.Has(Side.Src), $"the message says saving failed, but the source connection was saved: {message}");
+        Assert.False(services.Connections.Has(Side.Tgt), $"the message says saving failed, but the target connection was saved: {message}");
     }
 
     /// <summary>
