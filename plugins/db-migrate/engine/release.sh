@@ -1,6 +1,7 @@
 #!/bin/sh
 # Builds the committed engine/dist for the version in plugin.json (the POSIX twin of release.ps1).
 # Usage: sh plugins/db-migrate/engine/release.sh [--skip-tests] [--keep-all-runtimes]
+#        sh plugins/db-migrate/engine/release.sh --check=<build folder>   (release gates only; nothing is built)
 #
 # WHEN TO RUN THIS: engine/dist is a COMMITTED BUILD OUTPUT, and nothing rebuilds it automatically. The launcher only
 # rebuilds when engine/dist/VERSION differs from plugin.json - NOT when the source changed at the same version. So a
@@ -23,11 +24,13 @@ lock_owner="release-sh-$$"
 lock_stale_minutes=15
 skip_tests=0
 keep_all_runtimes=0
+check=""
 for arg in "$@"; do
   case "$arg" in
     --skip-tests) skip_tests=1 ;;
     --keep-all-runtimes) keep_all_runtimes=1 ;;
-    *) echo "usage: release.sh [--skip-tests] [--keep-all-runtimes]" >&2; exit 1 ;;
+    --check=*) check=${arg#--check=} ;;
+    *) echo "usage: release.sh [--skip-tests] [--keep-all-runtimes] | --check=<build folder>" >&2; exit 1 ;;
   esac
 done
 
@@ -35,6 +38,56 @@ die() {
   echo "release: $*" >&2
   exit 1
 }
+
+# True when the file's bytes contain $2 (case-insensitive). Dropping the NUL bytes makes UTF-16LE text (.NET user
+# strings) searchable as plain ASCII, so one search covers both encodings.
+binary_contains() {
+  tr -d '\000' < "$1" | LC_ALL=C grep -q -i -F -- "$2"
+}
+
+# This checkout's absolute path in every form a build on this machine could have recorded it.
+checkout_paths() {
+  printf '%s\n' "$repo_root"
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -w "$repo_root"
+    cygpath -m "$repo_root"
+  fi
+}
+
+# The release gates, asserted rather than eyeballed, run against a build BEFORE it replaces engine/dist:
+#  1. no symbol file, native host or settings file that could carry a connection string;
+#  2. no file holds this checkout's absolute path: a builder's path must never ship, and its presence means the bytes
+#     depend on where the checkout sits (Ruling 180);
+#  3. Dbm.dll holds no ".pdb" at all: a CodeView debug entry, even a path-mapped one, means the compile was reused from
+#     an earlier Release build with symbols instead of the clean DebugType=none compile this script makes.
+check_build() {
+  dir=$1
+  forbidden=$(find "$dir" -type f \( -name '*.pdb' -o -name '*.exe' -o -name '*.user' -o -name '*.suo' \
+    -o -name '*.mdb' -o -name 'appsettings.*.json' \) | sed "s|^$dir/||" | sort | tr '\n' ' ')
+  [ -z "$forbidden" ] || die "the build must not contain symbol files, native hosts or environment settings, found: $forbidden"
+  echo "  no .pdb, .exe, .user, .suo, .mdb or appsettings.*.json"
+
+  needles=$(checkout_paths)
+  leaks=$(find "$dir" -type f | while IFS= read -r file; do
+    printf '%s\n' "$needles" | while IFS= read -r needle; do
+      if [ -n "$needle" ] && binary_contains "$file" "$needle"; then printf '%s contains %s; ' "${file#"$dir"/}" "$needle"; fi
+    done
+  done; true)
+  [ -z "$leaks" ] || die "the build carries this checkout's path: $leaks"
+  echo "  no file contains the checkout path ($repo_root)"
+
+  [ -f "$dir/Dbm.dll" ] || die "the build has no Dbm.dll: $dir/Dbm.dll"
+  ! binary_contains "$dir/Dbm.dll" ".pdb" || die "Dbm.dll has a PDB (CodeView) debug entry: it was not compiled from scratch with DebugType=none"
+  echo "  Dbm.dll has no PDB (CodeView) entry"
+}
+
+if [ -n "$check" ]; then
+  [ -d "$check" ] || die "no such build folder: $check"
+  echo "== release gates on $check"
+  check_build "$(CDPATH= cd -- "$check" && pwd)"
+  echo "  all release gates pass"
+  exit 0
+fi
 
 # The publish output carries ~75 MB of native files db-migrate never loads: MSAL's WAM broker (SqlClient's Entra modes
 # use MSAL's managed/browser path, not the broker) and runtimes for platforms this plugin does not target. Removing them
@@ -116,19 +169,18 @@ if [ -f "$dist/Dbm.dll" ]; then dotnet "$dist/Dbm.dll" stop >/dev/null 2>&1 || t
 
 echo "== publish"
 rm -rf "$tmp"
+# Compile from scratch: publish would otherwise reuse a Release compile already in obj/ (this script's own
+# `dotnet test -c Release` makes one) together with its PDB, whatever DebugType is passed here.
+rm -rf "$engine/Dbm/obj/Release" "$engine/Dbm/bin/Release"
 dotnet publish "$engine/Dbm/Dbm.csproj" -c Release -o "$tmp" --nologo \
   "-p:Version=$version" -p:DebugType=none -p:UseAppHost=false || die "dotnet publish failed"
 [ "$keep_all_runtimes" = 1 ] || prune_natives "$tmp"
 printf '%s' "$version" > "$tmp/VERSION"
 
-# Both gates run against the new build BEFORE it replaces engine/dist, so a failed release leaves dist as it was.
-# Asserted, not eyeballed: nothing in a committed dist may be a symbol file, a native host or a settings file that
-# could carry a connection string.
-echo "== contents check"
-forbidden=$(find "$tmp" -type f \( -name '*.pdb' -o -name '*.exe' -o -name '*.user' -o -name '*.suo' \
-  -o -name '*.mdb' -o -name 'appsettings.*.json' \) | sed "s|^$tmp/||" | sort | tr '\n' ' ')
-[ -z "$forbidden" ] || die "the build must not contain symbol files, native hosts or environment settings, found: $forbidden"
-echo "  no .pdb, .exe, .user, .suo, .mdb or appsettings.*.json"
+# The gates and the smoke test run against the new build BEFORE it replaces engine/dist, so a failed release leaves
+# dist as it was.
+echo "== release gates"
+check_build "$tmp"
 
 echo "== smoke test"
 version_out=$(dotnet "$tmp/Dbm.dll" version) || die "dbm version failed"

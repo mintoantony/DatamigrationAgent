@@ -157,6 +157,10 @@ if exist "%DBM_DLL%" if not "%DBM_REBUILD%"=="1" if defined DBM_PLUGIN_VERSION i
 if exist "%DBM_DLL%" dotnet "%DBM_DLL%" stop >nul 2>&1
 set "DBM_TMP=%DBM_ENGINE%\dist.tmp.%RANDOM%%RANDOM%"
 if exist "%DBM_TMP%" rd /s /q "%DBM_TMP%"
+rem Compile from scratch, as engine\release.* do: publish would otherwise reuse an earlier Release compile in obj\
+rem together with its PDB, and the build would differ from the committed one.
+if exist "%DBM_ENGINE%\Dbm\obj\Release" rd /s /q "%DBM_ENGINE%\Dbm\obj\Release"
+if exist "%DBM_ENGINE%\Dbm\bin\Release" rd /s /q "%DBM_ENGINE%\Dbm\bin\Release"
 set "DBM_BUILD_VERSION=%DBM_PLUGIN_VERSION%"
 if not defined DBM_BUILD_VERSION set "DBM_BUILD_VERSION=0.0.0"
 dotnet publish "%DBM_ENGINE%\Dbm\Dbm.csproj" -c Release -o "%DBM_TMP%" --nologo -v q -p:Version=%DBM_BUILD_VERSION% -p:DebugType=none -p:UseAppHost=false 1>&2
