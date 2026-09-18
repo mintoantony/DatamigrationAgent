@@ -162,6 +162,7 @@ public static class Preflight
                 try
                 {
                     checks.Add(await SourceEstimateAsync(src, approved.Plan, ct));
+                    if (await ChunkKeyCheckAsync(src, approved.Plan, ct) is { } keys) checks.Add(keys);
                 }
                 catch (Exception ex) when (ex is SqlException or FormatException or InvalidCastException or InvalidOperationException
                                               or TimeoutException)
@@ -417,6 +418,66 @@ public static class Preflight
         // so it is an error. A query that answered with no number is the documented, non-fatal case and stays a warning.
         return new PreflightCheck("estimated_rows", false, faulted.Count > 0 ? "error" : "warning",
             detail + " Could not count: " + string.Join("; ", faulted.Concat(noNumber)) + ".");
+    }
+
+    /// <summary>The generator's own single-table shape: <c>SELECT …\nFROM [schema].[table] AS s</c>, optionally <c>\nWHERE (…)</c>. Its
+    /// key is the source table's primary key or unique index, so it is unique by construction.</summary>
+    private static readonly System.Text.RegularExpressions.Regex SingleTable = new(
+        @"\sFROM\s+\[[^\]]+\]\.\[[^\]]+\]\s+AS\s+s(\s+WHERE\s+\(.*\))?\s*$",
+        System.Text.RegularExpressions.RegexOptions.Singleline | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    /// <summary>True when the task's key columns are not guaranteed unique by the generator: a hand-edited task, or a FROM that joins.</summary>
+    public static bool NeedsKeyProbe(TaskPlan task)
+    {
+        ArgumentNullException.ThrowIfNull(task);
+        return task.KeyColumns.Count > 0 && (task.Custom || !SingleTable.IsMatch(task.SourceQuery ?? ""));
+    }
+
+    /// <summary>
+    /// Ruling 188 (final review M-1). Keyset chunking pages with <c>key &gt; @last</c>, so a key that repeats in the source query loses
+    /// the rows sharing the last key of a chunk - reported as a MISMATCH only after the whole run. For every task whose query is not
+    /// the generator's single-table shape, a bounded probe (<c>TOP 1 … GROUP BY keys HAVING COUNT_BIG(*) &gt; 1</c>) finds one repeated
+    /// key before the run starts. A repeat is an error naming the task and the key; a probe that cannot run is an error too (ruling
+    /// 120: an unverifiable check must not leave the gate saying "go"). Null when no task needs probing.
+    /// </summary>
+    public static async Task<PreflightCheck?> ChunkKeyCheckAsync(SqlConnection src, SqlPlanPayload plan, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(src);
+        ArgumentNullException.ThrowIfNull(plan);
+        var probed = TransferEngine.PlanOrder(plan).Where(id => NeedsKeyProbe(plan.Tasks[id])).ToList();
+        if (probed.Count == 0) return null;
+        var repeated = new List<string>();
+        var failed = new List<string>();
+        foreach (var id in probed)
+        {
+            var task = plan.Tasks[id];
+            string keys = string.Join(", ", task.KeyColumns.Select(SqlQuote.Ident));
+            string sql = $"SELECT TOP (1) {keys}, COUNT_BIG(*) FROM (\n{task.SourceQuery.TrimEnd().TrimEnd(';')}\n) AS q "
+                         + $"GROUP BY {keys} HAVING COUNT_BIG(*) > 1";
+            try
+            {
+                await using var cmd = new SqlCommand(sql, src) { CommandTimeout = 300 };
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                if (!await r.ReadAsync(ct)) continue;
+                var values = task.KeyColumns.Select((k, i) => $"{k}={(r.IsDBNull(i) ? "NULL" : Convert.ToString(r.GetValue(i), CultureInfo.InvariantCulture))}");
+                long n = r.GetInt64(task.KeyColumns.Count);
+                repeated.Add($"{id} ({task.Target}): key {string.Join(", ", values)} appears {n.ToString("N0", CultureInfo.InvariantCulture)} times");
+            }
+            catch (Exception ex) when (ex is SqlException or InvalidOperationException or TimeoutException)
+            {
+                failed.Add($"{id} ({task.Target}): {Describe(ex)}");
+            }
+        }
+        if (repeated.Count > 0)
+            return Err("chunk_keys", "The chunk key repeats in the source query, so rows sharing a key at a chunk boundary would be skipped: "
+                                     + string.Join("; ", repeated) + ". Make the key unique (add the joined table's key to the task's key "
+                                     + "columns) or remove the join that repeats rows, in the SQL phase."
+                                     + (failed.Count > 0 ? " Could not be checked: " + string.Join("; ", failed) + "." : ""));
+        if (failed.Count > 0)
+            return NotRun("chunk_keys", "Not checked whether the chunk key is unique in the source query: " + string.Join("; ", failed)
+                                        + ". A repeated key would lose rows at chunk boundaries.", causeIsAlreadyAnError: false);
+        return Ok("chunk_keys", $"The chunk key is unique in the source query of {string.Join(", ", probed)} (not the generator's "
+                                + "single-table shape, so it was checked).");
     }
 
     private static async Task<SqlConnection?> TryOpenAsync(string name, string? cs, List<PreflightCheck> checks, IReadOnlyList<string> secrets,

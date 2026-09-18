@@ -88,6 +88,52 @@ public sealed class PreflightTests(EngineSourceFixture fx) : IClassFixture<Engin
         Assert.Contains("largest: app.Child 2,000", check.Detail);
     }
 
+    /// <summary>
+    /// Ruling 188 (final review M-1). A 1:N join repeats the parent key, and keyset chunking pages with <c>key &gt; @last</c>: the
+    /// rows sharing the last key of a chunk would be skipped, and the run would only say MISMATCH at the very end. Pre-flight finds one
+    /// repeated key first and blocks the run, naming the task and the key.
+    /// </summary>
+    [Fact]
+    public async Task A_join_that_repeats_the_chunk_key_blocks_the_run_naming_the_task_and_the_key()
+    {
+        var plan = TransferEngineTests.Plan();
+        plan.Tasks["T01"].SourceQuery = "SELECT p.[Id] AS [Id], p.[Name] AS [Name], p.[Id] AS [__k0]\nFROM [dbo].[Parent] AS p\n"
+                                        + "JOIN [dbo].[Child] AS c ON c.[ParentId] = p.[Id]";
+        await using var conn = new SqlConnection(fx.Src.ConnectionString);
+        await conn.OpenAsync();
+
+        Assert.True(Preflight.NeedsKeyProbe(plan.Tasks["T01"]), "a task whose FROM joins a child table is not probed for a repeated key");
+        Assert.False(Preflight.NeedsKeyProbe(plan.Tasks["T02"]), "the generator's own single-table shape is probed needlessly");
+        var check = await Preflight.ChunkKeyCheckAsync(conn, plan, default);
+
+        Assert.True(check is { Ok: false, Severity: "error" }, "a repeated chunk key did not block the run: " + check?.Detail);
+        Assert.Matches(@"T01 \(app\.Parent\): key __k0=\d+ appears \d+ times", check!.Detail);
+
+        using var svc = new XferServices();
+        var s = svc.Services;
+        s.Connections.Save(Side.Src, fx.Src.ConnectionString, FakeServices.Meta("src", "x"));
+        Approve(s, plan);
+        var result = await Preflight.RunAsync(s, new TransferOptions(), default);
+        Assert.True(result.Checks.Any(c => c.Name == "chunk_keys" && !c.Ok && c.Detail.Contains("T01", StringComparison.Ordinal)),
+            "the pre-flight the Execute screen runs has no failing chunk_keys line: " + string.Join(", ", result.Checks.Select(c => c.Name)));
+        Assert.False(result.Passed);
+    }
+
+    [Fact]
+    public async Task A_join_whose_key_stays_unique_passes_the_probe()
+    {
+        var plan = TransferEngineTests.Plan();
+        plan.Tasks["T02"].SourceQuery = "SELECT c.[Id] AS [Id], c.[ParentId] AS [ParentId], c.[Qty] AS [Qty], c.[At] AS [At], c.[Id] AS [__k0]\n"
+                                        + "FROM [dbo].[Child] AS c JOIN [dbo].[Parent] AS p ON p.[Id] = c.[ParentId]";
+        await using var conn = new SqlConnection(fx.Src.ConnectionString);
+        await conn.OpenAsync();
+
+        var check = await Preflight.ChunkKeyCheckAsync(conn, plan, default);
+
+        Assert.True(check is { Ok: true }, "a joined task with a unique key: " + (check?.Detail ?? "not probed at all"));
+        Assert.Contains("T02", check!.Detail);
+    }
+
     // ---------------------------------------------------------------------------------------------------------------------------
 
     /// <summary>
