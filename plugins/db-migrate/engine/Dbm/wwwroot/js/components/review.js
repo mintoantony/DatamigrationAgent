@@ -95,6 +95,8 @@
       }
     }
 
+    var takeOverBtn = R.takeOverButton(ctx);
+
     return h('div', { class: 'review-bar' },
       versions.length ? picker : null,
       C.badge(row.status),
@@ -105,6 +107,7 @@
           C.icon('comment'), 'Feedback' + (n.all ? ' (' + n.all + ')' : '')),
         h('button', { type: 'button', class: 'btn btn-ghost', on: { click: function () { ctx.openHistory(); } } }, C.icon('history'), 'History'),
         reopenBtn,
+        takeOverBtn,
         canReview ? changesBtn : null,
         canReview ? approveBtn : null),
       blocked && canReview ? h('div', { class: 'review-blocked', style: { flexBasis: '100%' } }, C.notice('warn', blocked)) : null,
@@ -187,6 +190,49 @@
       C.busy(btn, function () {
         return ctx.api.post('/api/phase/' + ctx.phase + '/reopen').then(function () { ctx.refresh(); },
           function (err) { C.toast(C.errorText(err), 'err'); });
+      });
+    });
+  }
+
+  /**
+   * Ruling 195 (open item 37): "Take over" on a review phase Claude is drafting or reworking - the way out when its patch was
+   * rejected twice. Null on any other phase. While Claude is connected (state.project.agentOnline, the server's AgentPresence) it
+   * is shown disabled with the reason, because the agent may be applying a patch at that moment; the server refuses it too.
+   */
+  R.takeOverButton = function (ctx) {
+    var row = ctx.phaseRow;
+    if (!row || !REVIEWABLE[ctx.phase] || window.DBM_EXPORT || !ctx.api) return null;
+    if (row.status !== 'drafting' && row.status !== 'reworking') return null;
+    var online = !!(ctx.state && ctx.state.project && ctx.state.project.agentOnline);
+    var why = online
+      ? 'Claude is connected and may be applying a patch right now. Wait until Claude has stopped and the page shows '
+        + 'Agent offline (2 minutes after its last command), then take over.'
+      : 'Discard the pending agent work and edit this version by hand';
+    var btn = h('button', { type: 'button', class: 'btn btn-sm', disabled: online, title: why }, 'Take over');
+    btn.addEventListener('click', function () { takeOver(ctx, btn); });
+    return btn;
+  };
+
+  function takeOver(ctx, btn) {
+    var row = ctx.phaseRow;
+    var title = DBM.phaseTitle(ctx.phase);
+    var open = (ctx.feedback || []).filter(function (f) { return f.status === 'open'; }).length;
+    var discarded = row.status === 'drafting'
+      ? 'Claude’s first version of ' + title + ', which is not written yet'
+      : 'Claude’s rework of your ' + open + ' open comment' + (open === 1 ? '' : 's') + ', which is not saved yet';
+    C.modal({
+      title: 'Take over ' + title + '?',
+      body: 'This discards the pending agent work: ' + discarded + '. If Claude delivers that patch later, it is refused. '
+        + title + ' goes back to Awaiting review on v' + row.currentVersion + ', where you can edit it directly, approve it or '
+        + 'request changes again.' + (open ? ' Your open comments stay open.' : ''),
+      confirmText: 'Take over',
+    }).then(function (ok) {
+      if (!ok) return;
+      return C.busy(btn, function () {
+        return ctx.api.post('/api/phase/' + ctx.phase + '/take-over').then(function () {
+          C.toast('You took over ' + title + '.', 'ok');
+          ctx.refresh();
+        }, function (err) { C.toast(C.errorText(err), 'err'); });
       });
     });
   }

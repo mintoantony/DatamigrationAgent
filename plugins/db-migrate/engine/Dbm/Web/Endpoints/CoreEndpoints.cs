@@ -165,6 +165,21 @@ public static class CoreEndpoints
             return ApiResults.Ok();
         });
 
+        // Ruling 195 (open item 37): take over a phase Claude is drafting or reworking. Refused while an agent may be applying a patch,
+        // which is AgentPresence.Online: an open /api/agent/await, or a `dbm next` / `dbm await` within AgentPresence.SeenWindow
+        // (120 s) - `dbm next` is the command that hands the work packet to the subagent.
+        api.MapPost("/phase/{phase}/take-over", (string phase) =>
+        {
+            var p = ParsePhase(phase);
+            if (state.Presence.Online)
+                return ApiResults.Error(StatusCodes.Status409Conflict, "agent_active",
+                    $"Claude is connected and may be applying a patch to {p.Text()} right now (a dbm command ran within the last "
+                    + $"{AgentPresence.SeenWindow.TotalMinutes:0} minutes). Wait until Claude has stopped and the page shows Agent offline, "
+                    + "then take over.");
+            s.Workflow.TakeOver(p);
+            return ApiResults.Ok();
+        });
+
         api.MapPost("/phase/{phase}/retry", (string phase) =>
         {
             s.Workflow.RetryJob(ParsePhase(phase));

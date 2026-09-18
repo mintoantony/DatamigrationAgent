@@ -83,7 +83,13 @@
       var agentHint = (status === 'drafting' || status === 'reworking') && !ctx.state.project.agentOnline
         ? C.notice('warn', h('span', null, 'Claude is not connected. In Claude Code run ', h('code', null, '/db-migrate resume'), ' to continue.'))
         : null;
+      // Ruling 195: a phase Claude is stuck on (a patch rejected twice) can be taken over; on a reworking phase the review bar
+      // below carries the button, so here it is added only when there is no review bar.
       var hasArtifact = !!ctx.artifact && (status === 'awaiting_review' || status === 'approved' || status === 'reworking');
+      var takeOver = !hasArtifact && DBM.review && DBM.review.takeOverButton ? DBM.review.takeOverButton(ctx) : null;
+      var takeOverRow = takeOver ? h('div', { class: 'row-wrap' }, takeOver,
+        h('span', { class: 'small muted' }, 'Stuck? Take over discards Claude’s pending work so you can review and edit v'
+          + ctx.phaseRow.currentVersion + ' yourself.')) : null;
       var jobFailed = !!job && job.status === 'failed';
       var busy = !hasArtifact && !jobFailed && (status === 'running' || status === 'drafting' || status === 'reworking');
 
@@ -94,6 +100,7 @@
         hasArtifact ? C.reviewBar(ctx) : null,
         h('div', { class: 'stack' },
           agentHint,
+          takeOverRow,
           busy ? h('div', { class: 'row muted' }, h('span', { class: 'spinner' }), msg[0]) : null,
           hasArtifact ? artifactCard(ctx) : null,
           jobCard(ctx, job),

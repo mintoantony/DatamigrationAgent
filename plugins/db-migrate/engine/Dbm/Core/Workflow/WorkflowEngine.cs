@@ -324,6 +324,30 @@ public sealed class WorkflowEngine(DbmServices services)
         SetStatus(phase, PhaseStatus.Reworking);
     });
 
+    /// <summary>
+    /// Ruling 195 (open item 37): the human takes over a phase Claude is drafting or reworking - typically one whose patch was
+    /// rejected twice, which leaves the orchestrator stopped and the UI without direct edits or Request changes. The phase goes back
+    /// to awaiting_review on its current version; open feedback stays open (a later Request changes sends it again); Next() then
+    /// awaits the human. The pending agent work is discarded by the status alone: <see cref="ApplyPatch"/> accepts a patch only
+    /// while drafting or reworking, so a patch delivered afterwards is refused. The caller refuses this while an agent may be
+    /// applying (the web endpoint uses <c>AgentPresence.Online</c>).
+    /// </summary>
+    public void TakeOver(PhaseName phase) => services.Db.InTransaction(() =>
+    {
+        if (!Phases.Reviewable.Contains(phase)) throw new WorkflowException($"{phase.Text()} cannot be taken over.");
+        var row = services.Phases.Get(phase);
+        if (row.Status is not (PhaseStatus.Drafting or PhaseStatus.Reworking))
+            throw new WorkflowException($"{phase.Text()} is {EnumText.ToText(row.Status)}; only a phase Claude is drafting or reworking can be taken over.");
+        if (row.CurrentVersion is not int version) throw new WorkflowException($"{phase.Text()} has no version to review yet.");
+        SetStatus(phase, PhaseStatus.AwaitingReview);
+        Publish("log", new
+        {
+            level = "info",
+            message = $"You took over {phase.Text()}: Claude's pending {(row.Status == PhaseStatus.Drafting ? "first draft" : "rework")} was "
+                      + $"discarded and v{version} awaits your review.",
+        });
+    });
+
     /// <summary>Throws WorkflowException(details = blockers). Records approved_fingerprint = "&lt;src&gt;:&lt;tgt&gt;".
     /// <para>Ruling 194 (open item 1): <paramref name="seenVersion"/> is the version the reviewer saw. Unless it is still the current
     /// version the approval is refused with <see cref="WorkflowException.StaleVersion"/> - checked here, inside the transaction that
