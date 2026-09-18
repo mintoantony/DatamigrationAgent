@@ -175,6 +175,12 @@ rem Compile from scratch, as engine\release.* do: publish would otherwise reuse 
 rem together with its PDB, and the build would differ from the committed one.
 if exist "%DBM_ENGINE%\Dbm\obj\Release" rd /s /q "%DBM_ENGINE%\Dbm\obj\Release"
 if exist "%DBM_ENGINE%\Dbm\bin\Release" rd /s /q "%DBM_ENGINE%\Dbm\bin\Release"
+rem Static web assets record each wwwroot file's last-write time as Last-Modified in Dbm.staticwebassets.endpoints.json,
+rem so the time a checkout happened would reach engine\dist and git would show it modified (ruling 189, open item 42).
+rem Pin it exactly as engine\release.* do. cmd cannot set a file time, so powershell does; where it cannot run, the
+rem build still works and only that one file differs from the committed dist.
+set "DBM_WWWROOT=%DBM_ENGINE%\Dbm\wwwroot"
+powershell -NoProfile -NonInteractive -Command "$t = [DateTime]::new(2000, 1, 1, 0, 0, 0, [DateTimeKind]::Utc); Get-ChildItem -LiteralPath $env:DBM_WWWROOT -Recurse -File | ForEach-Object { $_.LastWriteTimeUtc = $t }" >nul 2>nul
 set "DBM_BUILD_VERSION=%DBM_PLUGIN_VERSION%"
 if not defined DBM_BUILD_VERSION set "DBM_BUILD_VERSION=0.0.0"
 call :msbuild_path

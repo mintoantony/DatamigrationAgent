@@ -65,6 +65,10 @@ build_engine() {
   # Compile from scratch, as engine/release.* do: publish would otherwise reuse an earlier Release compile in obj/
   # together with its PDB, and the build would differ from the committed one.
   rm -rf "$engine/Dbm/obj/Release" "$engine/Dbm/bin/Release"
+  # Static web assets record each wwwroot file's last-write time as Last-Modified in Dbm.staticwebassets.endpoints.json,
+  # so the time a checkout happened would reach engine/dist and git would show it modified (ruling 189, open item 42).
+  # Pin it exactly as engine/release.* do.
+  find "$engine/Dbm/wwwroot" -type f -exec env TZ=UTC touch -t 200001010000.00 {} +
   # -o reaches MSBuild as a property value, where ',' and ';' separate values (ruling 189): escape them, and '%' first.
   # sed, not ${var//x/y}: that is bash-only and dies with "Bad substitution" where /bin/sh is dash (Debian, Ubuntu).
   tmp_arg=$(printf '%s' "$tmp" | sed 's/%/%25/g; s/,/%2C/g; s/;/%3B/g')
