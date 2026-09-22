@@ -1064,6 +1064,35 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
             "the refusal does not name both LocalDB instances: " + thrown.Message);
     }
 
+    /// <summary>
+    /// Review J, MED-1, harm at the resume guard. The project folder is copied to another machine, whose LocalDB has an instance of
+    /// the same name (the default one is <c>(localdb)\MSSQLLocalDB</c> everywhere) with a database of the same name. The run's record
+    /// must still name the machine, or the resume continues there from checkpoints that database never had. The other machine is the
+    /// saved record's: this rig has one server.
+    /// </summary>
+    [Fact]
+    public async Task A_resume_is_refused_when_the_same_named_LocalDB_instance_is_on_another_machine()
+    {
+        await using var rig = await RigAsync();
+        var probed = rig.S.Connections.GetMeta(Side.Tgt)!;
+        string instance = probed.DataSource ?? @"(localdb)\DbmTestA";
+        rig.S.Connections.Save(Side.Tgt, rig.Tgt.ConnectionString, probed with { DataSource = instance });
+        long runId = await rig.Service.StartAsync(Skip with { ErrorMode = "stop", ChunkSize = 500 }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Failed, rig.S.Transfers.GetRun(runId)!.Status);
+        const string otherMachine = @"DBMOTHERBOX\LOCALDB#1A254D6D";
+        rig.S.Connections.Save(Side.Tgt, rig.Tgt.ConnectionString, probed with { Server = otherMachine, DataSource = instance });
+
+        var thrown = Record.Exception(() => rig.Service.Resume());
+        await rig.Service.Current;
+
+        Assert.True(thrown is TransferException { Code: "target_changed" },
+            $"run {runId}, recorded as '{rig.S.Transfers.GetRun(runId)!.TargetServer}', was resumed against {instance} on another machine "
+            + $"({otherMachine}): refusal: {thrown?.Message ?? "none"}");
+        Assert.True(thrown!.Message.Contains("DBMOTHERBOX", StringComparison.OrdinalIgnoreCase),
+            "the refusal does not name the other machine: " + thrown.Message);
+    }
+
     /// <summary>The same guard at a re-run (a new run id after a failed run, ruling 185's restart): refused, nothing loaded.</summary>
     [Fact]
     public async Task A_rerun_is_refused_when_the_target_no_longer_resolves_to_the_database_the_last_run_recorded()
