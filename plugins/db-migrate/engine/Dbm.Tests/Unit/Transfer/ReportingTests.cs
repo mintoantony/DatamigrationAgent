@@ -134,6 +134,38 @@ public sealed class ReportingTests
             "a task that loaded nothing is not named beside a mismatch: " + mixedHeadline);
     }
 
+    /// <summary>
+    /// Open item 44: the report carries, on each task that loaded no row of a non-empty source, the sentence its notes carry, so the
+    /// Report screen can name the task in a warning without wording one of its own - and the re-run into a table that already held
+    /// rows (Ruling 186, exempted by Ruling 201 when its rejects are duplicate keys) is worded here, once. <b>Harm:</b> the screen
+    /// shows green "every task matches" over a table that received nothing, or tells a confirmed re-run its mapping is wrong.
+    /// </summary>
+    [Fact]
+    public void A_task_that_loaded_nothing_carries_its_note_and_a_rerun_is_worded_as_one()
+    {
+        var tasks = new List<TransferTaskRow>
+        {
+            Row("T01", "app.Customers", 1000, 1000, 0, new TaskValidation(true, 1000, 0, 0, 1000, [], null), 4),
+            Row("T02", "app.Orders", 3005, 0, 3005, new TaskValidation(true, 3005, 3005, 0, 0, [], "rows were rejected"), 6),
+            Row("T03", "app.Products", 200, 0, 200, new TaskValidation(true, 200, 200, 0, 0, [], "rows were rejected"), 2) with { RowsBefore = 200 },
+        };
+        var report = FinalReportBuilder.Build(Run(), RunStatus.Completed, tasks, _ => [], T0.AddSeconds(10));
+
+        Assert.Null(report.Tasks[0].LoadedNothingNote);
+        string? orders = report.Tasks[1].LoadedNothingNote;
+        Assert.True(orders is not null && orders.StartsWith("app.Orders loaded 0 of 3,005 source rows (3,005 rejected).", StringComparison.Ordinal)
+                    && orders.Contains("the mapping or SQL is the likelier cause", StringComparison.Ordinal),
+            "the task that loaded nothing does not carry its note: " + orders);
+        string? products = report.Tasks[2].LoadedNothingNote;
+        Assert.True(products == "app.Products loaded 0 of 200 source rows (200 rejected). The table already held 200 rows before this "
+                                + "run: if the rejected rows are duplicate keys, those rows were already there; any other error points at "
+                                + "the mapping or SQL.",
+            "the re-run into a table that already held rows is not worded as one: " + products);
+        Assert.Contains(orders, report.Notes);
+        Assert.Contains(products, report.Notes);
+        Assert.Contains("\"loadedNothingNote\":", Json.Serialize(report.Tasks[1]), StringComparison.Ordinal);
+    }
+
     /// <summary>Review F7: a task that loaded nothing and rejected nothing - the source shrank between count and read - is not told
     /// that "every row is rejected". <b>Harm:</b> the note sends the operator to rejected rows that do not exist.</summary>
     [Fact]

@@ -227,7 +227,7 @@ lines (foreign key), 3 comments longer than the target column (truncation) and 1
 
 Read the report before you call a run clean: a *Completed* run can still carry notes, and a task with 0 rows loaded and
 its rows rejected points at the mapping, not at the data (see *Execute*); the headline names such a task instead of
-saying "validated". The one exception is a run into tables that were not empty (the headline says so) whose rejected
+saying "validated", and the Report screen's *Row counts* figure turns to a warning with a notice naming it. The one exception is a run into tables that were not empty (the headline says so) whose rejected
 rows are duplicate keys: those rows were already in the target.
 
 ## Exports
