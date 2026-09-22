@@ -56,8 +56,10 @@ run loaded into — that one is for the human to fix in the UI, never by re-poin
 
 - Chunks are keyset pages of the task's source key; each chunk and its checkpoint commit in one target transaction. The first 3
   chunks of every task hold at most 1,000 rows, then the chunk size applies. A row error that ends the transaction (a target
-  trigger's ROLLBACK, with "Fire target triggers") makes the runner read that chunk's rows again in 1,000-row chunks to isolate the
-  row, then go on at the chunk size: slower than a clean chunk, not a stop.
+  trigger's ROLLBACK - fired by the bulk insert with "Fire target triggers", or by a staging task's merge, whose INSERT … SELECT
+  from #stg fires triggers whatever that option says) makes the runner read that chunk's rows again in 1,000-row chunks to
+  isolate the row, then go on at the chunk size: slower than a clean chunk, not a stop. Under stop-on-error the 1,000-row chunks
+  before the bad row are committed and stay, like any earlier committed chunk; only the chunk holding it rolls back.
 - Tasks without a usable key load in a single transaction: a pause waits for them to finish, a failure restarts them from scratch.
   So a pause can take as long as the biggest keyless table does. Until it takes effect the Execute screen shows **pausing…** and
   `dbm transfer status` still reports `running` — that is the pause working, not a pause being ignored.
@@ -70,14 +72,14 @@ run loaded into — that one is for the human to fix in the UI, never by re-poin
   counts and column checksums.
 - Under skip-and-log, constraint violations (FOREIGN KEY, CHECK, PRIMARY KEY, UNIQUE) are always per-row rejects, even when every
   row of a chunk fails alike. A wrong FK or CHECK mapping therefore shows as a task whose first chunks reject everything: once its
-  first 3 chunks (at most 1,000 rows each, whatever the chunk size; or its whole source, if smaller) have loaded no row, the task fails with `bad_task` instead of rejecting the
-  whole table one row at a time. The exception is a re-run into a table that already held rows whose rejects are all duplicate
-  keys (PRIMARY KEY / UNIQUE, by error number 2627 / 2601; a recorded reject without a number never counts): those rows were
-  already there, so the task runs on. A task that still ends with 0 rows loaded of a
-  non-empty source (after Resume, or in such a re-run) is named in the report's one-line summary ("app.Orders loaded 0 of 3,005
-  rows"), which then never says "validated". If the summary says "target tables were not empty before this run" and the task's
-  errors are duplicate keys, its rows were already in the target — say that. Otherwise treat it as a mapping problem, not bad
-  data: the human reopens Mapping (or SQL), fixes it, approves again and starts a new run with "Truncate target first". Never
+  first 3 chunks (at most 1,000 rows each, whatever the chunk size; or its whole source, if smaller) have loaded no row,
+  the task fails with `bad_task` instead of rejecting the whole table one row at a time. The exception is a re-run into a
+  table that already held rows whose rejects are all duplicate keys (PRIMARY KEY / UNIQUE, by error number 2627 / 2601; a
+  recorded reject without a number never counts): those rows were already there, so the task runs on. A task that still
+  ends with 0 rows loaded of a non-empty source (after Resume, or in such a re-run) is named in the report's one-line
+  summary ("app.Orders loaded 0 of 3,005 rows"), which then never says "validated". If the summary says "target tables
+  were not empty before this run" and the task's errors are duplicate keys, its rows were already in the target — say
+  that. Otherwise treat it as a mapping problem, not bad data: the human reopens Mapping (or SQL), fixes it, approves again and starts a new run with "Truncate target first". Never
   suggest editing the target by hand.
 - Checkpoints belong to one run, so a new run starts from the first row. Pre-flight's *Target row counts* line names the target
   tables that already hold rows and which of them have no primary key or unique index ("rows will be loaded again — duplicates").

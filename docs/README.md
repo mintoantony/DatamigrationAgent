@@ -149,7 +149,7 @@ that needs reasoning (splits, merges, lookups, T-SQL transforms).
 
    | Option | Default | Meaning |
    |---|---|---|
-   | Chunk size (rows) | 100 000 | rows per committed chunk (tasks with LOB columns use 5 000); the first 3 chunks of every task hold at most 1 000 rows |
+   | Chunk size (rows) | 100 000 | rows per committed chunk (LOB tasks: 5 000; each task's first 3 chunks: 1 000 at most) |
    | Parallel tasks | 4 | tasks loaded at the same time; a task starts once the tables it depends on are loaded |
    | When a row is rejected | Stop at the first bad row | **Stop at the first bad row** = the chunk is rolled back and its task stops; **Skip and log bad rows** = bad rows are isolated, recorded and skipped |
    | Truncate target first | off | deletes **every** row in each target table of the plan before loading — also rows that were never this migration's |
@@ -177,10 +177,13 @@ boundaries, so it blocks the run with the task and one repeated key named; fix t
 
 **Rejected rows under *Skip and log bad rows*.** Constraint violations (foreign key, CHECK, primary key or unique) are
 always skipped and logged row by row, even when every row of a chunk fails alike. A row whose error ends the whole
-transaction - a target trigger that rolls back, with *Fire target triggers* on - is isolated by reading its chunk again
-in chunks of 1 000 rows, so it costs seconds rather than a reload of the whole chunk per step of the search. But when every row of a chunk (of more
-than one row) fails with the same other error, the task fails (`bad_task`) and the run stops. What to do depends on the
-error:
+transaction - a target trigger that rolls back, fired by the bulk insert when *Fire target triggers* is on, or by a
+staging task's merge (its `INSERT … SELECT` from `#stg` fires triggers whatever that option says) - is isolated by
+reading its chunk again in chunks of 1 000 rows, so it costs seconds rather than a reload of the whole chunk per step of
+the search. (Under *Stop at the first bad row* the same happens, so the 1 000-row chunks before the bad row are
+committed and stay, as earlier committed chunks always do; only the chunk holding the bad row is rolled back.) But when
+every row of a chunk (of more than one row) fails with the same other error, the task fails (`bad_task`) and the run
+stops. What to do depends on the error:
 
 - **A permission error** (e.g. `INSERT` or `ALTER` denied): nothing in the plan is wrong. Grant the permission and press
   **Resume**; the run continues from its checkpoints.
@@ -193,9 +196,9 @@ error:
 **A task that loads nothing is a mapping problem.** Because constraint violations are always per-row rejects, a wrong
 foreign-key or CHECK mapping under *Skip and log bad rows* shows as a task whose rows are all rejected. Once a task's
 first 3 chunks - at most 1 000 rows each, whatever the chunk size - (or its whole source, if it is smaller) have loaded
-no row at all, the task fails (`bad_task`) with a
-reason that says every row was rejected and names the most common error and its number, and the run stops - rather than
-rejecting the whole table one row at a time. The rejected rows are logged. Usually the fix is to reopen Mapping, fix it
+no row at all, the task fails (`bad_task`) with a reason that says every row was rejected and names the most common
+error and its number, and the run stops - rather than rejecting the whole table one row at a time. The rejected rows are
+logged. Usually the fix is to reopen Mapping, fix it
 and run again with **Truncate target first**, as above. If the rows really are bad, **Resume** carries on from the next
 chunk and does not stop the task for this again (a task without a key is rolled back instead, so for it only the fix
 helps). A run that still ends with a task that loaded 0 of its source rows names it in the report's headline ("app.Orders
@@ -203,8 +206,8 @@ loaded 0 of 3,005 rows") instead of saying the row counts were validated.
 
 The exception is a new run into tables that already held rows (see above): when every rejected row of such a table is a
 duplicate key (primary key or unique, told by SQL Server's error number 2627 or 2601), those rows were already there, so
-the task is not stopped and the headline's
-"loaded 0 of N" is expected - it is not a mapping problem. A foreign-key or CHECK error in such a run still stops the task.
+the task is not stopped and the headline's "loaded 0 of N" is expected - it is not a mapping problem. A foreign-key or
+CHECK error in such a run still stops the task.
 
 **Live view**: overall and per-task progress bars, rows per second, ETA, a throughput sparkline, the rejected-row count
 and a log tail. **Pause** lets every task commit its current chunk and stops; **Resume** continues from the checkpoints,
@@ -222,13 +225,15 @@ part of finishing.
 
 Per task: source rows, rows loaded, rejected rows, duration, rows per second and validation results (row counts and
 column checksums), plus the run's options and any notes the run recorded. Up to 5 rejected rows per task are listed by
-key with their error and SQL Server's error number (rows recorded by an older version of the plugin have none). In the demo with *Skip and log bad rows* you see 8 rejected rows: 2 orphan orders and their 2
-lines (foreign key), 3 comments longer than the target column (truncation) and 1 zero quantity (CHECK constraint).
+key with their error and SQL Server's error number (rows recorded by an older version of the plugin have none). In the
+demo with *Skip and log bad rows* you see 8 rejected rows: 2 orphan orders and their 2 lines (foreign key), 3 comments
+longer than the target column (truncation) and 1 zero quantity (CHECK constraint).
 
 Read the report before you call a run clean: a *Completed* run can still carry notes, and a task with 0 rows loaded and
 its rows rejected points at the mapping, not at the data (see *Execute*); the headline names such a task instead of
-saying "validated", and the Report screen's *Row counts* figure turns to a warning with a notice naming it. The one exception is a run into tables that were not empty (the headline says so) whose rejected
-rows are duplicate keys: those rows were already in the target.
+saying "validated", and the Report screen's *Row counts* figure turns to a warning with a notice naming it. The one
+exception is a run into tables that were not empty (the headline says so) whose rejected rows are duplicate keys: those
+rows were already in the target.
 
 ## Exports
 
