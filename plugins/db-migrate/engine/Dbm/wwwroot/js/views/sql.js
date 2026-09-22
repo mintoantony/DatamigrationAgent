@@ -473,7 +473,8 @@
       return el('p', { class: 'small muted sql-validated' }, ['Validated live ' + v.at + (v.ok ? '' : ' · errors found')]);
     }
     // Review L1: an approved version without evidence was approved before the evidence was kept; it does not "block" anything now.
-    var approved = !!(ctx.phaseRow && ctx.phaseRow.status === 'approved');
+    // Re-review N6: the version SHOWN is the approved one - not merely an approved phase.
+    var approved = !!ctx.phaseRow && typeof ctx.phaseRow.approvedVersion === 'number' && ctx.phaseRow.approvedVersion === versionOf(ctx);
     return el('section', { class: 'card sql-not-validated', 'aria-live': 'polite' }, [
       el('div', { class: 'card-h row' }, [el('h3', { class: 'h3' }, ['Not validated']),
         el('span', { class: 'badge ' + (approved ? 'st-stale' : 'st-failed') }, [approved ? 'approved before validation evidence was kept' : 'blocks approval'])]),

@@ -766,11 +766,17 @@ test('render: a version with no validation evidence says Not validated, and a va
     assert.ok(shown.includes('blocks approval'));
 
     // Review L1: an old version that is already approved is not "blocked" - it was approved before the evidence was kept.
-    const approved = sampleCtx({ phaseRow: { name: 'sql', status: 'approved' } });
+    const approved = sampleCtx({ phaseRow: { name: 'sql', status: 'approved', approvedVersion: 2 } });   // v2 is shown
     globalThis.DBM.views.sql.render(dom.root, approved.ctx);
     shown = dom.text(dom.root);
     assert.ok(!shown.includes('blocks approval') && shown.includes('approved before validation evidence was kept'),
       'an approved version without evidence is shown as blocking approval: ' + shown.slice(0, 300));
+    // Re-review N6: it is the version shown that was approved, not merely the phase - another version of an approved phase is not.
+    const other = sampleCtx({ phaseRow: { name: 'sql', status: 'approved', approvedVersion: 1 } });
+    globalThis.DBM.views.sql.render(dom.root, other.ctx);
+    shown = dom.text(dom.root);
+    assert.ok(!shown.includes('approved before validation evidence was kept'),
+      'v2 is labelled approved although the approved version is v1: ' + shown.slice(0, 300));
 
     // Review L3, mirrored: a version whose live validation could not connect names that, as the engine does.
     const failed = sampleCtx();

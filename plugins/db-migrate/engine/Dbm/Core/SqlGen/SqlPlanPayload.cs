@@ -16,13 +16,13 @@ public sealed class SqlPlanPayload
     /// validated, whatever the warnings say.</summary>
     public SqlValidation? Validation { get; set; }
 
-    /// <summary>Ruling 204: why this version is NOT validated - empty only when it carries <see cref="Validation"/> evidence and no
-    /// stored <see cref="SqlPlanSource.SkippedPrefix"/> line (the engine never writes both; a version that has both is refused too).
-    /// The stored skipped line(s) when there are any, else <see cref="SqlModule.NoEvidence"/>. Read by ApprovalBlockers, the script
-    /// pack and, through the same payload, the SQL screen.</summary>
     /// <summary>Review L3: prefix of the reason for a version whose live validation could not reach a database.</summary>
     public const string CouldNotConnect = "live validation could not connect: ";
 
+    /// <summary>Ruling 204: why this version is NOT validated - empty only when it carries <see cref="Validation"/> evidence and no
+    /// stored <see cref="SqlPlanSource.SkippedPrefix"/> line (the engine never writes both; a version that has both is refused too).
+    /// The stored skipped line(s) when there are any, else each stored connection failure as <see cref="CouldNotConnect"/> + line,
+    /// else <see cref="SqlModule.NoEvidence"/>. Read by ApprovalBlockers, the script pack and, through the same payload, the SQL screen.</summary>
     public List<string> NotValidatedReasons()
     {
         var skipped = (Warnings ?? []).Where(w => w is not null && w.StartsWith(SqlPlanSource.SkippedPrefix, StringComparison.Ordinal)).ToList();
