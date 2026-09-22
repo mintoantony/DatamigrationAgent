@@ -232,12 +232,15 @@ internal sealed class TaskRunner(RunContext rc)
         // checkpoint, and once they are past the chunk size applies again. Not persisted - a resume reads full chunks, which only costs
         // time.
         long smallRowsLeft = 0;
+        // Review E N2: the window's chunks must never exceed the loader's restart limit - a window chunk over it would be handed back
+        // again, and the task would re-read the same rows forever. Derived from the limit, not merely equal to it by constant.
+        int windowRows = Math.Min(SmallChunkRows, loader.RestartRowLimit ?? SmallChunkRows);
         await using var src = await SqlConnect.OpenAsync(rc.SourceCs, ct);
         while (true)
         {
             if (rc.Control.StopRequested) return new Pass(TransferTaskStatus.Paused, cp);
 
-            int size = smallRowsLeft > 0 ? Math.Min(chunkSize, SmallChunkRows) : ChunkRows(chunkSize, cp.ChunkNo);
+            int size = smallRowsLeft > 0 ? Math.Min(chunkSize, windowRows) : ChunkRows(chunkSize, cp.ChunkNo);
             DataTable table;
             await using (var cmd = ChunkPlanner.Command(src, task, last, size))
             await using (var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SequentialAccess, ct))
@@ -279,8 +282,8 @@ internal sealed class TaskRunner(RunContext rc)
                     // the checkpoint is upserted after the load). Leaving the block rolls it back; the checkpoint has not moved, so the next
                     // reads start at the same key.
                     smallRowsLeft = table.Rows.Count;
-                    rc.Log("info", $"{id} {task.Target}: a row error ended the transaction of a {table.Rows.Count:N0}-row chunk; reading "
-                        + $"those rows again in chunks of {SmallChunkRows:N0}.", persist: false);
+                    rc.Log("info", Inv($"{id} {task.Target}: a row error ended the transaction of a {table.Rows.Count:N0}-row chunk; reading ")
+                        + Inv($"those rows again in chunks of {windowRows:N0}."), persist: false);
                     continue;
                 }
                 if (outcome.Failed.Count > 0 && !rc.Options.SkipErrors)
