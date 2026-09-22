@@ -14,7 +14,7 @@ namespace Dbm.Core.SqlGen;
 public static class ScriptPack
 {
     const string Rule = "-- =====================================================================";
-    /// <summary>Heading over the plan's stored <see cref="SqlPlanSource.SkippedPrefix"/> line(s), which follow verbatim.</summary>
+    /// <summary>Heading over <see cref="SqlPlanPayload.NotValidatedReasons"/>, which follow verbatim.</summary>
     const string NotValidatedTitle = "WARNING: NOT VALIDATED - no database checked this plan";
     const string MismatchTitle ="WARNING: this pack does not match the plan's execution order";
     /// <summary>Open item 19: the task file's heading over its errors. Not "last validation": Ruling 96 makes the pack derive bare
@@ -37,7 +37,8 @@ public static class ScriptPack
     {
         /// <summary>Every way <see cref="SqlPlanPayload.Order"/> fails to list each task exactly once.</summary>
         public required List<string> Problems { get; init; }
-        /// <summary>The plan's stored <see cref="SqlPlanSource.SkippedPrefix"/> line(s).</summary>
+        /// <summary><see cref="SqlPlanPayload.NotValidatedReasons"/>: the stored <see cref="SqlPlanSource.SkippedPrefix"/> line(s), or
+        /// <see cref="SqlModule.NoEvidence"/> for a version with no validation evidence.</summary>
         public required List<string> NotValidated { get; init; }
         /// <summary>The plan's stored plan-level <see cref="SqlPlanPayload.Errors"/>.</summary>
         public required List<string> PlanErrors { get; init; }
@@ -69,7 +70,7 @@ public static class ScriptPack
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(projectName);
         var problems = plan.OrderProblems();
-        var notValidated = plan.Warnings.Where(w => w.StartsWith(SqlPlanSource.SkippedPrefix, StringComparison.Ordinal)).ToList();
+        var notValidated = plan.NotValidatedReasons();   // Ruling 204: from the evidence, exactly as ApprovalBlockers reads it
         var exported = new HashSet<string>(StringComparer.Ordinal);   // each task exactly once, at its first position in Order
         var ordered = plan.Order.Select(id => (Id: id, Known: plan.Tasks.ContainsKey(id) && exported.Add(id))).ToList();
         var listed = new HashSet<string>(plan.Order, StringComparer.Ordinal);

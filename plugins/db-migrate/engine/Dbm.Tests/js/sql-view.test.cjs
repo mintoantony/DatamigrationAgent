@@ -735,6 +735,38 @@ test('render: Compare with… on versions differing only in a lone CR shows the 
   });
 });
 
+/* Open item 10, Ruling 204: the screen states the same fact ApprovalBlockers and `dbm artifact sql` do, from the same stored field -
+   positive evidence ("validation": {at, ok}) or NOT validated, whatever the warnings say. */
+const CS_MODULE = fs.readFileSync(path.join(__dirname, '..', '..', 'Dbm', 'Core', 'SqlGen', 'SqlModule.cs'), 'utf8');
+const NO_EVIDENCE = /public const string NoEvidence = "([^"]*)";/.exec(CS_MODULE)[1];
+
+test('validationState mirrors SqlPlanPayload.NotValidatedReasons', () => {
+  const skipped = 'live validation skipped: source connection, target connection missing';
+  const at = '2026-09-18T09:30:00+00:00';
+  assert.deepEqual(V.validationState({ warnings: [], validation: { at, ok: true } }), { validated: true, at, ok: true, reasons: [] });
+  assert.deepEqual(V.validationState({ warnings: [] }), { validated: false, at: null, ok: null, reasons: [NO_EVIDENCE] },
+    'no evidence and no marker (an old record) is NOT validated, with the engine\'s own sentence');
+  assert.deepEqual(V.validationState({ warnings: ['x', skipped] }).reasons, [skipped]);
+  assert.equal(V.validationState({ warnings: [skipped], validation: { at, ok: true } }).validated, false, 'evidence plus a marker is refused, as in C#');
+});
+
+test('render: a version with no validation evidence says Not validated, and a validated one says when', async () => {
+  await withFakeDom(dom => {
+    const s = sampleCtx();
+    globalThis.DBM.views.sql.render(dom.root, s.ctx);   // sampleCtx's plan has no "validation" field
+    let shown = dom.text(dom.root);
+    assert.ok(shown.includes('Not validated') && shown.includes(NO_EVIDENCE),
+      'a version the engine refuses to approve as not validated looks validated on screen: ' + shown.slice(0, 300));
+
+    const ok = sampleCtx();
+    ok.plan.validation = { at: '2026-09-18T09:30:00+00:00', ok: true };
+    globalThis.DBM.views.sql.render(dom.root, ok.ctx);
+    shown = dom.text(dom.root);
+    assert.ok(shown.includes('Validated live 2026-09-18T09:30:00+00:00'), shown.slice(0, 300));
+    assert.ok(!shown.includes('Not validated'));
+  });
+});
+
 test('the view is registered', () => {
   assert.equal(globalThis.DBM.views.sql.title, 'SQL');
   assert.equal(typeof globalThis.DBM.views.sql.render, 'function');

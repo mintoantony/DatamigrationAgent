@@ -58,8 +58,9 @@ given — never `state.db` — and never print or look for connection strings.
 - No `GO` anywhere; each list element of `preSql`/`postSql` is one self-contained batch.
 - End lines with LF or CRLF only: a bare carriage return (`\r` not followed by `\n`) in any SQL field is an error, because SQL Server treats it as a line break.
 - Change `mode`, `columns` and `keyColumns` only together and consistently. Never patch `errors`, `warnings`, `custom`,
-  `countSql` or `mappingHash` — the engine owns them, and a patch that changes `errors`, `warnings` or `custom` (plan or
-  task) is rejected. Warnings prefixed `validate:` are recomputed on every check.
+  `validation`, `countSql` or `mappingHash` — the engine owns them, and a patch that changes `errors`, `warnings`, `custom`
+  (plan or task) or `validation` is rejected. `validation` (`{"at":…,"ok":…}`) is the engine's record that live validation
+  ran over that version; a version without it is not validated and cannot be approved. Warnings prefixed `validate:` are recomputed on every check.
 - `order` must list every task id exactly once; a patch that adds or removes a task updates `order` in the same patch.
 - Warnings are information, not failures. Do not twist SQL to silence a truncation or nullability warning — mention
   it in your summary unless the mapping or the reviewer asked for a transform.

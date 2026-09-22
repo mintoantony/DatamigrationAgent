@@ -7,7 +7,14 @@ namespace Dbm.Tests.Unit.SqlGen;
 
 public class ScriptPackTests
 {
-    static SqlPlanPayload Plan() => SqlGenerator.Generate(SampleMappings.Approved(), SampleCatalogs.Source(), SampleCatalogs.Target());
+    /// <summary>The generated sample plan with the evidence a live validation stores (Ruling 204): a validated version unless a test
+    /// clears <see cref="SqlPlanPayload.Validation"/>.</summary>
+    static SqlPlanPayload Plan()
+    {
+        var plan = SqlGenerator.Generate(SampleMappings.Approved(), SampleCatalogs.Source(), SampleCatalogs.Target());
+        plan.Validation = new SqlValidation(new DateTimeOffset(2026, 9, 18, 9, 30, 0, TimeSpan.Zero), true);
+        return plan;
+    }
 
     static List<(string Name, string Content)> Unzip(byte[] bytes)
     {
@@ -233,6 +240,13 @@ public class ScriptPackTests
         foreach (var (name, content) in ScriptPack.BuildFiles(Plan(), "demo"))
             Assert.DoesNotContain("NOT VALIDATED", content, StringComparison.Ordinal);
         Assert.DoesNotContain(SqlPlanSource.SkippedPrefix, string.Concat(ScriptPack.BuildFiles(Plan(), "demo").Select(f => f.Content)), StringComparison.Ordinal);
+
+        // Ruling 204: no evidence reads as NOT validated, marker or not - an old record, stored before the evidence existed, has neither.
+        var old = Plan();
+        old.Validation = null;
+        var oldPre = ScriptPack.BuildFiles(old, "demo")[0].Content;
+        Assert.True(oldPre.Contains("-- WARNING: NOT VALIDATED - no database checked this plan\n-- " + SqlModule.NoEvidence + "\n", StringComparison.Ordinal),
+            "a pack of a version with no validation evidence does not say it is not validated:\n" + oldPre[..Math.Min(600, oldPre.Length)]);
 
         // The stored line is untrusted text like any other: it cannot start a line of its own.
         var hostile = Plan();

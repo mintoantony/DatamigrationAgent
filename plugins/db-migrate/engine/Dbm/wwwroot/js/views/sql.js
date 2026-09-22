@@ -136,6 +136,23 @@
     return ops;
   }
 
+  var SKIPPED_PREFIX = 'live validation skipped: ';
+  /* Verbatim copy of C# SqlModule.NoEvidence (sql-view.test.cjs reads the C# source and compares). */
+  var NO_EVIDENCE = 'no live validation is recorded for this version; a new version saved while both connections and the target catalog exist records one';
+
+  /**
+   * MIRROR of C# SqlPlanPayload.NotValidatedReasons (open item 10, Ruling 204): a version is validated only when it carries the
+   * engine's evidence ("validation": {at, ok}) and no stored "live validation skipped" line. Reasons = those lines, else NO_EVIDENCE.
+   * → {validated, at, ok, reasons}
+   */
+  function validationState(plan) {
+    var skipped = ((plan && plan.warnings) || []).filter(function (w) { return typeof w === 'string' && w.indexOf(SKIPPED_PREFIX) === 0; });
+    var v = plan && plan.validation;
+    var evidence = !!v && typeof v === 'object' && typeof v.at === 'string';
+    if (evidence && !skipped.length) return { validated: true, at: v.at, ok: v.ok === true, reasons: [] };
+    return { validated: false, at: null, ok: null, reasons: skipped.length ? skipped : [NO_EVIDENCE] };
+  }
+
   /* {taskId: string[]} — the contracted shape of taskErrors / taskWarnings. */
   function isTaskLists(map) {
     if (!map || typeof map !== 'object' || Array.isArray(map)) return false;
@@ -429,6 +446,18 @@
     ]);
   }
 
+  /* Ruling 204: the stored version's own validation fact - the one ApprovalBlockers reads - never inferred from warnings alone. */
+  function validationNote(plan) {
+    var v = validationState(plan);
+    if (v.validated) {
+      return el('p', { class: 'small muted sql-validated' }, ['Validated live ' + v.at + (v.ok ? '' : ' · errors found')]);
+    }
+    return el('section', { class: 'card sql-not-validated', 'aria-live': 'polite' }, [
+      el('div', { class: 'card-h row' }, [el('h3', { class: 'h3' }, ['Not validated']), el('span', { class: 'badge st-failed' }, ['blocks approval'])]),
+      el('div', { class: 'card-b' }, [list('sql-msgs-warn', v.reasons)]),
+    ]);
+  }
+
   function globalCard(title, when, statements) {
     var body = statements && statements.length
       ? codeBlock(joinStatements(statements))
@@ -692,6 +721,7 @@
     }
 
     page.appendChild(kpis(plan));
+    page.appendChild(validationNote(plan));
     if (ui.report) page.appendChild(reportCard(plan));
     if ((plan.errors || []).length || (plan.warnings || []).length) {
       page.appendChild(el('section', { class: 'card' }, [
@@ -735,7 +765,7 @@
   DBM.sqlView = {
     listing: listing, listingText: listingText, parseAnchor: parseAnchor, sectionBlocks: sectionBlocks, splitStatements: splitStatements,
     joinStatements: joinStatements, cardLines: cardLines, listRoundTrips: listRoundTrips, editOps: editOps, reportSummary: reportSummary,
-    goSplitHazards: goSplitHazards,
+    goSplitHazards: goSplitHazards, validationState: validationState,
     openCommentsByTask: openCommentsByTask,
     diffRows: diffRows,
   };
