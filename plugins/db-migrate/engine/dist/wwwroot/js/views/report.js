@@ -69,6 +69,9 @@
     const counts = X.reportCounts(tasks);
     const sums = X.reportChecksums(tasks);
     const missing = r.tasksWithoutSource || 0;
+    // Open item 44 (Ruling 192): counts that balance over a table that received nothing - every row rejected - are not a match
+    // anyone should read as green. The same test as FinalReportBuilder.LoadedNothing: no row loaded of a source that had rows.
+    const nothing = tasks.filter(function (t) { return t.rowsLoaded === 0 && t.rowsSource > 0; });
 
     const exportBtn = ctx.export ? null
       : h('button', { class: 'btn', type: 'button', on: { click: function (e) { exportReport(e.currentTarget, ctx); } } }, 'Export HTML');
@@ -97,8 +100,9 @@
           r.rowsPerSec === null || r.rowsPerSec === undefined ? 'throughput unknown' : X.fmtRate(r.rowsPerSec)),
         kpi('Row counts', X.countHeadline(counts),
           counts.notCompared ? counts.notCompared + ' of ' + counts.total + ' tasks were not compared'
-            : (counts.mismatched ? counts.mismatched + ' mismatched' : 'every task matches'),
-          counts.mismatched ? 'err' : (counts.notCompared ? 'warn' : 'ok')),
+            : counts.mismatched ? counts.mismatched + ' mismatched'
+              : nothing.length ? nothing.length + ' of ' + counts.total + ' tasks loaded nothing' : 'every task matches',
+          counts.mismatched ? 'err' : (counts.notCompared || nothing.length ? 'warn' : 'ok')),
         // "differ" is the counted number, never total - matched: a column nobody compared is a gap, not a difference.
         kpi('Checksums', X.checksumHeadline(sums),
           sums.total ? (sums.differ ? sums.differ + ' differ' : 'every column compared matches') : 'not computed',
@@ -106,6 +110,7 @@
       // "of at least": while a task has no source count the total above it is a floor, not a total.
       missing ? DBM.components.notice('warn', missing + (missing === 1 ? ' task has' : ' tasks have')
         + ' no source row count, so the source total above is a floor and the percentages are priced from it.') : null,
+      nothing.length ? loadedNothingNotice(nothing) : null,
       // Ruling 186: over a target that already held rows the counts compare rows added, not the table.
       tasks.some(function (t) { return t.rowsBefore > 0; }) ? DBM.components.notice('warn', 'Target tables were not empty before this run; '
         + 'the row counts compare the rows it added, not the tables\u2019 contents. A table with no key can hold its rows twice.') : null,
@@ -117,6 +122,20 @@
     if (withSamples.length) page.appendChild(samplesCard(withSamples));
     page.appendChild(h('div', { class: 'grid-2' }, notesCard(r.notes || []), optionsCard(r.options || {})));
     root.appendChild(page);
+  }
+
+  /**
+   * Open item 44: one line per task that loaded no row of a source that had rows, in the engine's own words (`loadedNothingNote`,
+   * which also words the confirmed re-run into a table that already held rows). A report stored before that field existed gets the
+   * figures it does have, never a blank.
+   */
+  function loadedNothingNotice(nothing) {
+    return DBM.components.notice('warn', h('div', { class: 'stack-sm' },
+      h('div', {}, nothing.length + (nothing.length === 1 ? ' task' : ' tasks') + ' loaded no row of a source that had rows:'),
+      ...nothing.map(function (t) {
+        return h('div', {}, t.loadedNothingNote || (t.target + ' loaded 0 of ' + X.num(t.rowsSource) + ' source rows'
+          + (t.rowsError ? ' (' + X.num(t.rowsError) + ' rejected).' : '.')));
+      })));
   }
 
   /**
@@ -223,7 +242,9 @@
   function samplesList(samples) {
     return h('ul', { class: 'rep-samples' }, ...samples.map(function (s) {
       // The separator is a text node, not the grid gap: read aloud these two run together into "Id=88213Cannot insert…".
-      return h('li', {}, h('span', { class: 'mono small' }, X.keyText(s.key)), ' ', h('span', { class: 'small' }, s.error));
+      // Ruling 208: the server's error number, when the row was recorded with one; a row recorded without one shows none, never a 0.
+      const n = typeof s.errorNumber === 'number' ? 'error ' + s.errorNumber + ': ' : '';
+      return h('li', {}, h('span', { class: 'mono small' }, X.keyText(s.key)), ' ', h('span', { class: 'small' }, n + s.error));
     }));
   }
 
