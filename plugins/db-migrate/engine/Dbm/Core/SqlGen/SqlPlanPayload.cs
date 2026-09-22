@@ -20,11 +20,16 @@ public sealed class SqlPlanPayload
     /// stored <see cref="SqlPlanSource.SkippedPrefix"/> line (the engine never writes both; a version that has both is refused too).
     /// The stored skipped line(s) when there are any, else <see cref="SqlModule.NoEvidence"/>. Read by ApprovalBlockers, the script
     /// pack and, through the same payload, the SQL screen.</summary>
+    /// <summary>Review L3: prefix of the reason for a version whose live validation could not reach a database.</summary>
+    public const string CouldNotConnect = "live validation could not connect: ";
+
     public List<string> NotValidatedReasons()
     {
         var skipped = (Warnings ?? []).Where(w => w is not null && w.StartsWith(SqlPlanSource.SkippedPrefix, StringComparison.Ordinal)).ToList();
         if (Validation is not null && skipped.Count == 0) return [];
-        return skipped.Count > 0 ? skipped : [SqlModule.NoEvidence];
+        if (skipped.Count > 0) return skipped;
+        var failed = (Errors ?? []).Where(SqlValidator.IsConnectionFailure).Select(e => CouldNotConnect + e).ToList();   // review L3
+        return failed.Count > 0 ? failed : [SqlModule.NoEvidence];
     }
 
     public int ErrorCount() => Errors.Count + Tasks.Values.Sum(t => t.Errors.Count);

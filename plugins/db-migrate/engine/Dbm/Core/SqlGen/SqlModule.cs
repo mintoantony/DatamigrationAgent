@@ -169,7 +169,7 @@ public sealed class SqlModule : IPhaseModule
         errors.AddRange(SqlValidator.RecordBareCarriageReturns(plan));
         // Ruling 204: positive evidence, written last so its outcome covers every error this run found (a stored version always
         // has ok true: a patch with errors is refused before it is stored).
-        if (skipped is null) plan.Validation = new SqlValidation(Clock.Now(), errors.Count == 0);
+        plan.Validation = skipped is null && !errors.Any(SqlValidator.IsConnectionFailure) ? new SqlValidation(Clock.Now(), errors.Count == 0) : null;
 
         ReplaceContent(payload.AsObject(), plan);
         return new PayloadCheck(errors, warnings);

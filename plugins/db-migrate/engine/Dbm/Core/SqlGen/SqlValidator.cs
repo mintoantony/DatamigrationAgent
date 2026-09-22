@@ -42,6 +42,22 @@ public static class SqlValidator
     /// could not check it and why; both null = it compiled. <see cref="Errors"/> are the underlying server errors (wrappers removed).</summary>
     public sealed record TargetCheck(string? Error, string? NotChecked, IReadOnlyList<SqlError> Errors);
 
+    /// <summary>Start of the global error a report carries when it could not open that connection.</summary>
+    public const string SourceConnectionFailed = "source connection failed: ";
+    /// <summary>Start of the global error a report carries when it could not open that connection.</summary>
+    public const string TargetConnectionFailed = "target connection failed: ";
+
+    /// <summary>True when the line records a connection this validation could not open.</summary>
+    public static bool IsConnectionFailure(string? line) => line is not null
+        && (line.StartsWith(SourceConnectionFailed, StringComparison.Ordinal) || line.StartsWith(TargetConnectionFailed, StringComparison.Ordinal));
+
+    /// <summary>Review L3: a report is evidence of live validation only when it reached both databases; otherwise nothing compiled.</summary>
+    public static bool Connected(ValidationReport report)
+    {
+        ArgumentNullException.ThrowIfNull(report);
+        return !report.GlobalErrors.Any(IsConnectionFailure);
+    }
+
     public static Task<ValidationReport> ValidateAsync(SqlPlanPayload plan, string sourceCs, string targetCs, CatalogSnapshot tgt,
         string? onlyTaskId, CancellationToken ct) =>
         ValidateAsync(plan, sourceCs, targetCs, tgt, onlyTaskId, SqlConnect.OpenAsync, ct);
@@ -73,11 +89,11 @@ public static class SqlValidator
         {
             try { source = await open(sourceCs, ct); }
             catch (Exception ex) when (ex is SqlException or InvalidOperationException or ArgumentException)
-            { global.Add("source connection failed: " + Scrub(ex.Message)); }
+            { global.Add(SourceConnectionFailed + Scrub(ex.Message)); }
             // Not pooled: the session, and with it the #stg scaffold, ends when this connection closes.
             try { target = await open(WithoutPooling(targetCs), ct); }
             catch (Exception ex) when (ex is SqlException or InvalidOperationException or ArgumentException)
-            { global.Add("target connection failed: " + Scrub(ex.Message)); }
+            { global.Add(TargetConnectionFailed + Scrub(ex.Message)); }
 
             foreach (var id in ids)
                 await ValidateTaskAsync(plan.Tasks[id], source, target, tgt, taskErrors[id], taskWarnings[id], Scrub, ct);

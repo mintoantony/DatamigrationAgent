@@ -25,8 +25,8 @@ public sealed class SqlGenJob : IJobHandler
         if (SqlPlanSource.SkippedWarning(s) is { } skipped) plan.Warnings.Add(skipped);   // stored: the plan is unvalidated
         else
         {
-            validated = true;
             var report = await SqlPlanSource.ValidateLiveAsync(s, plan, null, ct);
+            validated = SqlValidator.Connected(report);   // review L3: a run that reached no database is not evidence
             SqlValidator.Apply(plan, report);
             ctx.Log($"sqlgen: validation {(report.Ok ? "ok" : "found errors")}");
         }
