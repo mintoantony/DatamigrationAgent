@@ -55,6 +55,18 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options, TargetSha
     private readonly TransferOptions _options = options ?? throw new ArgumentNullException(nameof(options));
     private readonly TargetShape? _shape = shape;
 
+    /// <summary>
+    /// Ruling 207 (open item 15): the most rows a chunk may hold and still be bisected across restarts. A transaction-ending row error
+    /// (a trigger's ROLLBACK, say) makes the bisector restart the transaction and reload every row confirmed so far, once per level:
+    /// measured 18 restarts and 7.0 s for one such row in a 100,000-row chunk, 0.5 s in a 1,000-row one. Over the limit, the first
+    /// restart instead begins a fresh transaction holding none of the chunk and throws <see cref="RestartCapped"/>, and the caller reads
+    /// the same rows again in chunks of at most this many. Null (the default) keeps the restart path unbounded.
+    /// </summary>
+    public int? RestartRowLimit { get; init; }
+
+    /// <summary>The <see cref="TransferException.Code"/> of the hand-back described at <see cref="RestartRowLimit"/>.</summary>
+    public const string RestartCapped = "restart_capped";
+
     /// <summary>Plan defects throw <c>TransferException("bad_task")</c> instead of being reported as rejected rows: no bindings, a binding
     /// whose source column is not in <paramref name="rows"/>, a binding in <see cref="TargetShape.NormalizedPrefix"/>'s namespace, a
     /// staging binding with no #stg column, and — when a shape was given — a binding to a column the target does not have or to an
@@ -222,6 +234,7 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options, TargetSha
         var mappings = new List<SqlBulkCopyColumnMapping>();
         var mapped = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var taken = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);   // #stg column -> the source already going there
+        var takenBy = new Dictionary<string, ColumnBinding>(StringComparer.OrdinalIgnoreCase);   // ... and the binding that claimed it
         var unmapped = new List<string>();
         foreach (var b in bindings)
         {
@@ -232,11 +245,22 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options, TargetSha
             if (staging.TryGetValue(b.Target, out var dest) || staging.TryGetValue(b.Source, out dest))
             {
                 if (taken.TryGetValue(dest, out var first))
+                {
+                    // Open item 21: a fan-out (one source, two targets) reaches here only when #stg has a column named after the source
+                    // and none per target - both bindings fall back to it. Naming "two source columns: A and A" would name the one
+                    // source three times and neither target; the fix is a #stg column per target, so that is what the sentence says.
+                    if (takenBy.TryGetValue(dest, out var claimed) && string.Equals(claimed.Source, b.Source, StringComparison.Ordinal))
+                        throw new TransferException("bad_task",
+                            $"Task for {target} binds source column {b.Source} to two targets ({claimed.Target}, {b.Target}) which both " +
+                            $"land in the one #stg column {dest}; give #stg a column per target.",
+                            [dest, claimed.Target, b.Target]);
                     throw new TransferException("bad_task",
                         $"Task for {target} binds two source columns to the one #stg column {dest}: {first} and {b.Source}. Only one of " +
                         "them can be loaded, so the task is refused rather than dropping the other without saying so.",
                         [dest, first, b.Source]);
+                }
                 mapped.Add(source);
+                takenBy[dest] = b;
                 taken[dest] = b.Source;
                 mappings.Add(new SqlBulkCopyColumnMapping(source, dest));
             }
@@ -510,6 +534,12 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options, TargetSha
             _merged = null;
             _mergeRan = false;
             Report(0);
+            // Ruling 207: over the limit, no reload - the chunk goes back to the caller in the fresh, empty transaction (see RestartRowLimit).
+            if (loader.RestartRowLimit is int cap && table.Rows.Count > cap)
+                throw new TransferException(RestartCapped, string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                    $"A row error ended the transaction while loading a chunk of {table.Rows.Count:N0} rows into {loader._task.Target}. " +
+                    $"The chunk is read again in chunks of at most {cap:N0} rows, so that isolating the row costs restarts of at most " +
+                    $"{cap:N0} rows each."));
         }
 
         /// <summary>Live rows-copied inside one attempt, on top of what is already confirmed. Withdrawn if the attempt is rolled back.</summary>

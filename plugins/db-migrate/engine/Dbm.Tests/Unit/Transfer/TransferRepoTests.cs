@@ -106,6 +106,47 @@ public sealed class TransferRepoTests : IDisposable
         Assert.Equal(5, _repo.ErrorRowCount(id, "T02"));
     }
 
+    /// <summary>
+    /// Ruling 208 (open item 46): an error row keeps the SQL Server error number of the attempt that refused it, and null when the
+    /// failure carried none. <b>Harm:</b> without it the re-run exemption can recognise a duplicate key only by SQL Server's English
+    /// text, and the most common recorded error cannot be named by its number.
+    /// </summary>
+    [Fact]
+    public void An_error_row_keeps_its_error_number_and_a_missing_number_stays_missing()
+    {
+        long id = NewRun();
+        _repo.AddErrorRow(id, "T02", "{\"__k0\":1}", "{}", "Violation of PRIMARY KEY constraint 'PK_O'.", 2627);
+        _repo.AddErrorRow(id, "T02", "{\"__k0\":2}", "{}", "client-side truncation", null);
+
+        var rows = _repo.ErrorRows(id, "T02");
+
+        Assert.True(rows[0].ErrorNumber == 2627, $"the recorded row lost its error number: {rows[0].ErrorNumber?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "null"}");
+        Assert.True(rows[1].ErrorNumber is null, "a row whose failure carried no number was recorded with one");
+        Assert.Equal(1L, _db.Scalar<long>("SELECT COUNT(*) FROM error_row WHERE error_number = 2627"));
+    }
+
+    /// <summary>
+    /// The count query behind the zero-load guard's re-run exemption (Ruling 208): the task's recorded rejects grouped by number, with
+    /// the first text seen for each, over every recorded row - not the 10,000 <see cref="TransferRepo.ErrorRows"/> would read. The
+    /// missing number is a group of its own, so "no number" can never be counted as a duplicate key.
+    /// </summary>
+    [Fact]
+    public void Error_number_counts_group_a_tasks_rejects_by_number_with_the_first_text_of_each()
+    {
+        long id = NewRun();
+        _repo.AddErrorRow(id, "T02", null, "{}", "dup 1", 2627);
+        _repo.AddErrorRow(id, "T02", null, "{}", "fk 1", 547);
+        _repo.AddErrorRow(id, "T02", null, "{}", "dup 2", 2627);
+        _repo.AddErrorRow(id, "T02", null, "{}", "old row, recorded before the number was", null);
+        _repo.AddErrorRow(id, "T01", null, "{}", "other task", 2627);
+
+        var counts = _repo.ErrorNumberCounts(id, "T02").OrderBy(c => c.Number ?? -1).ToList();
+
+        Assert.Equal(new[] { "- x1 old row, recorded before the number was", "547 x1 fk 1", "2627 x2 dup 1" },
+            counts.Select(c => $"{c.Number?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "-"} x{c.Rows} {c.FirstError}"));
+        Assert.Equal("unknown_task", Assert.Throws<TransferException>(() => _repo.ErrorNumberCounts(id, "T99")).Code);
+    }
+
     [Fact]
     public void RecoverInterrupted_pauses_running_runs_and_tasks()
     {

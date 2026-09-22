@@ -130,6 +130,46 @@ public sealed class BulkLoaderTests
         Assert.Equal(0, await db.ScalarAsync<int>("SELECT COUNT(*) FROM dbo.T WHERE v < 0"));
     }
 
+    /// <summary>
+    /// Ruling 207 (open item 15): with a <see cref="BulkLoader.RestartRowLimit"/>, a chunk of more rows than that is not bisected across
+    /// restarts. At the first transaction-ending error the loader begins a fresh transaction and gives the chunk back as
+    /// <c>restart_capped</c>, holding none of its rows, so the caller can read the same rows again in smaller chunks. <b>Harm:</b> each
+    /// restart reloads every row confirmed so far - 18 restarts and 7.0 s for one such row in 100,000, measured.
+    /// </summary>
+    [Fact]
+    public async Task A_transaction_ending_error_in_a_chunk_over_the_restart_limit_hands_the_chunk_back_in_a_fresh_transaction()
+    {
+        var (db, conn) = await OpenAsync();
+        await using var dbScope = db;
+        await using var connScope = conn;
+        var task = new TaskPlan { Target = "dbo.T", SourceQuery = "unused", KeyColumns = ["__k0"], Columns = [new("Id", "id"), new("V", "v")] };
+        var table = new DataTable();
+        table.Columns.Add("Id", typeof(int));
+        table.Columns.Add("V", typeof(int));
+        table.Columns.Add("__k0", typeof(int));
+        for (int i = 0; i < 20; i++) table.Rows.Add(i, i == 16 ? -1 : i, i);
+        var loader = new BulkLoader(task, new TransferOptions { ErrorMode = "skip", FireTriggers = true }) { RestartRowLimit = 10 };
+
+        await using var scope = await TxScope.BeginAsync(conn, default);
+        var refused = await Record.ExceptionAsync(() => loader.LoadAsync(scope, table, allowRestart: true, progress: null, default));
+
+        Assert.True(refused is TransferException { Code: "restart_capped" },
+            "a 20-row chunk over a restart limit of 10 was bisected across restarts instead of being handed back: "
+            + (refused?.Message ?? "no exception"));
+        int state = await scope.XactStateAsync(default);
+        Assert.True(state == 1, "the chunk was handed back in a transaction that is not live (XACT_STATE "
+            + state.ToString(System.Globalization.CultureInfo.InvariantCulture) + "), so the caller cannot load the smaller chunks in it");
+        await scope.CommitAsync(default);
+        Assert.Equal(0, await db.CountAsync("dbo.T"));                                // holding none of the chunk's rows
+
+        // At or under the limit the chunk is bisected across restarts exactly as before.
+        await using var again = await TxScope.BeginAsync(conn, default);
+        var outcome = await loader.LoadAsync(again, table.AsEnumerable().Skip(10).CopyToDataTable(), allowRestart: true, progress: null, default);
+        await again.CommitAsync(default);
+        Assert.True(outcome.Loaded == 9 && outcome.Restarts >= 1 && outcome.Failed.Single().Row == 6,
+            $"a 10-row chunk at the limit was not bisected across restarts: Loaded={outcome.Loaded} Restarts={outcome.Restarts}");
+    }
+
     [Fact]
     public async Task Keyless_loads_cannot_survive_a_transaction_ending_error()
     {

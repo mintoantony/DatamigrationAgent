@@ -11,7 +11,15 @@ public sealed record TransferTaskRow(long RunId, string TaskId, string Target, i
     long? RowsSource, long? RowsBefore, long RowsDone, long RowsError, string? LastKeyJson, DateTimeOffset? HeartbeatAt,
     DateTimeOffset? StartedAt, DateTimeOffset? EndedAt, string? Error, string? ValidationJson);
 
-public sealed record ErrorRowEntry(long Id, long RunId, string TaskId, string? KeyJson, string? RowJson, string Error, DateTimeOffset Ts);
+public sealed record ErrorRowEntry(long Id, long RunId, string TaskId, string? KeyJson, string? RowJson, string Error, DateTimeOffset Ts)
+{
+    /// <summary>The first SQL Server error number of the attempt that refused the row (Ruling 208); null when that failure carried
+    /// none, and for every row recorded before migration step 2.</summary>
+    public int? ErrorNumber { get; init; }
+}
+
+/// <summary>A task's recorded rejects that share one error number (null: no number), with how many there are and the first text.</summary>
+public sealed record ErrorNumberCount(int? Number, long Rows, string FirstError);
 
 /// <summary>
 /// SQLite mirror of transfer runs (the target control table is the source of truth for checkpoints).
@@ -154,23 +162,44 @@ public sealed class TransferRepo(StateDb db)
             new { Json = validationJson, RunId = runId, TaskId = taskId }));
     }
 
-    /// <summary>Records a rejected row; the task must exist (no orphan error rows).</summary>
-    public void AddErrorRow(long runId, string taskId, string? keyJson, string? rowJson, string error)
+    /// <summary>Records a rejected row; the task must exist (no orphan error rows). <paramref name="errorNumber"/> is the SQL Server
+    /// error number of the attempt that refused it, null when it carried none (Ruling 208).</summary>
+    public void AddErrorRow(long runId, string taskId, string? keyJson, string? rowJson, string error, int? errorNumber = null)
     {
         ArgumentNullException.ThrowIfNull(taskId);
         if (string.IsNullOrWhiteSpace(error)) throw new ArgumentException("An error row needs a non-blank error.", nameof(error));
         RequireTask(runId, taskId, _db.Execute(
-            "INSERT INTO error_row (run_id, task_id, key_json, row_json, error, ts) " +
-            "SELECT $RunId, $TaskId, $KeyJson, $RowJson, $Error, $Ts WHERE EXISTS (SELECT 1 FROM transfer_task WHERE run_id = $RunId AND task_id = $TaskId)",
-            new { RunId = runId, TaskId = taskId, KeyJson = keyJson, RowJson = rowJson, Error = error, Ts = Clock.NowText() }));
+            "INSERT INTO error_row (run_id, task_id, key_json, row_json, error, ts, error_number) " +
+            "SELECT $RunId, $TaskId, $KeyJson, $RowJson, $Error, $Ts, $Number WHERE EXISTS (SELECT 1 FROM transfer_task WHERE run_id = $RunId AND task_id = $TaskId)",
+            new { RunId = runId, TaskId = taskId, KeyJson = keyJson, RowJson = rowJson, Error = error, Ts = Clock.NowText(), Number = errorNumber }));
     }
 
     /// <summary>Oldest first; <paramref name="limit"/> is clamped to 1..10000.</summary>
     public IReadOnlyList<ErrorRowEntry> ErrorRows(long runId, string? taskId = null, int limit = 100)
-        => _db.Query("SELECT id, run_id, task_id, key_json, row_json, error, ts FROM error_row " +
+        => _db.Query("SELECT id, run_id, task_id, key_json, row_json, error, ts, error_number FROM error_row " +
                      "WHERE run_id = $RunId AND ($TaskId IS NULL OR task_id = $TaskId) ORDER BY id LIMIT $Limit",
-            r => new ErrorRowEntry(r.GetInt64(0), r.GetInt64(1), r.GetString(2), Str(r, 3), Str(r, 4), r.GetString(5), Ts(r, 6)!.Value),
+            r => new ErrorRowEntry(r.GetInt64(0), r.GetInt64(1), r.GetString(2), Str(r, 3), Str(r, 4), r.GetString(5), Ts(r, 6)!.Value)
+            {
+                ErrorNumber = r.IsDBNull(7) ? null : r.GetInt32(7),
+            },
             new { RunId = runId, TaskId = taskId, Limit = Math.Clamp(limit, 1, 10_000) });
+
+    /// <summary>
+    /// Ruling 208: every recorded reject of an existing task, counted by error number (null is a group of its own: no number, or a row
+    /// recorded before migration step 2), with the first text recorded for each. One aggregate over all of the task's rows - no limit.
+    /// An unknown run or task throws "unknown_task" rather than reading as "nothing recorded".
+    /// </summary>
+    public IReadOnlyList<ErrorNumberCount> ErrorNumberCounts(long runId, string taskId)
+    {
+        ArgumentNullException.ThrowIfNull(taskId);
+        if (Task(runId, taskId) is null) throw new TransferException("unknown_task", $"Transfer task {taskId} of run {runId} does not exist.");
+        return _db.Query(
+            "SELECT e.error_number, COUNT(*), (SELECT e2.error FROM error_row e2 WHERE e2.run_id = $RunId AND e2.task_id = $TaskId " +
+            "AND e2.error_number IS e.error_number ORDER BY e2.id LIMIT 1) " +
+            "FROM error_row e WHERE e.run_id = $RunId AND e.task_id = $TaskId GROUP BY e.error_number",
+            r => new ErrorNumberCount(r.IsDBNull(0) ? null : r.GetInt32(0), r.GetInt64(1), r.GetString(2)),
+            new { RunId = runId, TaskId = taskId });
+    }
 
     /// <summary>Rejected rows recorded for an existing task; an unknown run or task throws "unknown_task" rather than reading as 0 (ruling L2).</summary>
     public long ErrorRowCount(long runId, string taskId)
