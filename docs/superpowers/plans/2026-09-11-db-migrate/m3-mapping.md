@@ -5601,24 +5601,7 @@ The A1 invariant is unchanged and still governs. These two paths are further exa
 
 These are defects in the plan text above, not in the implementation. `MappingPacket.cs`, `MappingModule.cs`, `mapping-architect.md` and all four test files are byte-identical to the brief; the registry line is exactly as specified. The brief was wrong.
 
-### B1 — A table carrying a type risk is NOT confident (highest priority)
-
-**INVARIANT (this is the spec; everything after it is explanation):**
-
-> A column's `TypeRisk` must reach BOTH the human and the AI agent, on every path, whenever it is present. No summarisation, confidence score, compatibility level or match method may cause it to be omitted.
-
-`IsConfident` currently tests blockers, sources and `NeedsReview(method, confidence)` and never looks at `TypeRisk`. A confident table is summarised as `{target, source, confidence, columns}`, and the playbook tells the agent to skip confident tables. Only *detail* tables carry `columns[*].typeRisk`.
-
-The auto-mapper produces the dangerous case routinely: a column matching by name with a Widening or Risky type conversion scores `method: fuzzy` (Exact requires `Level == Exact`) at a total at or above the 0.85 auto-accept threshold, so it is not "needs review". Example: `varchar(300) → nvarchar(200)` at fuzzy 0.9 carrying `"may truncate (source max 300)"`. Its table is confident, the agent skips it, no `LEFT`/`CAST` is added, and rows truncate at transfer.
-
-**Fix, both halves:**
-
-1. `IsConfident` returns false when any column of the table has a non-null, non-empty `TypeRisk`. Such a table is therefore detailed, and the existing detail path already carries the risk — no new packet field, no playbook change.
-2. `NeedsAgent` returns true when any column carries a `TypeRisk` and has not already been decided by the agent or a human. Without this, a project whose *only* problem is type risk never invokes the agent at all.
-
-Chosen deliberately over the cheaper alternative of adding a `typeRisks` map to summarised entries plus a playbook instruction to stop skipping them: that leaves a seam where a risk can be forgotten again, and this milestone's entire failure history is risks disappearing at seams. Detailing a table that carries a genuine data-loss hazard is the correct place to spend packet tokens.
-
-**Rework contexts:** the `column:src:`, `table:src:` and `general` contexts omit the risk today, and `usedBy` lists bare target column names. Carry the risk in these too — the invariant above is not limited to the draft packet.
+The items of this amendment that concerned type risks, and every correction pass that followed it, were void and have been removed; the gaps in the lettering are theirs. The live risk rules are in `# THE RISK MODEL`, below every task.
 
 ### B2 — Validate must REJECT what the packet builder cannot process
 
@@ -5643,17 +5626,6 @@ The brief's `Identity_and_registration` test calls `new MappingModule(null!)`, s
 ### B4 — Drop the undocumented `map` key
 
 `TableDetail` emits `"map": null` for a target table with no map. That key appears in neither the normative Draft shape nor the playbook, so the agent receives an undocumented field. Omit the key when there is no map.
-
-### B5 — Tests that would actually catch B1
-
-Deleting the line that writes `typeRisk` into the packet leaves all of this task's tests passing — verified by mutation. The root cause is that `SampleMappings.Approved()` contains **zero** columns with a `TypeRisk`.
-
-**Do NOT add a `TypeRisk` to `SampleMappings.Approved()`.** That fixture is pinned across milestones: Milestone 4's SQL generator tests assert exact generated SQL and the exact summary string `"6 tasks, 0 errors, 9 warnings"` derived from it, and a new risk would add a warning and break them before that milestone starts. New tests must build their own payload carrying a risk and leave the shared fixture untouched.
-
-Required tests:
-- an auto draft's risky *detail* column carries `typeRisk`;
-- the B1 case: a high-confidence risky column in an otherwise clean table still reaches the agent (the table is no longer confident);
-- the `colmap:` rework context carries the risk.
 
 ### B6 — Note on `ctx.Services`
 
