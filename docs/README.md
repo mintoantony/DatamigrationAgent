@@ -199,7 +199,8 @@ helps). A run that still ends with a task that loaded 0 of its source rows names
 loaded 0 of 3,005 rows") instead of saying the row counts were validated.
 
 The exception is a new run into tables that already held rows (see above): when every rejected row of such a table is a
-duplicate key (primary key or unique), those rows were already there, so the task is not stopped and the headline's
+duplicate key (primary key or unique, told by SQL Server's error number 2627 or 2601), those rows were already there, so
+the task is not stopped and the headline's
 "loaded 0 of N" is expected - it is not a mapping problem. A foreign-key or CHECK error in such a run still stops the task.
 
 **Live view**: overall and per-task progress bars, rows per second, ETA, a throughput sparkline, the rejected-row count
@@ -218,7 +219,7 @@ part of finishing.
 
 Per task: source rows, rows loaded, rejected rows, duration, rows per second and validation results (row counts and
 column checksums), plus the run's options and any notes the run recorded. Up to 5 rejected rows per task are listed by
-key with their error. In the demo with *Skip and log bad rows* you see 8 rejected rows: 2 orphan orders and their 2
+key with their error and SQL Server's error number (rows recorded by an older version of the plugin have none). In the demo with *Skip and log bad rows* you see 8 rejected rows: 2 orphan orders and their 2
 lines (foreign key), 3 comments longer than the target column (truncation) and 1 zero quantity (CHECK constraint).
 
 Read the report before you call a run clean: a *Completed* run can still carry notes, and a task with 0 rows loaded and

@@ -223,7 +223,9 @@
   function samplesList(samples) {
     return h('ul', { class: 'rep-samples' }, ...samples.map(function (s) {
       // The separator is a text node, not the grid gap: read aloud these two run together into "Id=88213Cannot insert…".
-      return h('li', {}, h('span', { class: 'mono small' }, X.keyText(s.key)), ' ', h('span', { class: 'small' }, s.error));
+      // Ruling 208: the server's error number, when the row was recorded with one; a row recorded without one shows none, never a 0.
+      const n = typeof s.errorNumber === 'number' ? 'error ' + s.errorNumber + ': ' : '';
+      return h('li', {}, h('span', { class: 'mono small' }, X.keyText(s.key)), ' ', h('span', { class: 'small' }, n + s.error));
     }));
   }
 

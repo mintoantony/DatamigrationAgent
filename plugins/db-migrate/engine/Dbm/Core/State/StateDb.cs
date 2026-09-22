@@ -145,16 +145,35 @@ public sealed class StateDb : IDisposable
         return reader.ReadToEnd();
     }
 
+    /// <summary>
+    /// Ordered, independent steps, each additive and idempotent inside its own transaction and each re-reading the version inside it,
+    /// because another process may have won the race. <c>schema.sql</c> is the version-1 schema and stays that way: a new database
+    /// and one written by a released engine take the same steps from where they stand.
+    /// </summary>
     private void Migrate()
     {
-        if (Scalar<long>("PRAGMA user_version") >= 1) return;
-        InTransaction(() =>
+        Step(1, () => Execute(LoadSchema()));
+        // Ruling 208 (open item 46): the SQL Server error number of a rejected row. Nullable: rows recorded before this step, and rows
+        // whose failure carried no server error, have none - and a missing number never counts as a duplicate key.
+        Step(2, () =>
         {
-            if (Scalar<long>("PRAGMA user_version") >= 1) return;   // another process won the race
-            Execute(LoadSchema());
-            Execute("PRAGMA user_version = 1");
+            if (!HasColumn("error_row", "error_number")) Execute("ALTER TABLE error_row ADD COLUMN error_number INTEGER");
         });
     }
+
+    private void Step(long version, Action apply)
+    {
+        if (Scalar<long>("PRAGMA user_version") >= version) return;
+        InTransaction(() =>
+        {
+            if (Scalar<long>("PRAGMA user_version") >= version) return;   // another process won the race
+            apply();
+            Execute(string.Create(CultureInfo.InvariantCulture, $"PRAGMA user_version = {version}"));
+        });
+    }
+
+    private bool HasColumn(string table, string column)
+        => Scalar<long>("SELECT COUNT(*) FROM pragma_table_info($Table) WHERE name = $Column", new { Table = table, Column = column }) > 0;
 
     private SqliteCommand Command(string sql, object? args)
     {

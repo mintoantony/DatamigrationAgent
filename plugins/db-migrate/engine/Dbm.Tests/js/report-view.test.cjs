@@ -109,6 +109,21 @@ test('a sample\'s key does not run into its message, nor a target into its count
   assert.equal(D.text(D.query(root, '.card-b .row')), 'app.Orders 3 rejected rows; 1 sample below');
 });
 
+test('a sample shows its SQL Server error number beside the message, and one recorded without a number shows none (Ruling 208)', () => {
+  const tasks = report().tasks.map((t) => t.taskId !== 'T02' ? t : Object.assign({}, t, {
+    rowsError: 2,
+    errorSamples: [
+      { key: '{"Id":88213}', error: "Cannot insert the value NULL into column 'CustomerId'.", errorNumber: 515 },
+      { key: '{"Id":88214}', error: 'client-side truncation' },
+    ],
+  }));
+  const shown = D.texts(mount(report({ tasks: tasks })), '.rep-samples li').slice(0, 2);
+  assert.deepEqual(shown, [
+    "Id=88213 error 515: Cannot insert the value NULL into column 'CustomerId'.",
+    'Id=88214 client-side truncation',
+  ], 'the sample line does not carry the error number the engine stored: ' + JSON.stringify(shown));
+});
+
 test('the notes are rendered verbatim and in order', () => {
   const r = report();
   assert.deepEqual(D.texts(mount(r), '.rep-notes li'), r.notes);

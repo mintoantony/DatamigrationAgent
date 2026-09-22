@@ -24,6 +24,28 @@ public sealed class ReportingTests
     private static TransferRunRow Run(RunStatus status = RunStatus.Completed, DateTimeOffset? startedAt = null) =>
         new(9, 3, status, new TransferOptions(), startedAt ?? T0, null, null);
 
+    /// <summary>Ruling 208: a report's error sample carries the server's number beside the text, and a row recorded without one (before
+    /// migration step 2, or a client-side failure) carries none - not a 0. <b>Harm:</b> the number the engine now stores is lost on the way
+    /// to the one screen that lists the rejected rows.</summary>
+    [Fact]
+    public void An_error_sample_carries_the_error_number_and_a_missing_one_is_absent()
+    {
+        var tasks = new List<TransferTaskRow> { Row("T02", "app.Orders", 3005, 3003, 2, null, 6) };
+        var rows = new List<ErrorRowEntry>
+        {
+            new(1, 1, "T02", "{\"__k0\":1}", "{}", "FK conflict", T0) { ErrorNumber = 547 },
+            new(2, 1, "T02", "{\"__k0\":2}", "{}", "client-side truncation", T0),
+        };
+        var report = FinalReportBuilder.Build(Run(), RunStatus.Completed, tasks, _ => rows, T0.AddSeconds(10), [], _ => 2);
+
+        var samples = report.Tasks[0].ErrorSamples;
+        Assert.True(samples[0].ErrorNumber == 547, "the report's error sample lost the row's error number");
+        Assert.Null(samples[1].ErrorNumber);
+        string json = Json.Serialize(samples);
+        Assert.Equal("[{\"key\":\"{\\\"__k0\\\":1}\",\"error\":\"FK conflict\",\"errorNumber\":547},"
+                     + "{\"key\":\"{\\\"__k0\\\":2}\",\"error\":\"client-side truncation\"}]", json);
+    }
+
     [Fact]
     public void Build_aggregates_tasks_validation_samples_and_notes()
     {

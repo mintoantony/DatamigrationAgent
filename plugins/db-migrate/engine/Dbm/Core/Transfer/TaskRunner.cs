@@ -127,7 +127,9 @@ internal sealed class TaskRunner(RunContext rc)
         return Task.CompletedTask;
     }
 
-    internal sealed record ErrorRecord(string? Key, string Row, string Error);
+    /// <param name="Number">The row's SQL Server error number (<see cref="RowFailure.ErrorNumber"/>), null when its failure carried none;
+    /// stored beside the text (Ruling 208).</param>
+    internal sealed record ErrorRecord(string? Key, string Row, string Error, int? Number = null);
 
     private sealed record Pass(TransferTaskStatus Status, Checkpoint Checkpoint);
 
@@ -377,7 +379,7 @@ internal sealed class TaskRunner(RunContext rc)
     private void ThrowIfLoadedNothing(string id, string target, long? rowsBefore, Checkpoint cp, RejectTally rejects)
     {
         var why = LoadedNothingReason(target, cp.ChunkNo, cp.RowsDone, cp.RowsError, rowsBefore, rejects,
-            () => rc.Repo.ErrorRows(rc.RunId, id, (int)Math.Min(cp.RowsError, int.MaxValue)).Select(e => e.Error).ToList(), keyed: true);
+            () => rc.Repo.ErrorNumberCounts(rc.RunId, id), keyed: true);
         if (why is not null) throw new TransferException("bad_task", why);
     }
 
@@ -387,32 +389,33 @@ internal sealed class TaskRunner(RunContext rc)
     /// <para>Ruling 201: also null for the re-run Ruling 186 lets a human confirm - a target table that already held rows
     /// (<paramref name="rowsBefore"/> above 0) - when every reject is a duplicate key (2627 or 2601): those rows are already there, which
     /// is what the confirmation said would happen, not a plan defect. The duplicates must be <b>shown</b>: from the segment's tally when
-    /// it covers every reject, otherwise from all of the task's <paramref name="recorded"/> error texts. Anything short of that - a
-    /// reject that is not a duplicate, a recorded text the recogniser does not know, fewer recorded rows than rejects - is judged as
-    /// before. An FK or CHECK reject (547) in a re-run still stops.</para>
+    /// it covers every reject, otherwise from the error numbers of all of the task's <paramref name="recorded"/> rejects (Ruling 208).
+    /// Anything short of that - a reject that is not a duplicate, a recorded reject with no number (every row recorded before migration
+    /// step 2 has none), fewer recorded rows than rejects - is judged as before. An FK or CHECK reject (547) in a re-run still stops.</para>
     /// </summary>
-    /// <param name="recorded">The task's recorded error texts, read only when the tally does not cover every reject; null when there
-    /// are none to read (a keyless task records nothing before it completes, and its one segment's tally covers everything).</param>
+    /// <param name="recorded">The task's recorded rejects counted by error number, read only when the tally does not cover every
+    /// reject; null when there are none to read (a keyless task records nothing before it completes, and its one segment's tally covers
+    /// everything).</param>
     internal static string? LoadedNothingReason(string target, int chunks, long rowsDone, long rowsError, long? rowsBefore,
-        RejectTally rejects, Func<IReadOnlyList<string>>? recorded, bool keyed)
+        RejectTally rejects, Func<IReadOnlyList<ErrorNumberCount>>? recorded, bool keyed)
     {
         ArgumentNullException.ThrowIfNull(rejects);
         if (rowsDone != 0 || rowsError <= 0) return null;
         bool covered = rejects.Rows >= rowsError;
-        IReadOnlyList<string>? texts = covered ? null : recorded?.Invoke();
-        bool textsComplete = texts is not null && texts.Count >= rowsError;
-        if (rowsBefore > 0 && (covered ? rejects.OnlyDuplicateKeys : textsComplete && texts!.All(IsDuplicateKeyText))) return null;
+        IReadOnlyList<ErrorNumberCount>? groups = covered ? null : recorded?.Invoke();
+        long recordedRows = groups?.Sum(g => g.Rows) ?? 0;
+        bool recordedDuplicatesOnly = groups is not null && recordedRows >= rowsError
+                                      && groups.All(g => g.Rows == 0 || g.Number is 2627 or 2601);
+        if (rowsBefore > 0 && (covered ? rejects.OnlyDuplicateKeys : recordedDuplicatesOnly)) return null;
 
         string first = chunks == 1 ? "the first chunk" : Inv($"the first {chunks} chunks");
         string common;
-        if (!covered && texts is { Count: > 0 })
+        if (!covered && recordedRows > 0 && MostCommon(groups!.Select(g => (g.Number, g.Rows, g.FirstError))) is { } top)
         {
-            // Ruling 192 review F3: the tally is this segment's only; the recorded rows cover the chunks earlier segments rejected. The
-            // number is not recorded, so the sentence names the text.
-            // A duplicate-key message names its own value, so the texts are grouped by what comes before that value (re-review N2),
-            // and one whole text stands for the group.
-            var top = texts.GroupBy(ErrorKind, StringComparer.Ordinal).OrderByDescending(g => g.Count()).First();
-            common = Inv($" The most common recorded error, on {top.Count():N0} of {texts.Count:N0} recorded rows, was: ") + top.First();
+            // Ruling 192 review F3: the tally is this segment's only; the recorded rows cover the chunks earlier segments rejected.
+            // Grouped by number (Ruling 208), so duplicates naming different values are one error (re-review N2).
+            common = Inv($" The most common recorded error, on {top.Rows:N0} of {recordedRows:N0} recorded rows, was ")
+                     + (top.Number is int n ? Inv($"error {n}") : "an error recorded with no server error number") + ": " + top.Text;
         }
         else
         {
@@ -433,27 +436,18 @@ internal sealed class TaskRunner(RunContext rc)
 
     private static string Inv(FormattableString text) => FormattableString.Invariant(text);
 
-    /// <summary>A recorded error text without the part that names one row's value: SQL Server's duplicate-key message ends with
-    /// " The duplicate key value is (…)", which differs row by row although the error is the same.</summary>
-    internal static string ErrorKind(string text)
+    /// <summary>The error number with the most rows, ties to the lowest number; the entry with no number wins only with strictly more
+    /// rows than every number (a number says more than its absence). Null when there is nothing with a row.</summary>
+    internal static (int? Number, long Rows, string Text)? MostCommon(IEnumerable<(int? Number, long Rows, string Text)> entries)
     {
-        ArgumentNullException.ThrowIfNull(text);
-        int at = text.IndexOf(" The duplicate key value is", StringComparison.Ordinal);
-        return at < 0 ? text : text[..at];
-    }
-
-    /// <summary>
-    /// Ruling 201's fallback: whether a <b>recorded</b> error text is SQL Server's duplicate-key message - 2627 ("Violation of PRIMARY
-    /// KEY constraint" / "Violation of UNIQUE KEY constraint") or 2601 ("Cannot insert duplicate key row in object"). The error number
-    /// is not recorded, so this reads the English text the server sends at the start of the message. A server that answers in another
-    /// language is not recognised, and its re-run is judged as before - the safe direction.
-    /// </summary>
-    internal static bool IsDuplicateKeyText(string text)
-    {
-        ArgumentNullException.ThrowIfNull(text);
-        return text.StartsWith("Violation of PRIMARY KEY constraint ", StringComparison.Ordinal)
-               || text.StartsWith("Violation of UNIQUE KEY constraint ", StringComparison.Ordinal)
-               || text.StartsWith("Cannot insert duplicate key row in object ", StringComparison.Ordinal);
+        ArgumentNullException.ThrowIfNull(entries);
+        var list = entries.Where(e => e.Rows > 0).ToList();
+        (int? Number, long Rows, string Text)? best = null;
+        foreach (var e in list.Where(e => e.Number is not null).OrderBy(e => e.Number))
+            if (best is null || e.Rows > best.Value.Rows) best = e;
+        foreach (var e in list.Where(e => e.Number is null))
+            if (best is null || e.Rows > best.Value.Rows) best = e;
+        return best;
     }
 
     /// <summary>The rejected rows of a task's first chunks, counted by error number, with the first text seen for each (ruling 192).</summary>
@@ -480,15 +474,12 @@ internal sealed class TaskRunner(RunContext rc)
             }
         }
 
-        /// <summary>The error number with the most rows, ties to the lowest number; the rejects with no number win only with strictly
-        /// more rows than every number (a number says more than its absence). Null when nothing was added.</summary>
+        /// <summary><see cref="TaskRunner.MostCommon"/> over this tally. Null when nothing was added.</summary>
         public (int? Number, long Rows, string Text)? MostCommon()
         {
-            (int? Number, long Rows, string Text)? best = null;
-            foreach (var (n, e) in _byNumber.OrderBy(kv => kv.Key))
-                if (best is null || e.Rows > best.Value.Rows) best = (n, e.Rows, e.Text);
-            if (_noNumber is { } x && (best is null || x.Rows > best.Value.Rows)) best = (null, x.Rows, x.Text);
-            return best;
+            var entries = _byNumber.Select(kv => ((int?)kv.Key, kv.Value.Rows, kv.Value.Text)).ToList();
+            if (_noNumber is { } x) entries.Add((null, x.Rows, x.Text));
+            return TaskRunner.MostCommon(entries);
         }
     }
 
@@ -584,7 +575,7 @@ internal sealed class TaskRunner(RunContext rc)
                 }
             }
             string error = TransferFailure.NonBlank(f.Error, Bisector.NoErrorText);
-            list.Add(new ErrorRecord(key, RowSnapshot.Json(row, task.Columns), note is null ? error : $"{error} [{note}]"));
+            list.Add(new ErrorRecord(key, RowSnapshot.Json(row, task.Columns), note is null ? error : $"{error} [{note}]", f.ErrorNumber));
         }
         return list;
     }
@@ -599,6 +590,6 @@ internal sealed class TaskRunner(RunContext rc)
 
     private void Write(string id, IEnumerable<ErrorRecord> records)
     {
-        foreach (var e in records) rc.Repo.AddErrorRow(rc.RunId, id, e.Key, e.Row, ErrorText(e.Error, rc.Scrub));
+        foreach (var e in records) rc.Repo.AddErrorRow(rc.RunId, id, e.Key, e.Row, ErrorText(e.Error, rc.Scrub), e.Number);
     }
 }

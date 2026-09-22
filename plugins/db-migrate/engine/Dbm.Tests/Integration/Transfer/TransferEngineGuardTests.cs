@@ -189,6 +189,9 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
         var rejected = rig.Repo.ErrorRows(runId, "T01", 100);
         Assert.Equal(8, rejected.Count);                                               // every one of dbo.Uni's 8 source rows, recorded
         Assert.All(rejected, e => Assert.True(e.Error.Contains("CK_Uni_Qty", StringComparison.Ordinal), e.Error));
+        // Ruling 208: each recorded row keeps the server's number beside its text.
+        Assert.True(rejected.All(e => e.ErrorNumber == 547),
+            "a rejected row was recorded without its error number: " + string.Join(", ", rejected.Select(e => e.ErrorNumber?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "null")));
 
         var resumed = await rig.Engine.RunAsync(runId, new TransferControl(), default);
         Assert.True(resumed.Status == RunStatus.Completed,
@@ -338,7 +341,7 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
         Assert.Equal(RunStatus.Failed, (await rig.Engine.RunAsync(runId, new TransferControl(), default)).Status);
 
         string error = rig.Repo.Task(runId, "T01")!.Error!;
-        Assert.True(error.Contains("The most common recorded error, on 100 of 100 recorded rows, was: ", StringComparison.Ordinal)
+        Assert.True(error.Contains("The most common recorded error, on 100 of 100 recorded rows, was error 547: ", StringComparison.Ordinal)
                     && error.Contains("CK_Okay_V", StringComparison.Ordinal),
             "the reason for a judgement after a pause does not name the error: " + error);
     }

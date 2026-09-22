@@ -6,7 +6,12 @@ namespace Dbm.Core.Transfer;
 /// <summary>One rejected row, as shown to an operator. A null <see cref="Key"/> means the task had no key at all; a keyed task whose key
 /// could not be encoded carries the reason inside <see cref="Error"/> instead (5.3 <c>TaskRunner.Capture</c>), so null keeps the two
 /// meanings it already had and gains no third.</summary>
-public sealed record ErrorSample(string? Key, string Error);
+public sealed record ErrorSample(string? Key, string Error)
+{
+    /// <summary>The row's SQL Server error number (Ruling 208); null - and so absent from the JSON - when the row was recorded without
+    /// one: its failure carried none, or it was recorded before the state database stored numbers.</summary>
+    public int? ErrorNumber { get; init; }
+}
 
 /// <summary>
 /// One task in the final report. The nullable fields are absences, and each one has a sibling that says why it is absent, because
@@ -168,7 +173,7 @@ public static class FinalReportBuilder
     {
         var v = t.ValidationJson is null ? null : Json.Deserialize<TaskValidation>(t.ValidationJson);
         double? duration = t.StartedAt is { } s && t.EndedAt is { } e ? Math.Round(Math.Max(0, (e - s).TotalSeconds), 1) : null;
-        var samples = errorRows(t.TaskId).Take(MaxErrorSamples).Select(r => new ErrorSample(r.KeyJson, r.Error)).ToList();
+        var samples = errorRows(t.TaskId).Take(MaxErrorSamples).Select(r => new ErrorSample(r.KeyJson, r.Error) { ErrorNumber = r.ErrorNumber }).ToList();
         long? rowsSource = t.RowsSource ?? v?.RowsSource;
         return new TaskReport(t.TaskId, t.Target, t.Status, rowsSource, t.RowsDone, t.RowsError, duration,
             v?.CountMatch, v?.Checksums ?? [], v is null ? RunValidator.NoValidation : v.ChecksumsSkipped, samples, t.Error)

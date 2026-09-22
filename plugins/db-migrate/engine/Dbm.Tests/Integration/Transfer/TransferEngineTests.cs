@@ -227,7 +227,8 @@ public sealed class TransferEngineTests(EngineSourceFixture fx) : IClassFixture<
         var child = rig.Repo.Task(runId, "T02")!;
         Assert.Equal(TransferTaskStatus.Failed, child.Status);
         Assert.Contains("CK_Child_Qty", child.Error);
-        Assert.Single(rig.Repo.ErrorRows(runId, "T02"));
+        var bad = Assert.Single(rig.Repo.ErrorRows(runId, "T02"));
+        Assert.True(bad.ErrorNumber == 547, "stop mode recorded its bad row without the error number (Ruling 208)");
         Assert.Equal(500, await rig.Tgt.CountAsync("app.Child"));                   // chunk 2 (501..1000, holds Id 777) rolled back
         Assert.Equal(TransferTaskStatus.Pending, rig.Repo.Task(runId, "T03")!.Status);
         Assert.True(await ControlTableExistsAsync(rig.Tgt));

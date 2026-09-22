@@ -62,13 +62,15 @@ run loaded into — that one is for the human to fix in the UI, never by re-poin
   written down). They are in the final report under `notes`; a completed run with notes is not the same as a clean one.
 - The final report is the **Complete** artifact. The **Report** step shows it with an **Export HTML** button; from the CLI,
   `dbm export report` writes the same self-contained file (it fails with `export_unavailable` before a run has completed).
-- Rejected rows (skip-and-log) are counted per task; the final report lists up to 5 of them per task (key and error, never row
-  data) and validates row counts and column checksums.
+- Rejected rows (skip-and-log) are counted per task; the final report lists up to 5 of them per task (key, error and SQL Server
+  error number as `errorNumber` - absent for rows recorded by an older version of the plugin - never row data) and validates row
+  counts and column checksums.
 - Under skip-and-log, constraint violations (FOREIGN KEY, CHECK, PRIMARY KEY, UNIQUE) are always per-row rejects, even when every
   row of a chunk fails alike. A wrong FK or CHECK mapping therefore shows as a task whose first chunks reject everything: once its
   first 3 chunks (or its whole source, if smaller) have loaded no row, the task fails with `bad_task` instead of rejecting the
   whole table one row at a time. The exception is a re-run into a table that already held rows whose rejects are all duplicate
-  keys (PRIMARY KEY / UNIQUE): those rows were already there, so the task runs on. A task that still ends with 0 rows loaded of a
+  keys (PRIMARY KEY / UNIQUE, by error number 2627 / 2601; a recorded reject without a number never counts): those rows were
+  already there, so the task runs on. A task that still ends with 0 rows loaded of a
   non-empty source (after Resume, or in such a re-run) is named in the report's one-line summary ("app.Orders loaded 0 of 3,005
   rows"), which then never says "validated". If the summary says "target tables were not empty before this run" and the task's
   errors are duplicate keys, its rows were already in the target — say that. Otherwise treat it as a mapping problem, not bad
