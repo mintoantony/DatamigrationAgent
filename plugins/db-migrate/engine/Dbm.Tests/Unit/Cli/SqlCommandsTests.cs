@@ -149,6 +149,27 @@ public sealed class SqlCommandsTests : IDisposable
             "the live report left out the global statement's bare carriage return: " + r.Out);
     }
 
+    /// <summary>Review L4: `dbm artifact sql` states the validation fact in so many words - computed beside the payload, never stored
+    /// in it - instead of leaving it to the absence of a field.</summary>
+    [Fact]
+    public async Task Artifact_sql_says_whether_the_version_is_validated()
+    {
+        var s = WithSqlVersion();   // no evidence
+        var r = await CliRunner.RunAsync(_workspace.Ws, null, "artifact", "sql");
+        Assert.Equal(0, r.Exit);
+        Assert.True(r.Json["validated"] is not null && !(bool)r.Json["validated"]!, "dbm artifact sql does not say the version is not validated: " + r.Out[..Math.Min(300, r.Out.Length)]);
+        Assert.Equal([SqlModule.NoEvidence], r.Json["notValidatedReasons"]!.AsArray().Select(n => (string?)n));
+        Assert.Null(r.Json["payload"]!["validated"]);   // computed, not in the payload
+
+        var plan = Json.Deserialize<SqlPlanPayload>(s.Artifacts.Get(PhaseName.Sql, 0)!.PayloadJson);
+        plan.Validation = new SqlValidation(DateTimeOffset.UtcNow, true);
+        s.Artifacts.Add(PhaseName.Sql, 1, Json.Serialize(plan), "script", "validated");
+        s.Phases.SetCurrentVersion(PhaseName.Sql, 1);
+        var v = await CliRunner.RunAsync(_workspace.Ws, null, "artifact", "sql");
+        Assert.True((bool)v.Json["validated"]!);
+        Assert.Empty(v.Json["notValidatedReasons"]!.AsArray());
+    }
+
     [Fact]
     public async Task Gen_inline_reports_a_failed_job()
     {
