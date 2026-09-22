@@ -35,7 +35,16 @@ public sealed class SqlModuleTests : IDisposable
         return plan;
     }
 
-    private static readonly SqlValidation Evidence = new(new DateTimeOffset(2026, 9, 18, 9, 30, 0, TimeSpan.Zero), true);
+    private static readonly SqlValidation Evidence = SqlValidation.From(new DateTimeOffset(2026, 9, 18, 9, 30, 0, TimeSpan.Zero), true);
+
+    /// <summary>Review N3: the evidence time is written like every other stored time - UTC, ISO-8601 "O" - not System.Text.Json's
+    /// default, which drops the fraction digits.</summary>
+    [Fact]
+    public void Validation_evidence_time_is_written_in_the_O_format()
+    {
+        var json = Json.Serialize(SqlValidation.From(new DateTimeOffset(2026, 9, 18, 9, 30, 0, TimeSpan.Zero), true));
+        Assert.True(json.Contains("\"at\":\"2026-09-18T09:30:00.0000000+00:00\"", StringComparison.Ordinal), "evidence time is not written with \"O\": " + json);
+    }
 
     /// <summary>Ruling 204: a version without validation evidence is NOT validated, whatever its warnings say - here it carries no
     /// "live validation skipped" line at all, which is exactly the version the marker rule used to wave through. An old record, stored

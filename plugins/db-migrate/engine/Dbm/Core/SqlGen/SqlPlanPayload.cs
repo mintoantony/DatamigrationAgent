@@ -74,8 +74,14 @@ public sealed class TaskPlan
     public string? MappingHash { get; set; }              // M4 addition: SHA-256 (lower hex) of the TableMap JSON this task was generated from
 }
 
-/// <summary>When live validation ran over the version (UTC) and whether it left the plan without errors. JSON <c>{"at": …, "ok": …}</c>.</summary>
-public sealed record SqlValidation(DateTimeOffset At, bool Ok);
+/// <summary>When live validation ran over the version (UTC) and whether it left the plan without errors. JSON <c>{"at": …, "ok": …}</c>.
+/// <para>Review N3: <see cref="At"/> is the UTC time as ISO-8601 "O" text, like every other stored time (Clock.NowText).</para></summary>
+public sealed record SqlValidation(string At, bool Ok)
+{
+    /// <summary>The evidence for a validation that ran at <paramref name="when"/>. Writers pass <c>Clock.Now()</c>.</summary>
+    public static SqlValidation From(DateTimeOffset when, bool ok) =>
+        new(when.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:sszzz",System.Globalization.CultureInfo.InvariantCulture), ok);
+}
 
 /// <summary>Source = alias in SourceQuery (equals the target column name for generated tasks); Target = target column name.</summary>
 public sealed record ColumnBinding(string Source, string Target);

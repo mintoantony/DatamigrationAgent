@@ -12,7 +12,7 @@ public class ScriptPackTests
     static SqlPlanPayload Plan()
     {
         var plan = SqlGenerator.Generate(SampleMappings.Approved(), SampleCatalogs.Source(), SampleCatalogs.Target());
-        plan.Validation = new SqlValidation(new DateTimeOffset(2026, 9, 18, 9, 30, 0, TimeSpan.Zero), true);
+        plan.Validation = SqlValidation.From(new DateTimeOffset(2026, 9, 18, 9, 30, 0, TimeSpan.Zero), true);
         return plan;
     }
 

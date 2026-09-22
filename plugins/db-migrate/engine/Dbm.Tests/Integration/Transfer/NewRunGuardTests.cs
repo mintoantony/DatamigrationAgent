@@ -32,7 +32,7 @@ public sealed class NewRunGuardTests(EngineSourceFixture fx) : IClassFixture<Eng
         foreach (var p in new[] { PhaseName.Setup, PhaseName.Discovery, PhaseName.Analysis, PhaseName.Mapping }) s.Phases.SetApproved(p, 1, null);
         // Ruling 204: the stored plan stands for a live-validated version, so the reopen-and-approve below is not refused as not validated.
         var plan = TransferEngineTests.Plan();
-        plan.Validation = new Dbm.Core.SqlGen.SqlValidation(Clock.Now(), true);
+        plan.Validation = Dbm.Core.SqlGen.SqlValidation.From(Clock.Now(), true);
         s.Artifacts.Add(PhaseName.Sql, 1, Json.Serialize(plan), "script", "test plan");
         s.Phases.SetCurrentVersion(PhaseName.Sql, 1);
         s.Phases.SetApproved(PhaseName.Sql, 1, null);

@@ -43,7 +43,8 @@ public sealed class SqlGenJobTests
         Assert.Contains(log, l => l.StartsWith("sqlgen: 6 task(s) generated", StringComparison.Ordinal));
         // Ruling 204: the job validated live, so the draft carries positive evidence of it.
         Assert.True(plan.Validation is { Ok: true }, "a live sqlgen draft stored no validation evidence");
-        Assert.True(DateTimeOffset.UtcNow - plan.Validation!.At < TimeSpan.FromMinutes(5), "evidence time " + plan.Validation.At.ToString("O"));
+        var at = DateTimeOffset.ParseExact(plan.Validation!.At, "O", System.Globalization.CultureInfo.InvariantCulture);
+        Assert.True(DateTimeOffset.UtcNow - at < TimeSpan.FromMinutes(5), "evidence time " + plan.Validation.At);
     }
 
     /// <summary>H1: an offline sqlgen draft records, in the stored plan, that nothing validated it — and that blocks approval.</summary>

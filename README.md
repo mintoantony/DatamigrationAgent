@@ -211,7 +211,7 @@ unless noted: exit code 0 on success, and 1 with `{"error":"<code>","message":"â
 | `dbm search <query> [--side src\|tgt] [--kind table\|column] [-k n] [--json]` | Vector search over both catalogs (text output unless `--json`) |
 | `dbm show <schema.table[.column]\|F001> [--side src\|tgt] [--json]` | Compact view of a table, column or finding |
 | `dbm map auto [--inline]` | Re-run the auto-mapper |
-| `dbm sql gen [--inline]` / `dbm sql validate [--task <id>] [--patch <file>]` | Regenerate the plan; validate it live against both databases |
+| `dbm sql gen [--inline]` / `dbm sql validate [--task <id>] [--patch <file>]` | Regenerate the plan; validate it against both databases (bare carriage returns are reported offline too). Without `--patch`, a whole-plan pass over a version with no recorded validation stores it as a new version while SQL awaits review, like the screen's Validate live |
 | `dbm apply <patch.json> [--dry-run]` | Validate and apply a subagent patch as a new version |
 | `dbm artifact <phase> [--version n] [--path /pointer]` / `dbm feedback <phase> [--status s]` | Read a phase artifact or its feedback items |
 | `dbm transfer start --yes-target <db> [--chunk n] [--parallel n] [--skip-errors] [--truncate]` | Start the transfer (normally done from the UI) |

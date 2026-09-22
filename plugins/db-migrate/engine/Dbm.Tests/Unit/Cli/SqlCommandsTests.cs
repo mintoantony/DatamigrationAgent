@@ -162,7 +162,7 @@ public sealed class SqlCommandsTests : IDisposable
         Assert.Null(r.Json["payload"]!["validated"]);   // computed, not in the payload
 
         var plan = Json.Deserialize<SqlPlanPayload>(s.Artifacts.Get(PhaseName.Sql, 0)!.PayloadJson);
-        plan.Validation = new SqlValidation(DateTimeOffset.UtcNow, true);
+        plan.Validation = SqlValidation.From(DateTimeOffset.UtcNow, true);
         s.Artifacts.Add(PhaseName.Sql, 1, Json.Serialize(plan), "script", "validated");
         s.Phases.SetCurrentVersion(PhaseName.Sql, 1);
         var v = await CliRunner.RunAsync(_workspace.Ws, null, "artifact", "sql");

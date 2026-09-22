@@ -33,7 +33,7 @@ public sealed class SqlGenJob : IJobHandler
         // Ruling 57: this draft is stored without passing SqlModule.Validate, and carried-over or mapping-derived SQL can hold a lone CR.
         SqlValidator.RecordBareCarriageReturns(plan);
         // Ruling 204: positive evidence that live validation ran over this draft (never carried over: Generate builds a new plan).
-        if (validated) plan.Validation = new SqlValidation(Clock.Now(), plan.ErrorCount() == 0);
+        if (validated) plan.Validation = SqlValidation.From(Clock.Now(), plan.ErrorCount() == 0);
 
         return new JobResult(Json.ToNode(plan), Summary(plan));
     }
