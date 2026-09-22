@@ -185,6 +185,58 @@ public sealed class SqlCommandsTests : IDisposable
             "the live report left out the global statement's bare carriage return: " + r.Out);
     }
 
+    /// <summary>Open item 8 L3, decision I-2: the command's own 5-minute budget is internal to this command (never linked to an
+    /// external cancellation source), so any OperationCanceledException from it is this budget expiring - never a cancellation
+    /// the caller requested. It must report cleanly, not crash with an unhandled-exception stack trace. Uses the ValidateLive
+    /// seam so the test needs no live database and no real 5-minute wait.</summary>
+    [Fact]
+    public async Task Validate_reports_its_own_timeout_cleanly_instead_of_crashing()
+    {
+        var s = WithSqlVersion();
+        s.Connections.Save(Side.Src, FakeServices.SrcConnection, FakeServices.Meta("src-host", "Legacy"));
+        s.Connections.Save(Side.Tgt, FakeServices.TgtConnection, FakeServices.Meta("tgt-host", "ShopV2"));
+        s.Catalog.Save(Side.Tgt, SampleCatalogs.Target(), "tgt-fp");
+        var original = SqlValidateCommand.ValidateLive;
+        try
+        {
+            SqlValidateCommand.ValidateLive = (_, _, _, _) => throw new OperationCanceledException("test budget expired");
+            var r = await CliRunner.RunAsync(_workspace.Ws, null, "sql", "validate");
+            Assert.Equal(1, r.Exit);
+            Assert.Equal("not_ready", (string?)r.Json["error"]);
+            Assert.Contains("timed out", (string?)r.Json["message"], StringComparison.Ordinal);
+        }
+        finally
+        {
+            SqlValidateCommand.ValidateLive = original;
+        }
+    }
+
+    /// <summary>The offline bare-CR scan must not be lost just because live validation could not finish: the timeout message
+    /// joins the report's globalWarnings instead of replacing it with a generic "not ready".</summary>
+    [Fact]
+    public async Task Validate_reports_bare_carriage_returns_even_when_live_validation_times_out()
+    {
+        var s = WithSqlVersion();
+        s.Connections.Save(Side.Src, FakeServices.SrcConnection, FakeServices.Meta("src-host", "Legacy"));
+        s.Connections.Save(Side.Tgt, FakeServices.TgtConnection, FakeServices.Meta("tgt-host", "ShopV2"));
+        s.Catalog.Save(Side.Tgt, SampleCatalogs.Target(), "tgt-fp");
+        var original = SqlValidateCommand.ValidateLive;
+        try
+        {
+            SqlValidateCommand.ValidateLive = (_, _, _, _) => throw new OperationCanceledException("test budget expired");
+            var r = await CliRunner.RunAsync(_workspace.Ws, null, "sql", "validate", "--patch", PatchFile(CrPatch));
+            Assert.Equal(1, r.Exit);
+            Assert.True(r.Json["error"] is null, "the offline bare-CR scan needed live validation to finish before it could report: " + r.Out);
+            Assert.False((bool)r.Json["ok"]!);
+            Assert.Equal([CrLine], r.Json["taskErrors"]!["T05"]!.AsArray().Select(n => (string?)n));
+            Assert.Contains("timed out", (string?)r.Json["globalWarnings"]![0], StringComparison.Ordinal);
+        }
+        finally
+        {
+            SqlValidateCommand.ValidateLive = original;
+        }
+    }
+
     /// <summary>Review L4: `dbm artifact sql` states the validation fact in so many words - computed beside the payload, never stored
     /// in it - instead of leaving it to the absence of a field.</summary>
     [Fact]

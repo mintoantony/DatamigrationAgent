@@ -93,6 +93,25 @@ public class SqlValidatorUnitTests
         Assert.Equal([discard, containsPrefix, "validate: preSql[1]: not checked: fresh"], plan.Warnings);   // (2) replaced, not accumulated
     }
 
+    /// <summary>Open item 8 L3, decision I-2: a connection that drops mid-run (InvalidOperationException, never SqlException) ends
+    /// validation with a report, not an unhandled exception. A never-opened SqlConnection reproduces the same failure shape
+    /// ("...requires an open and available Connection...") without a live database. Every task not yet reached must be marked
+    /// not-checked, not left silently looking clean - the same rule the rest of this file already enforces for global statements.</summary>
+    [Fact]
+    public async Task A_connection_dropped_mid_validation_becomes_a_global_error_not_a_crash()
+    {
+        var plan = SqlGenerator.Generate(SampleMappings.Approved(), SampleCatalogs.Source(), SampleCatalogs.Target());
+
+        var report = await SqlValidator.ValidateAsync(plan, "Server=nowhere;Database=x", "Server=nowhere;Database=y",
+            SampleCatalogs.Target(), null,
+            (cs, _) => Task.FromResult(new SqlConnection(cs)),   // never opened: any command against it throws InvalidOperationException
+            CancellationToken.None);
+
+        Assert.False(report.Ok);
+        Assert.Contains(report.GlobalErrors, e => e.StartsWith(SqlValidator.ValidationStoppedPrefix, StringComparison.Ordinal));
+        Assert.All(plan.Tasks.Keys, id => Assert.Contains(report.TaskWarnings[id], w => w.Contains("not checked", StringComparison.Ordinal)));
+    }
+
     [Fact]
     public async Task Connection_failure_messages_are_scrubbed_of_the_password()
     {
