@@ -10,11 +10,14 @@ namespace Dbm.Cli.Commands;
 /// <summary>
 /// `dbm demo --server "&lt;conn&gt;" [--scale n] [--prefix name] [--force] [--attach]` — build the LegacyShop → ShopV2
 /// sample pair for a trial run. With --attach both connections are saved into this project, so nothing is pasted anywhere.
+/// `dbm demo --attach` without --server takes the server from a connection already saved in the project on the Setup
+/// screen (the source, else the target; open item 38), so a password never has to leave the browser.
 /// </summary>
 public sealed class DemoCommand : ICommand
 {
     public string Name => "demo";
-    public string Help => "Create the LegacyShop/ShopV2 sample databases (--attach saves them as this project's connections)";
+    public string Help => "Create the LegacyShop/ShopV2 sample databases (--attach saves them as this project's connections; " +
+                          "without --server it uses the server of a connection saved on the Setup screen)";
 
     /// <summary>
     /// Test seam, keyed by exact database name like DemoDatabases.CreateDatabaseSuffixOverrides: the connection string
@@ -34,14 +37,16 @@ public sealed class DemoCommand : ICommand
         describe = Redactor.Describe(connectionString),
     };
 
+    private const string Usage =
+        "dbm demo --server \"<connection string to any database on the server>\" [--scale n] [--prefix name] [--force] [--attach], " +
+        "or, in a project folder, dbm demo --attach [--scale n] [--prefix name] [--force] after saving a connection to that server " +
+        "on the Setup screen";
+
     public async Task<int> RunAsync(Args args, CliContext ctx)
     {
         var server = args.Opt("server");
-        if (string.IsNullOrWhiteSpace(server))
-        {
-            throw new CliFailure("usage",
-                "dbm demo --server \"<connection string to any database on the server>\" [--scale n] [--prefix name] [--force] [--attach]");
-        }
+        var attach = args.Flag("attach");
+        if (string.IsNullOrWhiteSpace(server) && !attach) throw new CliFailure("usage", Usage);
 
         var scale = args.Int("scale", 1);
         if (scale is < 1 or > 1000) throw new CliFailure("usage", "--scale must be between 1 and 1000.");
@@ -50,7 +55,6 @@ public sealed class DemoCommand : ICommand
         if (!DemoDatabases.IsValidPrefix(prefix))
             throw new CliFailure("usage", "--prefix may contain only letters, digits and '_' (at most 50 characters).");
 
-        var attach = args.Flag("attach");
         Workspace? ws = null;
         if (attach)
         {
@@ -61,11 +65,25 @@ public sealed class DemoCommand : ICommand
                 throw new CliFailure("locked",
                     "Connections cannot change after the transfer has started; run the demo in a new project folder.");
             }
+            // Open item 38: without --server the server comes from a connection saved on the Setup screen (the source if
+            // saved, else the target), so a SQL-auth password is typed only into the browser and never passes through
+            // the chat or a terminal command line.
+            if (string.IsNullOrWhiteSpace(server))
+            {
+                server = project.Connections.GetConnectionString(Side.Src) ?? project.Connections.GetConnectionString(Side.Tgt);
+                if (server is null)
+                {
+                    throw new CliFailure("usage",
+                        "No --server given and no connection is saved in this project: save a connection to the server on the " +
+                        "Setup screen (either side, any database), then run dbm demo --attach again. Usage: " + Usage);
+                }
+            }
         }
+        var serverText = server!;   // given, or read from the project just above
 
         try
         {
-            var result = await DemoDatabases.CreateAsync(server, scale, prefix, args.Flag("force"), CancellationToken.None);
+            var result = await DemoDatabases.CreateAsync(serverText, scale, prefix, args.Flag("force"), CancellationToken.None);
             if (attach)
             {
                 try
@@ -77,7 +95,7 @@ public sealed class DemoCommand : ICommand
                     throw new CliFailure("sql_error", Redactor.Scrub(
                         $"Created and seeded {result.SourceDatabase} and {result.TargetDatabase}, then failed saving them as this " +
                         $"project's connections: {ex.Message.Trim().TrimEnd('.')}. Re-run with --force --attach to start over.",
-                        Redactor.SecretsOf(server)));
+                        Redactor.SecretsOf(serverText)));
                 }
             }
             return Output.Ok(ctx, new
@@ -99,7 +117,7 @@ public sealed class DemoCommand : ICommand
         catch (DemoFailedException ex)
         {
             // Ruling 157: names both databases, what happened to each, the server's text and the remedy.
-            throw new CliFailure("sql_error", Redactor.Scrub(ex.Message, Redactor.SecretsOf(server)));
+            throw new CliFailure("sql_error", Redactor.Scrub(ex.Message, Redactor.SecretsOf(serverText)));
         }
     }
 

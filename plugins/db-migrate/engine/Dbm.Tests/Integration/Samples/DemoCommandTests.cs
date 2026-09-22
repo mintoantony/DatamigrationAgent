@@ -141,6 +141,45 @@ public sealed class DemoCommandTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// Open item 38: the server can come from a connection saved on the Setup screen, so a SQL-auth user never has to
+    /// hand a connection string to anyone. The saved source is preferred; the saved target here names a server that
+    /// does not exist, so the demo succeeds only if the source was used.
+    /// </summary>
+    [Fact]
+    public async Task Demo_attach_without_server_uses_the_saved_source_connection()
+    {
+        using var tw = new TestWorkspace();
+        using var services = tw.OpenServices();
+        services.Connections.Save(Side.Src, SqlTestServer.ConnectionString, await SqlConnect.ProbeAsync(SqlTestServer.ConnectionString, CancellationToken.None));
+        var meta = services.Connections.GetMeta(Side.Src)!;
+        services.Connections.Save(Side.Tgt, "Server=nowhere;Database=master;Integrated Security=true;Connect Timeout=1", meta);
+
+        var r = await CliRunner.RunAsync(tw.Ws, null, "demo", "--prefix", _prefix, "--attach");
+
+        Assert.True(r.Exit == 0, $"demo --attach without --server must use the saved source connection's server; got exit {r.Exit}: {r.Out}");
+        Assert.True(r.Json["attached"]!.GetValue<bool>());
+        Assert.Equal(_prefix + "LegacyShop", services.Connections.GetMeta(Side.Src)!.Database);
+        Assert.Equal(_prefix + "ShopV2", services.Connections.GetMeta(Side.Tgt)!.Database);
+        Assert.Equal(1000, await ScalarAsync(SourceCs, "SELECT COUNT_BIG(*) FROM dbo.CUST"));
+        Assert.Equal(PhaseStatus.Running, services.Phases.Get(PhaseName.Discovery).Status);
+    }
+
+    /// <summary>Open item 38: with only the target saved, that one gives the server.</summary>
+    [Fact]
+    public async Task Demo_attach_without_server_falls_back_to_the_saved_target_connection()
+    {
+        using var tw = new TestWorkspace();
+        using var services = tw.OpenServices();
+        services.Connections.Save(Side.Tgt, SqlTestServer.ConnectionString, await SqlConnect.ProbeAsync(SqlTestServer.ConnectionString, CancellationToken.None));
+
+        var r = await CliRunner.RunAsync(tw.Ws, null, "demo", "--prefix", _prefix, "--attach");
+
+        Assert.True(r.Exit == 0, $"demo --attach without --server must use the saved target connection when no source is saved; got exit {r.Exit}: {r.Out}");
+        Assert.Equal(_prefix + "LegacyShop", services.Connections.GetMeta(Side.Src)!.Database);
+        Assert.Equal(_prefix + "ShopV2", services.Connections.GetMeta(Side.Tgt)!.Database);
+    }
+
+    /// <summary>
     /// Open item 31: --attach failing after both databases are created and seeded (the target's probe is pointed at a
     /// database that does not exist, so the server itself refuses it) names both databases, the server's text and
     /// the remedy, and saves neither connection.

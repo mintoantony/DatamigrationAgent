@@ -186,6 +186,9 @@ and the user types `/db-migrate resume`.
   databases — ask the user first: anything in them is lost, also for any other project folder that uses them) or
   choose another `--prefix`.
 - **`locked`** (`dbm demo --attach`) — this project already started a transfer; run the demo in a new, empty folder.
+- **`usage`** (`dbm demo --attach` without `--server`) — no connection is saved in this project yet. Ask the user to
+  save a connection to the server on the Setup screen (either side, any database), then run it again; never ask for
+  the string in the chat.
 - **`sql_error`** (`dbm demo`) — usually the login on `--server` cannot connect or lacks `CREATE DATABASE` (`dbcreator`).
   The message lists every step already taken on the server, then the step that failed and the server's text:
   "Failed <step>: <server text>. No database was created or dropped." when nothing had changed yet, otherwise

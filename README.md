@@ -101,10 +101,10 @@ CHECK constraint, an FK cycle, a trigger).
 
    For a local SQL Server use `--server "Server=localhost;Integrated Security=true;TrustServerCertificate=true"`.
    Only give Claude a string like these, with Windows authentication and no secret in it. If the server needs a SQL
-   login, run `dbm demo --server "…" --attach` yourself in a terminal outside Claude Code, in the project folder — not
-   with `!` in Claude Code, whose command and output land in the conversation — so the password never reaches the chat.
-   `dbm` is on the PATH only inside Claude Code, so first ask Claude for the launcher's full path (it holds no secret);
-   in PowerShell or cmd use the `dbm.cmd` next to it.
+   login, never put that string in the chat: on the **Setup** screen, save a connection to the server on either side
+   (any database, e.g. `master`), then ask Claude to `run: dbm demo --attach` with no `--server`. The demo then takes the
+   server and login from the saved connection (the source if saved, else the target) and replaces both connections
+   with the two demo databases, so the password is typed only into the browser.
    `--attach` saves both connections into the project, so there is nothing to paste. Useful flags: `--force` (drop and
    recreate exactly those two demo databases — anything in them is lost), `--prefix Team_` (other names), `--scale 10`
    (ten times the rows).
@@ -217,6 +217,7 @@ unless noted: exit code 0 on success, and 1 with `{"error":"<code>","message":"�
 | `dbm transfer start --yes-target <db> [--chunk n] [--parallel n] [--skip-errors] [--truncate]` | Start the transfer (normally done from the UI) |
 | `dbm transfer pause\|resume\|cancel\|status` | Control or inspect the running transfer |
 | `dbm demo --server "<conn>" [--attach] [--force] [--prefix p] [--scale n]` | Create the LegacyShop/ShopV2 sample databases |
+| `dbm demo --attach [--force] [--prefix p] [--scale n]` | The same, on the server of a connection saved on the Setup screen |
 | `dbm export <analysis\|sql\|sqlpack\|report> [--out path]` | Write a standalone export (see the [user guide](docs/README.md#exports)) |
 | `dbm run-jobs` | Run queued server jobs in this process and exit |
 | `dbm version` / `dbm help` | Engine and runtime versions; command list |
