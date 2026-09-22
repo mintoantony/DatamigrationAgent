@@ -55,7 +55,9 @@ run loaded into — that one is for the human to fix in the UI, never by re-poin
 ## Facts worth knowing
 
 - Chunks are keyset pages of the task's source key; each chunk and its checkpoint commit in one target transaction. The first 3
-  chunks of every task hold at most 1,000 rows, then the chunk size applies.
+  chunks of every task hold at most 1,000 rows, then the chunk size applies. A row error that ends the transaction (a target
+  trigger's ROLLBACK, with "Fire target triggers") makes the runner read that chunk's rows again in 1,000-row chunks to isolate the
+  row, then go on at the chunk size: slower than a clean chunk, not a stop.
 - Tasks without a usable key load in a single transaction: a pause waits for them to finish, a failure restarts them from scratch.
   So a pause can take as long as the biggest keyless table does. Until it takes effect the Execute screen shows **pausing…** and
   `dbm transfer status` still reports `running` — that is the pause working, not a pause being ignored.

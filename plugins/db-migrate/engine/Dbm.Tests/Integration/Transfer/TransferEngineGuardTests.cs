@@ -22,7 +22,10 @@ public sealed class GuardSourceFixture : IAsyncLifetime
             CREATE TABLE dbo.Uni (Id int NOT NULL PRIMARY KEY, Qty int NOT NULL);
             CREATE TABLE dbo.Tkey (At datetime2(7) NOT NULL PRIMARY KEY, Qty int NOT NULL);
             CREATE TABLE dbo.Big (Id int NOT NULL PRIMARY KEY, V nvarchar(20) NOT NULL);
+            CREATE TABLE dbo.Many (Id int NOT NULL PRIMARY KEY, V nvarchar(20) NOT NULL);
             GO
+            WITH n AS (SELECT TOP (12000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects a CROSS JOIN sys.all_objects b)
+            INSERT dbo.Many (Id, V) SELECT i, CASE WHEN i = 7000 THEN N'bad' ELSE N'ok' END FROM n;
             WITH n AS (SELECT TOP (400) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects a CROSS JOIN sys.all_objects b)
             INSERT dbo.Wide (Id, V) SELECT i, CONCAT('v', i) FROM n;
             WITH n AS (SELECT TOP (3500) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects a CROSS JOIN sys.all_objects b)
@@ -59,6 +62,9 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
         CREATE TABLE app.Okay (Id int NOT NULL PRIMARY KEY, V nvarchar(20) NOT NULL CONSTRAINT CK_Okay_V CHECK (V = N'ok'));
         CREATE TABLE app.FlatOkay (V nvarchar(20) NOT NULL CONSTRAINT CK_FlatOkay_V CHECK (V = N'ok'));
         CREATE TABLE app.Big (Id int NOT NULL PRIMARY KEY, V nvarchar(20) NOT NULL CONSTRAINT CK_Big_V CHECK (V = N'ok'));
+        CREATE TABLE app.Many (Id int NOT NULL PRIMARY KEY, V nvarchar(20) NOT NULL);
+        GO
+        CREATE TRIGGER app.trg_Many_rollback ON app.Many AFTER INSERT AS BEGIN IF EXISTS (SELECT 1 FROM inserted WHERE V = N'bad') ROLLBACK TRANSACTION; END
         """;
 
     private sealed class Rig(XferServices svc, TempDatabase tgt, TransferEngine engine) : IAsyncDisposable
@@ -443,6 +449,37 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
         Assert.True(error.StartsWith("Every row of the first 3 chunks of app.FlatOkay was rejected (3,000 rows)", StringComparison.Ordinal),
             "the keyless task was not judged on its first three 1,000-row chunks: " + error);
         Assert.Equal(0, await rig.Tgt.CountAsync("app.FlatOkay"));
+    }
+
+    /// <summary>
+    /// Ruling 207 (open item 15): a row whose error ends the transaction (here a target trigger's ROLLBACK) costs a restart and a reload
+    /// of every row confirmed so far, once per bisection level - measured 18 restarts and 7.0 s for one such row in a 100,000-row chunk,
+    /// against 0.5 s in a 1,000-row one. So a chunk of more than <see cref="TaskRunner.SmallChunkRows"/> rows is not bisected across
+    /// restarts: at the first one it is given back, and the same rows are read again in chunks of 1,000, then the chunk size resumes.
+    /// <b>Harm:</b> up to ~17 reloads of up to 100,000 rows each to reject one row. 12,000 rows, chunk size 5,000, one bad row at 7,000:
+    /// chunks 1-3 are small anyway (open item 45); chunk 4 (rows 3001-8000) meets the row and is read again as five 1,000-row chunks;
+    /// then the chunk size applies again (rows 8001-12000 in one chunk).
+    /// </summary>
+    [Fact]
+    public async Task A_transaction_ending_row_error_in_a_big_chunk_is_isolated_in_1000_row_chunks()
+    {
+        await using var rig = await RigAsync(One(TaskOf("app.Many",
+            "SELECT s.[Id] AS [Id], s.[V] AS [V], s.[Id] AS [__k0] FROM [dbo].[Many] AS s", ["__k0"], [("Id", "Id"), ("V", "V")])));
+        long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 5_000, ErrorMode = "skip", FireTriggers = true });
+        var done = new List<long>();
+        var control = new TransferControl();
+        control.ChunkCommitted += c => done.Add(c.RowsDone);
+
+        var outcome = await rig.Engine.RunAsync(runId, control, default);
+
+        Assert.True(outcome.Status == RunStatus.Completed, $"the run ended {outcome.Status}: {outcome.Error}");
+        Assert.True(done.SequenceEqual(new long[] { 1_000, 2_000, 3_000, 4_000, 5_000, 6_000, 6_999, 7_999, 11_999 }),
+            "expected the 5,000-row chunk holding the transaction-ending row to be read again as five 1,000-row chunks and then the "
+            + "chunk size to apply again (…, 6999, 7999, 11999 done); rows done after each chunk were " + string.Join(", ", done));
+        Assert.Equal(11_999, await rig.Tgt.CountAsync("app.Many"));
+        Assert.Equal(11_999, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Many"));
+        var bad = Assert.Single(rig.Repo.ErrorRows(runId, "T01"));
+        Assert.Equal("{\"__k0\":7000}", bad.KeyJson);
     }
 
     /// <summary>

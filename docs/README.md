@@ -176,7 +176,9 @@ that query. A join that repeats rows (one order per order line, say) would make 
 boundaries, so it blocks the run with the task and one repeated key named; fix the key or the join in the SQL phase.
 
 **Rejected rows under *Skip and log bad rows*.** Constraint violations (foreign key, CHECK, primary key or unique) are
-always skipped and logged row by row, even when every row of a chunk fails alike. But when every row of a chunk (of more
+always skipped and logged row by row, even when every row of a chunk fails alike. A row whose error ends the whole
+transaction - a target trigger that rolls back, with *Fire target triggers* on - is isolated by reading its chunk again
+in chunks of 1 000 rows, so it costs seconds rather than a reload of the whole chunk per step of the search. But when every row of a chunk (of more
 than one row) fails with the same other error, the task fails (`bad_task`) and the run stops. What to do depends on the
 error:
 

@@ -170,7 +170,9 @@ internal sealed class TaskRunner(RunContext rc)
                 var shape = await TargetShape.LoadAsync(tgt, task.Target, ct);
                 // Ruling 73: the loader has to know the target it is loading into, or a binding to a missing column and a binding to an
                 // identity column become a chunk of rejected rows and a table of silently renumbered ids respectively.
-                var loader = new BulkLoader(task, rc.Options, shape);
+                // Ruling 207 (open item 15): a chunk bigger than SmallChunkRows is not bisected across restarts; RunKeyedAsync reads it
+                // again in small chunks instead. (The keyless path cannot restart at all, so the limit never comes into play there.)
+                var loader = new BulkLoader(task, rc.Options, shape) { RestartRowLimit = SmallChunkRows };
                 var pass = task.KeyColumns.Count > 0
                     ? await RunKeyedAsync(id, task, tgt, shape, loader, cp, row.RowsBefore, ct)
                     : await RunKeylessAsync(id, task, tgt, shape, loader, row.RowsBefore, ct);
@@ -223,12 +225,19 @@ internal sealed class TaskRunner(RunContext rc)
         KeyValue? last = cp.LastKeyJson is null ? null : KeyCodec.Decode(cp.LastKeyJson);
         IReadOnlyList<KeyType>? types = last?.Types;
         var rejects = new RejectTally();
+        // Ruling 207 (open item 15): rows still to be read in SmallChunkRows chunks because a big chunk over them was handed back by the
+        // loader at a transaction-ending row error. One wasted big attempt per such row, then restarts of at most 1,000 rows, instead of
+        // up to ~17 reloads of the whole chunk. (Halving the chunk instead, with or without growing it back, measured no faster: the
+        // doomed big attempts, not the commits, are what cost.) Counted in rows, not keys: the same rows are read again from the same
+        // checkpoint, and once they are past the chunk size applies again. Not persisted - a resume reads full chunks, which only costs
+        // time.
+        long smallRowsLeft = 0;
         await using var src = await SqlConnect.OpenAsync(rc.SourceCs, ct);
         while (true)
         {
             if (rc.Control.StopRequested) return new Pass(TransferTaskStatus.Paused, cp);
 
-            int size = ChunkRows(chunkSize, cp.ChunkNo);
+            int size = smallRowsLeft > 0 ? Math.Min(chunkSize, SmallChunkRows) : ChunkRows(chunkSize, cp.ChunkNo);
             DataTable table;
             await using (var cmd = ChunkPlanner.Command(src, task, last, size))
             await using (var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SequentialAccess, ct))
@@ -260,7 +269,20 @@ internal sealed class TaskRunner(RunContext rc)
             Checkpoint next;
             await using (var scope = await TxScope.BeginAsync(tgt, ct))
             {
-                outcome = await loader.LoadAsync(scope, table, allowRestart: true, n => rc.Progress.InFlight(id, n), ct);
+                try
+                {
+                    outcome = await loader.LoadAsync(scope, table, allowRestart: true, n => rc.Progress.InFlight(id, n), ct);
+                }
+                catch (TransferException ex) when (ex.Code == BulkLoader.RestartCapped)
+                {
+                    // The scope holds a fresh transaction with none of this chunk in it, and nothing else was written in it (ruling 113:
+                    // the checkpoint is upserted after the load). Leaving the block rolls it back; the checkpoint has not moved, so the next
+                    // reads start at the same key.
+                    smallRowsLeft = table.Rows.Count;
+                    rc.Log("info", $"{id} {task.Target}: a row error ended the transaction of a {table.Rows.Count:N0}-row chunk; reading "
+                        + $"those rows again in chunks of {SmallChunkRows:N0}.", persist: false);
+                    continue;
+                }
                 if (outcome.Failed.Count > 0 && !rc.Options.SkipErrors)
                 {
                     await scope.RollbackAsync();
@@ -284,6 +306,7 @@ internal sealed class TaskRunner(RunContext rc)
 
             cp = next;
             last = newLast;
+            smallRowsLeft = Math.Max(0, smallRowsLeft - table.Rows.Count);
             Write(id, Capture(task, table, outcome.Failed, types));   // after commit: a rolled-back chunk never leaves error rows
             Mirror(id, cp);
             rc.Control.OnChunkCommitted(new ChunkCommit(id, task.Target, cp.ChunkNo, cp.RowsDone, cp.RowsError)
