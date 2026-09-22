@@ -391,11 +391,18 @@
 
   /** Item 47: the target this run actually loaded into (never credentials), recorded once at start - not the same thing as the
    *  server's current Setup target, which can move after the run started. A run saved before this field existed carries neither
-   *  property, and the compact line is silent rather than reading "Loading into undefined". */
+   *  property, and the compact line is silent rather than reading "Loading into undefined".
+   *  Fix round 1 (MED): once the run has ended (completed, failed or cancelled) it can no longer add rows, so the verb switches
+   *  to the engine's own past tense for this fact (TransferService.cs:692, EnsureTargetIsTheOneTheRunStartedIn: "run N loaded
+   *  into ..."). Running and paused - the run can still resume and add rows - keep the present tense. */
   function runTargetLine(run) {
     const db = run.targetDatabase, srv = run.targetServer;
     if (!db && !srv) return null;
-    const text = db && srv ? 'Loading into ' + db + ' on ' + srv : db ? 'Loading into ' + db : 'Loading into a database on ' + srv;
+    const ended = run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled';
+    const verb = ended ? 'Loaded' : 'Loading';
+    // Defensive only: batch F always records targetServer and targetDatabase together or omits both, never one alone - but a
+    // run recorded some other way should still read as a sentence rather than naming a database with no server, or vice versa.
+    const text = db && srv ? verb + ' into ' + db + ' on ' + srv : db ? verb + ' into ' + db : verb + ' into a database on ' + srv;
     return h('div', { class: 'muted small exe-run-target' }, text);
   }
 

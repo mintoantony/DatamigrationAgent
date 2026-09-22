@@ -476,6 +476,22 @@ test('the live run names the database and server it actually loaded into, and sa
     'a run recorded before the target fields existed must show nothing, not "undefined" or an empty label');
 });
 
+test('a finished run says "Loaded into", the engine\'s own past-tense wording (TransferService.cs:692); running or paused stays present tense (fix round 1, MED)', async () => {
+  const withStatus = function (status) {
+    return runningView({ run: Object.assign({}, runningView().run, { targetServer: 'sql1.internal', targetDatabase: 'ShopV2', status: status, notes: [] }) });
+  };
+  for (const status of ['completed', 'failed', 'cancelled']) {
+    const m = await mount(withStatus(status));
+    assert.equal(D.text(D.query(m.root, '.exe-run-target')), 'Loaded into ShopV2 on sql1.internal',
+      'a ' + status + ' run still says it is loading, not that it loaded (' + status + ')');
+  }
+  for (const status of ['running', 'paused']) {
+    const m = await mount(withStatus(status));
+    assert.equal(D.text(D.query(m.root, '.exe-run-target')), 'Loading into ShopV2 on sql1.internal',
+      'a ' + status + ' run must still read present tense, not "Loaded into" before it has finished (' + status + ')');
+  }
+});
+
 /* ------------------------------------------------------------------ E-4: the error drawer shows the SQL Server error number */
 
 test('the error drawer shows the SQL Server error number beside the text, and nothing extra when it is absent (E-4)', async () => {
