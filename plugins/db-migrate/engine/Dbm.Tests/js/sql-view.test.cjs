@@ -685,6 +685,9 @@ test('goSplitHazards names the GO separator lines that fall inside a comment or 
   assert.deepEqual(V.goSplitHazards('A;\r\nGO\r\nB;'), []);
   assert.deepEqual(V.goSplitHazards('/* a */\nGO\nB;'), []);
   assert.deepEqual(V.goSplitHazards(''), []);
+  // Review N1: splitStatements' /m reads a lone CR as a line end too, so a GO between lone CRs inside a comment is a hazard as well.
+  assert.deepEqual(V.splitStatements('/* a\rGO\r*/ X'), ['/* a', '*/ X'], 'fixture guard: the splitter really cuts here');
+  assert.deepEqual(V.goSplitHazards('/* a\rGO\r*/ X'), [2], 'a GO line between lone CRs inside a comment is not named');
 });
 
 test('editor: a GO line typed inside a comment is named before posting, and nothing is sent', async () => {

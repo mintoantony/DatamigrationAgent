@@ -91,12 +91,13 @@
     var spans = [];
     var at = 0;
     DBM.highlight.tokenize(src).forEach(function (tok) {
-      if ((tok.c === 'com' || tok.c === 'str' || tok.c === 'id') && tok.v.indexOf('\n') >= 0) spans.push([at, at + tok.v.length]);
+      if ((tok.c === 'com' || tok.c === 'str' || tok.c === 'id') && /[\r\n]/.test(tok.v)) spans.push([at, at + tok.v.length]);
       at += tok.v.length;
     });
     var out = [];
     var start = 0;
-    src.split('\n').forEach(function (line, i) {
+    // Review N1: split on "\n" AND a lone "\r" - after norm() every break is one character, and splitStatements' /m reads both.
+    src.split(/[\r\n]/).forEach(function (line, i) {
       if (/^[ \t]*GO[ \t]*$/i.test(line) && spans.some(function (s) { return s[0] < start && start < s[1]; })) out.push(i + 1);
       start += line.length + 1;
     });
