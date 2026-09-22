@@ -80,7 +80,7 @@ public sealed record SqlValidation(string At, bool Ok)
 {
     /// <summary>The evidence for a validation that ran at <paramref name="when"/>. Writers pass <c>Clock.Now()</c>.</summary>
     public static SqlValidation From(DateTimeOffset when, bool ok) =>
-        new(when.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:sszzz",System.Globalization.CultureInfo.InvariantCulture), ok);
+        new(when.ToUniversalTime().ToString("O", System.Globalization.CultureInfo.InvariantCulture), ok);
 }
 
 /// <summary>Source = alias in SourceQuery (equals the target column name for generated tasks); Target = target column name.</summary>
