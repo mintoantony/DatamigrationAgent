@@ -1033,6 +1033,37 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
             "the refusal does not name both the recorded and the current target: " + ex.Message);
     }
 
+    /// <summary>
+    /// Open item 49, harm at the resume guard. A run recorded that it loaded into a LocalDB instance; the saved target then points at
+    /// another LocalDB instance holding a database of the same name. Both report <c>&lt;machine&gt;\LOCALDB#&lt;hex&gt;</c>, so Ruling 215's
+    /// machine-part rule takes one for the other and the resume loads into a database with none of the run's checkpoints. The stable
+    /// data source (<c>(localdb)\Name</c>) tells them apart. The second instance is the saved record's: this rig has one server.
+    /// </summary>
+    [Fact]
+    public async Task A_resume_is_refused_when_the_target_is_a_same_named_database_on_another_LocalDB_instance()
+    {
+        await using var rig = await RigAsync();
+        var probed = rig.S.Connections.GetMeta(Side.Tgt)!;
+        string instance = probed.DataSource ?? @"(localdb)\DbmTestA";
+        rig.S.Connections.Save(Side.Tgt, rig.Tgt.ConnectionString, probed with { DataSource = instance });
+        long runId = await rig.Service.StartAsync(Skip with { ErrorMode = "stop", ChunkSize = 500 }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Failed, rig.S.Transfers.GetRun(runId)!.Status);
+        long before = await rig.Tgt.CountAsync("app.Child") + await rig.Tgt.CountAsync("app.Log");
+        rig.S.Connections.Save(Side.Tgt, rig.Tgt.ConnectionString, probed with { DataSource = @"(localdb)\DbmTestOther" });
+
+        var thrown = Record.Exception(() => rig.Service.Resume());
+        await rig.Service.Current;
+
+        long after = await rig.Tgt.CountAsync("app.Child") + await rig.Tgt.CountAsync("app.Log");
+        Assert.True(thrown is TransferException { Code: "target_changed" } && after == before,
+            $@"run {runId} was resumed into the database of the same name on another LocalDB instance ((localdb)\DbmTestOther, the run "
+            + $"loaded into {instance}): {after - before} rows loaded, refusal: {thrown?.Message ?? "none"}");
+        Assert.True(thrown!.Message.Contains(instance, StringComparison.OrdinalIgnoreCase)
+                    && thrown.Message.Contains(@"(localdb)\DbmTestOther", StringComparison.OrdinalIgnoreCase),
+            "the refusal does not name both LocalDB instances: " + thrown.Message);
+    }
+
     /// <summary>The same guard at a re-run (a new run id after a failed run, ruling 185's restart): refused, nothing loaded.</summary>
     [Fact]
     public async Task A_rerun_is_refused_when_the_target_no_longer_resolves_to_the_database_the_last_run_recorded()

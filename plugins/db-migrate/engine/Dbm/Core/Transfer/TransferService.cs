@@ -317,7 +317,8 @@ public sealed class TransferService
                 EnsureNonEmptyTargetsConfirmed(await LiveNonEmptyTargetsAsync(tgtCs, approved.Plan, ct), confirmNonEmpty);
 
             var engine = new TransferEngine(_services, approved.Plan, srcCs, tgtCs);
-            long runId = engine.CreateRun(approved.Version, options, (savedTarget.Server, database));
+            // Open item 49: on LocalDB the run records the stable (localdb)\Name, which a later resume can tell from another instance.
+            long runId = engine.CreateRun(approved.Version, options, (Preflight.StableServer(savedTarget), database));
             // Ruling 190: a checklist taken before this run says nothing about the target after it - never reused for another start.
             // (The new run id changes WorkflowStamp too; the result itself stays readable as LastPreflight for the screen.)
             lock (_lock) _preflightStamp = null;
@@ -739,12 +740,12 @@ public sealed class TransferService
         // into whatever the target connection happens to point at today, which is the one thing this guard exists to stop.
         if (discovered is null)
             throw new TransferException("target_unknown",
-                $"Because {problem}, it cannot be confirmed that {saved.Database} on {saved.Server} is the database run {run.Id} "
+                $"Because {problem}, it cannot be confirmed that {saved.Database} on {Preflight.StableServer(saved)} is the database run {run.Id} "
                 + "loaded into. Re-run discovery, or cancel this run and start a new one.");
         if (Preflight.SameTarget(saved, discovered)) return;
         throw new TransferException("target_changed",
-            $"The saved target connection now points at {saved.Database} on {saved.Server}, but run {run.Id} loaded into "
-            + $"{discovered.Database} on {discovered.Server}. Its checkpoints and the {ControlTable.Name} table live in that database, "
+            $"The saved target connection now points at {saved.Database} on {Preflight.StableServer(saved)}, but run {run.Id} loaded into "
+            + $"{discovered.Database} on {Preflight.StableServer(discovered)}. Its checkpoints and the {ControlTable.Name} table live in that database, "
             + "so resuming against this one would load every row again from the beginning. Point the target connection back at "
             + $"{discovered.Database}, or cancel run {run.Id} and start a new one.");
     }
@@ -755,11 +756,11 @@ public sealed class TransferService
     /// </summary>
     private static void EnsureRecordedTarget(TransferRunRow run, ServerMeta saved, string consequence)
     {
-        // N-4: a LocalDB server name changes on every instance start, so it is compared by its machine part (Preflight's rule).
-        if (Same(saved.Database, run.TargetDatabase)
-            && Same(Preflight.ServerIdentity(saved.Server), Preflight.ServerIdentity(run.TargetServer))) return;
+        // N-4: a LocalDB server name changes on every instance start, so it is compared by its machine part (Preflight's rule) - or,
+        // open item 49, by the stable (localdb)\Name the run recorded, which also tells two LocalDB instances of one machine apart.
+        if (Same(saved.Database, run.TargetDatabase) && Preflight.SameRecordedServer(saved, run.TargetServer)) return;
         throw new TransferException("target_changed",
-            $"The saved target connection now points at {saved.Database} on {saved.Server}, but run {run.Id} loaded into "
+            $"The saved target connection now points at {saved.Database} on {Preflight.StableServer(saved)}, but run {run.Id} loaded into "
             + $"{run.TargetDatabase} on {run.TargetServer}. Its checkpoints and the {ControlTable.Name} table live in that database, "
             + consequence);
     }
@@ -779,8 +780,8 @@ public sealed class TransferService
                 + "nothing to check the saved connection against. Re-run discovery.");
         if (Preflight.SameTarget(saved, discovered)) return;
         throw new TransferException("not_ready",
-            $"The saved target connection no longer matches the discovered catalog ({saved.Database} on {saved.Server} against "
-            + $"{discovered.Database} on {discovered.Server}); re-run discovery. The SQL plan was generated for "
+            $"The saved target connection no longer matches the discovered catalog ({saved.Database} on {Preflight.StableServer(saved)} against "
+            + $"{discovered.Database} on {Preflight.StableServer(discovered)}); re-run discovery. The SQL plan was generated for "
             + $"{discovered.Database}, and neither the typed confirmation nor the schema-drift check can tell a different database "
             + "with the same schema apart from it.");
     }
