@@ -11,7 +11,14 @@ public static class JobRegistry
     /// </summary>
     public static IEnumerable<IJobHandler> Create(DbmServices s)
     {
-        if (s is null) yield break;   // keeps this an iterator while no handler is registered
+        // Non-iterator wrapper: an iterator method's body does not run until the sequence is enumerated, so a guard
+        // clause inside one defers (and can silently swallow) its throw. Validate here, at call time, instead.
+        ArgumentNullException.ThrowIfNull(s);
+        return CreateHandlers(s);
+    }
+
+    private static IEnumerable<IJobHandler> CreateHandlers(DbmServices s)
+    {
         // milestone registrations below
         yield return new Dbm.Core.Catalog.DiscoverJob();   // T2.5
         yield return new Dbm.Core.Analysis.AnalyzeJob();   // T2.6
