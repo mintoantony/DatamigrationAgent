@@ -258,7 +258,8 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
     {
         await using var rig = await RigAsync();
         long willBe = (rig.S.Transfers.Latest()?.Id ?? 0) + 1;
-        await using var held = await RunLock.AcquireAsync(rig.Tgt.ConnectionString, willBe, default);
+        // This project's own runner of that run (Ruling 212: the lock is the target's; the holder row says whose run holds it).
+        await using var held = await RunLock.AcquireAsync(rig.Tgt.ConnectionString, willBe, default, TransferEngine.OwnerOf(rig.S));
 
         var thrown = await Record.ExceptionAsync(() => rig.Service.StartAsync(Skip, rig.Tgt.Name, default));
         await rig.Service.Current;
@@ -276,6 +277,281 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
         var ex = Assert.IsType<TransferException>(thrown);
         Assert.Equal("busy", ex.Code);
         Assert.Contains("already being run", ex.Message);
+    }
+
+    /// <summary>
+    /// Open item 23 at the start door: another project's run 1 holds the target - the same run id this project's first run gets, which
+    /// is the ordinary case, since run ids start at 1 in every project (review MED-1). The start is refused <c>busy</c> naming the
+    /// target and the holder, not "run 1 is already being run", nothing is loaded, and the operator can retry.
+    /// </summary>
+    [Fact]
+    public async Task A_start_while_another_project_loads_the_target_is_busy_naming_the_holder()
+    {
+        await using var rig = await RigAsync();
+        var elsewhere = new CheckpointOwner(Guid.NewGuid().ToString("D"), @"D:\elsewhere");
+        await using var held = await RunLock.AcquireAsync(rig.Tgt.ConnectionString, 1, default, elsewhere);
+
+        var thrown = await Record.ExceptionAsync(() => rig.Service.StartAsync(Skip, rig.Tgt.Name, default));
+        await rig.Service.Current;
+
+        long parents = await rig.Tgt.CountAsync("app.Parent");
+        Assert.True(parents == 0, $"a start went ahead while another project was loading the same target: app.Parent holds {parents} rows");
+        Assert.Equal(1, rig.S.Transfers.Latest()!.Id);                                // the premise: both are run 1
+        var ex = Assert.IsType<TransferException>(thrown);
+        Assert.Equal("busy", ex.Code);
+        Assert.True(ex.Message.Contains(rig.Tgt.Name, StringComparison.Ordinal) && ex.Message.Contains(@"run 1 of the project in D:\elsewhere",
+            StringComparison.Ordinal), "the refusal does not name the target and what holds it: " + ex.Message);
+        Assert.True(ex.Message.Contains("already being loaded by another transfer", StringComparison.Ordinal),
+            "another project's run 1 was reported as this project's own run 1 already being run: " + ex.Message);
+        Assert.True(rig.Service.View().CanStart, rig.Service.View().CannotStart ?? "");
+    }
+
+    /// <summary>Another project's unfinished checkpoint row, written straight into the target as that project's engine would.</summary>
+    private static async Task PlantForeignCheckpointAsync(TempDatabase tgt, string projectId, string? folder, DateTime? updatedAt = null)
+    {
+        await using var conn = new SqlConnection(tgt.ConnectionString);
+        await conn.OpenAsync();
+        await ControlTable.EnsureAsync(conn, default);
+        await using var cmd = new SqlCommand("""
+            INSERT dbo.__dbm_checkpoint (run_id, task_id, chunk_no, last_key, rows_done, rows_error, done, updated_at, project_id, project_folder)
+            VALUES (1, N'T01', 1, N'[100]', 100, 0, 0, ISNULL(@at, SYSUTCDATETIME()), @p, @f);
+            """, conn);
+        cmd.Parameters.AddWithValue("@at", (object?)updatedAt ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@p", projectId);
+        cmd.Parameters.AddWithValue("@f", (object?)folder ?? DBNull.Value);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
+    /// Ruling 215 (re-review LOW): the start door's own refusal for another project's unfinished checkpoints - the probe, not the
+    /// engine - so the operator is told <c>busy</c> at Start instead of being handed a run that then refuses, and nothing is loaded.
+    /// The other project's run appears after a passing pre-flight (which would otherwise name it first), and the start reuses that
+    /// pre-flight - the window the probe exists for.
+    /// </summary>
+    [Fact]
+    public async Task A_start_over_another_projects_unfinished_checkpoints_is_busy_naming_its_folder()
+    {
+        await using var rig = await RigAsync();
+        Assert.True((await rig.Service.PreflightAsync(Skip, default)).Passed);
+        await PlantForeignCheckpointAsync(rig.Tgt, Guid.NewGuid().ToString("D"), @"D:\other-project");
+
+        var thrown = await Record.ExceptionAsync(() => rig.Service.StartAsync(Skip, rig.Tgt.Name, default));
+        await rig.Service.Current;
+
+        long parents = await rig.Tgt.CountAsync("app.Parent");
+        Assert.True(parents == 0, $"a start loaded {parents} rows into a target another project's run is part-way through");
+        Assert.True(thrown is not null,
+            "a start over another project's unfinished checkpoints was accepted; it should be refused busy at the door");
+        var ex = Assert.IsType<TransferException>(thrown);
+        Assert.True(ex.Code == "busy" && ex.Message.Contains(@"run 1 of the project in D:\other-project", StringComparison.Ordinal),
+            $"the start was not refused busy naming the other project ({ex.Code}): {ex.Message}");
+        Assert.Equal(RunStatus.Cancelled, rig.S.Transfers.Latest()!.Status);                     // ruling 126's close, and retryable
+        Assert.True(rig.Service.View().CanStart, rig.Service.View().CannotStart ?? "");
+    }
+
+    /// <summary>
+    /// Ruling 215, N-3 (probe REVF_G). Rows an earlier engine wrote have no project, and as built only a resume could claim them - so
+    /// their own project's cancel left them, and they then blocked that project's next run too, for ever. The owner's cancel claims them
+    /// (only rows whose counters match what its run recorded), ends them, and its next run starts; another project cannot claim them.
+    /// </summary>
+    [Fact]
+    public async Task A_cancel_ends_its_runs_checkpoints_written_by_an_earlier_engine_and_the_next_run_starts()
+    {
+        await using var rig = await RigAsync();
+        int pauses = 0;   // pause only the first run
+        rig.Service.ChunkCommitted += c => { if (c.TaskId == "T01" && c.ChunkNo == 1 && Interlocked.Increment(ref pauses) == 1) rig.Service.Pause(); };
+        long runId = await rig.Service.StartAsync(Skip, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Paused, rig.S.Transfers.GetRun(runId)!.Status);
+        // What an upgrade leaves: the paused run's rows without a project, last written well before the quiet period.
+        await rig.Tgt.ExecAsync("UPDATE dbo.__dbm_checkpoint SET project_id = N'', project_folder = NULL, updated_at = DATEADD(HOUR, -1, SYSUTCDATETIME());");
+        await using (var conn = new SqlConnection(rig.Tgt.ConnectionString))
+        {
+            await conn.OpenAsync();
+            var other = new CheckpointOwner(Guid.NewGuid().ToString("D"), @"D:\other");
+            await ControlTable.ClaimLegacyAsync(conn, other, new LegacyClaim(runId, [("T01", 999, 0)], 1_000), default);
+            Assert.True(await ControlTable.ForeignUnfinishedAsync(conn, other, default) is { Legacy: true },
+                "another project's run 1 claimed checkpoints its recorded counters do not match");
+        }
+
+        await rig.Service.CancelAsync(default);
+        var refused = await Record.ExceptionAsync(() => rig.Service.StartAsync(Skip with { TruncateTarget = true, ChunkSize = 1000 }, rig.Tgt.Name, default));
+        await rig.Service.Current;
+
+        Assert.True(refused is null,
+            "the owner's cancel left its earlier-engine checkpoints behind, and they refused its own next run: " + refused?.Message);
+        Assert.Equal(RunStatus.Completed, rig.S.Transfers.Latest()!.Status);
+        Assert.Equal(300, await rig.Tgt.CountAsync("app.Parent"));
+    }
+
+    /// <summary>
+    /// Ruling 216, L-1 (probe REVF_I). A crash between a chunk's commit and the state database's progress update leaves the
+    /// checkpoint a chunk ahead of what the run recorded. Such a row, written by an earlier engine, used to be unclaimable, so the
+    /// owner's resume was refused - with advice to drop the table, which would have destroyed its checkpoints. A row at most one chunk
+    /// ahead is the run's own and the checkpoint is trusted; a row further off is left alone, and the refusal does not advise dropping.
+    /// </summary>
+    [Fact]
+    public async Task A_resume_claims_an_earlier_engines_checkpoint_one_chunk_ahead_of_what_the_run_recorded()
+    {
+        await using var rig = await RigAsync();
+        int pauses = 0;
+        rig.Service.ChunkCommitted += c => { if (c.TaskId == "T01" && c.ChunkNo == 2 && Interlocked.Increment(ref pauses) == 1) rig.Service.Pause(); };
+        long runId = await rig.Service.StartAsync(Skip, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(200, rig.S.Transfers.Task(runId, "T01")!.RowsDone);
+        // The crash: the chunk and its checkpoint committed (200), the state database still says 100. Then the upgrade.
+        rig.S.Transfers.UpdateTaskProgress(runId, "T01", 100, 0, null);
+        await rig.Tgt.ExecAsync("UPDATE dbo.__dbm_checkpoint SET project_id = N'', project_folder = NULL, updated_at = DATEADD(HOUR, -1, SYSUTCDATETIME());");
+
+        // Further off than one chunk: not this run's to take, and not a table to drop.
+        await rig.Tgt.ExecAsync("UPDATE dbo.__dbm_checkpoint SET rows_done = 5000 WHERE task_id = N'T01';");
+        rig.Service.Resume();
+        await rig.Service.Current;
+        var notes = rig.Service.View().Run!.Notes;
+        Assert.Equal(RunStatus.Paused, rig.S.Transfers.GetRun(runId)!.Status);
+        Assert.True(notes.Any(n => n.Contains("may be this run's own checkpoints", StringComparison.Ordinal))
+                    && !notes.Any(n => n.Contains("can be dropped", StringComparison.Ordinal)),
+            "a refusal over checkpoints that may be the run's own advises dropping the table: " + string.Join(" | ", notes));
+
+        // One chunk ahead: the run's own; the resume continues from the checkpoint and loads nothing twice.
+        await rig.Tgt.ExecAsync("UPDATE dbo.__dbm_checkpoint SET rows_done = 200 WHERE task_id = N'T01';");
+        rig.Service.Resume();
+        await rig.Service.Current;
+        var status = rig.S.Transfers.GetRun(runId)!.Status;
+        Assert.True(status == RunStatus.Completed,
+            $"the owner's resume over its own earlier-engine checkpoint one chunk ahead of its record ended {EnumText.ToText(status)}: "
+            + string.Join(" | ", rig.Service.View().Run!.Notes));
+        Assert.Equal(300, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Parent"));
+        Assert.Equal(300, await rig.Tgt.CountAsync("app.Parent"));
+    }
+
+    /// <summary>
+    /// Ruling 216, L-3. A re-run abandons this project's failed run, and the start door claims and retires that run's earlier-engine
+    /// rows under the lock - but pre-flight, which runs first, reported them as another project's and blocked the re-run before the
+    /// door could. Rows matching the latest failed or cancelled run's record are this project's own on the checklist too.
+    /// </summary>
+    [Fact]
+    public async Task Pre_flight_counts_its_own_failed_runs_earlier_engine_checkpoints_as_its_own_and_the_rerun_starts()
+    {
+        await using var rig = await RigAsync();
+        long failed = await rig.Service.StartAsync(Skip with { ErrorMode = "stop", ChunkSize = 500 }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Failed, rig.S.Transfers.GetRun(failed)!.Status);
+        await rig.Tgt.ExecAsync("UPDATE dbo.__dbm_checkpoint SET project_id = N'', project_folder = NULL, updated_at = DATEADD(HOUR, -1, SYSUTCDATETIME());");
+        Assert.True(await rig.Tgt.ScalarAsync<int>("SELECT COUNT(*) FROM dbo.__dbm_checkpoint WHERE done = 0") > 0);   // the premise
+
+        var pre = await rig.Service.PreflightAsync(Skip with { TruncateTarget = true, ChunkSize = 1000 }, default);
+
+        var line = pre.Checks.Single(c => c.Name == "control_table");
+        Assert.True(line.Ok, $"pre-flight reported this project's own failed run's checkpoints as another project's: {line.Detail}");
+        long second = await rig.Service.StartAsync(Skip with { TruncateTarget = true, ChunkSize = 1000 }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Completed, rig.S.Transfers.GetRun(second)!.Status);
+    }
+
+    /// <summary>
+    /// Ruling 217, R3-2 (probe REVF_K). A failed run cancelled while the target was unreachable leaves its unfinished rows (F-16); after
+    /// a reopen the next start is not a re-run, so nothing abandons that run under the lock, and the start door refused this folder's
+    /// own fresh run 2 as "may be a copy" of itself - for good, with no way out. This folder's ended run's rows are retired instead.
+    /// </summary>
+    [Fact]
+    public async Task After_a_reopen_a_fresh_run_retires_its_own_cancelled_runs_unfinished_checkpoints_and_starts()
+    {
+        await using var rig = await RigAsync();
+        long failed = await rig.Service.StartAsync(Skip with { ErrorMode = "stop", ChunkSize = 500 }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Failed, rig.S.Transfers.GetRun(failed)!.Status);
+        // The cancel that could not reach the target: the run is cancelled, its checkpoints are still unfinished.
+        rig.S.Transfers.SetRunStatus(failed, RunStatus.Cancelled);
+        Assert.True(await rig.Tgt.ScalarAsync<int>($"SELECT COUNT(*) FROM dbo.__dbm_checkpoint WHERE run_id = {failed} AND done = 0") > 0);
+        // What a reopen and a new approval leave: Transfer back to pending, Ready awaiting review - a start, not a re-run.
+        rig.S.Phases.SetStatus(PhaseName.Transfer, PhaseStatus.Pending);
+        rig.S.Phases.SetStatus(PhaseName.Ready, PhaseStatus.AwaitingReview);
+
+        var refused = await Record.ExceptionAsync(() => rig.Service.StartAsync(Skip with { TruncateTarget = true, ChunkSize = 1000 }, rig.Tgt.Name, default));
+        await rig.Service.Current;
+
+        Assert.True(refused is null,
+            $"a fresh run of this folder was refused over its own cancelled run {failed}'s checkpoints as if the folder were a copy: "
+            + refused?.Message);
+        var latest = rig.S.Transfers.Latest()!;
+        Assert.True(latest.Id != failed && latest.Status == RunStatus.Completed, $"run {latest.Id} ended {EnumText.ToText(latest.Status)}");
+        Assert.Equal(300, await rig.Tgt.CountAsync("app.Parent"));
+    }
+
+    /// <summary>
+    /// Ruling 216, L-4: the service's cancel with "Keep the checkpoint table" (REVF_F pins the engine's). The rows are retired and the
+    /// table kept, and another project can then load the target.
+    /// </summary>
+    [Fact]
+    public async Task A_service_cancel_with_the_table_kept_retires_the_rows_and_another_project_can_run()
+    {
+        await using var rig = await RigAsync();
+        rig.Service.ChunkCommitted += c => { if (c.TaskId == "T01" && c.ChunkNo == 1) rig.Service.Pause(); };
+        long runId = await rig.Service.StartAsync(Skip with { KeepControlTable = true }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Paused, rig.S.Transfers.GetRun(runId)!.Status);
+
+        await rig.Service.CancelAsync(default);
+
+        int unfinished = await rig.Tgt.ScalarAsync<int>("SELECT COUNT(*) FROM dbo.__dbm_checkpoint WHERE done = 0");
+        int kept = await rig.Tgt.ScalarAsync<int>("SELECT COUNT(*) FROM dbo.__dbm_checkpoint");
+        Assert.True(unfinished == 0 && kept > 0,
+            $"a cancel with the table kept left {unfinished} unfinished checkpoints ({kept} kept): a claim on the target for ever");
+        using var other = new XferServices();
+        var engine = new TransferEngine(other.Services, TransferEngineTests.Plan(), fx.Src.ConnectionString, rig.Tgt.ConnectionString);
+        long otherRun = engine.CreateRun(1, Skip with { TruncateTarget = true, ChunkSize = 1000 });
+        Assert.Equal(RunStatus.Completed, (await engine.RunAsync(otherRun, new TransferControl(), default)).Status);
+    }
+
+    /// <summary>
+    /// Ruling 215, N-2 at the re-run door: a re-run abandons the failed run for a new id. With "Keep the checkpoint table" the failed
+    /// run's unfinished rows used to stay a claim on the target for ever; the abandon marks them done.
+    /// </summary>
+    [Fact]
+    public async Task A_rerun_that_abandons_a_failed_run_leaves_no_claim_on_the_target_even_with_the_table_kept()
+    {
+        await using var rig = await RigAsync();
+        var keep = Skip with { KeepControlTable = true };
+        long failed = await rig.Service.StartAsync(keep with { ErrorMode = "stop", ChunkSize = 500 }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Failed, rig.S.Transfers.GetRun(failed)!.Status);
+
+        long second = await rig.Service.StartAsync(keep with { TruncateTarget = true, ChunkSize = 1000 }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.NotEqual(failed, second);
+
+        int unfinished = await rig.Tgt.ScalarAsync<int>($"SELECT COUNT(*) FROM dbo.__dbm_checkpoint WHERE run_id = {failed} AND done = 0");
+        Assert.True(unfinished == 0, $"the abandoned run {failed} still has {unfinished} unfinished checkpoints: a claim on the target for ever");
+    }
+
+    /// <summary>
+    /// Ruling 212 (c). Cancelling a paused run runs the plan's PostSql and removes checkpoints in the target, so it happens under the
+    /// target lock: while another project's runner holds it the cancel is refused <c>busy</c> and changes nothing - before, it ran the
+    /// PostSql and dropped the shared checkpoint table under the live runner.
+    /// </summary>
+    [Fact]
+    public async Task A_cancel_while_another_project_holds_the_target_changes_nothing()
+    {
+        await using var rig = await RigAsync();
+        rig.Service.ChunkCommitted += c => { if (c.TaskId == "T01" && c.ChunkNo == 1) rig.Service.Pause(); };
+        long runId = await rig.Service.StartAsync(Skip, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Paused, rig.S.Transfers.GetRun(runId)!.Status);
+
+        Exception? thrown;
+        await using (await RunLock.AcquireAsync(rig.Tgt.ConnectionString, 1, default, new CheckpointOwner(Guid.NewGuid().ToString("D"), @"D:\other")))
+            thrown = await Record.ExceptionAsync(() => rig.Service.CancelAsync(default));
+
+        int table = await rig.Tgt.ScalarAsync<int>("SELECT CASE WHEN OBJECT_ID(N'dbo.__dbm_checkpoint') IS NULL THEN 0 ELSE 1 END");
+        var status = rig.S.Transfers.GetRun(runId)!.Status;
+        Assert.True(table == 1 && status == RunStatus.Paused,
+            $"a cancel ran against the target while another project held it: the checkpoint table {(table == 1 ? "is there" : "was dropped")}, "
+            + $"the run is {EnumText.ToText(status)}");
+        Assert.Equal("busy", Assert.IsType<TransferException>(thrown).Code);
+
+        await rig.Service.CancelAsync(default);                                     // free again: the cancel goes through
+        Assert.Equal(RunStatus.Cancelled, rig.S.Transfers.GetRun(runId)!.Status);
     }
 
     /// <summary>
@@ -621,7 +897,7 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
 
         var before = rig.Service.View().Run!;
 
-        await using (await RunLock.AcquireAsync(rig.Tgt.ConnectionString, runId, default))
+        await using (await RunLock.AcquireAsync(rig.Tgt.ConnectionString, runId, default, TransferEngine.OwnerOf(rig.S)))
         {
             Assert.Equal(runId, rig.Service.Resume());
             await rig.Service.Current;
@@ -694,7 +970,7 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
         Assert.Equal(RunStatus.Paused, rig.S.Transfers.GetRun(runId)!.Status);
         var before = rig.Service.View().Run!;
 
-        await using (await RunLock.AcquireAsync(rig.Tgt.ConnectionString, runId, default))
+        await using (await RunLock.AcquireAsync(rig.Tgt.ConnectionString, runId, default, TransferEngine.OwnerOf(rig.S)))
         {
             Assert.Equal(runId, rig.Service.Resume());
             await rig.Service.Current;
@@ -710,6 +986,88 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
         await rig.Service.Current;
         Assert.Equal(RunStatus.Completed, rig.Service.View().Run!.Status);
         Assert.Equal(1998, await rig.Tgt.CountAsync("app.Child"));
+    }
+
+    // ------------------------------------------------------------------ open item 22: the run records its target
+
+    /// <summary>A failed run (stop at the first bad row), then the target connection AND its discovered catalog repointed at a second
+    /// database with the plan's schema - the one shape the catalog proxy (ruling 127) cannot see, because both of its sides moved.</summary>
+    private async Task<(long RunId, TempDatabase Other)> FailedRunThenRepointedAsync(Rig rig)
+    {
+        long runId = await rig.Service.StartAsync(Skip with { ErrorMode = "stop", ChunkSize = 500 }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Failed, rig.S.Transfers.GetRun(runId)!.Status);
+        var other = await TempDatabase.CreateAsync("dbm_svc_other");
+        await other.ExecAsync(TransferEngineTests.TargetSchema);
+        await SaveSideAsync(rig.S, Side.Tgt, other.ConnectionString);
+        return (runId, other);
+    }
+
+    /// <summary>
+    /// Harm: a resume continues a run from checkpoints that live in the database it loaded into. With the connection and the catalog
+    /// both repointed, the proxy guard compares the new target with itself and lets the resume load the rest of the migration - from
+    /// row one, since there are no checkpoints there - into a database nobody reviewed. The run's own record says where it loaded.
+    /// </summary>
+    [Fact]
+    public async Task A_resume_is_refused_when_the_target_no_longer_resolves_to_the_database_the_run_recorded()
+    {
+        await using var rig = await RigAsync();
+        var (runId, other) = await FailedRunThenRepointedAsync(rig);
+        await using var _ = other;
+        var recorded = rig.Service.View().Run!;
+        Assert.True(recorded.TargetDatabase == rig.Tgt.Name && !string.IsNullOrEmpty(recorded.TargetServer),
+            $"the run does not show the target it loaded into: {recorded.TargetServer}/{recorded.TargetDatabase}");
+
+        var thrown = Record.Exception(() => rig.Service.Resume());
+        await rig.Service.Current;
+
+        // T01 finished in the first segment, so the resume's work is T02 and T03 - and before any row it creates its checkpoint table.
+        long loaded = await other.CountAsync("app.Child") + await other.CountAsync("app.Log");
+        int touched = await other.ScalarAsync<int>("SELECT CASE WHEN OBJECT_ID(N'dbo.__dbm_checkpoint') IS NULL THEN 0 ELSE 1 END");
+        Assert.True(loaded == 0 && touched == 0,
+            $"a resume ran run {runId} against a database it never loaded into: {other.Name} got {loaded} rows"
+            + (touched == 1 ? " and a checkpoint table" : ""));
+        var ex = Assert.IsType<TransferException>(thrown);
+        Assert.Equal("target_changed", ex.Code);
+        Assert.True(ex.Message.Contains(rig.Tgt.Name, StringComparison.Ordinal) && ex.Message.Contains(other.Name, StringComparison.Ordinal),
+            "the refusal does not name both the recorded and the current target: " + ex.Message);
+    }
+
+    /// <summary>The same guard at a re-run (a new run id after a failed run, ruling 185's restart): refused, nothing loaded.</summary>
+    [Fact]
+    public async Task A_rerun_is_refused_when_the_target_no_longer_resolves_to_the_database_the_last_run_recorded()
+    {
+        await using var rig = await RigAsync();
+        var (runId, other) = await FailedRunThenRepointedAsync(rig);
+        await using var _ = other;
+
+        var thrown = await Record.ExceptionAsync(() => rig.Service.StartAsync(Skip, other.Name, default));
+        await rig.Service.Current;
+
+        long loaded = await other.CountAsync("app.Parent");
+        Assert.True(loaded == 0, $"a re-run after run {runId} loaded into a different database: {other.Name}.app.Parent holds {loaded} rows");
+        var ex = Assert.IsType<TransferException>(thrown);
+        Assert.Equal("target_changed", ex.Code);
+        Assert.Contains(rig.Tgt.Name, ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The other half of ruling 127's cost: with the run's own record there is no need for the discovered catalog to vouch for the
+    /// target, so a workspace whose catalog rows are gone can still resume its run into the database it recorded.
+    /// </summary>
+    [Fact]
+    public async Task A_resume_needs_no_discovered_catalog_when_the_run_recorded_its_target()
+    {
+        await using var rig = await RigAsync();
+        long runId = await rig.Service.StartAsync(Skip with { ErrorMode = "stop", ChunkSize = 500 }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        rig.S.Db.Execute("DELETE FROM catalog");
+
+        var thrown = Record.Exception(() => rig.Service.Resume());
+        await rig.Service.Current;
+
+        Assert.True(thrown is null, "a resume into the very database the run recorded was refused: " + thrown?.Message);
+        Assert.NotEqual(RunStatus.Paused, rig.S.Transfers.GetRun(runId)!.Status);
     }
 
     /// <summary>

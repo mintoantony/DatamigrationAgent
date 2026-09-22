@@ -9,7 +9,7 @@ see rows or connection strings, and never start a transfer on your own initiativ
 |---|---|---|
 | `await` / `execute` | SQL approved. The human runs pre-flight, picks options, clicks **Execute…**, types the target database name and clicks **Start transfer**. | One line: "SQL approved — open the Execute screen (<Url>) to run pre-flight and start the transfer." Keep `dbm await` running in the background. |
 | `await` / `transfer` | A run is in progress. | Nothing. If the human asks for progress, run `dbm transfer status` once and report one line. Keep `dbm await` in the background; do not poll. |
-| `await` / `transfer_paused` | Paused by the human, or by a server restart (crash recovery turns interrupted runs into paused ones). All committed chunks are safe; the plan's pre-load SQL (e.g. a disabled foreign key) stays in force until the run completes or is cancelled. | One line: "The transfer is paused — resume it from the Execute screen." Resume only when the human asks: `dbm transfer resume`. |
+| `await` / `transfer_paused` | Paused by the human, by a server restart (crash recovery turns interrupted runs into paused ones), or by the engine because the run lost its lock on the target database (its connection was dropped; the run's notes say so, and a resume takes the lock again). All committed chunks are safe; the plan's pre-load SQL (e.g. a disabled foreign key) stays in force until the run completes or is cancelled. | One line: "The transfer is paused — resume it from the Execute screen." Resume only when the human asks: `dbm transfer resume`. |
 | `stop` / `transfer_failed` | Stop-on-error rejected a row, a task/script failed, or (under skip-and-log too) a task failed with `bad_task` because every row of a chunk failed alike on a non-constraint error, or because its first 3 chunks (or its whole source, if smaller) loaded no row while rejecting rows. The plan's pre-load SQL is still in force (Resume expects it); the Execute screen names it. | Run `dbm transfer status`; report the failed task, its target and its error (already redacted) and the matching option below, then end your turn — no `dbm await` after a `stop` (it returns at once). After the human acts, they type `/db-migrate resume`. |
 | `stop` / `transfer_cancelled` | The human cancelled. Rows already committed stay in the target. Cancel ran the plan's post-load SQL; the run's notes say, statement by statement, what it restored and what it could not (with the server's text). | Report the `summary`, and any note that says NOT restored. Then end your turn. The human's options: a new run from the Execute screen (it loads every table again, so it needs "Truncate target first" or a confirmation naming the tables that already hold rows — see *Facts*), or reopen Analysis, Mapping or SQL to change the plan first. |
 | `stop` / `complete` | Finished. | Report the one-line summary. If it says "target tables were not empty before this run", the counts compare rows added, not the tables — say so. The final report is stored as a **Complete** artifact (one per completed run): the UI's **Report** step shows it (with a picker for earlier runs' reports), `dbm artifact complete` prints the latest, and `dbm export report` writes the latest as `.dbmigrate/exports/final-report.html`. If the summary names a task that "loaded 0 of N rows" (it then never says "validated"), say so: that is a mapping problem, not bad data (see *Facts*) — unless the summary also says "target tables were not empty before this run" and that task's errors are duplicate keys (PRIMARY KEY / UNIQUE, "Cannot insert duplicate key"): then those rows were already in the target. To run again with a changed plan, the human reopens Analysis, Mapping or SQL. |
@@ -21,16 +21,19 @@ see rows or connection strings, and never start a transfer on your own initiativ
 | `dbm transfer status` | `{"runId","status","done","total","errors","tasksDone","tasksTotal","tasks":[running/paused/failed tasks]}` |
 | `dbm transfer pause` | Running tasks finish their current chunk, commit its checkpoint, then stop. |
 | `dbm transfer resume` | Continues a paused **or failed** run from the last committed checkpoint of every task — no duplicates, no gaps. |
-| `dbm transfer cancel` | Running: stop after the current chunk. Paused/failed: cancel now. Either way the plan's post-load SQL then runs (best effort) to undo its pre-load SQL, and the checkpoint table is dropped unless the run was started with "Keep the checkpoint table". |
+| `dbm transfer cancel` | Running: stop after the current chunk. Paused/failed: cancel now. Either way the plan's post-load SQL then runs (best effort) to undo its pre-load SQL, and this project's checkpoints are removed (the checkpoint table is dropped once no other project's are left in it) unless the run was started with "Keep the checkpoint table". Cancelling a paused or failed run is refused `busy` while another transfer is loading the target. |
 | `dbm transfer start --yes-target <db> [--chunk n] [--parallel n] [--skip-errors] [--truncate]` | Only when the human explicitly asks you to start from the CLI **and** gave you the target database name. Into target tables that already hold rows it is refused with `target_not_empty` unless `--truncate` is given; the confirmation by name exists only in the Execute screen's start dialog. |
 
 Every one of them can come back as a refusal — `{"error":"<code>","message":"<sentence>"}` and exit 1. The message is written for the
-human: report it as it stands rather than rewording it. The codes you will actually see are `busy` (another runner has this run),
+human: report it as it stands rather than rewording it. The codes you will actually see are `busy` (another runner has this run; another transfer - from any project folder - is
+loading the same target database; or another project folder's run is paused, failed or interrupted part-way through it and
+must be resumed or cancelled from that project first; the message names the target and what holds it),
 `not_running`, `not_resumable`, `not_cancellable`, `paused_run` (a paused run must be resumed or cancelled first), `not_ready` (no
 approved SQL plan, or it cannot be read), `preflight_failed`, `target_not_empty` (the details list each non-empty table and whether it
 has a key), `confirm_required` / `confirm_mismatch`, `no_connection`, `no_plan`, and
 `target_changed` / `target_unknown` (the saved target connection no longer points, or cannot be shown to point, at the database the
-run loaded into — that one is for the human to fix in the UI, never by re-pointing it yourself).
+run loaded into — each run records its target server and database, and a resume or a re-run after a failed or cancelled run is
+refused when the target now resolves elsewhere; that one is for the human to fix in the UI, never by re-pointing it yourself).
 
 ## After a failure
 
@@ -46,8 +49,9 @@ run loaded into — that one is for the human to fix in the UI, never by re-poin
 - **A mapping or SQL defect** (any failure, or a completed run with a whole table rejected): the human reopens Mapping or SQL on its
   review screen. Reopening cancels a failed run first (running its post-load SQL); after the phase is approved again the Execute
   screen starts a **new** run. Reopen is refused while a run is running or paused — pause and cancel it first.
-- **Pre-flight failed:** report the failing checks. Schema drift → the human re-runs discovery in the UI (allowed before the first run
-  and after a completed, cancelled or failed run). `chunk_keys` → a task's source query repeats its chunk key (a join that multiplies
+- **Pre-flight failed:** report the failing checks. Schema drift, or a schema check that did not run because a discovered catalog is
+  missing or cannot be read → the human re-runs discovery in the UI (allowed before the first run and after a completed, cancelled
+  or failed run). `chunk_keys` → a task's source query repeats its chunk key (a join that multiplies
   rows), which would lose rows at chunk boundaries: the SQL phase must make the key unique or drop the join.
 - **Connection/permission errors:** report them; the human fixes access and resumes.
 - Never suggest editing the target tables by hand, disabling constraints, or re-running with truncation without the human deciding.

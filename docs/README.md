@@ -171,6 +171,30 @@ start dialog, which names the non-empty tables and the keyless ones. Without eit
 rows added" instead of "validated". If neither choice is right, the target has to be restored (for example from a
 backup); never edit it by hand.
 
+**One transfer per target database.** While a run is loading, it holds a lock in the target database itself, so a second
+transfer into the same database — from another project folder, another terminal or the CLI beside the UI — is refused
+(`busy`) before it copies a row, with a message naming the target and the run and project folder that hold it. The lock
+goes away when that run finishes, pauses or its process ends, so a resume after a crash is not affected. A run of another
+project folder that is paused, failed or was interrupted part-way still leaves its checkpoints in the target, and a new
+transfer from here is refused (`busy`, naming that project folder) until that run is resumed to the end or cancelled from
+its own project. Each project's checkpoint rows are its own: a finished or cancelled run removes only them, and
+`dbo.__dbm_checkpoint` is dropped only when nothing else is left in it. Cancelling a paused or failed run also takes the
+lock, so it is refused while another transfer is loading that target. A copy of a project folder carries the same
+project identity; its new run is refused if the original's run has checkpoints in the target, so work from one copy.
+"Keep the checkpoint table" keeps the table for auditing, but a cancelled or abandoned run's rows in it are marked done
+and never block another run. A cancel that could not reach the target leaves the run's checkpoints behind; the next new run
+from the same project folder removes them.
+
+**Upgrading from an earlier db-migrate version.** Earlier versions took a different lock and do not see this one, so do
+not run an earlier version and this one against the same target at the same time. The first run of this version upgrades
+`dbo.__dbm_checkpoint` in place; a run paused under the earlier version resumes, or is cancelled, from its own project as
+before; only checkpoints of tasks that run had started, matching what it recorded, are taken as its own. Until then its
+checkpoints hold the target for every other project, and they are never taken over while they are
+still changing (within 10 minutes of the last write). If no db-migrate project still uses the target, the table can be
+dropped. The run checks
+after every committed chunk that it still holds the lock; if its lock connection was dropped (a network or failover
+fault), it pauses after the current chunk and says so in its notes, and **Resume** takes the lock again.
+
 **Chunk keys.** When a task's source query joins other tables, pre-flight checks that its chunk key is still unique in
 that query. A join that repeats rows (one order per order line, say) would make the key repeat and lose rows at chunk
 boundaries, so it blocks the run with the task and one repeated key named; fix the key or the join in the SQL phase.

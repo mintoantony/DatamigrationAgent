@@ -160,7 +160,19 @@ public sealed class StateDb : IDisposable
         {
             if (!HasColumn("error_row", "error_number")) Execute("ALTER TABLE error_row ADD COLUMN error_number INTEGER");
         }, missing: () => !HasColumn("error_row", "error_number"));
+        // Step 3 (open item 22, Ruling 212): the target a run loaded into, and this workspace's identity in a target's checkpoint table.
+        Step(3, () =>
+        {
+            if (!HasColumn("transfer_run", "target_server")) Execute("ALTER TABLE transfer_run ADD COLUMN target_server TEXT");
+            if (!HasColumn("transfer_run", "target_database")) Execute("ALTER TABLE transfer_run ADD COLUMN target_database TEXT");
+            Execute("CREATE TABLE IF NOT EXISTS transfer_identity (id INTEGER PRIMARY KEY CHECK (id = 1), workspace_id TEXT NOT NULL)");
+            Execute("INSERT OR IGNORE INTO transfer_identity (id, workspace_id) VALUES (1, $Id)", new { Id = Guid.NewGuid().ToString("D") });
+        }, missing: () => !HasColumn("transfer_run", "target_server") || !HasColumn("transfer_run", "target_database") || IdentityMissing());
     }
+
+    private bool IdentityMissing()
+        => Scalar<long>("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'transfer_identity'") == 0
+           || Scalar<long>("SELECT COUNT(*) FROM transfer_identity WHERE id = 1") == 0;
 
     /// <summary>Applies one step when the database is below <paramref name="version"/>, or when <paramref name="missing"/> says what the
     /// step adds is absent at any version. The version is only ever raised, never lowered.</summary>

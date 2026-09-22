@@ -103,9 +103,16 @@ public static class Preflight
                 {
                     var drift = await DriftChecker.CheckAsync(s, ct);
                     string sides = string.Join(" and ", new[] { drift.SrcChanged ? "source" : null, drift.TgtChanged ? "target" : null }.OfType<string>());
+                    // Open item 26: the drift checker compares fingerprints, a column of their own, so "no drift" says nothing about
+                    // whether the discovered catalogs themselves exist and can be read. A pass is only claimed when they do; otherwise
+                    // the check did not run, which is also what the start door (409 not_ready) says about the same catalog.
+                    string? unreadable = drift.Any ? null : CatalogProblem(s);
                     checks.Add(drift.Any
                         ? Err("schema_drift", $"The {sides} schema changed since discovery. Re-run discovery and review before transferring.")
-                        : Ok("schema_drift", "Both schemas match the discovered catalogs."));
+                        : unreadable is not null
+                            ? NotRun("schema_drift", $"Not checked: {unreadable}, so there is nothing to compare the schemas against. "
+                                                     + "Re-run discovery.", causeIsAlreadyAnError: false)
+                            : Ok("schema_drift", "Both schemas match the discovered catalogs."));
                 }
                 // JsonException too: the drift check reads the ServerMeta discovery stored, and a stored value that will not parse must
                 // cost a line of the checklist, not the checklist.
@@ -130,11 +137,14 @@ public static class Preflight
                     causeIsAlreadyAnError: true));
             }
 
+            checks.Add(TargetIdentityCheck(s));
+
             if (tgt is not null)
             {
                 try
                 {
-                    checks.AddRange(await TargetChecksAsync(tgt, approved.Plan, options, ct, nonEmptyTargets));
+                    checks.AddRange(await TargetChecksAsync(tgt, approved.Plan, options, ct, nonEmptyTargets, TransferEngine.OwnerOf(s),
+                        OwnLegacyClaim(s)));
                 }
                 catch (Exception ex) when (ex is SqlException or InvalidOperationException or TimeoutException)
                 {
@@ -202,6 +212,111 @@ public static class Preflight
     }
 
     /// <summary>
+    /// Ruling 212 (review MED-2): <b>the one predicate for "the discovered catalog of <paramref name="side"/> is usable"</b>, shared by
+    /// pre-flight and the start and resume doors (<c>TransferService.DiscoveredTarget</c>), so the checklist and the door cannot
+    /// disagree about the same record again. Usable = a row exists, it parses, and it names a server and a non-blank database. Returns
+    /// the catalog, or null with the sentence saying why.
+    /// </summary>
+    public static (CatalogSnapshot? Catalog, string? Problem) DiscoveredCatalog(DbmServices s, Side side)
+    {
+        ArgumentNullException.ThrowIfNull(s);
+        string word = side == Side.Src ? "source" : "target";
+        CatalogSnapshot? catalog;
+        try
+        {
+            catalog = s.Catalog.Get(side);
+        }
+        catch (JsonException ex)
+        {
+            return (null, $"the discovered {word} catalog could not be read ({Describe(ex)})");
+        }
+        if (catalog is null) return (null, $"no discovered {word} catalog is recorded in this workspace");
+        if (catalog.Server is null || string.IsNullOrWhiteSpace(catalog.Server.Database))
+            return (null, $"the discovered {word} catalog does not record which server and database it was read from");
+        return (catalog, null);
+    }
+
+    /// <summary>
+    /// Ruling 128's identity rule, shared with the start door: same server and database, ignoring case. Never throws: a missing side
+    /// is simply not the same target.
+    /// <para>Ruling 215 (N-4): a LocalDB server reports <c>&lt;machine&gt;\LOCALDB#&lt;hex&gt;</c>, and the hex changes every time the
+    /// instance starts - so the server a connection was saved against and the one discovery read differ for the same database, a
+    /// false red that "re-run discovery" cannot cure. Two LocalDB names are compared by their machine part.</para>
+    /// </summary>
+    public static bool SameTarget(ServerMeta? a, ServerMeta? b)
+    {
+        if (a is null || b is null) return false;
+        return string.Equals(a.Database ?? "", b.Database ?? "", StringComparison.OrdinalIgnoreCase)
+               && string.Equals(ServerIdentity(a.Server), ServerIdentity(b.Server), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex LocalDbServer = new(@"^(?<machine>[^\\]+)\\LOCALDB#[0-9A-F]+$",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    internal static string ServerIdentity(string? server)
+    {
+        string s = server ?? "";
+        return LocalDbServer.Match(s) is { Success: true } m ? m.Groups["machine"].Value + @"\LOCALDB" : s;
+    }
+
+    /// <summary>Ruling 216 (L-3): this project's latest run, when it is failed or cancelled - the run a re-run abandons, whose earlier-engine
+    /// rows the start door claims - as a claim; null otherwise, or when the run cannot be read.</summary>
+    private static LegacyClaim? OwnLegacyClaim(DbmServices s)
+    {
+        try
+        {
+            return s.Transfers.Latest() is { Status: RunStatus.Failed or RunStatus.Cancelled } last
+                ? TransferEngine.ClaimOf(last.Id, last.Options, s.Transfers.Tasks(last.Id))
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Open item 26: why a discovered catalog cannot vouch for the schemas, or null when both are usable. One sentence per side
+    /// at fault, joined.</summary>
+    private static string? CatalogProblem(DbmServices s)
+    {
+        var problems = new[] { Side.Src, Side.Tgt }.Select(side => DiscoveredCatalog(s, side).Problem).OfType<string>().ToList();
+        return problems.Count == 0 ? null : string.Join("; ", problems);
+    }
+
+    /// <summary>
+    /// Ruling 212 (review MED-2), Ruling 128 on the checklist: the saved target connection must still be the database discovery read,
+    /// because the SQL plan was generated for it and neither the typed confirmation nor the fingerprint can tell an identical-schema
+    /// database apart. The start door refuses the same fact (<c>not_ready</c>).
+    /// </summary>
+    private static PreflightCheck TargetIdentityCheck(DbmServices s)
+    {
+        var (discovered, problem) = DiscoveredCatalog(s, Side.Tgt);
+        // What makes this unknowable is already an error elsewhere in the list: schema_drift says the catalog is unusable, or the
+        // connection lines say why that check could not run. Guarded on the server as well as the catalog, so a looser predicate can
+        // never turn this line into an exception that loses the checklist (Ruling 119).
+        if (discovered?.Server is not { } d)
+            return NotRun("target_identity", $"Not checked: {problem ?? "the discovered target catalog records no server"}, so it is unknown whether the saved target is the database the "
+                                             + "plan was generated for.", causeIsAlreadyAnError: true);
+        ServerMeta? saved;
+        try
+        {
+            saved = s.Connections.GetMeta(Side.Tgt);
+        }
+        catch (JsonException ex)
+        {
+            return NotRun("target_identity", "Not checked: the saved target connection's server details could not be read ("
+                                             + Describe(ex) + "). Re-test the target connection on the Setup screen.",
+                causeIsAlreadyAnError: false);
+        }
+        if (saved is null)
+            return NotRun("target_identity", "Not checked: the target connection is not saved.", causeIsAlreadyAnError: true);
+        return SameTarget(saved, d)
+            ? Ok("target_identity", $"The saved target is the database discovery read: {d.Database} on {d.Server}.")
+            : Err("target_identity", $"The saved target connection ({saved.Database} on {saved.Server}) is not the database discovery read "
+                                     + $"({d.Database} on {d.Server}); the SQL plan was generated for {d.Database}. Re-run discovery.");
+    }
+
+    /// <summary>
     /// A plan with no tasks has no task with a validation error, so "none with validation errors" would pass it. It then reaches
     /// CreateRun, which refuses a run with no tasks (ruling L2) with an ArgumentException - an exception where a preflight error belongs.
     /// </summary>
@@ -222,8 +337,12 @@ public static class Preflight
     /// not cover: "INSERT permission on every target table" pronounced over a set that silently excludes one is the same lie as no
     /// check at all.</para>
     /// </summary>
+    /// <param name="owner">This workspace, so the checkpoint-table line can report another project's unfinished checkpoints; null skips
+    /// that part (callers with no workspace).</param>
+    /// <param name="ownLegacy">Ruling 216 (L-3): an earlier engine's rows that are this project's latest failed or cancelled run's -
+    /// the start door claims and retires them for a re-run, so they are not reported as another project's.</param>
     public static async Task<List<PreflightCheck>> TargetChecksAsync(SqlConnection tgt, SqlPlanPayload plan, TransferOptions options,
-        CancellationToken ct, List<NonEmptyTarget>? nonEmptyTargets = null)
+        CancellationToken ct, List<NonEmptyTarget>? nonEmptyTargets = null, CheckpointOwner? owner = null, LegacyClaim? ownLegacy = null)
     {
         ArgumentNullException.ThrowIfNull(tgt);
         ArgumentNullException.ThrowIfNull(plan);
@@ -326,7 +445,15 @@ public static class Preflight
                 await r.ReadAsync(ct);
                 (ctlExists, canCreate, canAlterDbo) = (r.GetInt32(0), r.GetInt32(1), r.GetInt32(2));
             }
-            checks.Add(ctlExists == 1 ? Ok("control_table", $"The checkpoint table {ControlTable.Name} already exists and will be reused.")
+            // Ruling 215 (concern 3): the start refuses while another project's run has unfinished checkpoints here, so the checklist
+            // says so first, naming that project.
+            var foreign = ctlExists == 1 && owner is not null ? await ControlTable.ForeignUnfinishedAsync(tgt, owner, ct, ownLegacy) : null;
+            checks.Add(foreign is not null
+                ? Err("control_table", $"{ControlTable.Name} holds the unfinished checkpoints of {foreign.Description}: that run is paused, "
+                                       + "failed or was interrupted part-way through this target, and a new run here is refused until it is "
+                                       + "resumed or cancelled from its own project."
+                                       + (foreign.Legacy ? $" If no db-migrate project still uses this target, {ControlTable.Name} can be dropped." : ""))
+                : ctlExists == 1 ? Ok("control_table", $"The checkpoint table {ControlTable.Name} already exists and will be reused.")
                 : canCreate == 1 && canAlterDbo == 1 ? Ok("control_table", $"Can create the checkpoint table {ControlTable.Name}.")
                 : Err("control_table", $"Creating {ControlTable.Name} needs CREATE TABLE and ALTER on schema dbo."));
         }

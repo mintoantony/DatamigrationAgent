@@ -9,6 +9,31 @@ namespace Dbm.Tests.Integration.Transfer;
 [Trait("Category", "Integration")]
 public sealed class ControlTableTests
 {
+    /// <summary>Ruling 215 (N-6): checkpoints are read and written for a project, and an unset owner throws; every test here writes as
+    /// this one. Set in the constructor, which xUnit calls synchronously in the flow that then runs the test.</summary>
+    private static readonly CheckpointOwner TestOwner = new("00000000-0000-0000-0000-00000000c7b1", @"D:\control-table-tests");
+
+    public ControlTableTests() => ControlTable.CurrentOwner = TestOwner;
+
+    /// <summary>N-6: a caller that forgot the owner is told so, instead of writing rows that look like an earlier engine's.</summary>
+    [Fact]
+    public async Task Reading_or_writing_a_checkpoint_with_no_owner_set_throws_instead_of_writing_ownerless_rows()
+    {
+        await using var db = await TempDatabase.CreateAsync("dbm_ctlnoown");
+        await using var conn = new SqlConnection(db.ConnectionString);
+        await conn.OpenAsync();
+        await ControlTable.EnsureAsync(conn, default);
+        ControlTable.CurrentOwner = null;
+
+        var write = await Record.ExceptionAsync(() => ControlTable.UpsertAsync(conn, null, 1, "T01", Checkpoint.Start, default));
+        var read = await Record.ExceptionAsync(() => ControlTable.ReadAsync(conn, 1, "T01", default));
+
+        long rows = await db.CountAsync("dbo.__dbm_checkpoint");
+        Assert.True(write is InvalidOperationException && rows == 0,
+            $"a checkpoint was written with no owner set ({rows} rows, {write?.GetType().Name ?? "no exception"}): it would read as an earlier engine's");
+        Assert.IsType<InvalidOperationException>(read);
+    }
+
     [Fact]
     public async Task Checkpoint_is_written_only_when_the_transaction_commits()
     {
@@ -222,11 +247,111 @@ public sealed class ControlTableTests
         Assert.Equal("customer", await db.ScalarAsync<string>("SELECT owner FROM dbo.__dbm_checkpoint"));
         Assert.Equal(5, await db.ScalarAsync<int>("SELECT chunk_no FROM dbo.__dbm_checkpoint"));
 
-        // The harm the shape check prevents: nothing else stops the checkpoint statements from overwriting and adding to that data.
-        await ControlTable.UpsertAsync(conn, null, 1, "T01", Checkpoint.Start, default);
-        await ControlTable.UpsertAsync(conn, null, 1, "T02", Checkpoint.Start, default);
-        Assert.Equal(0, await db.ScalarAsync<int>("SELECT chunk_no FROM dbo.__dbm_checkpoint WHERE task_id = N'T01'"));
-        Assert.Equal(2L, await db.CountAsync("dbo.__dbm_checkpoint"));
+        // Ruling 212: the end-of-run release (delete our rows, drop when empty) refuses it the same way and leaves its rows alone. (The
+        // upsert-into-it demonstration this test used to end with no longer applies: the checkpoint statements now name the project
+        // columns, which this table does not have.)
+        var release = await Assert.ThrowsAsync<TransferException>(() => ControlTable.ReleaseAsync(conn, CheckpointOwner.Unowned, 1, default));
+        Assert.Equal("control_table_mismatch", release.Code);
+        Assert.Equal(1L, await db.CountAsync("dbo.__dbm_checkpoint"));
+    }
+
+    /// <summary>
+    /// Ruling 212: a checkpoint table an earlier engine created (no project columns) is upgraded in place, keeping its rows, which are
+    /// then claimable only by a resume of the same run - and until claimed they count as another project's unfinished rows, never as
+    /// rows a fresh run may adopt.
+    /// </summary>
+    [Fact]
+    public async Task An_earlier_engines_checkpoint_table_is_upgraded_in_place_and_its_rows_are_claimed_only_by_their_run()
+    {
+        await using var db = await TempDatabase.CreateAsync("dbm_ctlold");
+        await db.ExecAsync("""
+            CREATE TABLE dbo.__dbm_checkpoint (
+              run_id bigint NOT NULL, task_id nvarchar(64) COLLATE Latin1_General_100_BIN2 NOT NULL, chunk_no int NOT NULL,
+              last_key nvarchar(max) COLLATE Latin1_General_100_BIN2 NULL,
+              rows_done bigint NOT NULL, rows_error bigint NOT NULL, done bit NOT NULL, updated_at datetime2(3) NOT NULL,
+              PRIMARY KEY (run_id, task_id));
+            INSERT dbo.__dbm_checkpoint VALUES (1, N'T01', 2, N'[200]', 200, 0, 0, DATEADD(HOUR, -1, SYSUTCDATETIME()));
+            """);
+        await using var conn = new SqlConnection(db.ConnectionString);
+        await conn.OpenAsync();
+        var me = new CheckpointOwner(Guid.NewGuid().ToString("D"), @"D:\me");
+
+        await ControlTable.EnsureAsync(conn, default);
+
+        Assert.Equal(1L, await db.CountAsync("dbo.__dbm_checkpoint"));
+        var foreign = await ControlTable.ForeignUnfinishedAsync(conn, me, default);
+        Assert.True(foreign is { Legacy: true }, "an earlier engine's unfinished checkpoint was not counted as another project's");
+        // N-3: a run whose recorded counters differ (another project's run 1, T01) cannot take them.
+        await ControlTable.ClaimLegacyAsync(conn, me, new LegacyClaim(1, [("T01", 150, 0)], 0), default);
+        Assert.True(await ControlTable.ForeignUnfinishedAsync(conn, me, default) is not null,
+            "a run whose recorded rows_done (150) differ from the legacy row's (200) claimed it");
+        await ControlTable.ClaimLegacyAsync(conn, me, new LegacyClaim(1, [("T01", 200, 0)], 0), default);
+        Assert.Null(await ControlTable.ForeignUnfinishedAsync(conn, me, default));
+        ControlTable.CurrentOwner = me;
+        try
+        {
+            Assert.Equal(200, (await ControlTable.ReadAsync(conn, 1, "T01", default))!.RowsDone);
+        }
+        finally
+        {
+            ControlTable.CurrentOwner = TestOwner;
+        }
+        Assert.True(await ControlTable.ReleaseAsync(conn, me, 1, default));
+        Assert.False(await ControlTable.ExistsAsync(conn, default));
+    }
+
+    /// <summary>
+    /// Ruling 216, N-7 (b). A run's end removes its own rows and this project's finished rows - never another unfinished run of the
+    /// same project, which can only be a copy of this workspace's part-way through the target (REVF_H's second harm: the copy's
+    /// release deleted the original's checkpoints).
+    /// </summary>
+    [Fact]
+    public async Task Release_keeps_another_unfinished_run_of_the_same_project()
+    {
+        await using var db = await TempDatabase.CreateAsync("dbm_ctlrel");
+        await using var conn = new SqlConnection(db.ConnectionString);
+        await conn.OpenAsync();
+        await ControlTable.EnsureAsync(conn, default);
+        await db.ExecAsync($"""
+            INSERT dbo.__dbm_checkpoint (run_id, task_id, chunk_no, last_key, rows_done, rows_error, done, updated_at, project_id, project_folder)
+            VALUES (1, N'T01', 2, NULL, 200, 0, 0, SYSUTCDATETIME(), N'{TestOwner.ProjectId}', N'D:\original'),
+                   (2, N'T01', 4, NULL, 400, 0, 0, SYSUTCDATETIME(), N'{TestOwner.ProjectId}', N'D:\copy'),
+                   (3, N'T01', 4, NULL, 400, 0, 1, SYSUTCDATETIME(), N'{TestOwner.ProjectId}', N'D:\copy');
+            """);
+
+        bool dropped = await ControlTable.ReleaseAsync(conn, TestOwner, 2, default);
+
+        int original = dropped ? 0 : await db.ScalarAsync<int>("SELECT COUNT(*) FROM dbo.__dbm_checkpoint WHERE run_id = 1");
+        Assert.True(!dropped && original == 1,
+            $"run 2's release deleted run 1's unfinished checkpoint of the same project (table {(dropped ? "dropped" : "kept")}, {original} rows of run 1 left)");
+        Assert.Equal(1, await db.ScalarAsync<int>("SELECT COUNT(*) FROM dbo.__dbm_checkpoint"));   // run 2 and the finished run 3 went
+    }
+
+    /// <summary>
+    /// Ruling 215 (N-5). A released engine takes a run-scoped lock this one does not contend for, so the two could load one target at
+    /// once. Its rows changing within <see cref="ControlTable.LegacyQuietPeriod"/> is the sign that it may be loading now: they are not
+    /// claimed, and the claim is refused <c>run_in_progress</c> saying why.
+    /// </summary>
+    [Fact]
+    public async Task Legacy_checkpoints_written_moments_ago_are_never_claimed()
+    {
+        await using var db = await TempDatabase.CreateAsync("dbm_ctllive");
+        await using var conn = new SqlConnection(db.ConnectionString);
+        await conn.OpenAsync();
+        await ControlTable.EnsureAsync(conn, default);
+        await db.ExecAsync("""
+            INSERT dbo.__dbm_checkpoint (run_id, task_id, chunk_no, last_key, rows_done, rows_error, done, updated_at, project_id, project_folder)
+            VALUES (1, N'T01', 2, N'[200]', 200, 0, 0, SYSUTCDATETIME(), N'', NULL);
+            """);
+        var me = new CheckpointOwner(Guid.NewGuid().ToString("D"), @"D:\me");
+
+        var refusal = await Record.ExceptionAsync(() => ControlTable.ClaimLegacyAsync(conn, me, new LegacyClaim(1, [("T01", 200, 0)], 0), default));
+
+        Assert.True(await ControlTable.ForeignUnfinishedAsync(conn, me, default) is not null,
+            "legacy checkpoints written moments ago were claimed: an earlier engine may be loading them right now");
+        var refused = Assert.IsType<TransferException>(refusal);
+        Assert.Equal("run_in_progress", refused.Code);
+        Assert.Contains("earlier db-migrate version", refused.Message, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -1,3 +1,4 @@
+using Dbm.Core;
 using Dbm.Core.SqlGen;
 using Dbm.Core.State;
 using Dbm.Core.Transfer;
@@ -589,6 +590,502 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
         var refused = Assert.IsType<TransferException>(refusal);
         Assert.Equal("run_in_progress", refused.Code);
         Assert.Contains($"run {runId}", refused.Message, StringComparison.Ordinal);                                           // and it says which run
+    }
+
+    /// <summary>
+    /// Open item 23 / rulings 209, 212. Two project folders - two terminals, or the CLI beside a desktop session - each create their own
+    /// run against one target, and both are run 1: run ids start at 1 in every project (review MED-1). The lock is the target's: the
+    /// second is refused before it copies a row, told which target and which project's run holds it - not "run 1 is already being
+    /// run", which names neither - and the target is free again once the first is done.
+    /// </summary>
+    [Fact]
+    public async Task A_second_project_loading_the_same_target_is_refused_naming_the_target_and_the_holder()
+    {
+        var plan = One(WidePlan());
+        await using var rig = await RigAsync(plan);
+        using var otherProject = new XferServices();
+        var second = new TransferEngine(otherProject.Services, plan, fx.Src.ConnectionString, rig.Tgt.ConnectionString);
+        var options = new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip" };
+        long runId = rig.Engine.CreateRun(1, options);
+        long otherRunId = second.CreateRun(1, options);
+        Assert.Equal(runId, otherRunId);                                // the ordinary case: both projects are on run 1
+
+        var holding = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var control = new TransferControl();
+        control.ChunkCommitted += _ =>
+        {
+            holding.TrySetResult();
+            release.Task.GetAwaiter().GetResult();
+        };
+        var first = Task.Run(() => rig.Engine.RunAsync(runId, control, default));
+        await holding.Task;
+
+        var refusal = await Record.ExceptionAsync(() => second.RunAsync(otherRunId, new TransferControl(), default));
+        long rowsWhileHeld = await rig.Tgt.CountAsync("app.Wide");
+        release.TrySetResult();
+        var outcome = await first;
+
+        long rows = await rig.Tgt.CountAsync("app.Wide");
+        Assert.True(rows == 400,
+            $"a second project's run loaded into the target another project was loading: app.Wide holds {rows} rows, not 400");
+        Assert.Equal(RunStatus.Completed, outcome.Status);
+        var refused = Assert.IsType<TransferException>(refusal);
+        Assert.Equal("run_in_progress", refused.Code);
+        Assert.True(refused.Message.Contains(rig.Tgt.Name, StringComparison.Ordinal),
+            "the refusal does not name the target database: " + refused.Message);
+        Assert.True(refused.Message.Contains($"run {runId} of the project in {rig.Svc.Root}", StringComparison.OrdinalIgnoreCase),
+            "the refusal does not name what holds the target (its run and project folder): " + refused.Message);
+        Assert.True(refused.Message.Contains("already being loaded by another transfer", StringComparison.Ordinal),
+            "another project's run 1 was reported as this project's own run 1 already being run: " + refused.Message);
+        Assert.True(rowsWhileHeld <= 100, $"rows were loaded by the refused runner: {rowsWhileHeld}");
+
+        // Not a permanent refusal: once the first run is done the target is free for the other project.
+        await using (await RunLock.AcquireAsync(rig.Tgt.ConnectionString, otherRunId, default, TransferEngine.OwnerOf(otherProject.Services))) { }
+    }
+
+    /// <summary>
+    /// Ruling 212, review HIGH-1 (the reviewer's probe REVF_B). The lock excludes only while a segment executes, and run and task ids
+    /// repeat across projects: project A's run 1 pauses at 200 of 400 rows, holding nothing, and project B's fresh run 1 then found A's
+    /// checkpoint row (1, T01) and adopted it - it loaded the other 200, recorded 400 as its own, completed, and dropped the table,
+    /// so A's resume failed with "no checkpoint row". B must be refused, naming A's folder, and A's resume must complete to 400.
+    /// </summary>
+    [Fact]
+    public async Task A_second_project_is_refused_while_another_projects_run_is_paused_part_way_through_the_target()
+    {
+        var plan = One(WidePlan());
+        await using var rig = await RigAsync(plan);
+        using var projectB = new XferServices();
+        var engineB = new TransferEngine(projectB.Services, plan, fx.Src.ConnectionString, rig.Tgt.ConnectionString);
+        var options = new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip" };
+        long runA = rig.Engine.CreateRun(1, options);
+        var pauseA = new TransferControl();
+        pauseA.ChunkCommitted += c => { if (c.ChunkNo == 2) pauseA.RequestPause(); };
+        Assert.Equal(RunStatus.Paused, (await rig.Engine.RunAsync(runA, pauseA, default)).Status);
+        Assert.Equal(200, await rig.Tgt.CountAsync("app.Wide"));
+
+        long runB = engineB.CreateRun(1, options);
+        Assert.Equal(runA, runB);                                       // both are run 1, and both plans say T01
+        var refusal = await Record.ExceptionAsync(() => engineB.RunAsync(runB, new TransferControl(), default));
+
+        long rowsAfterB = await rig.Tgt.CountAsync("app.Wide");
+        Assert.True(rowsAfterB == 200,
+            $"project B loaded into the target while project A's run was paused part-way: app.Wide holds {rowsAfterB} rows (A had loaded 200); "
+            + $"B {(refusal is null ? "ran" : "was refused: " + refusal.Message)}");
+        var refused = Assert.IsType<TransferException>(refusal);
+        Assert.Equal("run_in_progress", refused.Code);
+        Assert.True(refused.Message.Contains($"run {runA} of the project in {rig.Svc.Root}", StringComparison.OrdinalIgnoreCase),
+            "the refusal does not name the paused run's project folder: " + refused.Message);
+
+        var resumed = await rig.Engine.RunAsync(runA, new TransferControl(), default);
+        Assert.True(resumed.Status == RunStatus.Completed, $"project A's resume ended {resumed.Status}: {resumed.Error}");
+        Assert.Equal(400, await rig.Tgt.CountAsync("app.Wide"));
+        Assert.Equal(400, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Wide"));
+    }
+
+    /// <summary>
+    /// Ruling 212, review LOW-1. A run records the database it loads into, and the lock session says which database the connection
+    /// reaches now (<c>DB_NAME()</c>). A segment whose connection now reaches another database is refused before anything is written
+    /// there - checkpoints, PreSql or rows - instead of starting the run over in a database nobody reviewed.
+    /// </summary>
+    [Fact]
+    public async Task A_segment_whose_connection_reaches_another_database_than_the_run_recorded_is_refused()
+    {
+        var plan = One(WidePlan());
+        await using var rig = await RigAsync(plan);
+        await using var other = await TempDatabase.CreateAsync("dbm_eng_g_oth");
+        await other.ExecAsync(TargetSchema);
+        long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 100, ErrorMode = "skip" }, ("any server", rig.Tgt.Name));
+        var elsewhere = new TransferEngine(rig.Svc.Services, plan, fx.Src.ConnectionString, other.ConnectionString);
+
+        var refusal = await Record.ExceptionAsync(() => elsewhere.RunAsync(runId, new TransferControl(), default));
+
+        long rows = await other.CountAsync("app.Wide");
+        int table = await other.ScalarAsync<int>("SELECT CASE WHEN OBJECT_ID(N'dbo.__dbm_checkpoint') IS NULL THEN 0 ELSE 1 END");
+        Assert.True(rows == 0 && table == 0,
+            $"run {runId}, recorded as loading into {rig.Tgt.Name}, ran in {other.Name}: {rows} rows" + (table == 1 ? " and a checkpoint table" : ""));
+        var refused = Assert.IsType<TransferException>(refusal);
+        Assert.Equal("target_changed", refused.Code);
+        Assert.True(refused.Message.Contains(rig.Tgt.Name, StringComparison.Ordinal) && refused.Message.Contains(other.Name, StringComparison.Ordinal),
+            refused.Message);
+        // The recorded server is not compared (LocalDB renames its instance on every start): "any server" above did not refuse it.
+        Assert.Equal(RunStatus.Completed, (await rig.Engine.RunAsync(runId, new TransferControl(), default)).Status);
+    }
+
+    /// <summary>
+    /// Ruling 215, N-1 (probe REVF_E). A copied project folder carries its state database, and with it the workspace identity, so the
+    /// copy's run 1 is indistinguishable from the original's in the target: the copy's fresh run adopted the original's paused
+    /// checkpoint, completed, and the original's resume then failed. A fresh run owns no checkpoint yet, so one already there for its
+    /// (project, run) is refused, naming the folder that wrote it and saying this folder may be a copy.
+    /// </summary>
+    [Fact]
+    public async Task A_copied_project_folders_fresh_run_is_refused_rather_than_adopting_the_originals_checkpoint()
+    {
+        var plan = One(WidePlan());
+        await using var rig = await RigAsync(plan);
+        using var copy = new XferServices();
+        copy.Services.Db.Execute("UPDATE transfer_identity SET workspace_id = $W", new { W = rig.Svc.Services.Transfers.WorkspaceId() });
+        var engineCopy = new TransferEngine(copy.Services, plan, fx.Src.ConnectionString, rig.Tgt.ConnectionString);
+        var options = new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip" };
+        long run = rig.Engine.CreateRun(1, options);
+        var pause = new TransferControl();
+        pause.ChunkCommitted += c => { if (c.ChunkNo == 2) pause.RequestPause(); };
+        Assert.Equal(RunStatus.Paused, (await rig.Engine.RunAsync(run, pause, default)).Status);
+        long copyRun = engineCopy.CreateRun(1, options);
+        Assert.Equal(run, copyRun);
+
+        var refusal = await Record.ExceptionAsync(() => engineCopy.RunAsync(copyRun, new TransferControl(), default));
+
+        long rows = await rig.Tgt.CountAsync("app.Wide");
+        var copied = copy.Services.Transfers.Task(copyRun, "T01")!;
+        Assert.True(rows == 200 && copied.RowsDone == 0,
+            $"a copy of the project folder took over the original's paused checkpoint: app.Wide holds {rows} rows, the copy recorded "
+            + $"{copied.RowsDone} loaded; {(refusal is null ? "it ran" : "refused: " + refusal.Message)}");
+        var refused = Assert.IsType<TransferException>(refusal);
+        Assert.Equal("run_in_progress", refused.Code);
+        Assert.True(refused.Message.Contains(rig.Svc.Root, StringComparison.OrdinalIgnoreCase)
+                    && refused.Message.Contains("may be a copy", StringComparison.Ordinal),
+            "the refusal does not name the folder that wrote the checkpoint and say this one may be a copy: " + refused.Message);
+
+        var resumed = await rig.Engine.RunAsync(run, new TransferControl(), default);
+        Assert.True(resumed.Status == RunStatus.Completed, $"the original's resume ended {resumed.Status}: {resumed.Error}");
+        Assert.Equal(400, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Wide"));
+    }
+
+    /// <summary>
+    /// Ruling 216, N-7 (probe REVF_H). Copies' run ids drift apart - a busy refusal cancels the run it just created and uses up an id -
+    /// so the copy's fresh run is run 2 while the original's run 1 is paused at 200 of 400. Keyed on its own run id, the copy was not
+    /// refused, loaded the table, and its release deleted the original's checkpoints; the original's resume then failed. Any unfinished
+    /// row of this project under any run id refuses a fresh run.
+    /// </summary>
+    [Fact]
+    public async Task A_copied_project_folder_whose_run_ids_have_drifted_is_refused_while_the_original_is_part_way()
+    {
+        var plan = One(WidePlan());
+        await using var rig = await RigAsync(plan);
+        using var copy = new XferServices();
+        copy.Services.Db.Execute("UPDATE transfer_identity SET workspace_id = $W", new { W = rig.Svc.Services.Transfers.WorkspaceId() });
+        var engineCopy = new TransferEngine(copy.Services, plan, fx.Src.ConnectionString, rig.Tgt.ConnectionString);
+        var options = new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip" };
+        long run = rig.Engine.CreateRun(1, options);
+        var pause = new TransferControl();
+        pause.ChunkCommitted += c => { if (c.ChunkNo == 2) pause.RequestPause(); };
+        Assert.Equal(RunStatus.Paused, (await rig.Engine.RunAsync(run, pause, default)).Status);
+        long refusedEarlier = engineCopy.CreateRun(1, options);                              // the id a busy refusal used up
+        copy.Services.Transfers.SetRunStatus(refusedEarlier, RunStatus.Cancelled);
+        long copyRun = engineCopy.CreateRun(1, options);
+        Assert.NotEqual(run, copyRun);
+
+        var refusal = await Record.ExceptionAsync(() => engineCopy.RunAsync(copyRun, new TransferControl(), default));
+
+        long rows = await rig.Tgt.CountAsync("app.Wide");
+        Assert.True(rows == 200,
+            $"a copy of the project folder on run {copyRun} loaded into the target while the original's run {run} was paused at 200: "
+            + $"app.Wide holds {rows} rows; {(refusal is null ? "it ran" : "refused: " + refusal.Message)}");
+        var refused = Assert.IsType<TransferException>(refusal);
+        Assert.Equal("run_in_progress", refused.Code);
+        Assert.True(refused.Message.Contains($"run {run} of this project", StringComparison.Ordinal)
+                    && refused.Message.Contains(rig.Svc.Root, StringComparison.OrdinalIgnoreCase)
+                    && refused.Message.Contains("may be a copy", StringComparison.Ordinal),
+            "the refusal does not name the original's run and folder and say this one may be a copy: " + refused.Message);
+
+        var resumed = await rig.Engine.RunAsync(run, new TransferControl(), default);
+        Assert.True(resumed.Status == RunStatus.Completed, $"the original's resume ended {resumed.Status}: {resumed.Error}");
+        Assert.Equal(400, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Wide"));
+    }
+
+    /// <summary>
+    /// Ruling 217, R3-1 (probe REVF_J). An earlier engine's row (run 1, T01) stands at 300 rows with last key 300 - another project's
+    /// run, from before rows carried a project. This project's run 1 was prepared and paused before T01 started, so it recorded 0 for
+    /// T01. "At most one chunk ahead" (300 - 0 &lt;= 1,000) let its resume claim the row, continue from key 300 and record 400 rows done
+    /// having loaded 100 - the other 300 of its own never loaded, and nothing said so. A pending task never wrote a checkpoint and
+    /// claims nothing: the resume is refused as over checkpoints that may be its own, and the row stays unclaimed.
+    /// </summary>
+    [Fact]
+    public async Task A_resume_does_not_claim_an_earlier_engines_checkpoint_for_a_task_it_never_started()
+    {
+        var plan = One(WidePlan());
+        await using var rig = await RigAsync(plan);
+        using var earlier = new XferServices();
+        var engineEarlier = new TransferEngine(earlier.Services, plan, fx.Src.ConnectionString, rig.Tgt.ConnectionString);
+        var options = new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip" };
+        long run = rig.Engine.CreateRun(1, options);
+        var stopAtOnce = new TransferControl();
+        stopAtOnce.RequestPause();                                     // prepared, then paused before T01 starts
+        Assert.Equal(RunStatus.Paused, (await rig.Engine.RunAsync(run, stopAtOnce, default)).Status);
+        var pending = rig.Repo.Task(run, "T01")!;
+        Assert.True(pending.Status == TransferTaskStatus.Pending && pending.RowsDone == 0 && pending.RowsBefore == 0);   // the premise
+        long earlierRun = engineEarlier.CreateRun(1, options);
+        Assert.Equal(run, earlierRun);
+        var pause = new TransferControl();
+        pause.ChunkCommitted += c => { if (c.ChunkNo == 3) pause.RequestPause(); };
+        Assert.Equal(RunStatus.Paused, (await engineEarlier.RunAsync(earlierRun, pause, default)).Status);
+        // What an upgrade leaves of that run: its row without a project, last written well before the quiet period.
+        await rig.Tgt.ExecAsync("UPDATE dbo.__dbm_checkpoint SET project_id = N'', project_folder = NULL, updated_at = DATEADD(HOUR, -1, SYSUTCDATETIME());");
+        Assert.Equal(300, await rig.Tgt.CountAsync("app.Wide"));
+
+        var refusal = await Record.ExceptionAsync(() => rig.Engine.RunAsync(run, new TransferControl(), default));
+
+        long rows = await rig.Tgt.CountAsync("app.Wide");
+        // -1: the table is gone (a run that completed over the claimed row released it).
+        int ownerless = await rig.Tgt.ScalarAsync<int>("""
+            IF OBJECT_ID(N'dbo.__dbm_checkpoint', N'U') IS NULL SELECT -1
+            ELSE EXEC (N'SELECT COUNT(*) FROM dbo.__dbm_checkpoint WHERE project_id = N''''');
+            """);
+        var t01 = rig.Repo.Task(run, "T01")!;
+        Assert.True(rows == 300 && ownerless == 1,
+            $"a resume claimed an earlier engine's checkpoint (300 rows, last key 300) for T01, a task it had never started: app.Wide "
+            + $"holds {rows} rows, the run recorded {t01.RowsDone} loaded, "
+            + (ownerless < 0 ? "the checkpoint table was dropped" : $"{ownerless} ownerless checkpoints are left") + "; "
+            + (refusal is null ? $"it ended {EnumText.ToText(rig.Repo.GetRun(run)!.Status)}" : "refused: " + refusal.Message));
+        var refused = Assert.IsType<TransferException>(refusal);
+        Assert.True(refused.Code == "run_in_progress" && refused.Message.Contains("may be this run's own checkpoints", StringComparison.Ordinal),
+            $"the resume was not refused as over checkpoints that may be its own ({refused.Code}): {refused.Message}");
+    }
+
+    /// <summary>Ruling 217, R3-1: the one-chunk tolerance stays for a task the run had started - a crash in its first chunk leaves it
+    /// running with 0 recorded while the checkpoint committed with that chunk says 100 - and a pending task claims nothing at all.</summary>
+    [Fact]
+    public void Only_a_started_task_claims_an_earlier_engines_checkpoint_ahead_of_its_record()
+    {
+        using var svc = new XferServices();
+        var engine = new TransferEngine(svc.Services, One(WidePlan()), fx.Src.ConnectionString, fx.Src.ConnectionString);
+        var options = new TransferOptions { ChunkSize = 100 };
+        long run = engine.CreateRun(1, options);
+        var pending = svc.Services.Transfers.Task(run, "T01")!;
+        var crashed = pending with { Status = TransferTaskStatus.Running, StartedAt = DateTimeOffset.UtcNow };
+
+        bool startedClaims = TransferEngine.ClaimOf(run, options, [crashed]).Matches(run, "T01", 100, 0);
+        bool pendingClaims = TransferEngine.ClaimOf(run, options, [pending]).Matches(run, "T01", 100, 0);
+
+        Assert.True(startedClaims, "a task that crashed in its first chunk no longer claims its own checkpoint one chunk ahead of its record");
+        Assert.False(pendingClaims, "a task still pending claimed an earlier engine's checkpoint: it never wrote one");
+    }
+
+    /// <summary>
+    /// Ruling 217, R3-2 (probe REVF_K, engine half). A cancel that could not reach the target (F-16) leaves the run's unfinished rows,
+    /// written from this very folder. The run has ended and nothing will resume or cancel it again, so a fresh run of the same folder
+    /// was refused for good as "may be a copy" of itself. Its own ended run's rows are retired instead, and the fresh run loads.
+    /// </summary>
+    [Theory]
+    [InlineData(RunStatus.Cancelled)]
+    [InlineData(RunStatus.Failed)]
+    public async Task A_fresh_run_retires_its_own_folders_ended_runs_unfinished_checkpoints(RunStatus ended)
+    {
+        var plan = One(WidePlan());
+        await using var rig = await RigAsync(plan);
+        var options = new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip" };
+        long first = rig.Engine.CreateRun(1, options);
+        var pause = new TransferControl();
+        pause.ChunkCommitted += c => { if (c.ChunkNo == 2) pause.RequestPause(); };
+        Assert.Equal(RunStatus.Paused, (await rig.Engine.RunAsync(first, pause, default)).Status);
+        rig.Repo.SetRunStatus(first, ended);                              // ended while the target could not be reached: rows left
+        Assert.Equal(1, await rig.Tgt.ScalarAsync<int>($"SELECT COUNT(*) FROM dbo.__dbm_checkpoint WHERE run_id = {first} AND done = 0"));
+        long second = rig.Engine.CreateRun(1, options with { TruncateTarget = true });
+
+        var outcome = await Record.ExceptionAsync(async () =>
+            Assert.Equal(RunStatus.Completed, (await rig.Engine.RunAsync(second, new TransferControl(), default)).Status));
+
+        Assert.True(outcome is null,
+            $"a fresh run {second} was refused over its own folder's {EnumText.ToText(ended)} run {first} as if this folder were a copy: "
+            + outcome?.Message);
+        Assert.Equal(400, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Wide"));
+        Assert.Equal(400, await rig.Tgt.CountAsync("app.Wide"));
+    }
+
+    /// <summary>
+    /// Ruling 218, R4-1 (probe REVF_M). The original project is paused at 200 of 400 on run 1; it is moved, and a copy is left at the
+    /// old path whose run 1 is cancelled (a busy-refused start cancels the run it created). The copy's fresh run 2 took the original's
+    /// row for its own ended run's and marked it done - and the original's resume then read the task as finished and ended Completed
+    /// with 200 of 400 rows, saying nothing. The R3-2 path deletes the ended run's rows instead: nothing of this folder resumes an
+    /// ended run, and a mistaken delete makes the victim's resume fail loudly for want of its checkpoint.
+    /// </summary>
+    [Fact]
+    public async Task A_copy_at_the_old_path_never_lets_the_originals_resume_complete_short()
+    {
+        var plan = One(WidePlan());
+        await using var rig = await RigAsync(plan);
+        using var copy = new XferServices();
+        copy.Services.Db.Execute("UPDATE transfer_identity SET workspace_id = $W", new { W = rig.Svc.Services.Transfers.WorkspaceId() });
+        var engineCopy = new TransferEngine(copy.Services, plan, fx.Src.ConnectionString, rig.Tgt.ConnectionString);
+        var options = new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip" };
+        long run = rig.Engine.CreateRun(1, options);
+        var pause = new TransferControl();
+        pause.ChunkCommitted += c => { if (c.ChunkNo == 2) pause.RequestPause(); };
+        Assert.Equal(RunStatus.Paused, (await rig.Engine.RunAsync(run, pause, default)).Status);
+        // The original wrote its row from the path the copy now occupies (it has since been moved).
+        await rig.Tgt.ExecAsync($"UPDATE dbo.__dbm_checkpoint SET project_folder = N'{copy.Root.Replace("'", "''")}';");
+        long cancelled = engineCopy.CreateRun(1, options);
+        Assert.Equal(run, cancelled);
+        copy.Services.Transfers.SetRunStatus(cancelled, RunStatus.Cancelled);
+        long copyRun = engineCopy.CreateRun(1, options);
+        var stopAtOnce = new TransferControl();
+        stopAtOnce.RequestPause();                                      // its start checks run, then it stops before loading
+        await Record.ExceptionAsync(() => engineCopy.RunAsync(copyRun, stopAtOnce, default));
+
+        var resumed = await rig.Engine.RunAsync(run, new TransferControl(), default);
+
+        long rows = await rig.Tgt.CountAsync("app.Wide");
+        Assert.True(resumed.Status != RunStatus.Completed || rows == 400,
+            $"a retired copy's checkpoint let the original's resume end Completed with {rows} of 400 rows and no error");
+        Assert.True(resumed.Status == RunStatus.Failed && (resumed.Error ?? "").Contains("has no checkpoint row", StringComparison.Ordinal),
+            $"the original's resume did not fail for want of its checkpoint ({EnumText.ToText(resumed.Status)}): {resumed.Error}");
+    }
+
+    /// <summary>Ruling 217, R3-2: only this folder's own ENDED run is retired. A paused run of this folder is still a live claim (a
+    /// fresh run beside it is refused, and its rows stay unfinished).</summary>
+    [Fact]
+    public async Task A_fresh_run_still_refuses_its_own_folders_paused_run()
+    {
+        var plan = One(WidePlan());
+        await using var rig = await RigAsync(plan);
+        var options = new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip" };
+        long first = rig.Engine.CreateRun(1, options);
+        var pause = new TransferControl();
+        pause.ChunkCommitted += c => { if (c.ChunkNo == 2) pause.RequestPause(); };
+        Assert.Equal(RunStatus.Paused, (await rig.Engine.RunAsync(first, pause, default)).Status);
+        long second = rig.Engine.CreateRun(1, options);
+
+        var refusal = await Record.ExceptionAsync(() => rig.Engine.RunAsync(second, new TransferControl(), default));
+
+        int unfinished = await rig.Tgt.ScalarAsync<int>($"""
+            IF OBJECT_ID(N'dbo.__dbm_checkpoint', N'U') IS NULL SELECT 0
+            ELSE EXEC (N'SELECT COUNT(*) FROM dbo.__dbm_checkpoint WHERE run_id = {first} AND done = 0');
+            """);
+        Assert.True(refusal is TransferException { Code: "run_in_progress" } && unfinished == 1,
+            $"a fresh run retired its own folder's paused run {first} ({unfinished} unfinished checkpoints left) and "
+            + (refusal is null ? $"loaded {await rig.Tgt.CountAsync("app.Wide")} rows beside it" : "was refused: " + refusal.Message));
+    }
+
+    /// <summary>
+    /// Ruling 217, R3-3. A run's end keeps the table when rows of another unfinished run are left - and when that run is this very
+    /// project's (a copy of this workspace part-way through the target), the note said "another project's checkpoints". It names the
+    /// run of this project instead.
+    /// </summary>
+    [Fact]
+    public async Task A_kept_table_note_names_this_projects_other_unfinished_run_not_another_project()
+    {
+        var plan = One(WidePlan());
+        await using var rig = await RigAsync(plan);
+        string id = rig.Svc.Services.Transfers.WorkspaceId();
+        long run = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip" });
+        var control = new TransferControl();
+        int planted = 0;
+        // A copy of this workspace starts its run 9 while this one loads (after this run's own start checks).
+        control.ChunkCommitted += c =>
+        {
+            if (c.ChunkNo != 1 || Interlocked.Exchange(ref planted, 1) != 0) return;
+            rig.Tgt.ExecAsync($"""
+                INSERT dbo.__dbm_checkpoint (run_id, task_id, chunk_no, last_key, rows_done, rows_error, done, updated_at, project_id, project_folder)
+                VALUES (9, N'T01', 1, NULL, 100, 0, 0, SYSUTCDATETIME(), N'{id}', N'D:\copy-of-this-project');
+                """).GetAwaiter().GetResult();
+        };
+
+        Assert.Equal(RunStatus.Completed, (await rig.Engine.RunAsync(run, control, default)).Status);
+
+        string summary = rig.Repo.GetRun(run)!.SummaryJson ?? "";
+        Assert.True(summary.Contains("run 9 of this project", StringComparison.Ordinal)
+                    && !summary.Contains("another project's checkpoints", StringComparison.Ordinal),
+            "the kept-table note calls this project's own other unfinished run another project's checkpoints: " + summary);
+    }
+
+    /// <summary>
+    /// Ruling 215, N-2 (probe REVF_F). A run cancelled with "Keep the checkpoint table" left its unfinished rows behind, and they
+    /// blocked every other project's run on that target for good, with advice (resume or cancel it) that could no longer be followed.
+    /// The option keeps the table, never a claim on the target: the cancelled run's rows are marked done.
+    /// </summary>
+    [Fact]
+    public async Task A_run_cancelled_with_the_table_kept_leaves_no_claim_on_the_target()
+    {
+        var plan = One(WidePlan());
+        await using var rig = await RigAsync(plan);
+        using var projectB = new XferServices();
+        var engineB = new TransferEngine(projectB.Services, plan, fx.Src.ConnectionString, rig.Tgt.ConnectionString);
+        long runA = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip", KeepControlTable = true });
+        var cancel = new TransferControl();
+        cancel.ChunkCommitted += c => { if (c.ChunkNo == 2) cancel.RequestCancel(); };
+        Assert.Equal(RunStatus.Cancelled, (await rig.Engine.RunAsync(runA, cancel, default)).Status);
+        Assert.Equal(1, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(*) FROM dbo.__dbm_checkpoint"));   // kept, as asked
+        long runB = engineB.CreateRun(1, new TransferOptions { ChunkSize = 100, ErrorMode = "skip", TruncateTarget = true });
+
+        var outcome = await Record.ExceptionAsync(async () =>
+            Assert.Equal(RunStatus.Completed, (await engineB.RunAsync(runB, new TransferControl(), default)).Status));
+
+        Assert.True(outcome is null,
+            "a run cancelled with its checkpoint table kept still blocks another project's run on the target: " + outcome?.Message);
+        Assert.Equal(400, await rig.Tgt.CountAsync("app.Wide"));
+    }
+
+    /// <summary>
+    /// Ruling 212 (c). A run's end removes its own project's checkpoint rows and drops the table only when it is then empty. Project A
+    /// completed keeping its checkpoint table for auditing; project B's run then completes and, before, dropped the shared table with
+    /// A's rows in it.
+    /// </summary>
+    [Fact]
+    public async Task A_completing_run_removes_only_its_own_checkpoints_and_keeps_the_table_for_another_projects()
+    {
+        var plan = One(WidePlan());
+        await using var rig = await RigAsync(plan);
+        using var projectB = new XferServices();
+        var engineB = new TransferEngine(projectB.Services, plan, fx.Src.ConnectionString, rig.Tgt.ConnectionString);
+        long runA = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 100, ErrorMode = "skip", KeepControlTable = true });
+        Assert.Equal(RunStatus.Completed, (await rig.Engine.RunAsync(runA, new TransferControl(), default)).Status);
+        long runB = engineB.CreateRun(1, new TransferOptions { ChunkSize = 100, ErrorMode = "skip", TruncateTarget = true });
+
+        Assert.Equal(RunStatus.Completed, (await engineB.RunAsync(runB, new TransferControl(), default)).Status);
+
+        int table = await rig.Tgt.ScalarAsync<int>("SELECT CASE WHEN OBJECT_ID(N'dbo.__dbm_checkpoint') IS NULL THEN 0 ELSE 1 END");
+        Assert.True(table == 1, "project B's completed run dropped the checkpoint table that still held project A's checkpoints");
+        string idA = rig.Svc.Services.Transfers.WorkspaceId();
+        Assert.Equal(1, await rig.Tgt.ScalarAsync<int>($"SELECT COUNT(*) FROM dbo.__dbm_checkpoint WHERE project_id = N'{idA}'"));
+        Assert.Equal(0, await rig.Tgt.ScalarAsync<int>($"SELECT COUNT(*) FROM dbo.__dbm_checkpoint WHERE project_id <> N'{idA}'"));
+        Assert.Contains("still holds another project's checkpoints", projectB.Services.Transfers.GetRun(runB)!.SummaryJson ?? "",
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Open item 20 / ruling 209. The lock connection is idle for the whole run, so anything that drops it - an idle timeout between
+    /// here and the server, a failover, a KILL - frees the target without a word, and a second runner could then load beside this
+    /// one. The seam kills the lock session after the first chunk: the run must notice at the next chunk commit and stop as
+    /// <c>paused</c>, saying why, instead of loading the rest of the table unguarded. A resume takes the lock again and finishes.
+    /// </summary>
+    [KillSessionFact]
+    public async Task A_run_whose_lock_session_is_killed_pauses_saying_the_lock_was_lost()
+    {
+        await using var rig = await RigAsync(One(WidePlan()));
+        long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip" });
+        int lockSession = 0;
+        TransferEngine.AfterLockTaken = l => lockSession = l.SessionId;
+        var control = new TransferControl();
+        control.ChunkCommitted += c =>
+        {
+            if (c.ChunkNo != 1) return;
+            using var killer = new SqlConnection(rig.Tgt.ConnectionString);
+            killer.Open();
+            using var kill = new SqlCommand($"KILL {lockSession}", killer);
+            kill.ExecuteNonQuery();
+        };
+        TransferOutcome outcome;
+        try
+        {
+            outcome = await rig.Engine.RunAsync(runId, control, default);
+        }
+        finally
+        {
+            TransferEngine.AfterLockTaken = null;
+        }
+
+        long rows = await rig.Tgt.CountAsync("app.Wide");
+        Assert.True(outcome.Status == RunStatus.Paused && rows < 400,
+            $"the run kept loading after its lock session was killed: it ended {outcome.Status} with {rows} of 400 rows loaded unguarded");
+        string summary = rig.Repo.GetRun(runId)!.SummaryJson ?? "";
+        Assert.True(summary.Contains("lock on the target database", StringComparison.Ordinal) && summary.Contains("was lost", StringComparison.Ordinal),
+            "the paused run does not say its lock was lost: " + summary);
+
+        var resumed = await rig.Engine.RunAsync(runId, new TransferControl(), default);
+        Assert.Equal(RunStatus.Completed, resumed.Status);
+        Assert.Equal(400, await rig.Tgt.CountAsync("app.Wide"));
+        Assert.Equal(400, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Wide"));
     }
 
     /// <summary>

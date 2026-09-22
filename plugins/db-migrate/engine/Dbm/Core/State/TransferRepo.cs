@@ -5,7 +5,15 @@ using Microsoft.Data.Sqlite;
 namespace Dbm.Core.State;
 
 public sealed record TransferRunRow(long Id, int SqlVersion, RunStatus Status, TransferOptions Options,
-    DateTimeOffset? StartedAt, DateTimeOffset? EndedAt, string? SummaryJson);
+    DateTimeOffset? StartedAt, DateTimeOffset? EndedAt, string? SummaryJson)
+{
+    /// <summary>Open item 22: the target server the run loaded into, as its connection resolved it (<c>@@SERVERNAME</c>). Null for a
+    /// run created before migration step 3, which recorded none. Never a credential.</summary>
+    public string? TargetServer { get; init; }
+
+    /// <summary>Open item 22: the target database the run loaded into (<c>DB_NAME()</c>); null as for <see cref="TargetServer"/>.</summary>
+    public string? TargetDatabase { get; init; }
+}
 
 public sealed record TransferTaskRow(long RunId, string TaskId, string Target, int Ordinal, TransferTaskStatus Status,
     long? RowsSource, long? RowsBefore, long RowsDone, long RowsError, string? LastKeyJson, DateTimeOffset? HeartbeatAt,
@@ -28,14 +36,17 @@ public sealed record ErrorNumberCount(int? Number, long Rows, string FirstError)
 /// </summary>
 public sealed class TransferRepo(StateDb db)
 {
-    private const string RunCols = "id, sql_version, status, options_json, started_at, ended_at, summary_json";
+    private const string RunCols = "id, sql_version, status, options_json, started_at, ended_at, summary_json, target_server, target_database";
     private const string TaskCols = "run_id, task_id, target, ordinal, status, rows_source, rows_before, rows_done, rows_error, " +
                                     "last_key_json, heartbeat_at, started_at, ended_at, error, validation_json";
 
     private readonly StateDb _db = db ?? throw new ArgumentNullException(nameof(db));
 
     /// <summary>Creates a "running" run with its tasks "pending", ordinal = index in <paramref name="tasks"/>. Options are persisted normalized.</summary>
-    public long CreateRun(int sqlVersion, TransferOptions options, IReadOnlyList<(string TaskId, string Target)> tasks)
+    /// <param name="targetDatabase">Open item 22: the server and database the run will load into, as the target connection resolved them.
+    /// Null records none (a caller with no resolved target); resume and re-run then fall back to the discovered catalog.</param>
+    public long CreateRun(int sqlVersion, TransferOptions options, IReadOnlyList<(string TaskId, string Target)> tasks,
+        (string Server, string Database)? targetDatabase = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(tasks);
@@ -54,8 +65,10 @@ public sealed class TransferRepo(StateDb db)
 
         return _db.InTransaction(() =>
         {
-            _db.Execute("INSERT INTO transfer_run (sql_version, status, options_json, started_at) VALUES ($SqlVersion, $Status, $Options, $Now)",
-                new { SqlVersion = sqlVersion, Status = EnumText.ToText(RunStatus.Running), Options = Json.Serialize(normalized), Now = Clock.NowText() });
+            _db.Execute("INSERT INTO transfer_run (sql_version, status, options_json, started_at, target_server, target_database) " +
+                        "VALUES ($SqlVersion, $Status, $Options, $Now, $Server, $Database)",
+                new { SqlVersion = sqlVersion, Status = EnumText.ToText(RunStatus.Running), Options = Json.Serialize(normalized), Now = Clock.NowText(),
+                      Server = targetDatabase?.Server, Database = targetDatabase?.Database });
             long id = _db.Scalar<long>("SELECT last_insert_rowid()");
             for (int i = 0; i < tasks.Count; i++)
                 _db.Execute("INSERT INTO transfer_task (run_id, task_id, target, ordinal, status) VALUES ($RunId, $TaskId, $Target, $Ordinal, $Status)",
@@ -63,6 +76,11 @@ public sealed class TransferRepo(StateDb db)
             return id;
         });
     }
+
+    /// <summary>Ruling 212: this workspace's identity (a GUID created by migration step 3), which owns its checkpoint rows in a target.</summary>
+    public string WorkspaceId()
+        => _db.Scalar<string>("SELECT workspace_id FROM transfer_identity WHERE id = 1")
+           ?? throw new InvalidOperationException("The state database has no workspace identity (migration step 3 did not run).");
 
     public TransferRunRow? Latest()
         => _db.Query($"SELECT {RunCols} FROM transfer_run ORDER BY id DESC LIMIT 1", MapRun).FirstOrDefault();
@@ -239,7 +257,11 @@ public sealed class TransferRepo(StateDb db)
 
     private static TransferRunRow MapRun(SqliteDataReader r) => new(
         r.GetInt64(0), r.GetInt32(1), EnumText.Parse<RunStatus>(r.GetString(2)), Json.Deserialize<TransferOptions>(r.GetString(3)),
-        Ts(r, 4), Ts(r, 5), Str(r, 6));
+        Ts(r, 4), Ts(r, 5), Str(r, 6))
+    {
+        TargetServer = Str(r, 7),
+        TargetDatabase = Str(r, 8),
+    };
 
     private static TransferTaskRow MapTask(SqliteDataReader r) => new(
         r.GetInt64(0), r.GetString(1), r.GetString(2), r.GetInt32(3), EnumText.Parse<TransferTaskStatus>(r.GetString(4)),
