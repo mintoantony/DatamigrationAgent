@@ -632,10 +632,13 @@
           list.appendChild(h('div', { class: 'muted small' }, 'Showing the first ' + p.rows.length + ' of ' + X.num(t.rowsError) + '.'));
         }
         p.rows.forEach(function (r) {
+          // Ruling 208 / E-4: the server's error number, when the row was recorded with one - a row recorded without one shows
+          // none, never a 0. Mirrors the Report screen's samples (views/report.js samplesList).
+          const n = typeof r.errorNumber === 'number' ? 'error ' + r.errorNumber + ': ' : '';
           list.appendChild(h('div', { class: 'exe-err-item stack' },
             h('div', { class: 'row' }, h('span', { class: 'mono small' }, X.keyText(r.keyJson)), h('div', { class: 'spacer' }),
               h('span', { class: 'muted small' }, ts(r.ts))),
-            h('div', { class: 'small' }, r.error),
+            h('div', { class: 'small' }, n + r.error),
             r.rowJson ? h('pre', { class: 'code exe-row-json' }, X.prettyJson(r.rowJson)) : null));
         });
       })

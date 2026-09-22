@@ -476,6 +476,26 @@ test('the live run names the database and server it actually loaded into, and sa
     'a run recorded before the target fields existed must show nothing, not "undefined" or an empty label');
 });
 
+/* ------------------------------------------------------------------ E-4: the error drawer shows the SQL Server error number */
+
+test('the error drawer shows the SQL Server error number beside the text, and nothing extra when it is absent (E-4)', async () => {
+  const m = await mount(runningView(), {
+    errors: [
+      { keyJson: '{"Id":88213}', ts: '2026-09-17T09:05:00+00:00', error: 'Cannot insert duplicate key row.', errorNumber: 2627 },
+      { keyJson: '{"Id":88214}', ts: '2026-09-17T09:05:01+00:00', error: 'String or binary data would be truncated.' },
+    ],
+  });
+  D.query(m.root, '.exe-err-btn').fire('click');
+  await D.settle();
+  await D.settle();
+  const items = D.queryAll(dom.ids.drawer, '.exe-err-item');
+  assert.equal(items.length, 2, 'both rejected rows should be listed in the drawer');
+  assert.equal(D.text(items[0].children[1]), 'error 2627: Cannot insert duplicate key row.',
+    'a row recorded with a SQL Server error number must show it beside the text');
+  assert.equal(D.text(items[1].children[1]), 'String or binary data would be truncated.',
+    'a row recorded without an error number must show none, never a 0 or "error undefined:"');
+});
+
 /* Open item 32: the completed-run banner sends the operator to the stepper step by the name the stepper shows. */
 test('the completed-run banner names the final-report step exactly as the stepper labels it', async () => {
   const m = await mount(runningView({
