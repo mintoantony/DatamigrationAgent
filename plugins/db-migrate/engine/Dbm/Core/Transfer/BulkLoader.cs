@@ -222,6 +222,7 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options, TargetSha
         var mappings = new List<SqlBulkCopyColumnMapping>();
         var mapped = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var taken = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);   // #stg column -> the source already going there
+        var takenBy = new Dictionary<string, ColumnBinding>(StringComparer.OrdinalIgnoreCase);   // ... and the binding that claimed it
         var unmapped = new List<string>();
         foreach (var b in bindings)
         {
@@ -232,11 +233,22 @@ public sealed class BulkLoader(TaskPlan task, TransferOptions options, TargetSha
             if (staging.TryGetValue(b.Target, out var dest) || staging.TryGetValue(b.Source, out dest))
             {
                 if (taken.TryGetValue(dest, out var first))
+                {
+                    // Open item 21: a fan-out (one source, two targets) reaches here only when #stg has a column named after the source
+                    // and none per target - both bindings fall back to it. Naming "two source columns: A and A" would name the one
+                    // source three times and neither target; the fix is a #stg column per target, so that is what the sentence says.
+                    if (takenBy.TryGetValue(dest, out var claimed) && string.Equals(claimed.Source, b.Source, StringComparison.Ordinal))
+                        throw new TransferException("bad_task",
+                            $"Task for {target} binds source column {b.Source} to two targets ({claimed.Target}, {b.Target}) which both " +
+                            $"land in the one #stg column {dest}; give #stg a column per target.",
+                            [dest, claimed.Target, b.Target]);
                     throw new TransferException("bad_task",
                         $"Task for {target} binds two source columns to the one #stg column {dest}: {first} and {b.Source}. Only one of " +
                         "them can be loaded, so the task is refused rather than dropping the other without saying so.",
                         [dest, first, b.Source]);
+                }
                 mapped.Add(source);
+                takenBy[dest] = b;
                 taken[dest] = b.Source;
                 mappings.Add(new SqlBulkCopyColumnMapping(source, dest));
             }
