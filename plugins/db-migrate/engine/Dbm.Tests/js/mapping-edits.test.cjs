@@ -6,72 +6,14 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const D = require('./dom-stub.cjs');
 
 const JS = path.join(__dirname, '..', '..', 'Dbm', 'wwwroot', 'js');
 
-/* ------------------------------------------------------------------ fake DOM */
+/* ------------------------------------------------------------------ fake DOM: the suite's one stub (open item 25) */
 
-class FakeNode {
-  constructor(tag) {
-    this.tagName = tag;
-    this.children = [];
-    this.attributes = {};
-    this.dataset = {};
-    this.listeners = {};
-    this.className = '';
-    this.parentNode = null;
-    this.text = '';
-    this.hidden = false;
-    this.disabled = false;
-    this.value = '';
-    this.style = { setProperty() {} };
-    this.classList = { add() {}, remove() {}, toggle() {}, contains() { return false; } };
-  }
-  appendChild(c) { c.parentNode = this; this.children.push(c); return c; }
-  replaceChild(n, o) { const i = this.children.indexOf(o); this.children[i] = n; n.parentNode = this; o.parentNode = null; return o; }
-  removeChild(c) { this.children.splice(this.children.indexOf(c), 1); c.parentNode = null; return c; }
-  get firstChild() { return this.children[0] || null; }
-  set textContent(v) { this.children = []; this.text = String(v); }
-  get textContent() { return this.text + this.children.map((c) => c.textContent).join(''); }
-  setAttribute(k, v) { this.attributes[k] = v; if (k === 'value') this.value = v; }
-  getAttribute(k) { return this.attributes[k]; }
-  removeAttribute(k) { delete this.attributes[k]; }
-  addEventListener(ev, fn) { (this.listeners[ev] = this.listeners[ev] || []).push(fn); }
-  removeEventListener() {}
-  querySelector() { return null; }
-  closest() { return null; }
-  scrollIntoView() {}
-  focus() {}
-  fire(ev) { (this.listeners[ev] || []).forEach((fn) => fn({ target: this, preventDefault() {}, stopPropagation() {} })); }
-}
-
-function find(node, pred) {
-  if (pred(node)) return node;
-  for (const c of node.children) { const hit = find(c, pred); if (hit) return hit; }
-  return null;
-}
-
-const ids = {};
-['app', 'topbar', 'banners', 'stepper', 'view', 'drawer', 'toasts'].forEach((id) => { ids[id] = new FakeNode('div'); });
-globalThis.window = globalThis;
-globalThis.document = {
-  readyState: 'complete',
-  title: '',
-  activeElement: null,
-  documentElement: new FakeNode('html'),
-  body: new FakeNode('body'),
-  createElement: (tag) => new FakeNode(tag),
-  createTextNode: (t) => { const n = new FakeNode('#text'); n.text = t; return n; },
-  getElementById: (id) => ids[id] || null,
-  addEventListener() {},
-  removeEventListener() {},
-};
-globalThis.location = { hash: '' };
-globalThis.history = { replaceState() {} };
-globalThis.addEventListener = () => {};
-globalThis.scrollY = 0;
-globalThis.scrollTo = () => {};
-Object.defineProperty(globalThis, 'localStorage', { value: { getItem: () => null, setItem() {} }, configurable: true });
+const { ids } = D.install();
+const find = D.find;
 
 /* ------------------------------------------------------------------ stub server */
 

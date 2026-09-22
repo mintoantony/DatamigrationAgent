@@ -41,6 +41,10 @@ public sealed class SqlGenJobTests
             w => w.StartsWith("validate: Comment: varchar(500) -> nvarchar(200)", StringComparison.Ordinal));
         Assert.DoesNotContain("Integrated Security", Json.Serialize(plan), StringComparison.OrdinalIgnoreCase);
         Assert.Contains(log, l => l.StartsWith("sqlgen: 6 task(s) generated", StringComparison.Ordinal));
+        // Ruling 204: the job validated live, so the draft carries positive evidence of it.
+        Assert.True(plan.Validation is { Ok: true }, "a live sqlgen draft stored no validation evidence");
+        var at = DateTimeOffset.ParseExact(plan.Validation!.At, "O", System.Globalization.CultureInfo.InvariantCulture);
+        Assert.True(DateTimeOffset.UtcNow - at < TimeSpan.FromMinutes(5), "evidence time " + plan.Validation.At);
     }
 
     /// <summary>H1: an offline sqlgen draft records, in the stored plan, that nothing validated it — and that blocks approval.</summary>
@@ -54,6 +58,7 @@ public sealed class SqlGenJobTests
 
         const string marker = "live validation skipped: source connection, target connection missing";
         Assert.Contains(marker, Json.FromNode<SqlPlanPayload>(result.DraftPayload!).Warnings);
+        Assert.Null(Json.FromNode<SqlPlanPayload>(result.DraftPayload!).Validation);   // Ruling 204: offline, no evidence
         var ctx = new Dbm.Core.Workflow.ModuleContext
         {
             Services = project.Services, OpenFeedback = [],
@@ -84,6 +89,47 @@ public sealed class SqlGenJobTests
         const string line = "preSql[0]: bare carriage return at line 1 (SQL Server treats it as a line break; use CRLF or LF)";
         Assert.Equal([line], task.Value.Errors);
         Assert.Contains(", 1 errors,", result.Summary);
+    }
+
+    /// <summary>Review L5: the evidence's outcome is pinned - a live sqlgen whose validation finds an error stores ok false.</summary>
+    [Fact]
+    public async Task A_live_job_whose_validation_finds_errors_stores_ok_false()
+    {
+        await using var pair = await SampleDatabases.CreateAsync(1, seed: false);
+        using var project = await SampleProject.CreateAsync(pair);
+        var s = project.Services;
+        Prepare(s);
+        var previous = SqlGenerator.Generate(SampleMappings.Approved(), SampleCatalogs.Source(), SampleCatalogs.Target());
+        var orders = previous.Tasks.Single(kv => kv.Value.Target == "app.Orders").Key;
+        previous.Tasks[orders].Custom = true;
+        previous.Tasks[orders].SourceQuery = previous.Tasks[orders].SourceQuery.Replace("SELECT", "SELECT s.[NO_SUCH_COLUMN] AS [x_dbm_missing],", StringComparison.Ordinal);
+        s.Artifacts.Add(PhaseName.Sql, s.Artifacts.NextVersion(PhaseName.Sql), Json.Serialize(previous), "agent", "custom");
+
+        var result = await new SqlGenJob().RunAsync(Ctx(s, new List<string>()), CancellationToken.None);
+
+        var plan = Json.FromNode<SqlPlanPayload>(result.DraftPayload!);
+        Assert.True(plan.ErrorCount() > 0, "fixture guard: the carried-over SQL must fail live validation");
+        Assert.True(plan.Validation is { Ok: false }, "a live sqlgen with errors did not store ok:false evidence: " + Json.Serialize(plan.Validation));
+    }
+
+    /// <summary>Review L3: a sqlgen whose connections fail compiled nothing. It stores no evidence, and the reason it is not validated
+    /// names the failed connection - never "Validated live · errors found".</summary>
+    [Fact]
+    public async Task A_job_that_could_not_connect_stores_no_evidence()
+    {
+        using var project = TempProject.Create();
+        var s = project.Services;
+        Prepare(s);
+        const string dead = "Server=tcp:127.0.0.1,1;Database=x;Integrated Security=true;Connect Timeout=2;TrustServerCertificate=True";
+        s.Connections.Save(Side.Src, dead, FakeServices.Meta("127.0.0.1", "x"));
+        s.Connections.Save(Side.Tgt, dead, FakeServices.Meta("127.0.0.1", "x"));
+
+        var result = await new SqlGenJob().RunAsync(Ctx(s, new List<string>()), CancellationToken.None);
+
+        var plan = Json.FromNode<SqlPlanPayload>(result.DraftPayload!);
+        Assert.Contains(plan.Errors, e => e.StartsWith("source connection failed: ", StringComparison.Ordinal));   // fixture guard
+        Assert.True(plan.Validation is null, "a sqlgen that could not connect stored validation evidence: " + Json.Serialize(plan.Validation));
+        Assert.Contains(plan.NotValidatedReasons(), r => r.StartsWith(SqlPlanPayload.CouldNotConnect, StringComparison.Ordinal));
     }
 
     [Fact]

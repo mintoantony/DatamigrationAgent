@@ -14,8 +14,12 @@ public sealed class SqlModule : IPhaseModule
 {
     static readonly TimeSpan LiveTimeout = TimeSpan.FromMinutes(3);
 
-    /// <summary>ApprovalBlockers line for a plan whose stored warnings record that live validation did not run.</summary>
+    /// <summary>Prefix of the ApprovalBlockers line for a version that is not validated (<see cref="SqlPlanPayload.NotValidatedReasons"/>).</summary>
     public const string NotValidatedBlocker = "plan is not validated: ";
+
+    /// <summary>Ruling 204: why a version is not validated when it has no evidence and no stored "live validation skipped" line - a
+    /// version stored before the evidence existed. Validate live (or `dbm sql validate`) while Sql awaits review records it (Ruling 211).</summary>
+    public const string NoEvidence = "no live validation is recorded for this version; press Validate live on the SQL screen (or run `dbm sql validate`) while it awaits review to record one";
 
     public PhaseName Phase => PhaseName.Sql;
     public string Agent => "sql-engineer";
@@ -108,7 +112,8 @@ public sealed class SqlModule : IPhaseModule
     /// <para>The patch surface may write SQL, never validation evidence: a payload that changes <c>errors</c>, <c>warnings</c>
     /// (plan or task) or <c>custom</c> against the base is rejected before anything is normalised. The engine then writes its own
     /// lines — including, when live validation cannot run, the stored <see cref="SqlPlanSource.SkippedPrefix"/> marker that blocks
-    /// approval (re-derived on every run: added offline, removed live), and, on every run, the bare-CR errors
+    /// approval (re-derived on every run: added offline, removed live), the <see cref="SqlPlanPayload.Validation"/> evidence (written
+    /// live, cleared offline; Ruling 204), and, on every run, the bare-CR errors
     /// (<see cref="SqlValidator.RecordBareCarriageReturns"/>).</para></summary>
     public PayloadCheck Validate(ModuleContext ctx, JsonNode payload)
     {
@@ -154,6 +159,7 @@ public sealed class SqlModule : IPhaseModule
         }
         else
         {
+            plan.Validation = null;   // Ruling 204: nothing validated THIS SQL, so the base's evidence does not pass on
             plan.Warnings = [.. WithoutSkippedMarker(plan.Warnings), skipped];
             warnings.Add(skipped);
             foreach (var (id, task) in plan.Tasks.OrderBy(kv => kv.Key, StringComparer.Ordinal))
@@ -161,6 +167,9 @@ public sealed class SqlModule : IPhaseModule
         }
         // Ruling 57: offline, live or not, every run re-derives the bare-CR errors into the stored errors (a fixed CR clears).
         errors.AddRange(SqlValidator.RecordBareCarriageReturns(plan));
+        // Ruling 204: positive evidence, written last so its outcome covers every error this run found (a stored version always
+        // has ok true: a patch with errors is refused before it is stored).
+        plan.Validation = skipped is null && !errors.Any(SqlValidator.IsConnectionFailure) ? SqlValidation.From(Clock.Now(), errors.Count == 0) : null;
 
         ReplaceContent(payload.AsObject(), plan);
         return new PayloadCheck(errors, warnings);
@@ -194,6 +203,7 @@ public sealed class SqlModule : IPhaseModule
 
         var errors = new List<string>();
         if (!Same(plan.Errors, basePlan?.Errors ?? [])) errors.Add(Owned("plan", "errors", ByValidation));
+        if (plan.Validation != basePlan?.Validation) errors.Add(Owned("plan", "validation", ByValidation));   // Ruling 204
         if (!Same(plan.Warnings, basePlan?.Warnings ?? [])) errors.Add(Owned("plan", "warnings", ByEngine));
         foreach (var (id, task) in plan.Tasks.OrderBy(kv => kv.Key, StringComparer.Ordinal))
         {
@@ -210,8 +220,8 @@ public sealed class SqlModule : IPhaseModule
         ArgumentNullException.ThrowIfNull(payload);
         var plan = Json.FromNode<SqlPlanPayload>(payload);
         var blockers = plan.Errors.Select(e => $"plan: {e}").ToList();
-        // Absence of errors is not evidence of validation: a plan nothing compiled cannot be approved.
-        blockers.AddRange(plan.Warnings.Where(w => w.StartsWith(SqlPlanSource.SkippedPrefix, StringComparison.Ordinal)).Select(w => NotValidatedBlocker + w));
+        // Absence of errors is not evidence of validation, and neither is the absence of a marker (Ruling 204): only stored evidence is.
+        blockers.AddRange(plan.NotValidatedReasons().Select(w => NotValidatedBlocker + w));
         foreach (var id in plan.Order.Where(plan.Tasks.ContainsKey).Distinct(StringComparer.Ordinal))
             if (plan.Tasks[id].Errors.Count > 0) blockers.Add($"{id} ({plan.Tasks[id].Target}): {plan.Tasks[id].Errors.Count} validation error(s)");
         var orderSet = new HashSet<string>(plan.Order, StringComparer.Ordinal);

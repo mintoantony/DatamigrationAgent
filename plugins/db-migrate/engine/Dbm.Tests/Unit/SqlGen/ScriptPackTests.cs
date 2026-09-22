@@ -7,7 +7,14 @@ namespace Dbm.Tests.Unit.SqlGen;
 
 public class ScriptPackTests
 {
-    static SqlPlanPayload Plan() => SqlGenerator.Generate(SampleMappings.Approved(), SampleCatalogs.Source(), SampleCatalogs.Target());
+    /// <summary>The generated sample plan with the evidence a live validation stores (Ruling 204): a validated version unless a test
+    /// clears <see cref="SqlPlanPayload.Validation"/>.</summary>
+    static SqlPlanPayload Plan()
+    {
+        var plan = SqlGenerator.Generate(SampleMappings.Approved(), SampleCatalogs.Source(), SampleCatalogs.Target());
+        plan.Validation = SqlValidation.From(new DateTimeOffset(2026, 9, 18, 9, 30, 0, TimeSpan.Zero), true);
+        return plan;
+    }
 
     static List<(string Name, string Content)> Unzip(byte[] bytes)
     {
@@ -48,7 +55,7 @@ public class ScriptPackTests
     }
 
     /// <summary>Ruling 57: a bare-CR error is flagged in the pack exactly as any other stored task error — in the task file's
-    /// "Errors (last validation)" header.</summary>
+    /// "Errors (validation and export checks)" header (open item 19's wording).</summary>
     [Fact]
     public void A_bare_carriage_return_error_is_listed_like_any_other_task_error()
     {
@@ -59,8 +66,8 @@ public class ScriptPackTests
 
         var files = ScriptPack.BuildFiles(plan, "demo").ToDictionary(f => f.Name, f => f.Content);
 
-        Assert.Contains("-- Errors (last validation):\n--   - sourceQuery: Invalid column name 'X'.\n", files["04_app_Addresses.sql"]);
-        Assert.Contains("-- Errors (last validation):\n--   - preSql[0]: bare carriage return at line 1 (SQL Server treats it as a line break; use CRLF or LF)\n",
+        Assert.Contains("-- Errors (validation and export checks):\n--   - sourceQuery: Invalid column name 'X'.\n", files["04_app_Addresses.sql"]);
+        Assert.Contains("-- Errors (validation and export checks):\n--   - preSql[0]: bare carriage return at line 1 (SQL Server treats it as a line break; use CRLF or LF)\n",
             files["05_app_Orders.sql"]);
     }
 
@@ -80,14 +87,20 @@ public class ScriptPackTests
 
         var files = ScriptPack.BuildFiles(plan, "demo");
 
+        // Open item 19: no validation produced these lines (the export derived them), so no heading or body may say one did.
+        foreach (var (name, content) in files)
+            Assert.False(content.Contains("last validation", StringComparison.Ordinal), $"{name} credits the export's derived error lines to \"the last validation\"");
         const string advice = " (SQL Server treats it as a line break; use CRLF or LF)";
         Assert.Contains("-- WARNING: PLAN HAS ERRORS (see README.md)\n--   - preSql[1]: bare carriage return at line 3" + advice + "\n", files[0].Content);
         Assert.Contains("-- WARNING: 1 TASK(S) HAVE ERRORS (see each task file's header)\n--   - T05 (app.Orders): 1 error(s)\n", files[0].Content);
-        Assert.Contains("-- Errors (last validation):\n--   - preSql[0]: bare carriage return at line 1" + advice + "\n",
+        Assert.Contains("-- Errors (validation and export checks):\n--   - preSql[0]: bare carriage return at line 1" + advice + "\n",
             files.Single(f => f.Name == "05_app_Orders.sql").Content);
         var readme = files.Single(f => f.Name == "README.md").Content;
         Assert.Contains("## WARNING: PLAN HAS ERRORS\n\n", readme);
         Assert.Contains("## WARNING: 1 TASK(S) HAVE ERRORS\n\n", readme);
+        Assert.Contains("## WARNING: PLAN HAS ERRORS\n\nValidation and the export's own checks recorded these plan-level errors", readme);
+        Assert.Contains("These tasks carry errors from validation and the export's own checks. Each error is listed in that task's own file, under\n"
+            + "*Errors (validation and export checks)* in its header.", readme);
         // The executable carriage return still ships in the same file as its warning: the pack warns, it does not withhold.
         Assert.Contains(files, f => f.Content.Contains("\rDROP TABLE app.Orders", StringComparison.Ordinal));
 
@@ -220,13 +233,20 @@ public class ScriptPackTests
 
         var files = ScriptPack.BuildFiles(plan, "demo");
 
-        Assert.Contains("-- WARNING: NOT VALIDATED - no database checked this plan\n-- " + marker + "\n", files[0].Content);
+        Assert.Contains("-- WARNING: NOT VALIDATED - no live validation is recorded for this plan\n-- " + marker + "\n", files[0].Content);
         var readme = files.Single(f => f.Name == "README.md").Content;
-        Assert.Contains("## WARNING: NOT VALIDATED - no database checked this plan\n\n" + marker + "\n", readme);
+        Assert.Contains("## WARNING: NOT VALIDATED - no live validation is recorded for this plan\n\n" + marker + "\n", readme);
 
         foreach (var (name, content) in ScriptPack.BuildFiles(Plan(), "demo"))
             Assert.DoesNotContain("NOT VALIDATED", content, StringComparison.Ordinal);
         Assert.DoesNotContain(SqlPlanSource.SkippedPrefix, string.Concat(ScriptPack.BuildFiles(Plan(), "demo").Select(f => f.Content)), StringComparison.Ordinal);
+
+        // Ruling 204: no evidence reads as NOT validated, marker or not - an old record, stored before the evidence existed, has neither.
+        var old = Plan();
+        old.Validation = null;
+        var oldPre = ScriptPack.BuildFiles(old, "demo")[0].Content;
+        Assert.True(oldPre.Contains("-- WARNING: NOT VALIDATED - no live validation is recorded for this plan\n-- " + SqlModule.NoEvidence + "\n", StringComparison.Ordinal),
+            "a pack of a version with no validation evidence does not say it is not validated:\n" + oldPre[..Math.Min(600, oldPre.Length)]);
 
         // The stored line is untrusted text like any other: it cannot start a line of its own.
         var hostile = Plan();
@@ -310,6 +330,33 @@ public class ScriptPackTests
         Assert.All(Plan().Tasks.Values, t => Assert.Empty(t.Errors));   // fixture guard: the generated tasks really have no errors
         foreach (var (name, content) in ScriptPack.BuildFiles(Plan(), "demo"))
             Assert.DoesNotContain("TASK(S) HAVE ERRORS", content, StringComparison.Ordinal);
+    }
+
+    /// <summary>Open item 18: 99_post.sql used to get <c>PackNotes.None</c> because nothing constructed its notes, not because there was
+    /// nothing to say — the "silence reads as none" shape Ruling 77 closed for 00_pre.sql. The post file runs after every task (it
+    /// re-enables constraints <c>WITH CHECK</c>), so a DBA who opens it alone must read the same warnings the pre file carries.</summary>
+    [Fact]
+    public void The_post_file_carries_the_same_warnings_as_the_pre_file()
+    {
+        var plan = Plan();
+        plan.Warnings.Add(SqlPlanSource.SkippedPrefix + "source connection, target connection missing");
+        plan.Errors.Add("target connection failed: timeout");
+        plan.Tasks["T05"].Errors.Add("sourceQuery: Invalid column name 'X'.");
+        plan.Order.Remove("T03");
+
+        var files = ScriptPack.BuildFiles(plan, "demo");
+        var pre = Warnings(files.Single(f => f.Name == "00_pre.sql").Content);
+        var post = Warnings(files.Single(f => f.Name == "99_post.sql").Content);
+
+        Assert.Equal(4, pre.Count(l => l.StartsWith("-- WARNING: ", StringComparison.Ordinal)));   // fixture guard: all four lists speak
+        Assert.True(pre.SequenceEqual(post), "99_post.sql does not carry 00_pre.sql's warnings:\npre:\n" + string.Join('\n', pre) + "\npost:\n" + string.Join('\n', post));
+
+        var clean = ScriptPack.BuildFiles(Plan(), "demo").Single(f => f.Name == "99_post.sql").Content;
+        Assert.Empty(Warnings(clean));   // a plan with nothing to say says nothing in the post file either
+
+        // The header lines after the two that name the file and say when it runs, up to the closing rule.
+        static List<string> Warnings(string file) =>
+            file.Split('\n').Skip(3).TakeWhile(l => !l.StartsWith("-- ====", StringComparison.Ordinal)).ToList();
     }
 
     /// <summary>Ruling 97, which makes Ruling 79's condition mechanical instead of remembered. Four warning lists have four heading

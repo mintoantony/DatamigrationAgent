@@ -81,6 +81,29 @@
 
   function joinStatements(list) { return (list || []).join('\nGO\n'); }
 
+  /* Open item 14, Ruling 205: 1-based lines of `text` (CRLF normalised, as splitStatements reads it) that splitStatements would treat as
+     a GO separator although they sit inside a comment or a string, as DBM.highlight.tokenize reads the whole text (the way SQL Server
+     does: nested block comments, '' escapes). The engine cannot be mirrored here: it has no splitter, and it refuses ANY GO line inside
+     a statement (SqlValidator.GoLine), comment or not, so such a line cannot be stored in any form. The editor names it instead of
+     posting a statement cut in two. */
+  function goSplitHazards(text) {
+    var src = norm(text);
+    var spans = [];
+    var at = 0;
+    DBM.highlight.tokenize(src).forEach(function (tok) {
+      if ((tok.c === 'com' || tok.c === 'str' || tok.c === 'id') && /[\r\n]/.test(tok.v)) spans.push([at, at + tok.v.length]);
+      at += tok.v.length;
+    });
+    var out = [];
+    var start = 0;
+    // Review N1: split on "\n" AND a lone "\r" - after norm() every break is one character, and splitStatements' /m reads both.
+    src.split(/[\r\n]/).forEach(function (line, i) {
+      if (/^[ \t]*GO[ \t]*$/i.test(line) && spans.some(function (s) { return s[0] < start && start < s[1]; })) out.push(i + 1);
+      start += line.length + 1;
+    });
+    return out;
+  }
+
   /* Ruling 70: a statement list is editable as one text only if splitting its joined text gives back exactly the stored list,
      element for element. Otherwise (a GO line inside a comment or string, a whitespace-only or padded statement, CRLF) a save
      would rewrite statements the user never touched and shift every later line number. */
@@ -112,6 +135,28 @@
       ops.push({ op: task[f] == null ? 'add' : 'replace', path: base + f, value: after });
     });
     return ops;
+  }
+
+  var SKIPPED_PREFIX = 'live validation skipped: ';
+  /* Verbatim copy of C# SqlModule.NoEvidence (sql-view.test.cjs reads the C# source and compares). */
+  var NO_EVIDENCE = 'no live validation is recorded for this version; press Validate live on the SQL screen (or run `dbm sql validate`) while it awaits review to record one';
+
+  /**
+   * MIRROR of C# SqlPlanPayload.NotValidatedReasons (open item 10, Ruling 204): a version is validated only when it carries the
+   * engine's evidence ("validation": {at, ok}) and no stored "live validation skipped" line. Reasons = those lines, else each stored
+   * connection failure as "live validation could not connect: …" (review L3), else NO_EVIDENCE.
+   * → {validated, at, ok, reasons}
+   */
+  function validationState(plan) {
+    var skipped = ((plan && plan.warnings) || []).filter(function (w) { return typeof w === 'string' && w.indexOf(SKIPPED_PREFIX) === 0; });
+    var v = plan && plan.validation;
+    var evidence = !!v && typeof v === 'object' && typeof v.at === 'string';
+    if (evidence && !skipped.length) return { validated: true, at: v.at, ok: v.ok === true, reasons: [] };
+    if (skipped.length) return { validated: false, at: null, ok: null, reasons: skipped };
+    var failed = ((plan && plan.errors) || []).filter(function (e) {
+      return typeof e === 'string' && (e.indexOf('source connection failed: ') === 0 || e.indexOf('target connection failed: ') === 0);
+    }).map(function (e) { return 'live validation could not connect: ' + e; });
+    return { validated: false, at: null, ok: null, reasons: failed.length ? failed : [NO_EVIDENCE] };
   }
 
   /* {taskId: string[]} — the contracted shape of taskErrors / taskWarnings. */
@@ -314,11 +359,20 @@
   function runValidate(ctx) {
     ui.busy = true;
     rerender();
-    ctx.api.post('/api/sql/validate', {}).then(function (report) {
+    // Rulings 210/211: the version on screen is named; a whole-plan pass over a version without evidence is stored by the server
+    // as a new version (only while Sql awaits review), and the screen moves onto it.
+    ctx.api.post('/api/sql/validate', { version: versionOf(ctx) }).then(function (report) {
       ui.busy = false;
       if (!mounted) return;   // the view was left while validating
       var toast = mounted.ctx.toast || ctx.toast;
       ui.reportFailure = null;
+      if (report && report.stored === true) {
+        ui.report = null;
+        rerender();
+        toast('Validation passed and was recorded: saved as v' + report.storedVersion + ' (no SQL change)', 'ok');
+        (mounted.ctx.refresh || ctx.refresh)();
+        return;
+      }
       if (!reportFits(report)) {
         ui.report = null;
         rerender();
@@ -329,7 +383,12 @@
       ui.report = report;
       rerender();
       var s = reportSummary(report);
-      if (s.state === 'clean') toast('Validation passed', 'ok');
+      var still = payloadOf(mounted.ctx) && !validationState(payloadOf(mounted.ctx)).validated;
+      if (still && (s.state === 'clean' || s.state === 'warnings')) {
+        // Never "passed" beside a card that says Not validated: this pass recorded nothing.
+        toast('Validation passed, but nothing was recorded, so v' + report.version + ' is still not validated'
+          + (report.storeNote ? ': ' + report.storeNote : '') + '.', 'warn');
+      } else if (s.state === 'clean') toast('Validation passed', 'ok');
       else if (s.state === 'warnings') toast('Validation passed with ' + plural(s.warnings, 'warning') + ' — read them before approving', 'warn');
       else if (s.state === 'unreported') toast('Validation passed, but the server did not report what it checked', 'warn');
       else toast('Validation found ' + plural(s.errors, 'error'), 'err');
@@ -404,6 +463,22 @@
       ]) : null, s.state === 'clean'
         ? el('p', { class: 'muted' }, ['Every task and the global statements were checked: no errors or warnings.'])
         : el('ul', { class: 'sql-msgs sql-report-list' }, rows)]),
+    ]);
+  }
+
+  /* Ruling 204: the stored version's own validation fact - the one ApprovalBlockers reads - never inferred from warnings alone. */
+  function validationNote(ctx, plan) {
+    var v = validationState(plan);
+    if (v.validated) {
+      return el('p', { class: 'small muted sql-validated' }, ['Validated live ' + v.at + (v.ok ? '' : ' · errors found')]);
+    }
+    // Review L1: an approved version without evidence was approved before the evidence was kept; it does not "block" anything now.
+    // Re-review N6: the version SHOWN is the approved one - not merely an approved phase.
+    var approved = !!ctx.phaseRow && typeof ctx.phaseRow.approvedVersion === 'number' && ctx.phaseRow.approvedVersion === versionOf(ctx);
+    return el('section', { class: 'card sql-not-validated', 'aria-live': 'polite' }, [
+      el('div', { class: 'card-h row' }, [el('h3', { class: 'h3' }, ['Not validated']),
+        el('span', { class: 'badge ' + (approved ? 'st-stale' : 'st-failed') }, [approved ? 'approved before validation evidence was kept' : 'blocks approval'])]),
+      el('div', { class: 'card-b' }, [list('sql-msgs-warn', v.reasons)]),
     ]);
   }
 
@@ -571,7 +646,18 @@
 
     function save() {
       if (ui.saving) return;
-      var ops = editOps(id, t, touchedEdits());   // only fields the user typed into; untouched fields are never re-derived
+      var edits = touchedEdits();
+      var hazards = [];
+      fields.forEach(function (f) {
+        if ((f[0] === 'preSql' || f[0] === 'postSql') && Object.prototype.hasOwnProperty.call(edits, f[0])) {
+          goSplitHazards(edits[f[0]]).forEach(function (n) {
+            hazards.push(f[1].split(' · ')[0] + ', line ' + n + ': this GO line is inside a comment or string, so saving would cut the '
+              + 'statement there (a line holding only GO always separates statements). Remove it or change that line, then save.');
+          });
+        }
+      });
+      if (hazards.length) { show(hazards); return; }   // Ruling 205: named before posting; nothing is sent
+      var ops = editOps(id, t, edits);   // only fields the user typed into; untouched fields are never re-derived
       if (!ops.length) { ctx.toast('Nothing changed', 'info'); return; }
       ui.saving = true;
       submit.disabled = true;
@@ -659,6 +745,7 @@
     }
 
     page.appendChild(kpis(plan));
+    page.appendChild(validationNote(ctx, plan));
     if (ui.report) page.appendChild(reportCard(plan));
     if ((plan.errors || []).length || (plan.warnings || []).length) {
       page.appendChild(el('section', { class: 'card' }, [
@@ -702,6 +789,7 @@
   DBM.sqlView = {
     listing: listing, listingText: listingText, parseAnchor: parseAnchor, sectionBlocks: sectionBlocks, splitStatements: splitStatements,
     joinStatements: joinStatements, cardLines: cardLines, listRoundTrips: listRoundTrips, editOps: editOps, reportSummary: reportSummary,
+    goSplitHazards: goSplitHazards, validationState: validationState,
     openCommentsByTask: openCommentsByTask,
     diffRows: diffRows,
   };

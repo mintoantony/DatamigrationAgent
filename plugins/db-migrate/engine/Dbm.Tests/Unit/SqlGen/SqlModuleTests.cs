@@ -26,8 +26,121 @@ public sealed class SqlModuleTests : IDisposable
 
     public void Dispose() => _workspace.Dispose();
 
-    private static SqlPlanPayload Plan(MappingPayload? mapping = null) =>
-        SqlGenerator.Generate(mapping ?? SampleMappings.Approved(), SampleCatalogs.Source(), SampleCatalogs.Target());
+    /// <summary>The generated sample plan, carrying the evidence a live validation would have stored (Ruling 204): the fixture stands
+    /// for a validated version unless a test clears <see cref="SqlPlanPayload.Validation"/>.</summary>
+    private static SqlPlanPayload Plan(MappingPayload? mapping = null)
+    {
+        var plan = SqlGenerator.Generate(mapping ?? SampleMappings.Approved(), SampleCatalogs.Source(), SampleCatalogs.Target());
+        plan.Validation = Evidence;
+        return plan;
+    }
+
+    private static readonly SqlValidation Evidence = SqlValidation.From(new DateTimeOffset(2026, 9, 18, 9, 30, 0, TimeSpan.Zero), true);
+
+    private static readonly ValidationReport CleanReport = new(true, [], [], [], []);
+
+    /// <summary>Two stored versions without evidence, v(n-1) and v(n), Sql awaiting review on v(n). Returns n.</summary>
+    private int TwoVersionsAwaitingReview()
+    {
+        var plan = Plan();
+        plan.Validation = null;
+        Ctx(plan);
+        Ctx(plan);
+        _services.Phases.SetStatus(PhaseName.Sql, PhaseStatus.AwaitingReview);
+        return _services.Phases.Get(PhaseName.Sql).CurrentVersion!.Value;
+    }
+
+    /// <summary>Re-review R1: Revalidate checks the seen version INSIDE its transaction. An edit saved in another tab while a slow live
+    /// validation ran must not be silently replaced by a re-stored copy of the version the validation started from.</summary>
+    [Fact]
+    public void Revalidate_refuses_a_version_that_is_no_longer_current_and_stores_nothing()
+    {
+        var current = TwoVersionsAwaitingReview();
+        var ex = Record.Exception(() => _services.Workflow.Revalidate(PhaseName.Sql, current - 1));
+        Assert.True(ex is WorkflowException { Code: WorkflowException.StaleVersion },
+            "Revalidate stored over a newer version instead of refusing the stale one: " + (ex?.Message ?? "no exception"));
+        Assert.Equal(current, _services.Phases.Get(PhaseName.Sql).CurrentVersion);
+    }
+
+    /// <summary>Re-review R3: that refusal reaches StoreEvidence's callers as a store note, not an exception - the report still prints
+    /// (CLI) and the screen still shows it (web).</summary>
+    [Fact]
+    public void StoreEvidence_turns_a_stale_version_into_a_note()
+    {
+        var current = TwoVersionsAwaitingReview();
+        SqlPlanSource.StoreOutcome? outcome = null;
+        var ex = Record.Exception(() => outcome = SqlPlanSource.StoreEvidence(_services, current - 1, CleanReport, null));
+        Assert.True(ex is null, "StoreEvidence let the stale-version refusal escape: " + ex?.Message);
+        Assert.False(outcome!.Stored);
+        Assert.Contains("current version", outcome.Note!, StringComparison.Ordinal);
+        Assert.Equal(current, _services.Phases.Get(PhaseName.Sql).CurrentVersion);
+    }
+
+    /// <summary>Re-review R4: Revalidate stores only a result that IS validated. This fixture has no connections, so the re-run is
+    /// offline and records no evidence - storing it would add an unvalidated "validation, no SQL change" version.</summary>
+    [Fact]
+    public void A_revalidation_that_records_no_evidence_stores_nothing()
+    {
+        var current = TwoVersionsAwaitingReview();
+        var outcome = SqlPlanSource.StoreEvidence(_services, current, CleanReport, null);
+        Assert.True(!outcome.Stored && _services.Phases.Get(PhaseName.Sql).CurrentVersion == current,
+            "a re-validation that recorded no evidence was stored as a new version: v" + _services.Phases.Get(PhaseName.Sql).CurrentVersion);
+        Assert.Contains("not recorded", outcome.Note!, StringComparison.Ordinal);
+    }
+
+    /// <summary>Review N3: the evidence time is written like every other stored time - UTC, ISO-8601 "O" - not System.Text.Json's
+    /// default, which drops the fraction digits.</summary>
+    [Fact]
+    public void Validation_evidence_time_is_written_in_the_O_format()
+    {
+        var json = Json.Serialize(SqlValidation.From(new DateTimeOffset(2026, 9, 18, 9, 30, 0, TimeSpan.Zero), true));
+        Assert.True(json.Contains("\"at\":\"2026-09-18T09:30:00.0000000+00:00\"", StringComparison.Ordinal), "evidence time is not written with \"O\": " + json);
+    }
+
+    /// <summary>Ruling 204: a version without validation evidence is NOT validated, whatever its warnings say - here it carries no
+    /// "live validation skipped" line at all, which is exactly the version the marker rule used to wave through. An old record, stored
+    /// before the evidence existed, has no "validation" field and reads the same way.</summary>
+    [Fact]
+    public void A_version_without_validation_evidence_is_not_validated_whatever_its_warnings_say()
+    {
+        var plan = Plan();
+        plan.Validation = null;
+        Assert.DoesNotContain(plan.Warnings, w => w.StartsWith(SqlPlanSource.SkippedPrefix, StringComparison.Ordinal));   // no marker
+        var stored = Json.Serialize(plan);
+        Assert.DoesNotContain("\"validation\"", stored, StringComparison.Ordinal);   // an old record looks exactly like this
+        var ctx = Ctx(plan);
+
+        var blockers = _module.ApprovalBlockers(ctx, JsonNode.Parse(stored)!);
+
+        Assert.True(blockers.Contains(SqlModule.NotValidatedBlocker + SqlModule.NoEvidence),
+            "a version with no validation evidence was not blocked as not validated: [" + string.Join("; ", blockers) + "]");
+        Assert.Empty(_module.ApprovalBlockers(ctx, Json.ToNode(Plan())));   // the same plan with evidence is approvable
+    }
+
+    /// <summary>Ruling 204, every writer that validates: an offline run (SqlModule.Validate - agent patch, dry-run and UI edit) must not
+    /// pass its base's evidence on, because it did not validate THIS SQL. Pinned through both stored doors, agent and human.</summary>
+    [Fact]
+    public void An_offline_patch_or_edit_stores_no_validation_evidence_even_when_its_base_had_some()
+    {
+        var plan = Plan();
+        var payload = Json.ToNode(plan);
+        payload["tasks"]!["T04"]!["sourceQuery"] = plan.Tasks["T04"].SourceQuery + "\nWHERE s.[CITY] <> ''";
+        Assert.True(_module.Validate(Ctx(plan), payload).Ok);
+        Assert.True(payload["validation"] is null, "an offline patch kept its base's validation evidence: " + payload["validation"]?.ToJsonString());
+
+        foreach (var human in new[] { false, true })
+        {
+            Ctx(plan);
+            _services.Phases.SetStatus(PhaseName.Sql, human ? PhaseStatus.AwaitingReview : PhaseStatus.Drafting);
+            var current = _services.Phases.Get(PhaseName.Sql).CurrentVersion!.Value;
+            var patch = new Dbm.Core.Patching.Patch("sql", current,
+                [new Dbm.Core.Patching.PatchOp("replace", "/tasks/T04/sourceQuery", JsonValue.Create(plan.Tasks["T04"].SourceQuery + "\nWHERE 1 = 1"))], []);
+            var result = human ? _services.Workflow.HumanEdit(patch) : _services.Workflow.ApplyPatch(patch);
+            Assert.True(result.Ok, string.Join("; ", result.Errors));
+            var stored = Json.Deserialize<SqlPlanPayload>(_services.Artifacts.Get(PhaseName.Sql, result.Version!.Value)!.PayloadJson);
+            Assert.True(stored.Validation is null, (human ? "a UI edit" : "an agent patch") + " stored offline kept its base's validation evidence");
+        }
+    }
 
     private ModuleContext Ctx(SqlPlanPayload plan, params FeedbackRow[] feedback)
     {
@@ -296,6 +409,8 @@ public sealed class SqlModuleTests : IDisposable
     [InlineData("clear custom", "T02: custom is engine-owned (set when the task's SQL changes); a patch may not change it")]
     [InlineData("new task with errors", "T07: errors is engine-owned (recorded by validation); a patch may not change it")]
     [InlineData("new task with warnings", "T07: warnings is engine-owned (recorded by the generator and validation); a patch may not change it")]
+    [InlineData("forge validation evidence", "plan: validation is engine-owned (recorded by validation); a patch may not change it")]
+    [InlineData("erase validation evidence", "plan: validation is engine-owned (recorded by validation); a patch may not change it")]
     public void A_patch_may_not_author_or_erase_validation_evidence(string change, string expected)
     {
         var mapping = SampleMappings.Approved();
@@ -328,12 +443,14 @@ public sealed class SqlModuleTests : IDisposable
             case "new task with warnings":
                 newTask["errors"] = new JsonArray(); newTask["warnings"] = new JsonArray("x");
                 payload["tasks"]!["T07"] = newTask; payload["order"]!.AsArray().Add("T07"); break;
+            case "forge validation evidence": payload["validation"] = new JsonObject { ["at"] = "2030-01-01T00:00:00+00:00", ["ok"] = true }; break;
+            case "erase validation evidence": payload.AsObject().Remove("validation"); break;
             default: throw new ArgumentException(change);
         }
 
         var check = _module.Validate(ctx, payload);
 
-        Assert.False(check.Ok);
+        Assert.False(check.Ok, change + ": a patch that changes engine-owned evidence was accepted");
         Assert.Equal([expected], check.Errors);
     }
 
