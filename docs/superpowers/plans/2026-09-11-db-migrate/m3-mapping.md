@@ -2,17 +2,13 @@
 
 > Part of the db-migrate plan. Read 00-overview.md (Global Constraints + Shared contracts) before any task; every task implicitly includes the Global Constraints.
 
-> ## ⚠ STOP — most of this file's text about type risks is VOID
+> ## ⚠ Type risks — one section of this file is normative
 >
-> This file contains a long superseded chain about type risks: an original model, five amendments, a cut, its completion, and four JavaScript risk sections. **All of it is void** — not superseded-but-consultable, not historical-but-useful. Void.
+> **The only normative risk text is the section headed `# THE RISK MODEL — the only normative risk text in this plan`** (currently around line 5630, below every task). It states every live rule in full and references nothing by description. If a rule about type risks is not written there, it is not a rule — including any risk wording inside the Task 3.1–3.5 definitions themselves.
 >
-> **The only normative risk text is the section headed `# THE RISK MODEL — the only normative risk text in this plan`** (currently around line 6540, below every task). It states every live rule in full and references nothing by description. If a rule about type risks is not written there, it is not a rule.
+> **The void risk chain has been removed.** This file used to carry a long superseded chain about type risks above that section: an original model, five amendments, a cut, its completion, the JavaScript risk sections, and the risk items of the Task 3.4 and Task 3.5 fix-round amendments. All of it was void, and it was physically deleted in commits `a2b8a39` through `138dae0` (sweep round 2, batch L). It survives only in git history.
 >
-> Specifically void, and known to read as authoritative: any text describing a `riskAck` field, a `riskClass` field, a hazard class, a per-column acknowledgement or sign-off, an attention predicate that consults type risks, or a "D7" section imposing rules on Milestone 4. None of those mechanisms exist. `riskAck` and `riskClass` were removed and are actively stripped by `MappingModule`.
->
-> **Why this banner exists.** This file is read top-down, and the void chain comes *first*. An implementer working on Milestone 4 quoted two of these dead passages back as binding rules that contradicted the live model, and lost a round-trip to it. The declaration of voidness inside the risk-model section only helps a reader who has already got that far.
->
-> The void chain is retained only in git history and is scheduled for physical deletion once Milestone 3 closes.
+> None of the mechanisms it described exist: a `riskAck` field, a `riskClass` field, a hazard class, a per-column acknowledgement or sign-off, an attention predicate that consults type risks, or rules imposed on Milestone 4 by that chain. `riskAck` and `riskClass` were removed and are actively stripped by `MappingModule`. If you meet any of them quoted elsewhere, it is void.
 
 **Goal:** a deterministic auto-mapper drafts the source→target mapping from the stored catalogs, the `mapping-architect` subagent resolves what the script could not decide (splits, merges, lookups, transforms, drops), and the human reviews and edits the mapping in the web UI until nothing blocks approval. After this milestone the MAPPING phase runs the full review loop: `automap` job → agent draft → human review / direct edit / feedback → rework → approve. The C15 sample pair (LegacyShop → ShopV2) is the fixture for every test: `SampleCatalogs` mirrors its schema in code (kept honest by an integration test against the real databases), and `SampleMappings.Approved()` is the ground-truth mapping that M4/M5 tests build on.
 
