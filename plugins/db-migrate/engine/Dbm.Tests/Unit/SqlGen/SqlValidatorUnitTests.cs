@@ -1,11 +1,33 @@
 using Dbm.Core.SqlGen;
 using Dbm.Tests.Support;
+using Microsoft.Data.SqlClient;
 using Xunit;
 
 namespace Dbm.Tests.Unit.SqlGen;
 
 public class SqlValidatorUnitTests
 {
+    /// <summary>Open item 8 L2: the target connection must not be pooled, because the connection (and with it the #stg scaffold
+    /// in tempdb) must end when this validation's connection closes - a pooled connection could hand the same physical
+    /// connection, scaffold and all, to the next validation. Pinned via the connection-string builder the target `open` call
+    /// receives, using the fake-opener seam (no live database needed).</summary>
+    [Fact]
+    public async Task Target_connection_disables_pooling_but_the_source_connection_is_untouched()
+    {
+        var captured = new List<string>();
+        var plan = SqlGenerator.Generate(SampleMappings.Approved(), SampleCatalogs.Source(), SampleCatalogs.Target());
+        const string sourceCs = "Server=nowhere;Database=x;Pooling=true";
+        const string targetCs = "Server=nowhere;Database=y;Pooling=true";
+
+        await SqlValidator.ValidateAsync(plan, sourceCs, targetCs, SampleCatalogs.Target(), null,
+            (cs, _) => { captured.Add(cs); throw new InvalidOperationException("no server"); }, CancellationToken.None);
+
+        Assert.Equal(2, captured.Count);
+        Assert.Equal(sourceCs, captured[0]);   // the source connection keeps whatever pooling the caller configured
+        var targetPooling = new SqlConnectionStringBuilder(captured[1]).Pooling;
+        Assert.False(targetPooling, "the target connection must not be pooled (Pooling=true survived into it): " + captured[1]);
+    }
+
     [Fact]
     public void CheckShape_reports_mode_staging_duplicates_and_go()
     {
