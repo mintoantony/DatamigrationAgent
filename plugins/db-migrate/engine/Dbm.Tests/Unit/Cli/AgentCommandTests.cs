@@ -215,19 +215,54 @@ public class AgentCommandTests
             Dbm.Core.Json.Deserialize<NextAction>(r.Out));
     }
 
+    /// <summary>Open item 11: this flaked because the TEST stopped the server too early, not because the command is wrong. It waited for
+    /// <c>agentOnline</c>, but <c>dbm await</c> touches agent_seen_at (which alone makes the agent online) BEFORE it finds the server and
+    /// opens its long-poll. When the server stopped inside that window, the command found no server and - correctly for a command that
+    /// has no server to talk to - started a new one, which is not the scenario under test. So the test now waits for the long-poll
+    /// itself: the <c>agent_presence</c> event <c>AgentPresence.Enter</c> publishes when an /api/agent/await opens. The agent is marked
+    /// seen first, as <c>dbm next</c> leaves it, and the command starts half a second late, as on a loaded machine: the old wait passes
+    /// at once and loses the race every time (measured). A respawn is refused by
+    /// a spawn seam that fails loudly, so a lost race names itself instead of starting a real server process from the test.</summary>
     [Fact]
     public async Task Await_reports_server_stopped_when_the_server_shuts_down()
     {
         using var tw = new TestWorkspace();
         var factory = FakeServices.Factory();
         var server = await WebTestServer.StartAsync(tw.Ws, factory);
+        ServerControl.SpawnOverrides[tw.Ws.Root] = (_, _) => throw new InvalidOperationException(
+            "dbm await found no server and tried to start one: the test stopped the server before the long-poll was open");
+        try
+        {
+            server.Services.Project.TouchAgent();   // as `dbm next` leaves it: agentOnline is already true
+            using var events = new HttpClient { BaseAddress = new Uri(server.Info.BaseUrl), Timeout = Timeout.InfiniteTimeSpan };
+            using var stream = await events.GetAsync($"/api/events?t={server.Info.Token}", HttpCompletionOption.ResponseHeadersRead);
+            using var reader = new StreamReader(await stream.Content.ReadAsStreamAsync());
 
-        var waiting = CliRunner.RunAsync(tw.Ws, factory, "await");
-        await Wait.UntilAsync(async () => (await server.GetJsonAsync("/api/state"))["project"]!["agentOnline"]!.GetValue<bool>());
-        await server.DisposeAsync();
-        var r = await waiting.WaitAsync(TimeSpan.FromSeconds(20));
+            // The command starts late, as it does on a loaded machine: a wait that does not observe the long-poll loses the race here.
+            var waiting = Task.Run(async () => { await Task.Delay(500); return await CliRunner.RunAsync(tw.Ws, factory, "await"); });
+            await LongPollOpenAsync(reader).WaitAsync(TimeSpan.FromSeconds(15));
+            await server.DisposeAsync();
+            var r = await waiting.WaitAsync(TimeSpan.FromSeconds(20));
 
-        Assert.Equal(0, r.Exit);
-        Assert.Equal(("stop", "server_stopped"), (r.Json["action"]!.GetValue<string>(), r.Json["reason"]!.GetValue<string>()));
+            Assert.True(r.Exit == 0, "dbm await did not report a clean stop: " + r.Out);
+            Assert.Equal(("stop", "server_stopped"), (r.Json["action"]!.GetValue<string>(), r.Json["reason"]!.GetValue<string>()));
+        }
+        finally
+        {
+            ServerControl.SpawnOverrides.TryRemove(tw.Ws.Root, out _);
+        }
+    }
+
+    /// <summary>Returns once the SSE stream carries <c>agent_presence</c> with online true - published only when an /api/agent/await
+    /// opens (AgentPresence.Enter), never by a CLI touch of agent_seen_at.</summary>
+    private static async Task LongPollOpenAsync(StreamReader reader)
+    {
+        var presence = false;
+        while (await reader.ReadLineAsync() is { } line)
+        {
+            if (line.StartsWith("event: ", StringComparison.Ordinal)) presence = line == "event: agent_presence";
+            else if (presence && line.StartsWith("data: ", StringComparison.Ordinal) && line.Contains("\"online\":true", StringComparison.Ordinal)) return;
+        }
+        throw new InvalidOperationException("the event stream ended before the long-poll opened");
     }
 }
