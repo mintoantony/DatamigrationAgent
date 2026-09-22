@@ -263,4 +263,30 @@ public class StateDbTests
 
         Assert.Equal("from-a", b.Scalar<string>("SELECT type FROM event"));
     }
+
+    /// <summary>
+    /// Open item 3.4, decision H-1: <c>ToDb</c>'s bare-<c>DateTime</c> branch called <c>.ToUniversalTime()</c>, which
+    /// treats <see cref="DateTimeKind.Unspecified"/> as local and silently shifts the value by the machine's offset -
+    /// a trap on this cross-platform, multi-machine project. No caller passes a bare <c>DateTime</c> today (every
+    /// project time is a <c>DateTimeOffset</c>), so the safer choice is to throw and name the kind rather than guess
+    /// UTC. <b>Harm:</b> a future caller that passes an Unspecified-kind DateTime gets a value quietly shifted by
+    /// whatever timezone the engine happens to run in, instead of an error telling them to disambiguate it.
+    /// </summary>
+    [Fact]
+    public void ToDb_throws_naming_the_kind_for_an_unspecified_DateTime()
+    {
+        var ex = Assert.Throws<ArgumentException>(() => StateDb.ToDb(new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Unspecified)));
+
+        Assert.Contains("Unspecified", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(DateTimeKind.Utc)]
+    [InlineData(DateTimeKind.Local)]
+    public void ToDb_still_converts_a_DateTime_with_a_known_kind(DateTimeKind kind)
+    {
+        var value = StateDb.ToDb(new DateTime(2026, 1, 1, 0, 0, 0, kind));
+
+        Assert.IsType<string>(value);
+    }
 }
