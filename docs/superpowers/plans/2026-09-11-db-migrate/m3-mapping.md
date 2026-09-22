@@ -5473,6 +5473,8 @@ EOF
 
 These are defects in the plan text above, not in the implementation. The committed code matches the original brief byte-for-byte; the brief was wrong. Everything below replaces or adds to the corresponding part of Task 3.5.
 
+The items of this amendment that concerned type risks were void and have been removed; the gap in the lettering is theirs. The live risk rules are in `# THE RISK MODEL`, below every task.
+
 ### A1 — The shell must never destroy unsaved human edits (replaces the dirty-guard design)
 
 **INVARIANT (this is the spec; the triggers listed afterwards are examples, not an exhaustive list):**
@@ -5530,14 +5532,6 @@ so the view picks up any version that arrived while the user was editing.
 
 `onEvent`'s toast stays: it is now true advice rather than dead code.
 
-### A2 — A column carrying a `typeRisk` needs review (C# and JS must agree)
-
-`needsReview` only flags `method === 'fuzzy' || 'vector'` below the auto-accept score, so an `exact` — or `human` — match carrying a data-loss hazard shows as OK, counts 0 in the KPI, and is hidden by the "Needs review" filter. The amber tag exists only inside the expanded row, which a reviewer triaging by filter never opens. The C# mirror has the identical gap.
-
-- `wwwroot/js/views/mapping.js`: `columnStatus` returns `'attention'` when `cm && cm.typeRisk` is a non-empty string, in addition to the existing `needsReview` test. `attentionCount` counts such columns. `tableStatus` returns `'attention'` when any of its columns does.
-- `Dbm/Core/Mapping/MappingValidator.cs`: `Attention` and `NeedsReview` gain the same rule, so the two implementations stay in step.
-- Add a test on **both** sides asserting that a column with `method: 'exact'`, `confidence: 1` and a non-empty `typeRisk` is attention, not ok.
-
 ### A3 — Column names that collide with Object.prototype (scope: column level only)
 
 `editColumn` (`t.columns[column] || (t.columns[column] = {...})`) and `restoreIfUnchanged` (`bt.columns[column]`, `at.columns[column]`) use raw bracket access. A target column named `__proto__` returns `Object.prototype` — truthy — so the edit writes onto the prototype, `diff` returns `[]` so the edit cannot be saved, and every object on the page then carries `expr`/`method`/`confidence`, corrupting `blockers()` and `needsReview()`. `toString`, `valueOf` and `constructor` yield built-ins and the edit is silently dropped. These are legal SQL Server identifiers and the schema is foreign input.
@@ -5572,7 +5566,7 @@ Fix with the idiom this file already uses: guard every column-map lookup with `O
 
 ### AMENDMENT CORRECTIONS (fix round 1, second pass)
 
-These replace the corresponding parts of A1, A2, A3 and A4 above. They came from the reviewer checking the first pass at source. A5 and A6 are unchanged.
+These replace the corresponding parts of A1, A3 and A4 above. They came from the reviewer checking the first pass at source. A5 and A6 are unchanged.
 
 #### A3 corrected — the reason, and a missing site
 
@@ -5593,12 +5587,6 @@ What actually protects them is the **dotted-key invariant**: a table key is alwa
 **Required test pair:** (1) a blocker on `app.Customers.Old` must not mark `app.Customers`; (2) a genuine column blocker still does mark its table.
 
 `columnStatus` stays out of this round but is **not** proven safe: a target table literally named `app.Customers.Name` yields a blocker that `columnStatus('app.Customers', 'Name')` matches. Known residual, deliberately deferred.
-
-#### A2 corrected — the predicate must ignore method and confidence
-
-The `typeRisk` check keys on a non-empty `typeRisk` **alone**. It must not be routed through `needsReview`, and must not carry any fuzzy/vector or confidence test. `needsReview` gates on `method` being `fuzzy` or `vector`, so reusing it leaves `exact` matches and `human` edits invisible — precisely the rows the deferred stale-risk finding produces.
-
-Parity tests must cover **both** an `exact` row carrying a risk and a `human` row carrying a risk, on the C# and JS sides.
 
 #### A1 corrected — two further paths
 
