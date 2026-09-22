@@ -214,6 +214,71 @@ public sealed class PreflightTests(EngineSourceFixture fx) : IClassFixture<Engin
         Assert.False(new PreflightResult(1, DateTimeOffset.UtcNow, [.. checks]).Passed);
     }
 
+    /// <summary>Both connections and both discovered catalogs saved exactly as discovery saves them (real fingerprints), and the
+    /// plan approved - so every check can run and the schemas really do match.</summary>
+    private async Task<(XferServices Svc, TempDatabase Tgt)> DiscoveredRigAsync()
+    {
+        var tgt = await TempDatabase.CreateAsync("dbm_pre_cat");
+        await tgt.ExecAsync(TransferEngineTests.TargetSchema);
+        var svc = new XferServices();
+        foreach (var (side, cs) in new[] { (Side.Src, fx.Src.ConnectionString), (Side.Tgt, tgt.ConnectionString) })
+        {
+            var meta = await Dbm.Core.Sql.SqlConnect.ProbeAsync(cs, default);
+            svc.Services.Connections.Save(side, cs, meta);
+            await using var conn = await Dbm.Core.Sql.SqlConnect.OpenAsync(cs, default);
+            var snapshot = await CatalogExtractor.ExtractAsync(conn, meta, default);
+            svc.Services.Catalog.Save(side, snapshot, Fingerprint.Compute(snapshot));
+        }
+        Approve(svc.Services, TransferEngineTests.Plan());
+        return (svc, tgt);
+    }
+
+    /// <summary>
+    /// Open item 26. With a discovered catalog that will not parse, the drift check still compared fingerprints (a column of its own)
+    /// and said "Both schemas match the discovered catalogs" - a green tick over catalogs nobody could read, while the start door
+    /// refuses 409 <c>not_ready</c> naming that same catalog. The check comes back not run, with the reason, and blocks.
+    /// </summary>
+    [Theory]
+    [InlineData("tgt", "target")]
+    [InlineData("src", "source")]
+    public async Task An_unreadable_discovered_catalog_makes_the_schema_check_not_run_never_passed(string side, string word)
+    {
+        var (svc, tgt) = await DiscoveredRigAsync();
+        using var _ = svc;
+        await using var __ = tgt;
+        Assert.True(Check((await Preflight.RunAsync(svc.Services, new TransferOptions(), default)).Checks, "schema_drift").Ok);   // the premise
+        svc.Services.Db.Execute("UPDATE catalog SET snapshot_json = '{not json' WHERE side = $Side", new { Side = side });
+
+        var result = await Preflight.RunAsync(svc.Services, new TransferOptions(), default);
+
+        var drift = Check(result.Checks, "schema_drift");
+        Assert.True(!drift.Ok && drift.NotRun && drift.Severity == "error",
+            $"pre-flight passed the schema check over a discovered {word} catalog it could not read: ok={drift.Ok}, notRun={drift.NotRun}, "
+            + $"{drift.Severity}: {drift.Detail}");
+        Assert.Contains($"discovered {word} catalog could not be read", drift.Detail, StringComparison.Ordinal);
+        Assert.Contains("re-run discovery", drift.Detail, StringComparison.OrdinalIgnoreCase);
+        Assert.False(result.Passed);
+    }
+
+    /// <summary>The same shape one step further: no discovered catalog at all for a side. "Nothing to drift from" is not "they match".</summary>
+    [Fact]
+    public async Task A_missing_discovered_catalog_makes_the_schema_check_not_run_never_passed()
+    {
+        var (svc, tgt) = await DiscoveredRigAsync();
+        using var _ = svc;
+        await using var __ = tgt;
+        svc.Services.Db.Execute("DELETE FROM catalog WHERE side = 'tgt'");
+
+        var result = await Preflight.RunAsync(svc.Services, new TransferOptions(), default);
+
+        var drift = Check(result.Checks, "schema_drift");
+        Assert.True(!drift.Ok && drift.NotRun && drift.Severity == "error",
+            $"pre-flight passed the schema check with no discovered target catalog to compare against: ok={drift.Ok}, notRun={drift.NotRun}, "
+            + $"{drift.Severity}: {drift.Detail}");
+        Assert.Contains("no discovered target catalog", drift.Detail, StringComparison.Ordinal);
+        Assert.False(result.Passed);
+    }
+
     /// <summary>
     /// Harm (F2, ruling 120): NotRun was always a warning, so on the route where the drift checker itself fails - both connections
     /// open, nothing else in the list an error - PreflightResult.Passed stayed true. Drift DETECTED blocks the run; drift

@@ -103,9 +103,16 @@ public static class Preflight
                 {
                     var drift = await DriftChecker.CheckAsync(s, ct);
                     string sides = string.Join(" and ", new[] { drift.SrcChanged ? "source" : null, drift.TgtChanged ? "target" : null }.OfType<string>());
+                    // Open item 26: the drift checker compares fingerprints, a column of their own, so "no drift" says nothing about
+                    // whether the discovered catalogs themselves exist and can be read. A pass is only claimed when they do; otherwise
+                    // the check did not run, which is also what the start door (409 not_ready) says about the same catalog.
+                    string? unreadable = drift.Any ? null : CatalogProblem(s);
                     checks.Add(drift.Any
                         ? Err("schema_drift", $"The {sides} schema changed since discovery. Re-run discovery and review before transferring.")
-                        : Ok("schema_drift", "Both schemas match the discovered catalogs."));
+                        : unreadable is not null
+                            ? NotRun("schema_drift", $"Not checked: {unreadable}, so there is nothing to compare the schemas against. "
+                                                     + "Re-run discovery.", causeIsAlreadyAnError: false)
+                            : Ok("schema_drift", "Both schemas match the discovered catalogs."));
                 }
                 // JsonException too: the drift check reads the ServerMeta discovery stored, and a stored value that will not parse must
                 // cost a line of the checklist, not the checklist.
@@ -199,6 +206,25 @@ public static class Preflight
         {
             NonEmptyTargets = nonEmptyTargets,
         };
+    }
+
+    /// <summary>Open item 26: why a discovered catalog cannot vouch for the schemas - absent, or not readable - or null when both are
+    /// there and parse. One sentence per side at fault, joined.</summary>
+    private static string? CatalogProblem(DbmServices s)
+    {
+        var problems = new List<string>();
+        foreach (var (side, word) in new[] { (Side.Src, "source"), (Side.Tgt, "target") })
+        {
+            try
+            {
+                if (s.Catalog.Get(side) is null) problems.Add($"no discovered {word} catalog is recorded in this workspace");
+            }
+            catch (JsonException ex)
+            {
+                problems.Add($"the discovered {word} catalog could not be read ({Describe(ex)})");
+            }
+        }
+        return problems.Count == 0 ? null : string.Join("; ", problems);
     }
 
     /// <summary>

@@ -48,8 +48,9 @@ refused when the target now resolves elsewhere; that one is for the human to fix
 - **A mapping or SQL defect** (any failure, or a completed run with a whole table rejected): the human reopens Mapping or SQL on its
   review screen. Reopening cancels a failed run first (running its post-load SQL); after the phase is approved again the Execute
   screen starts a **new** run. Reopen is refused while a run is running or paused — pause and cancel it first.
-- **Pre-flight failed:** report the failing checks. Schema drift → the human re-runs discovery in the UI (allowed before the first run
-  and after a completed, cancelled or failed run). `chunk_keys` → a task's source query repeats its chunk key (a join that multiplies
+- **Pre-flight failed:** report the failing checks. Schema drift, or a schema check that did not run because a discovered catalog is
+  missing or cannot be read → the human re-runs discovery in the UI (allowed before the first run and after a completed, cancelled
+  or failed run). `chunk_keys` → a task's source query repeats its chunk key (a join that multiplies
   rows), which would lose rows at chunk boundaries: the SQL phase must make the key unique or drop the join.
 - **Connection/permission errors:** report them; the human fixes access and resumes.
 - Never suggest editing the target tables by hand, disabling constraints, or re-running with truncation without the human deciding.
