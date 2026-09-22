@@ -524,6 +524,51 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
     }
 
     /// <summary>
+    /// Open item 20 / ruling 209. The lock connection is idle for the whole run, so anything that drops it - an idle timeout between
+    /// here and the server, a failover, a KILL - frees the target without a word, and a second runner could then load beside this
+    /// one. The seam kills the lock session after the first chunk: the run must notice at the next chunk commit and stop as
+    /// <c>paused</c>, saying why, instead of loading the rest of the table unguarded. A resume takes the lock again and finishes.
+    /// </summary>
+    [Fact]
+    public async Task A_run_whose_lock_session_is_killed_pauses_saying_the_lock_was_lost()
+    {
+        await using var rig = await RigAsync(One(WidePlan()));
+        long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip" });
+        int lockSession = 0;
+        TransferEngine.AfterLockTaken = l => lockSession = l.SessionId;
+        var control = new TransferControl();
+        control.ChunkCommitted += c =>
+        {
+            if (c.ChunkNo != 1) return;
+            using var killer = new SqlConnection(rig.Tgt.ConnectionString);
+            killer.Open();
+            using var kill = new SqlCommand($"KILL {lockSession}", killer);
+            kill.ExecuteNonQuery();
+        };
+        TransferOutcome outcome;
+        try
+        {
+            outcome = await rig.Engine.RunAsync(runId, control, default);
+        }
+        finally
+        {
+            TransferEngine.AfterLockTaken = null;
+        }
+
+        long rows = await rig.Tgt.CountAsync("app.Wide");
+        Assert.True(outcome.Status == RunStatus.Paused && rows < 400,
+            $"the run kept loading after its lock session was killed: it ended {outcome.Status} with {rows} of 400 rows loaded unguarded");
+        string summary = rig.Repo.GetRun(runId)!.SummaryJson ?? "";
+        Assert.True(summary.Contains("lock on the target database", StringComparison.Ordinal) && summary.Contains("was lost", StringComparison.Ordinal),
+            "the paused run does not say its lock was lost: " + summary);
+
+        var resumed = await rig.Engine.RunAsync(runId, new TransferControl(), default);
+        Assert.Equal(RunStatus.Completed, resumed.Status);
+        Assert.Equal(400, await rig.Tgt.CountAsync("app.Wide"));
+        Assert.Equal(400, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Wide"));
+    }
+
+    /// <summary>
     /// Harm: the chunk's rows and its checkpoint must commit in one transaction. Written afterwards instead, a crash in between leaves
     /// rows in the target that no checkpoint knows about, and the resume loads them again - on a target with no unique key, silently.
     /// The staged crash is the only place this is visible: between chunks both writes have always happened.

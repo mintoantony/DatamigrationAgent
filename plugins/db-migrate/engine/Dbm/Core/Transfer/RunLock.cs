@@ -36,6 +36,7 @@ public sealed class RunLock : IAsyncDisposable
 
     private readonly SqlConnection _connection;
     private readonly string _targetResource;
+    private readonly SemaphoreSlim _gate = new(1, 1);
     private bool _released;
 
     private RunLock(SqlConnection connection, long runId, string targetResource, string server, string database, int sessionId)
@@ -101,6 +102,35 @@ public sealed class RunLock : IAsyncDisposable
         {
             await connection.DisposeAsync();
             throw;
+        }
+    }
+
+    /// <summary>
+    /// Open item 20. Null while this session still holds both locks; otherwise the sentence saying they are gone. The lock connection
+    /// is otherwise idle for the whole run, and anything that drops it - an idle timeout in between, a failover, a KILL - frees the
+    /// target silently: a second runner could start and load beside this one. This is the cheap check that notices: one
+    /// <c>APPLOCK_MODE</c> round trip on the lock session, serialised because parallel tasks ask at once. Never throws.
+    /// </summary>
+    public async Task<string?> LostAsync(CancellationToken ct)
+    {
+        await _gate.WaitAsync(ct);
+        try
+        {
+            await using var cmd = new SqlCommand(
+                "SELECT APPLOCK_MODE(N'public', @t, N'Session'), APPLOCK_MODE(N'public', @r, N'Session')", _connection) { CommandTimeout = 15 };
+            cmd.Parameters.Add(new SqlParameter("@t", SqlDbType.NVarChar, 255) { Value = _targetResource });
+            cmd.Parameters.Add(new SqlParameter("@r", SqlDbType.NVarChar, 255) { Value = ResourceName(RunId) });
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            if (await r.ReadAsync(ct) && r.GetString(0) == "Exclusive" && r.GetString(1) == "Exclusive") return null;
+            return $"The lock on the target database {Database} was lost: its session no longer holds {_targetResource}.";
+        }
+        catch (Exception ex) when (ex is SqlException or InvalidOperationException or IOException)
+        {
+            return $"The lock on the target database {Database} was lost: its session is gone ({TransferFailure.Describe(ex, t => t)}).";
+        }
+        finally
+        {
+            _gate.Release();
         }
     }
 
