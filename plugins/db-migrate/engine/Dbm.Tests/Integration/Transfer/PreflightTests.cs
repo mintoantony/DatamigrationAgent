@@ -260,6 +260,54 @@ public sealed class PreflightTests(EngineSourceFixture fx) : IClassFixture<Engin
         Assert.False(result.Passed);
     }
 
+    /// <summary>
+    /// Ruling 212, review MED-2 (probe REVF_C). A catalog that parses but names no server, or a blank database, passed pre-flight while
+    /// the start door refused it <c>not_ready</c>: the two had two different predicates for one record. Now they share one.
+    /// </summary>
+    [Theory]
+    [InlineData("{}")]
+    [InlineData("""{"server":{"server":"x","database":""},"tables":[]}""")]
+    public async Task A_discovered_target_catalog_that_names_no_database_makes_the_schema_check_not_run(string snapshot)
+    {
+        var (svc, tgt) = await DiscoveredRigAsync();
+        using var _ = svc;
+        await using var __ = tgt;
+        svc.Services.Db.Execute("UPDATE catalog SET snapshot_json = $J WHERE side = 'tgt'", new { J = snapshot });
+
+        var result = await Preflight.RunAsync(svc.Services, new TransferOptions(), default);
+
+        var drift = Check(result.Checks, "schema_drift");
+        Assert.True(!drift.Ok && drift.NotRun && drift.Severity == "error",
+            $"pre-flight passed the schema check over a discovered target catalog that names no database ({snapshot}): ok={drift.Ok}, "
+            + $"notRun={drift.NotRun}, {drift.Severity}: {drift.Detail}");
+        Assert.Contains("does not record which server and database", drift.Detail, StringComparison.Ordinal);
+        Assert.False(result.Passed);
+    }
+
+    /// <summary>
+    /// Ruling 128 on the checklist (review MED-2): the start door refuses a saved target that is not the database discovery read, and
+    /// pre-flight said nothing about it - a green checklist above a Start that then refuses.
+    /// </summary>
+    [Fact]
+    public async Task A_saved_target_that_is_not_the_discovered_database_fails_pre_flight()
+    {
+        var (svc, tgt) = await DiscoveredRigAsync();
+        using var _ = svc;
+        await using var __ = tgt;
+        Assert.True(Check((await Preflight.RunAsync(svc.Services, new TransferOptions(), default)).Checks, "target_identity").Ok);  // premise
+        var meta = svc.Services.Connections.GetMeta(Side.Tgt)!;
+        svc.Services.Connections.Save(Side.Tgt, tgt.ConnectionString, meta with { Database = "SomeOtherDb" });
+
+        var result = await Preflight.RunAsync(svc.Services, new TransferOptions(), default);
+
+        var identity = Check(result.Checks, "target_identity");
+        Assert.True(!identity.Ok && identity.Severity == "error" && !identity.NotRun,
+            $"pre-flight passed a saved target that is not the database discovery read: ok={identity.Ok}, {identity.Severity}: {identity.Detail}");
+        Assert.Contains("SomeOtherDb", identity.Detail, StringComparison.Ordinal);
+        Assert.Contains(tgt.Name, identity.Detail, StringComparison.Ordinal);
+        Assert.False(result.Passed);
+    }
+
     /// <summary>The same shape one step further: no discovered catalog at all for a side. "Nothing to drift from" is not "they match".</summary>
     [Fact]
     public async Task A_missing_discovered_catalog_makes_the_schema_check_not_run_never_passed()

@@ -137,6 +137,8 @@ public static class Preflight
                     causeIsAlreadyAnError: true));
             }
 
+            checks.Add(TargetIdentityCheck(s));
+
             if (tgt is not null)
             {
                 try
@@ -208,23 +210,79 @@ public static class Preflight
         };
     }
 
-    /// <summary>Open item 26: why a discovered catalog cannot vouch for the schemas - absent, or not readable - or null when both are
-    /// there and parse. One sentence per side at fault, joined.</summary>
+    /// <summary>
+    /// Ruling 212 (review MED-2): <b>the one predicate for "the discovered catalog of <paramref name="side"/> is usable"</b>, shared by
+    /// pre-flight and the start and resume doors (<c>TransferService.DiscoveredTarget</c>), so the checklist and the door cannot
+    /// disagree about the same record again. Usable = a row exists, it parses, and it names a server and a non-blank database. Returns
+    /// the catalog, or null with the sentence saying why.
+    /// </summary>
+    public static (CatalogSnapshot? Catalog, string? Problem) DiscoveredCatalog(DbmServices s, Side side)
+    {
+        ArgumentNullException.ThrowIfNull(s);
+        string word = side == Side.Src ? "source" : "target";
+        CatalogSnapshot? catalog;
+        try
+        {
+            catalog = s.Catalog.Get(side);
+        }
+        catch (JsonException ex)
+        {
+            return (null, $"the discovered {word} catalog could not be read ({Describe(ex)})");
+        }
+        if (catalog is null) return (null, $"no discovered {word} catalog is recorded in this workspace");
+        if (catalog.Server is null || string.IsNullOrWhiteSpace(catalog.Server.Database))
+            return (null, $"the discovered {word} catalog does not record which server and database it was read from");
+        return (catalog, null);
+    }
+
+    /// <summary>Ruling 128's identity rule, shared with the start door: same server and database, ignoring case.</summary>
+    public static bool SameTarget(ServerMeta a, ServerMeta b)
+    {
+        ArgumentNullException.ThrowIfNull(a);
+        ArgumentNullException.ThrowIfNull(b);
+        return string.Equals(a.Database ?? "", b.Database ?? "", StringComparison.OrdinalIgnoreCase)
+               && string.Equals(a.Server ?? "", b.Server ?? "", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Open item 26: why a discovered catalog cannot vouch for the schemas, or null when both are usable. One sentence per side
+    /// at fault, joined.</summary>
     private static string? CatalogProblem(DbmServices s)
     {
-        var problems = new List<string>();
-        foreach (var (side, word) in new[] { (Side.Src, "source"), (Side.Tgt, "target") })
-        {
-            try
-            {
-                if (s.Catalog.Get(side) is null) problems.Add($"no discovered {word} catalog is recorded in this workspace");
-            }
-            catch (JsonException ex)
-            {
-                problems.Add($"the discovered {word} catalog could not be read ({Describe(ex)})");
-            }
-        }
+        var problems = new[] { Side.Src, Side.Tgt }.Select(side => DiscoveredCatalog(s, side).Problem).OfType<string>().ToList();
         return problems.Count == 0 ? null : string.Join("; ", problems);
+    }
+
+    /// <summary>
+    /// Ruling 212 (review MED-2), Ruling 128 on the checklist: the saved target connection must still be the database discovery read,
+    /// because the SQL plan was generated for it and neither the typed confirmation nor the fingerprint can tell an identical-schema
+    /// database apart. The start door refuses the same fact (<c>not_ready</c>).
+    /// </summary>
+    private static PreflightCheck TargetIdentityCheck(DbmServices s)
+    {
+        var (discovered, problem) = DiscoveredCatalog(s, Side.Tgt);
+        // What makes this unknowable is already an error elsewhere in the list: schema_drift says the catalog is unusable, or the
+        // connection lines say why that check could not run.
+        if (discovered is null)
+            return NotRun("target_identity", $"Not checked: {problem}, so it is unknown whether the saved target is the database the "
+                                             + "plan was generated for.", causeIsAlreadyAnError: true);
+        ServerMeta? saved;
+        try
+        {
+            saved = s.Connections.GetMeta(Side.Tgt);
+        }
+        catch (JsonException ex)
+        {
+            return NotRun("target_identity", "Not checked: the saved target connection's server details could not be read ("
+                                             + Describe(ex) + "). Re-test the target connection on the Setup screen.",
+                causeIsAlreadyAnError: false);
+        }
+        var d = discovered.Server!;
+        if (saved is null)
+            return NotRun("target_identity", "Not checked: the target connection is not saved.", causeIsAlreadyAnError: true);
+        return SameTarget(saved, d)
+            ? Ok("target_identity", $"The saved target is the database discovery read: {d.Database} on {d.Server}.")
+            : Err("target_identity", $"The saved target connection ({saved.Database} on {saved.Server}) is not the database discovery read "
+                                     + $"({d.Database} on {d.Server}); the SQL plan was generated for {d.Database}. Re-run discovery.");
     }
 
     /// <summary>
