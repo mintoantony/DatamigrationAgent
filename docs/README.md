@@ -30,7 +30,9 @@ to let Claude continue …**.
 - **Top bar** — project name, the *Agent online* / *Agent offline* indicator, **Pause / Resume**, and the theme switch.
 - **Review bar** (on Analysis, Mapping and SQL) — the version picker, **Feedback** and **History**, which open the right
   drawer: the feedback thread for the current phase (your items and Claude's responses) and the version history with a
-  diff between any two versions.
+  diff between any two versions. **Approve** signs off the version on your screen and nothing else: if a newer version
+  arrived meanwhile (Claude's, or an edit from another tab), approval is refused with *A newer version arrived — review
+  it first* and the page reloads to show it.
 
 ## Setup
 
@@ -51,11 +53,19 @@ started; after that the connections are locked.
 - A certificate error on Test: add `TrustServerCertificate=True` for test servers, or install the server's CA certificate.
 - Entra ID: for example `Authentication=Active Directory Default` (uses your `az login` or IDE sign-in) or
   `Active Directory Interactive`, which opens a sign-in window on this machine.
+- **Privacy — Send sample values to Claude** (on by default). On, the column profiles Claude reads include up to 3 real
+  values per text column and its min/max. Off, the values already collected are removed from the project and its
+  work packets (the state database is overwritten as far as SQLite allows; raw pages freed before the switch can still
+  hold old values until reused) and discovery collects none, so nothing Claude reads carries a sample value; it
+  still sees null shares, distinct counts, lengths and value patterns, and its analysis and mapping suggestions may be
+  less precise. Exports you wrote earlier to `.dbmigrate/exports` keep the values they were written with. Turning it back on takes effect at the
+  next discovery (**Re-run discovery** on Analysis). `dbm config sample-values off` switches them off from the command
+  line; switching them back on is your decision and is done only here.
 
 ## Discovery
 
 Runs by itself: extracts both catalogs, profiles the columns (null share, distinct values, lengths, value patterns,
-sample values), builds the search index and records a schema fingerprint per database. Nothing to do; large databases
+sample values unless you switched them off in Setup), builds the search index and records a schema fingerprint per database. Nothing to do; large databases
 take a few minutes. On failure the error is shown with a **Retry** button — fix the cause first (usually permissions).
 
 ## Analysis
@@ -139,7 +149,7 @@ that needs reasoning (splits, merges, lookups, T-SQL transforms).
 
    | Option | Default | Meaning |
    |---|---|---|
-   | Chunk size (rows) | 100 000 | rows per committed chunk (tasks with LOB columns use 5 000) |
+   | Chunk size (rows) | 100 000 | rows per committed chunk (LOB tasks: 5 000; each task's first 3 chunks: 1 000 at most) |
    | Parallel tasks | 4 | tasks loaded at the same time; a task starts once the tables it depends on are loaded |
    | When a row is rejected | Stop at the first bad row | **Stop at the first bad row** = the chunk is rolled back and its task stops; **Skip and log bad rows** = bad rows are isolated, recorded and skipped |
    | Truncate target first | off | deletes **every** row in each target table of the plan before loading — also rows that were never this migration's |
@@ -161,14 +171,43 @@ start dialog, which names the non-empty tables and the keyless ones. Without eit
 rows added" instead of "validated". If neither choice is right, the target has to be restored (for example from a
 backup); never edit it by hand.
 
+**One transfer per target database.** While a run is loading, it holds a lock in the target database itself, so a second
+transfer into the same database — from another project folder, another terminal or the CLI beside the UI — is refused
+(`busy`) before it copies a row, with a message naming the target and the run and project folder that hold it. The lock
+goes away when that run finishes, pauses or its process ends, so a resume after a crash is not affected. A run of another
+project folder that is paused, failed or was interrupted part-way still leaves its checkpoints in the target, and a new
+transfer from here is refused (`busy`, naming that project folder) until that run is resumed to the end or cancelled from
+its own project. Each project's checkpoint rows are its own: a finished or cancelled run removes only them, and
+`dbo.__dbm_checkpoint` is dropped only when nothing else is left in it. Cancelling a paused or failed run also takes the
+lock, so it is refused while another transfer is loading that target. A copy of a project folder carries the same
+project identity; its new run is refused if the original's run has checkpoints in the target, so work from one copy.
+"Keep the checkpoint table" keeps the table for auditing, but a cancelled or abandoned run's rows in it are marked done
+and never block another run. A cancel that could not reach the target leaves the run's checkpoints behind; the next new run
+from the same project folder removes them.
+
+**Upgrading from an earlier db-migrate version.** Earlier versions took a different lock and do not see this one, so do
+not run an earlier version and this one against the same target at the same time. The first run of this version upgrades
+`dbo.__dbm_checkpoint` in place; a run paused under the earlier version resumes, or is cancelled, from its own project as
+before; only checkpoints of tasks that run had started, matching what it recorded, are taken as its own. Until then its
+checkpoints hold the target for every other project, and they are never taken over while they are
+still changing (within 10 minutes of the last write). If no db-migrate project still uses the target, the table can be
+dropped. The run checks
+after every committed chunk that it still holds the lock; if its lock connection was dropped (a network or failover
+fault), it pauses after the current chunk and says so in its notes, and **Resume** takes the lock again.
+
 **Chunk keys.** When a task's source query joins other tables, pre-flight checks that its chunk key is still unique in
 that query. A join that repeats rows (one order per order line, say) would make the key repeat and lose rows at chunk
 boundaries, so it blocks the run with the task and one repeated key named; fix the key or the join in the SQL phase.
 
 **Rejected rows under *Skip and log bad rows*.** Constraint violations (foreign key, CHECK, primary key or unique) are
-always skipped and logged row by row, even when every row of a chunk fails alike. But when every row of a chunk (of more
-than one row) fails with the same other error, the task fails (`bad_task`) and the run stops. What to do depends on the
-error:
+always skipped and logged row by row, even when every row of a chunk fails alike. A row whose error ends the whole
+transaction - a target trigger that rolls back, fired by the bulk insert when *Fire target triggers* is on, or by a
+staging task's merge (its `INSERT … SELECT` from `#stg` fires triggers whatever that option says) - is isolated by
+reading its chunk again in chunks of 1 000 rows, so it costs seconds rather than a reload of the whole chunk per step of
+the search. (Under *Stop at the first bad row* the same happens, so the 1 000-row chunks before the bad row are
+committed and stay, as earlier committed chunks always do; only the chunk holding the bad row is rolled back.) But when
+every row of a chunk (of more than one row) fails with the same other error, the task fails (`bad_task`) and the run
+stops. What to do depends on the error:
 
 - **A permission error** (e.g. `INSERT` or `ALTER` denied): nothing in the plan is wrong. Grant the permission and press
   **Resume**; the run continues from its checkpoints.
@@ -178,14 +217,28 @@ error:
   still holds what this run committed, so the new run needs **Truncate target first** (with the caution above) or the
   confirmation by name.
 
-**A task that loaded 0 rows is a mapping problem.** Because constraint violations are always per-row rejects, a wrong
-foreign-key or CHECK mapping under *Skip and log bad rows* does not fail the run: it can end *Completed* with every row
-of a table rejected. If a task shows 0 rows loaded and many rejected, do not treat it as bad data — read the rejected
-rows' error, reopen Mapping, fix it and run again with **Truncate target first**, as above.
+**A task that loads nothing is a mapping problem.** Because constraint violations are always per-row rejects, a wrong
+foreign-key or CHECK mapping under *Skip and log bad rows* shows as a task whose rows are all rejected. Once a task's
+first 3 chunks - at most 1 000 rows each, whatever the chunk size - (or its whole source, if it is smaller) have loaded
+no row at all, the task fails (`bad_task`) with a reason that says every row was rejected and names the most common
+error and its number, and the run stops - rather than rejecting the whole table one row at a time. The rejected rows are
+logged. Usually the fix is to reopen Mapping, fix it
+and run again with **Truncate target first**, as above. If the rows really are bad, **Resume** carries on from the next
+chunk and does not stop the task for this again (a task without a key is rolled back instead, so for it only the fix
+helps). A run that still ends with a task that loaded 0 of its source rows names it in the report's headline ("app.Orders
+loaded 0 of 3,005 rows") instead of saying the row counts were validated.
+
+The exception is a new run into tables that already held rows (see above): when every rejected row of such a table is a
+duplicate key (primary key or unique, told by SQL Server's error number 2627 or 2601), those rows were already there, so
+the task is not stopped and the headline's "loaded 0 of N" is expected - it is not a mapping problem. A foreign-key or
+CHECK error in such a run still stops the task.
 
 **Live view**: overall and per-task progress bars, rows per second, ETA, a throughput sparkline, the rejected-row count
-and a log tail. **Pause** lets every task commit its current chunk and stops; **Resume** continues from the checkpoints,
+and a log tail, plus the database and server the run actually loaded into (runs recorded before this was added show
+neither). **Pause** lets every task commit its current chunk and stops; **Resume** continues from the checkpoints,
 also after a failure, a crash or a reboot; **Cancel run** stops for good, and rows already committed stay in the target.
+Each task's rejected-row count opens a drawer of the rows themselves, each with its error and, when the row was
+recorded with one, SQL Server's error number.
 
 **What Cancel restores.** The plan's pre-load SQL can switch things off in the target for the load - for a foreign-key
 cycle it disables the cut constraint (`NOCHECK`). While a run is running, paused or failed that stays in force (Resume
@@ -199,11 +252,15 @@ part of finishing.
 
 Per task: source rows, rows loaded, rejected rows, duration, rows per second and validation results (row counts and
 column checksums), plus the run's options and any notes the run recorded. Up to 5 rejected rows per task are listed by
-key with their error. In the demo with *Skip and log bad rows* you see 8 rejected rows: 2 orphan orders and their 2
-lines (foreign key), 3 comments longer than the target column (truncation) and 1 zero quantity (CHECK constraint).
+key with their error and SQL Server's error number (rows recorded by an older version of the plugin have none). In the
+demo with *Skip and log bad rows* you see 8 rejected rows: 2 orphan orders and their 2 lines (foreign key), 3 comments
+longer than the target column (truncation) and 1 zero quantity (CHECK constraint).
 
 Read the report before you call a run clean: a *Completed* run can still carry notes, and a task with 0 rows loaded and
-its rows rejected points at the mapping, not at the data (see *Execute*).
+its rows rejected points at the mapping, not at the data (see *Execute*); the headline names such a task instead of
+saying "validated", and the Report screen's *Row counts* figure turns to a warning with a notice naming it. The one
+exception is a run into tables that were not empty (the headline says so) whose rejected rows are duplicate keys: those
+rows were already in the target.
 
 ## Exports
 
@@ -234,3 +291,11 @@ Every export is saved under `.dbmigrate/exports/` as well, and none of them cont
 - When Claude reports a failure (a job failed, the transfer failed or was cancelled, a draft was rejected twice) it
   ends its turn instead of waiting. After you have fixed the cause and pressed **Retry** or **Resume**, type
   `/db-migrate resume`.
+- **Take over.** While Claude is drafting or reworking a phase you cannot edit it or request changes. If Claude is stuck
+  there (its patch was rejected twice), press **Take over** on that phase: it discards Claude's pending work and puts
+  the phase back to *Awaiting review* on its current version. On Mapping and SQL you can then edit it yourself, approve
+  it or request changes again. Analysis cannot be edited by hand, and an Analysis taken over while Claude was drafting it
+  has no narrative yet, so it cannot be approved: add comments with your guidance and press **Request changes**. Your
+  open comments stay open, and a patch Claude delivers afterwards is refused. The button is disabled while Claude is
+  connected (it may be applying a patch at that moment): wait until Claude has stopped and the page shows *Agent
+  offline* (2 minutes after its last command).

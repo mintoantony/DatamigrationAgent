@@ -105,6 +105,8 @@ public sealed class SqlModuleIntegrationTests
         var stored = s.Artifacts.Get(PhaseName.Sql, result.Version!.Value)!;
         Assert.DoesNotContain(Json.Deserialize<SqlPlanPayload>(stored.PayloadJson).Warnings,
             w => w.StartsWith(SqlPlanSource.SkippedPrefix, StringComparison.Ordinal));
+        // Ruling 204: what makes it approvable is positive evidence, stored by the patch that validated live.
+        Assert.True(Json.Deserialize<SqlPlanPayload>(stored.PayloadJson).Validation is { Ok: true }, "a live patch stored no validation evidence");
         var ctx = new Dbm.Core.Workflow.ModuleContext { Services = s, Current = stored, OpenFeedback = [] };
         Assert.Empty(s.Modules[PhaseName.Sql].ApprovalBlockers(ctx, JsonNode.Parse(stored.PayloadJson)!));
     }

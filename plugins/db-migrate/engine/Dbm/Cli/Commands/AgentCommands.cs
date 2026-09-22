@@ -135,6 +135,18 @@ public sealed class ArtifactCommand : ICommand
         var pointer = args.Opt("path");
         // Git Bash rewrites an argument that starts with '/' into a Windows path, so the playbooks drop the slash.
         if (pointer is not null && !pointer.StartsWith('/')) pointer = "/" + pointer;
+        if (pointer is null && phase == PhaseName.Sql)
+        {
+            // Review L4: the validation fact in so many words, computed as ApprovalBlockers reads it (never stored in the payload).
+            List<string>? reasons = null;
+            try { reasons = Json.FromNode<Dbm.Core.SqlGen.SqlPlanPayload>(payload).NotValidatedReasons(); }
+            catch (System.Text.Json.JsonException) { }
+            return Task.FromResult(Output.Ok(ctx, new
+            {
+                phase, version, author = artifact.Author, summary = artifact.Summary,
+                validated = reasons is { Count: 0 }, notValidatedReasons = reasons ?? ["the stored payload is not a SQL plan"], payload,
+            }));
+        }
         if (pointer is null)
             return Task.FromResult(Output.Ok(ctx, new { phase, version, author = artifact.Author, summary = artifact.Summary, payload }));
 

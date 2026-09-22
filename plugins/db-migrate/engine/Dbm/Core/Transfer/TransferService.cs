@@ -27,6 +27,12 @@ public sealed record TransferRunView(long Id, int SqlVersion, RunStatus Status, 
     /// <summary>Ruling 184: the plan's pre-load statements still in force in the target - a paused or failed run keeps them on purpose
     /// (Resume expects them), and the Execute screen names them. Empty for every other run, and when the plan has none.</summary>
     public List<string> PreSqlInForce { get; init; } = [];
+
+    /// <summary>Open item 22: the server and database this run loaded into, as recorded when it was created. Null (omitted) for a run
+    /// from before the record existed.</summary>
+    public string? TargetServer { get; init; }
+
+    public string? TargetDatabase { get; init; }
 }
 
 /// <summary>
@@ -267,6 +273,12 @@ public sealed class TransferService
             if (savedTarget?.Database is not { } database || !string.Equals((confirmTarget ?? "").Trim(), database, StringComparison.Ordinal))
                 throw new TransferException("confirm_mismatch", "Type the target database name exactly to confirm the transfer.");
             EnsureTargetMatchesTheDiscoveredCatalog(savedTarget);
+            // Open item 22: a re-run continues the migration a failed or cancelled run left part-loaded, so it goes where that run went.
+            if (restart && latest is { TargetDatabase: not null })
+                EnsureRecordedTarget(latest, savedTarget,
+                    $"and it left that database part-loaded, so a new run here would load this migration into a different one. Point "
+                    + $"the target connection back at {latest.TargetDatabase}; to migrate into {savedTarget.Database} instead, re-run "
+                    + "discovery against it and approve the plan again.");
             ApprovedPlan approved;
             try
             {
@@ -305,11 +317,11 @@ public sealed class TransferService
                 EnsureNonEmptyTargetsConfirmed(await LiveNonEmptyTargetsAsync(tgtCs, approved.Plan, ct), confirmNonEmpty);
 
             var engine = new TransferEngine(_services, approved.Plan, srcCs, tgtCs);
-            long runId = engine.CreateRun(approved.Version, options);
+            long runId = engine.CreateRun(approved.Version, options, (savedTarget.Server, database));
             // Ruling 190: a checklist taken before this run says nothing about the target after it - never reused for another start.
             // (The new run id changes WorkflowStamp too; the result itself stays readable as LastPreflight for the screen.)
             lock (_lock) _preflightStamp = null;
-            await EnsureNoOtherRunnerAsync(runId, tgtCs, ct);
+            await EnsureNoOtherRunnerAsync(runId, tgtCs, ct, restart ? latest : null);
             if (!restart) _services.Workflow.OnTransferStarted();
             Launch(engine, runId, srcCs, tgtCs, RunOrigin.Created);
             return runId;
@@ -466,6 +478,23 @@ public sealed class TransferService
         string targetCs = ConnectionStrings().Target;
         var notes = new List<string>();
         if (note is not null) notes.Add(note);
+        // Ruling 212 (c): the PostSql and the checkpoint rows are the target's business, so they happen under the target lock. A live
+        // runner of another project refuses the cancel (busy) and nothing changes; a target that cannot be reached at all is no reason
+        // to keep a run from being cancelled - what could not be done there is noted below, as before.
+        RunLock? held = null;
+        try
+        {
+            held = await RunLock.AcquireAsync(targetCs, run.Id, ct, TransferEngine.OwnerOf(_services));
+        }
+        catch (TransferException ex) when (ex.Code == "run_in_progress")
+        {
+            throw new TransferException("busy", ex.Message + " The cancel changed nothing; try again when it is free.");
+        }
+        catch (SqlException)
+        {
+            // unreachable: RestoreAsync and the release below each note their own failure
+        }
+        await using var _ = held;
         try
         {
             var plan = _services.Artifacts.Get(PhaseName.Sql, run.SqlVersion) is { } artifact
@@ -481,7 +510,8 @@ public sealed class TransferService
             notes.Add($"{GlobalSql.RestorePrefix} it could not run, because SQL plan v{run.SqlVersion} could not be read ({Describe(ex)}); "
                       + "whatever its pre-load SQL disabled in the target is still disabled.");
         }
-        if (!run.Options.KeepControlTable) await DropControlTableAsync(targetCs, ct);
+        // Ruling 215 (N-2): a cancelled run's checkpoints stop being a claim on the target whatever "Keep the checkpoint table" says.
+        await DropControlTableAsync(targetCs, ct, run, notes);
         _services.Transfers.SetRunStatus(run.Id, RunStatus.Cancelled, WithNotes(_services.Transfers.GetRun(run.Id)?.SummaryJson, notes));
         _services.Sink.Publish("transfer_run_changed", new { runId = run.Id, status = EnumText.ToText(RunStatus.Cancelled) });
         _services.Workflow.OnTransferFinished("cancelled", null);
@@ -572,6 +602,8 @@ public sealed class TransferService
         {
             Notes = RunNotes(run),
             PreSqlInForce = run.Status is RunStatus.Paused or RunStatus.Failed ? GlobalSql.Statements(plan?.PreSql) : [],
+            TargetServer = run.TargetServer,
+            TargetDatabase = run.TargetDatabase,
         };
         return new TransferView(runView, tasks, totals, active, cannotStart is null, targetDatabase,
             approved?.Version, LastPreflight, new TransferOptions())
@@ -651,12 +683,25 @@ public sealed class TransferService
     /// <para>The lock is released again immediately and the engine re-takes it, so a runner that appears in between is still refused -
     /// by <see cref="RunBackgroundAsync"/>, which leaves the run <c>paused</c> and carries the same sentence in its notes.</para>
     /// </summary>
-    private async Task EnsureNoOtherRunnerAsync(long runId, string targetCs, CancellationToken ct)
+    /// <param name="abandoned">Ruling 215 (N-2, N-3): the failed or cancelled run a re-run abandons. Its checkpoints stop being a claim on
+    /// the target here, under the lock - an earlier engine's rows of it claimed first - whatever "Keep the checkpoint table" says.</param>
+    private async Task EnsureNoOtherRunnerAsync(long runId, string targetCs, CancellationToken ct, TransferRunRow? abandoned = null)
     {
         try
         {
-            var probe = await RunLock.AcquireAsync(targetCs, runId, ct);
-            await probe.DisposeAsync();
+            var owner = TransferEngine.OwnerOf(_services);
+            await using var probe = await RunLock.AcquireAsync(targetCs, runId, ct, owner);
+            await using var tgt = await SqlConnect.OpenAsync(targetCs, ct);
+            if (abandoned is not null)
+            {
+                await ControlTable.ClaimLegacyAsync(tgt, owner,
+                    TransferEngine.ClaimOf(abandoned.Id, abandoned.Options, _services.Transfers.Tasks(abandoned.Id)), ct);
+                await ControlTable.RetireRunAsync(tgt, owner, abandoned.Id, ct);
+            }
+            // Ruling 212 (b), asked here as well so another project's paused run reaches the operator as busy, not as a run that
+            // started and was then refused. The run was created a moment ago, so it is fresh (N-1).
+            await TransferEngine.EnsureNoForeignCheckpointsAsync(tgt, owner, runId, fresh: true, probe.Database, ct,
+                id => TransferEngine.EndedRun(_services, id));
         }
         catch (TransferException ex) when (ex.Code == "run_in_progress")
         {
@@ -680,6 +725,15 @@ public sealed class TransferService
         var saved = SavedTargetMeta()
             ?? throw new TransferException("no_connection", "The target connection is not saved, so run "
                                                             + $"{run.Id} cannot be continued against the database it started in.");
+        // Open item 22: the run's own record is exact, and needs no discovered catalog to vouch for it. The catalog proxy below is
+        // kept for a run created before the record existed (migration step 3), which has none.
+        if (run.TargetDatabase is not null)
+        {
+            EnsureRecordedTarget(run, saved,
+                "so resuming against this one would load every row again from the beginning. Point the target connection back at "
+                + $"{run.TargetDatabase}, or cancel run {run.Id} and start a new one.");
+            return;
+        }
         var (discovered, problem) = DiscoveredTarget();
         // Ruling 127, fail closed: "there is nothing to compare against" is not "they match". Failing open here would resume the run
         // into whatever the target connection happens to point at today, which is the one thing this guard exists to stop.
@@ -687,12 +741,27 @@ public sealed class TransferService
             throw new TransferException("target_unknown",
                 $"Because {problem}, it cannot be confirmed that {saved.Database} on {saved.Server} is the database run {run.Id} "
                 + "loaded into. Re-run discovery, or cancel this run and start a new one.");
-        if (Same(saved.Database, discovered.Database) && Same(saved.Server, discovered.Server)) return;
+        if (Preflight.SameTarget(saved, discovered)) return;
         throw new TransferException("target_changed",
             $"The saved target connection now points at {saved.Database} on {saved.Server}, but run {run.Id} loaded into "
             + $"{discovered.Database} on {discovered.Server}. Its checkpoints and the {ControlTable.Name} table live in that database, "
             + "so resuming against this one would load every row again from the beginning. Point the target connection back at "
             + $"{discovered.Database}, or cancel run {run.Id} and start a new one.");
+    }
+
+    /// <summary>
+    /// Open item 22: refuses <c>target_changed</c> when the saved target connection no longer resolves to the server and database
+    /// <paramref name="run"/> recorded when it was created. <paramref name="consequence"/> finishes the sentence for the caller's door.
+    /// </summary>
+    private static void EnsureRecordedTarget(TransferRunRow run, ServerMeta saved, string consequence)
+    {
+        // N-4: a LocalDB server name changes on every instance start, so it is compared by its machine part (Preflight's rule).
+        if (Same(saved.Database, run.TargetDatabase)
+            && Same(Preflight.ServerIdentity(saved.Server), Preflight.ServerIdentity(run.TargetServer))) return;
+        throw new TransferException("target_changed",
+            $"The saved target connection now points at {saved.Database} on {saved.Server}, but run {run.Id} loaded into "
+            + $"{run.TargetDatabase} on {run.TargetServer}. Its checkpoints and the {ControlTable.Name} table live in that database, "
+            + consequence);
     }
 
     /// <summary>
@@ -708,7 +777,7 @@ public sealed class TransferService
             throw new TransferException("not_ready",
                 $"The transfer cannot start because {problem}: the SQL plan was generated against the discovered target, and there is "
                 + "nothing to check the saved connection against. Re-run discovery.");
-        if (Same(saved.Database, discovered.Database) && Same(saved.Server, discovered.Server)) return;
+        if (Preflight.SameTarget(saved, discovered)) return;
         throw new TransferException("not_ready",
             $"The saved target connection no longer matches the discovered catalog ({saved.Database} on {saved.Server} against "
             + $"{discovered.Database} on {discovered.Server}); re-run discovery. The SQL plan was generated for "
@@ -723,17 +792,9 @@ public sealed class TransferService
     /// </summary>
     private (ServerMeta? Meta, string? Problem) DiscoveredTarget()
     {
-        try
-        {
-            var meta = _services.Catalog.Get(Side.Tgt)?.Server;
-            return meta is null || string.IsNullOrWhiteSpace(meta.Database)
-                ? (null, "no discovered target catalog is recorded in this workspace")
-                : (meta, null);
-        }
-        catch (JsonException ex)
-        {
-            return (null, "the discovered target catalog could not be read (" + Describe(ex) + ")");
-        }
+        // Ruling 212 (MED-2): the same predicate pre-flight uses, so the checklist and this door cannot disagree about one record.
+        var (catalog, problem) = Preflight.DiscoveredCatalog(_services, Side.Tgt);
+        return (catalog?.Server, problem);
     }
 
     /// <summary>The saved target's server details. A row that will not parse is a refusal, not a 500 (ruling 123 at the start door).</summary>
@@ -806,8 +867,10 @@ public sealed class TransferService
             {
                 return;   // server shutting down: the run stays 'running' and RecoverInterrupted pauses it on the next start
             }
-            catch (TransferException ex) when (ex.Code == "run_in_progress")
+            catch (TransferException ex) when (ex.Code is "run_in_progress" or "target_changed")
             {
+                // target_changed (Ruling 212, LOW-1): the lock session reached a different database than the run recorded - refused
+                // before anything was read or written, so it is recorded exactly like a lock refusal.
                 // The lock refused this runner after EnsureNoOtherRunnerAsync let it through - another process took the run's lock in
                 // between. Nothing of it ran here, so it is not a failed run: it is put back exactly where this attempt found it
                 // (ruling 134), carrying the lock's sentence.
@@ -1295,12 +1358,32 @@ public sealed class TransferService
         return connectionString ?? throw new TransferException("no_connection", $"The {which} connection is not saved.");
     }
 
-    private async Task DropControlTableAsync(string targetCs, CancellationToken ct)
+    /// <summary>The end of a cancelled run's checkpoints: an earlier engine's rows of it claimed (N-3), then marked done when the table is
+    /// kept (N-2), or removed with the table dropped once empty (Ruling 212 c).</summary>
+    private async Task DropControlTableAsync(string targetCs, CancellationToken ct, TransferRunRow run, List<string> notes)
     {
+        var owner = TransferEngine.OwnerOf(_services);
         try
         {
             await using var conn = await SqlConnect.OpenAsync(targetCs, ct);
-            await ControlTable.DropAsync(conn, ct);
+            try
+            {
+                await ControlTable.ClaimLegacyAsync(conn, owner, TransferEngine.ClaimOf(run.Id, run.Options, _services.Transfers.Tasks(run.Id)), ct);
+            }
+            catch (TransferException ex) when (ex.Code == "run_in_progress")
+            {
+                notes.Add(ex.Message + " The earlier version's checkpoints were left as they are.");
+            }
+            if (run.Options.KeepControlTable)
+            {
+                await ControlTable.RetireRunAsync(conn, owner, run.Id, ct);
+                return;
+            }
+            // Ruling 212 (c): only this project's rows; the table stays while another project's are in it.
+            if (!await ControlTable.ReleaseAsync(conn, owner, run.Id, ct))
+                _services.Sink.Publish("log", new { level = "info",
+                    message = $"{ControlTable.Name} was left in the target: run {run.Id}'s checkpoints were removed, but it still holds "
+                              + $"{await ControlTable.KeptByAsync(conn, owner, run.Id, ct)}." });
         }
         catch (Exception ex) when (ex is SqlException or TransferException)
         {

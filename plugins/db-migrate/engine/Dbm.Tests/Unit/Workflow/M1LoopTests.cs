@@ -62,7 +62,7 @@ public class M1LoopTests
             Assert.Equal(FeedbackStatus.Addressed, s.Feedback.Get(item.Id)!.Status);
             Assert.Equal("review", s.Workflow.Next().Reason);
 
-            s.Workflow.Approve(phase);
+            s.ApproveCurrent(phase);
             Assert.Equal(2, s.Phases.Get(phase).ApprovedVersion);
             await RunJobs(s);                                         // automap / sqlgen after approval
         }

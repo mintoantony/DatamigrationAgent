@@ -228,6 +228,8 @@ test('openCommentsByTask counts draft and open comments per task through parseAn
 
 /* ------------------------------------------------------------------ render over a minimal fake DOM */
 
+/* The one named exception to dom-stub.cjs (review N2; one-dom-stub.test.cjs lists it): no `document`, DBM.h itself is swapped for a
+   plain-object tree, and the render tests below assert against that tree's attrs/children. */
 function fakeDom() {
   function node(tag, attrs, kids) {
     let value = '';
@@ -457,6 +459,36 @@ test('render: a report for another version than the one shown is not displayed (
   });
 });
 
+/* Open item 13: a revalidation of the same version that fails keeps the earlier verdict, marked as from an earlier check, and says
+   the latest attempt failed - and the next successful check clears that mark. */
+test('render: a failed revalidation of the same version keeps the earlier card, marked as earlier, with the failure', async () => {
+  const clean = { version: 2, ok: true, taskErrors: { T01: [], T02: [] }, taskWarnings: { T01: [], T02: [] }, globalErrors: [], globalWarnings: [] };
+  await withFakeDom(async dom => {
+    const s = await renderValidated(dom, clean);
+    assert.ok(!/earlier check/.test(dom.text(dom.root)), 'a fresh verdict is not marked as earlier');
+
+    const failed = Promise.reject(Object.assign(new Error('The db-migrate server is not reachable.'), { code: 'network' }));
+    failed.catch(() => {});
+    s.ctx.api.post = () => failed;
+    click(dom, t => t === 'Validate live');
+    await failed.catch(() => {});
+    await tick();
+
+    const shown = dom.text(dom.root);
+    assert.ok(shown.includes('Every task and the global statements were checked'), 'the earlier verdict on this same version is kept');
+    assert.ok(/from an earlier check/.test(shown) && /latest validation.*failed/i.test(shown) && shown.includes('not reachable'),
+      'after a failed revalidation of v2 the screen must say the card is from an earlier check and that the latest attempt failed '
+      + '(with why); it shows: ' + shown.slice(0, 400));
+
+    const ok = Promise.resolve(clean);
+    s.ctx.api.post = () => ok;
+    click(dom, t => t === 'Validate live');
+    await ok;
+    await tick();
+    assert.ok(!/earlier check|latest validation.*failed/i.test(dom.text(dom.root)), 'a successful check clears the failure mark');
+  });
+});
+
 /* F2 + F6: leave() resets every piece of view state — the report, the selected task, editing. */
 test('render: leaving and returning shows no report and the default task, whatever was selected before', async () => {
   await withFakeDom(async dom => {
@@ -644,6 +676,41 @@ test('N1: a real edit to one statement of a round-tripping list leaves its sibli
   });
 });
 
+/* Open item 14, Ruling 205 (fallback): the engine has no statement splitter to mirror - it refuses ANY GO line inside a statement,
+   comment or not (SqlValidator.GoLine) - so a GO line typed inside a comment or string cannot be stored in any form. The browser
+   names such a line before posting instead of cutting the statement there. */
+test('goSplitHazards names the GO separator lines that fall inside a comment or a string, and only those', () => {
+  assert.deepEqual(V.goSplitHazards('/* note\nGO\n*/ ALTER X;'), [2], 'a GO line inside a block comment is not named');
+  assert.deepEqual(V.goSplitHazards("SELECT 'a\n  go  \nb';"), [2], 'a GO line inside a string is not named');
+  assert.deepEqual(V.goSplitHazards('/* outer /* inner */\nGO\n*/\nA;\nGO\nB;'), [2], 'nested comment: line 2 inside, line 5 a real separator');
+  assert.deepEqual(V.goSplitHazards('A; -- a line comment ends here\nGO\nB;'), []);
+  assert.deepEqual(V.goSplitHazards('A;\r\nGO\r\nB;'), []);
+  assert.deepEqual(V.goSplitHazards('/* a */\nGO\nB;'), []);
+  assert.deepEqual(V.goSplitHazards(''), []);
+  // Review N1: splitStatements' /m reads a lone CR as a line end too, so a GO between lone CRs inside a comment is a hazard as well.
+  assert.deepEqual(V.splitStatements('/* a\rGO\r*/ X'), ['/* a', '*/ X'], 'fixture guard: the splitter really cuts here');
+  assert.deepEqual(V.goSplitHazards('/* a\rGO\r*/ X'), [2], 'a GO line between lone CRs inside a comment is not named');
+});
+
+test('editor: a GO line typed inside a comment is named before posting, and nothing is sent', async () => {
+  await withFakeDom(async dom => {
+    const s = sampleCtx();
+    const posts = [];
+    s.ctx.api = Object.assign({}, s.ctx.api, { post: (url, b) => { posts.push(b); return new Promise(() => {}); } });
+    editorFor(dom, s, 'T01');
+    type(areaFor(dom, 'Task pre-load'), 'ALTER TABLE [a].[b] NOCHECK CONSTRAINT [c];\nGO\n/* disabled for the load\nGO\n*/ UPDATE STATISTICS [a].[b];');
+    submit(dom);
+    const problems = dom.all(dom.root, n => n.attrs && n.attrs.class === 'sql-edit-problems')[0];
+    assert.equal(posts.length, 0, 'the editor posted a statement list that splits inside a comment: ' + JSON.stringify(posts[0] && posts[0].ops));
+    assert.match(dom.text(problems), /Task pre-load, line 4: this GO line is inside a comment or string/);
+
+    type(areaFor(dom, 'Task pre-load'), 'ALTER TABLE [a].[b] NOCHECK CONSTRAINT [c];\nGO\n/* disabled for the load */ UPDATE STATISTICS [a].[b];');
+    submit(dom);
+    assert.equal(posts.length, 1, 'a clean list is posted');
+    assert.deepEqual(posts[0].ops[0].value, ['ALTER TABLE [a].[b] NOCHECK CONSTRAINT [c];', '/* disabled for the load */ UPDATE STATISTICS [a].[b];']);
+  });
+});
+
 /* F5: the diff compares listings line for line by the TaskListing rule, so a lone CR vs LF (and CR CR LF) is a difference. */
 test('diffRows: lone CR vs LF and CR CR LF are differences, shown with a visible CR', () => {
   const rows = V.diffRows({ sourceQuery: 'a\rb' }, { sourceQuery: 'a\nb' });
@@ -670,6 +737,90 @@ test('render: Compare with… on versions differing only in a lone CR shows the 
     const shown = dom.text(dom.root);
     assert.ok(!shown.includes('No differences'), 'a lone CR vs LF is a difference');
     assert.ok(shown.includes('SELECT 1␍FROM t'));
+  });
+});
+
+/* Open item 10, Ruling 204: the screen states the same fact ApprovalBlockers and `dbm artifact sql` do, from the same stored field -
+   positive evidence ("validation": {at, ok}) or NOT validated, whatever the warnings say. */
+const CS_MODULE = fs.readFileSync(path.join(__dirname, '..', '..', 'Dbm', 'Core', 'SqlGen', 'SqlModule.cs'), 'utf8');
+const NO_EVIDENCE = /public const string NoEvidence = "([^"]*)";/.exec(CS_MODULE)[1];
+
+test('validationState mirrors SqlPlanPayload.NotValidatedReasons', () => {
+  const skipped = 'live validation skipped: source connection, target connection missing';
+  const at = '2026-09-18T09:30:00+00:00';
+  assert.deepEqual(V.validationState({ warnings: [], validation: { at, ok: true } }), { validated: true, at, ok: true, reasons: [] });
+  assert.deepEqual(V.validationState({ warnings: [] }), { validated: false, at: null, ok: null, reasons: [NO_EVIDENCE] },
+    'no evidence and no marker (an old record) is NOT validated, with the engine\'s own sentence');
+  assert.deepEqual(V.validationState({ warnings: ['x', skipped] }).reasons, [skipped]);
+  assert.equal(V.validationState({ warnings: [skipped], validation: { at, ok: true } }).validated, false, 'evidence plus a marker is refused, as in C#');
+});
+
+test('render: a version with no validation evidence says Not validated, and a validated one says when', async () => {
+  await withFakeDom(dom => {
+    const s = sampleCtx();
+    globalThis.DBM.views.sql.render(dom.root, s.ctx);   // sampleCtx's plan has no "validation" field
+    let shown = dom.text(dom.root);
+    assert.ok(shown.includes('Not validated') && shown.includes(NO_EVIDENCE),
+      'a version the engine refuses to approve as not validated looks validated on screen: ' + shown.slice(0, 300));
+
+    assert.ok(shown.includes('blocks approval'));
+
+    // Review L1: an old version that is already approved is not "blocked" - it was approved before the evidence was kept.
+    const approved = sampleCtx({ phaseRow: { name: 'sql', status: 'approved', approvedVersion: 2 } });   // v2 is shown
+    globalThis.DBM.views.sql.render(dom.root, approved.ctx);
+    shown = dom.text(dom.root);
+    assert.ok(!shown.includes('blocks approval') && shown.includes('approved before validation evidence was kept'),
+      'an approved version without evidence is shown as blocking approval: ' + shown.slice(0, 300));
+    // Re-review N6: it is the version shown that was approved, not merely the phase - another version of an approved phase is not.
+    const other = sampleCtx({ phaseRow: { name: 'sql', status: 'approved', approvedVersion: 1 } });
+    globalThis.DBM.views.sql.render(dom.root, other.ctx);
+    shown = dom.text(dom.root);
+    assert.ok(!shown.includes('approved before validation evidence was kept'),
+      'v2 is labelled approved although the approved version is v1: ' + shown.slice(0, 300));
+
+    // Review L3, mirrored: a version whose live validation could not connect names that, as the engine does.
+    const failed = sampleCtx();
+    failed.plan.errors = ['target connection failed: timeout'];
+    assert.deepEqual(V.validationState(failed.plan).reasons, ['live validation could not connect: target connection failed: timeout']);
+
+    const ok = sampleCtx();
+    ok.plan.validation = { at: '2026-09-18T09:30:00+00:00', ok: true };
+    globalThis.DBM.views.sql.render(dom.root, ok.ctx);
+    shown = dom.text(dom.root);
+    assert.ok(shown.includes('Validated live 2026-09-18T09:30:00+00:00'), shown.slice(0, 300));
+    assert.ok(!shown.includes('Not validated'));
+  });
+});
+
+/* Review M1 (Rulings 210/211): Validate live names the version on screen, and its toast agrees with the Not validated card - a
+   stored validation says so and refreshes onto the new version; a passing one that stored nothing does not say "passed" over a
+   version that is still not validated. */
+test('render: Validate live names the version, and a pass over a not-validated version never contradicts the card', async () => {
+  const clean = { version: 2, ok: true, taskErrors: { T01: [], T02: [] }, taskWarnings: { T01: [], T02: [] }, globalErrors: [], globalWarnings: [] };
+  await withFakeDom(async dom => {
+    const toasts = [];
+    let refreshed = 0;
+    let sent = null;
+    const s = sampleCtx({ toast: (m, k) => toasts.push(k + ': ' + m), refresh() { refreshed++; } });
+    const storedReply = Promise.resolve(Object.assign({}, clean, { stored: true, storedVersion: 3 }));
+    s.ctx.api = Object.assign({}, s.ctx.api, { post: (url, b) => { sent = b; return storedReply; } });
+    globalThis.DBM.views.sql.render(dom.root, s.ctx);
+    click(dom, t => t === 'Validate live');
+    await storedReply;
+    await tick();
+    assert.deepEqual(sent, { version: 2 }, 'Validate live must name the version on screen');
+    assert.equal(refreshed, 1, 'a stored validation refreshes onto the new version');
+    assert.ok(toasts.some(t => /^ok: .*saved as v3/.test(t)), 'toasts: ' + JSON.stringify(toasts));
+
+    toasts.length = 0;
+    const notStored = Promise.resolve(Object.assign({}, clean, { stored: false, storeNote: 'sql is drafting; a validation is stored as a new version only while it awaits review' }));
+    s.ctx.api.post = () => notStored;
+    click(dom, t => t === 'Validate live');
+    await notStored;
+    await tick();
+    assert.ok(!toasts.some(t => /^ok: Validation passed$/.test(t)),
+      'the toast said "Validation passed" while the card says Not validated: ' + JSON.stringify(toasts));
+    assert.ok(toasts.some(t => /^warn: .*still not validated.*drafting/.test(t)), 'toasts: ' + JSON.stringify(toasts));
   });
 });
 

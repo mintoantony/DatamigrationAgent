@@ -99,11 +99,20 @@ public sealed class TransferEngineTests(EngineSourceFixture fx) : IClassFixture<
         return await ControlTable.ExistsAsync(conn, default);
     }
 
-    private static async Task<Checkpoint?> CheckpointAsync(TempDatabase tgt, long runId, string taskId)
+    /// <summary>The checkpoint as the run's own project reads it (Ruling 212: checkpoint rows belong to a project).</summary>
+    private static async Task<Checkpoint?> CheckpointAsync(Rig rig, long runId, string taskId)
     {
-        await using var conn = new SqlConnection(tgt.ConnectionString);
+        await using var conn = new SqlConnection(rig.Tgt.ConnectionString);
         await conn.OpenAsync();
-        return await ControlTable.ReadAsync(conn, runId, taskId, default);
+        ControlTable.CurrentOwner = TransferEngine.OwnerOf(rig.Svc.Services);
+        try
+        {
+            return await ControlTable.ReadAsync(conn, runId, taskId, default);
+        }
+        finally
+        {
+            ControlTable.CurrentOwner = null;
+        }
     }
 
     private async Task AssertExactFinalStateAsync(Rig rig, long runId)
@@ -180,7 +189,7 @@ public sealed class TransferEngineTests(EngineSourceFixture fx) : IClassFixture<
 
         // The checkpoint is the resume point, so it has to agree with what is actually in the target: a chunk that committed its rows
         // without its checkpoint is loaded twice on resume, and a checkpoint past uncommitted rows skips them for good.
-        var cp = await CheckpointAsync(rig.Tgt, runId, "T02");
+        var cp = await CheckpointAsync(rig, runId, "T02");
         Assert.NotNull(cp);
         Assert.Equal(await rig.Tgt.CountAsync("app.Child"), cp!.RowsDone);
 
@@ -227,7 +236,8 @@ public sealed class TransferEngineTests(EngineSourceFixture fx) : IClassFixture<
         var child = rig.Repo.Task(runId, "T02")!;
         Assert.Equal(TransferTaskStatus.Failed, child.Status);
         Assert.Contains("CK_Child_Qty", child.Error);
-        Assert.Single(rig.Repo.ErrorRows(runId, "T02"));
+        var bad = Assert.Single(rig.Repo.ErrorRows(runId, "T02"));
+        Assert.True(bad.ErrorNumber == 547, "stop mode recorded its bad row without the error number (Ruling 208)");
         Assert.Equal(500, await rig.Tgt.CountAsync("app.Child"));                   // chunk 2 (501..1000, holds Id 777) rolled back
         Assert.Equal(TransferTaskStatus.Pending, rig.Repo.Task(runId, "T03")!.Status);
         Assert.True(await ControlTableExistsAsync(rig.Tgt));

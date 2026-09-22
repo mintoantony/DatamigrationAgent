@@ -5,13 +5,29 @@ using Microsoft.Data.Sqlite;
 namespace Dbm.Core.State;
 
 public sealed record TransferRunRow(long Id, int SqlVersion, RunStatus Status, TransferOptions Options,
-    DateTimeOffset? StartedAt, DateTimeOffset? EndedAt, string? SummaryJson);
+    DateTimeOffset? StartedAt, DateTimeOffset? EndedAt, string? SummaryJson)
+{
+    /// <summary>Open item 22: the target server the run loaded into, as its connection resolved it (<c>@@SERVERNAME</c>). Null for a
+    /// run created before migration step 3, which recorded none. Never a credential.</summary>
+    public string? TargetServer { get; init; }
+
+    /// <summary>Open item 22: the target database the run loaded into (<c>DB_NAME()</c>); null as for <see cref="TargetServer"/>.</summary>
+    public string? TargetDatabase { get; init; }
+}
 
 public sealed record TransferTaskRow(long RunId, string TaskId, string Target, int Ordinal, TransferTaskStatus Status,
     long? RowsSource, long? RowsBefore, long RowsDone, long RowsError, string? LastKeyJson, DateTimeOffset? HeartbeatAt,
     DateTimeOffset? StartedAt, DateTimeOffset? EndedAt, string? Error, string? ValidationJson);
 
-public sealed record ErrorRowEntry(long Id, long RunId, string TaskId, string? KeyJson, string? RowJson, string Error, DateTimeOffset Ts);
+public sealed record ErrorRowEntry(long Id, long RunId, string TaskId, string? KeyJson, string? RowJson, string Error, DateTimeOffset Ts)
+{
+    /// <summary>The first SQL Server error number of the attempt that refused the row (Ruling 208); null when that failure carried
+    /// none, and for every row recorded before migration step 2.</summary>
+    public int? ErrorNumber { get; init; }
+}
+
+/// <summary>A task's recorded rejects that share one error number (null: no number), with how many there are and the first text.</summary>
+public sealed record ErrorNumberCount(int? Number, long Rows, string FirstError);
 
 /// <summary>
 /// SQLite mirror of transfer runs (the target control table is the source of truth for checkpoints).
@@ -20,14 +36,17 @@ public sealed record ErrorRowEntry(long Id, long RunId, string TaskId, string? K
 /// </summary>
 public sealed class TransferRepo(StateDb db)
 {
-    private const string RunCols = "id, sql_version, status, options_json, started_at, ended_at, summary_json";
+    private const string RunCols = "id, sql_version, status, options_json, started_at, ended_at, summary_json, target_server, target_database";
     private const string TaskCols = "run_id, task_id, target, ordinal, status, rows_source, rows_before, rows_done, rows_error, " +
                                     "last_key_json, heartbeat_at, started_at, ended_at, error, validation_json";
 
     private readonly StateDb _db = db ?? throw new ArgumentNullException(nameof(db));
 
     /// <summary>Creates a "running" run with its tasks "pending", ordinal = index in <paramref name="tasks"/>. Options are persisted normalized.</summary>
-    public long CreateRun(int sqlVersion, TransferOptions options, IReadOnlyList<(string TaskId, string Target)> tasks)
+    /// <param name="targetDatabase">Open item 22: the server and database the run will load into, as the target connection resolved them.
+    /// Null records none (a caller with no resolved target); resume and re-run then fall back to the discovered catalog.</param>
+    public long CreateRun(int sqlVersion, TransferOptions options, IReadOnlyList<(string TaskId, string Target)> tasks,
+        (string Server, string Database)? targetDatabase = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(tasks);
@@ -46,8 +65,10 @@ public sealed class TransferRepo(StateDb db)
 
         return _db.InTransaction(() =>
         {
-            _db.Execute("INSERT INTO transfer_run (sql_version, status, options_json, started_at) VALUES ($SqlVersion, $Status, $Options, $Now)",
-                new { SqlVersion = sqlVersion, Status = EnumText.ToText(RunStatus.Running), Options = Json.Serialize(normalized), Now = Clock.NowText() });
+            _db.Execute("INSERT INTO transfer_run (sql_version, status, options_json, started_at, target_server, target_database) " +
+                        "VALUES ($SqlVersion, $Status, $Options, $Now, $Server, $Database)",
+                new { SqlVersion = sqlVersion, Status = EnumText.ToText(RunStatus.Running), Options = Json.Serialize(normalized), Now = Clock.NowText(),
+                      Server = targetDatabase?.Server, Database = targetDatabase?.Database });
             long id = _db.Scalar<long>("SELECT last_insert_rowid()");
             for (int i = 0; i < tasks.Count; i++)
                 _db.Execute("INSERT INTO transfer_task (run_id, task_id, target, ordinal, status) VALUES ($RunId, $TaskId, $Target, $Ordinal, $Status)",
@@ -55,6 +76,11 @@ public sealed class TransferRepo(StateDb db)
             return id;
         });
     }
+
+    /// <summary>Ruling 212: this workspace's identity (a GUID created by migration step 3), which owns its checkpoint rows in a target.</summary>
+    public string WorkspaceId()
+        => _db.Scalar<string>("SELECT workspace_id FROM transfer_identity WHERE id = 1")
+           ?? throw new InvalidOperationException("The state database has no workspace identity (migration step 3 did not run).");
 
     public TransferRunRow? Latest()
         => _db.Query($"SELECT {RunCols} FROM transfer_run ORDER BY id DESC LIMIT 1", MapRun).FirstOrDefault();
@@ -154,23 +180,44 @@ public sealed class TransferRepo(StateDb db)
             new { Json = validationJson, RunId = runId, TaskId = taskId }));
     }
 
-    /// <summary>Records a rejected row; the task must exist (no orphan error rows).</summary>
-    public void AddErrorRow(long runId, string taskId, string? keyJson, string? rowJson, string error)
+    /// <summary>Records a rejected row; the task must exist (no orphan error rows). <paramref name="errorNumber"/> is the SQL Server
+    /// error number of the attempt that refused it, null when it carried none (Ruling 208).</summary>
+    public void AddErrorRow(long runId, string taskId, string? keyJson, string? rowJson, string error, int? errorNumber = null)
     {
         ArgumentNullException.ThrowIfNull(taskId);
         if (string.IsNullOrWhiteSpace(error)) throw new ArgumentException("An error row needs a non-blank error.", nameof(error));
         RequireTask(runId, taskId, _db.Execute(
-            "INSERT INTO error_row (run_id, task_id, key_json, row_json, error, ts) " +
-            "SELECT $RunId, $TaskId, $KeyJson, $RowJson, $Error, $Ts WHERE EXISTS (SELECT 1 FROM transfer_task WHERE run_id = $RunId AND task_id = $TaskId)",
-            new { RunId = runId, TaskId = taskId, KeyJson = keyJson, RowJson = rowJson, Error = error, Ts = Clock.NowText() }));
+            "INSERT INTO error_row (run_id, task_id, key_json, row_json, error, ts, error_number) " +
+            "SELECT $RunId, $TaskId, $KeyJson, $RowJson, $Error, $Ts, $Number WHERE EXISTS (SELECT 1 FROM transfer_task WHERE run_id = $RunId AND task_id = $TaskId)",
+            new { RunId = runId, TaskId = taskId, KeyJson = keyJson, RowJson = rowJson, Error = error, Ts = Clock.NowText(), Number = errorNumber }));
     }
 
     /// <summary>Oldest first; <paramref name="limit"/> is clamped to 1..10000.</summary>
     public IReadOnlyList<ErrorRowEntry> ErrorRows(long runId, string? taskId = null, int limit = 100)
-        => _db.Query("SELECT id, run_id, task_id, key_json, row_json, error, ts FROM error_row " +
+        => _db.Query("SELECT id, run_id, task_id, key_json, row_json, error, ts, error_number FROM error_row " +
                      "WHERE run_id = $RunId AND ($TaskId IS NULL OR task_id = $TaskId) ORDER BY id LIMIT $Limit",
-            r => new ErrorRowEntry(r.GetInt64(0), r.GetInt64(1), r.GetString(2), Str(r, 3), Str(r, 4), r.GetString(5), Ts(r, 6)!.Value),
+            r => new ErrorRowEntry(r.GetInt64(0), r.GetInt64(1), r.GetString(2), Str(r, 3), Str(r, 4), r.GetString(5), Ts(r, 6)!.Value)
+            {
+                ErrorNumber = r.IsDBNull(7) ? null : r.GetInt32(7),
+            },
             new { RunId = runId, TaskId = taskId, Limit = Math.Clamp(limit, 1, 10_000) });
+
+    /// <summary>
+    /// Ruling 208: every recorded reject of an existing task, counted by error number (null is a group of its own: no number, or a row
+    /// recorded before migration step 2), with the first text recorded for each. One aggregate over all of the task's rows - no limit.
+    /// An unknown run or task throws "unknown_task" rather than reading as "nothing recorded".
+    /// </summary>
+    public IReadOnlyList<ErrorNumberCount> ErrorNumberCounts(long runId, string taskId)
+    {
+        ArgumentNullException.ThrowIfNull(taskId);
+        if (Task(runId, taskId) is null) throw new TransferException("unknown_task", $"Transfer task {taskId} of run {runId} does not exist.");
+        return _db.Query(
+            "SELECT e.error_number, COUNT(*), (SELECT e2.error FROM error_row e2 WHERE e2.run_id = $RunId AND e2.task_id = $TaskId " +
+            "AND e2.error_number IS e.error_number ORDER BY e2.id LIMIT 1) " +
+            "FROM error_row e WHERE e.run_id = $RunId AND e.task_id = $TaskId GROUP BY e.error_number",
+            r => new ErrorNumberCount(r.IsDBNull(0) ? null : r.GetInt32(0), r.GetInt64(1), r.GetString(2)),
+            new { RunId = runId, TaskId = taskId });
+    }
 
     /// <summary>Rejected rows recorded for an existing task; an unknown run or task throws "unknown_task" rather than reading as 0 (ruling L2).</summary>
     public long ErrorRowCount(long runId, string taskId)
@@ -210,7 +257,11 @@ public sealed class TransferRepo(StateDb db)
 
     private static TransferRunRow MapRun(SqliteDataReader r) => new(
         r.GetInt64(0), r.GetInt32(1), EnumText.Parse<RunStatus>(r.GetString(2)), Json.Deserialize<TransferOptions>(r.GetString(3)),
-        Ts(r, 4), Ts(r, 5), Str(r, 6));
+        Ts(r, 4), Ts(r, 5), Str(r, 6))
+    {
+        TargetServer = Str(r, 7),
+        TargetDatabase = Str(r, 8),
+    };
 
     private static TransferTaskRow MapTask(SqliteDataReader r) => new(
         r.GetInt64(0), r.GetString(1), r.GetString(2), r.GetInt32(3), EnumText.Parse<TransferTaskStatus>(r.GetString(4)),

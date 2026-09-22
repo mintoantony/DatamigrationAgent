@@ -30,7 +30,10 @@ public sealed class NewRunGuardTests(EngineSourceFixture fx) : IClassFixture<Eng
             s.Catalog.Save(side, snapshot, Fingerprint.Compute(snapshot));
         }
         foreach (var p in new[] { PhaseName.Setup, PhaseName.Discovery, PhaseName.Analysis, PhaseName.Mapping }) s.Phases.SetApproved(p, 1, null);
-        s.Artifacts.Add(PhaseName.Sql, 1, Json.Serialize(TransferEngineTests.Plan()), "script", "test plan");
+        // Ruling 204: the stored plan stands for a live-validated version, so the reopen-and-approve below is not refused as not validated.
+        var plan = TransferEngineTests.Plan();
+        plan.Validation = Dbm.Core.SqlGen.SqlValidation.From(Clock.Now(), true);
+        s.Artifacts.Add(PhaseName.Sql, 1, Json.Serialize(plan), "script", "test plan");
         s.Phases.SetCurrentVersion(PhaseName.Sql, 1);
         s.Phases.SetApproved(PhaseName.Sql, 1, null);
         s.Phases.SetStatus(PhaseName.Ready, PhaseStatus.AwaitingReview);
@@ -130,7 +133,7 @@ public sealed class NewRunGuardTests(EngineSourceFixture fx) : IClassFixture<Eng
         await Wait.UntilAsync(() => s.Phases.Get(PhaseName.Complete).Status == PhaseStatus.Approved, 60_000);
         Assert.Equal(700, await tgt.CountAsync("app.Log"));
         s.Workflow.Reopen(PhaseName.Sql);
-        s.Workflow.Approve(PhaseName.Sql);                                              // the same SQL version, well inside 15 minutes
+        s.ApproveCurrent(PhaseName.Sql);                                              // the same SQL version, well inside 15 minutes
 
         var (status, body) = await server.SendAsync(HttpMethod.Post, "/api/transfer/start", new { options = Skip, confirmTarget = tgt.Name });
 

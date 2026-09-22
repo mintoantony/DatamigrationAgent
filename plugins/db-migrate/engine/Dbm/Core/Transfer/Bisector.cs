@@ -10,10 +10,23 @@ public sealed record LoadAttempt(bool Ok, string? Error = null, bool Doomed = fa
     /// </summary>
     public bool RowFault { get; init; }
 
+    /// <summary>The numbers of the server errors (class above 10) the attempt failed with, in order; empty when it carried none - a
+    /// client-side fault, or a fake target. Ruling 193: the bisection short-cut compares these, because a duplicate-key message names the
+    /// duplicate value and so differs row by row while the number does not.</summary>
+    public IReadOnlyList<int> ErrorNumbers { get; init; } = [];
+
     public static readonly LoadAttempt Success = new(true);
 }
 
-public sealed record RowFailure(int Row, string Error);
+/// <summary>One row the load refused, and why.</summary>
+/// <param name="Row">The row's index in the chunk.</param>
+/// <param name="Error">The server's (or the client's) text for it; never blank.</param>
+public sealed record RowFailure(int Row, string Error)
+{
+    /// <summary>The first server error number of the attempt that refused the row; null when the attempt carried none. Ruling 192's
+    /// guard names the most common one when a task's first chunks load nothing.</summary>
+    public int? ErrorNumber { get; init; }
+}
 
 public sealed record BisectResult(IReadOnlyList<int> Loaded, IReadOnlyList<RowFailure> Failed)
 {
@@ -54,6 +67,8 @@ public static class Bisector
         string? uniformText = null;   // the error text every attempt so far has carried
         bool uniform = true;          // ... and nothing at all has loaded
         bool uniformRowFault = true;  // ... and every one of those attempts was a constraint violation (ruling 147)
+        IReadOnlyList<int>? uniformNumbers = null;   // the server error numbers every attempt so far has carried
+        bool sameNumbers = true;                     // ... non-empty every time, and nothing at all has loaded (ruling 193)
         int failedRows = 0;
 
         var stack = new Stack<int[]>();
@@ -65,8 +80,10 @@ public static class Bisector
 
             // A multi-row attempt earns its cost only while a whole segment might still load. Once the whole chunk and two single rows
             // have failed with one identical error and nothing has loaded, the load itself is what is broken, so every further multi-row
-            // attempt is a re-run of it: go straight to the rows (H2). 2N-1 attempts become N + log2(N) + 1.
-            if (segment.Length > 1 && uniform && failedRows >= 2)
+            // attempt is a re-run of it: go straight to the rows (H2). 2N-1 attempts become N + log2(N). Ruling 193 takes the same
+            // short-cut when the texts differ but every attempt failed with the same server error numbers: a chunk of duplicates, whose
+            // messages each name their own duplicate value. Only the short-cut reads the numbers; the verdict below stays on the text.
+            if (segment.Length > 1 && (uniform || sameNumbers) && failedRows >= 2)
             {
                 Halve(stack, segment);
                 continue;
@@ -76,12 +93,17 @@ public static class Bisector
             if (attempt.Ok)
             {
                 uniform = false;
+                sameNumbers = false;
                 loaded.AddRange(segment);
                 continue;
             }
             string text = TextOf(attempt.Error);
             if (uniformText is null) uniformText = text;
             else if (!string.Equals(uniformText, text, StringComparison.Ordinal)) uniform = false;
+            var numbers = attempt.ErrorNumbers ?? [];
+            if (numbers.Count == 0) sameNumbers = false;
+            else if (uniformNumbers is null) uniformNumbers = numbers;
+            else if (!uniformNumbers.SequenceEqual(numbers)) sameNumbers = false;
             // Only for the verdict at the end, never for the short-cut above: a chunk of alike rejects still wastes every multi-row
             // attempt, so skipping them stays right. One attempt that is not a row fault keeps H2 - the stricter reading wins.
             uniformRowFault &= attempt.RowFault;
@@ -100,7 +122,7 @@ public static class Bisector
             if (segment.Length == 1)
             {
                 failedRows++;
-                failed.Add(new RowFailure(segment[0], text));
+                failed.Add(new RowFailure(segment[0], text) { ErrorNumber = numbers.Count > 0 ? numbers[0] : null });
                 if (stopAtFirstFailure) break;
                 continue;
             }

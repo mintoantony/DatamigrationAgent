@@ -143,6 +143,32 @@
     return C.notice('err', result.error || 'Connection failed.');
   }
 
+  /** Ruling 196 (open item 33): the SampleValues project setting - whether the column profiles Claude reads carry sample values. */
+  function privacyCard(ctx) {
+    var project = (ctx.state && ctx.state.project) || {};
+    var on = project.sampleValues !== false;
+    var box = h('input', { type: 'checkbox', class: 'check', id: 'sample-values', checked: on });
+    box.checked = on;
+    box.addEventListener('change', function () {
+      var want = !!box.checked;
+      box.disabled = true;
+      ctx.api.post('/api/settings', { sampleValues: want }).then(function (r) {
+        C.toast((r && r.note) || (want ? 'Sample values are on.' : 'Sample values are off.'), 'ok');
+        ctx.refresh();
+      }, function (err) {
+        box.checked = !want;
+        C.toast(C.errorText(err), 'err');
+      }).then(function () { box.disabled = false; });
+    });
+    return h('section', { class: 'card', 'aria-label': 'Privacy', style: { marginTop: '16px' } },
+      h('div', { class: 'card-h' }, C.icon('info'), h('span', { class: 'spacer' }, 'Privacy')),
+      h('div', { class: 'card-b stack-sm' },
+        h('label', { class: 'exe-choice', for: 'sample-values' }, box, h('span', null, 'Send sample values to Claude')),
+        h('p', { class: 'small muted', style: { margin: '0' } },
+          'On: the column profiles Claude reads include up to 3 real values per text column and its min/max. Off: Claude sees '
+          + 'only statistics and value patterns, and its suggestions may be less precise.')));
+  }
+
   DBM.views = DBM.views || {};
   DBM.views.setup = {
     title: 'Setup',
@@ -155,7 +181,8 @@
           h('p', { class: 'muted' }, 'Connection strings are encrypted on this computer and never shown to Claude, logs or reports.'))),
         h('div', { class: 'grid-2' }, SIDES.map(function (side) { return sideCard(ctx, side); })),
         both ? h('div', { style: { marginTop: '16px' } }, C.notice('info',
-          'Both databases are connected. Discovery runs automatically — the next phases appear on the left as they become ready.')) : null));
+          'Both databases are connected. Discovery runs automatically — the next phases appear on the left as they become ready.')) : null,
+        ctx.api ? privacyCard(ctx) : null));
     },
   };
 })(window.DBM = window.DBM || {});

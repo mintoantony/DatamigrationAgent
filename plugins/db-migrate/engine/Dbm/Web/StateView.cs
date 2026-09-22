@@ -15,14 +15,18 @@ public static class StateView
     {
         var s = state.Services;
         var project = s.Project.Get();
+        var projectNode = new JsonObject
+        {
+            ["name"] = project.Name,
+            ["paused"] = project.Paused,
+            ["agentOnline"] = state.Presence.Online,
+            ["sampleValues"] = s.Project.GetSettings().SampleValues,   // Ruling 196: the Setup screen's switch
+        };
+        // Ruling 197: when the CLI-touch window lapses nothing is published; the UI refreshes once at this instant instead.
+        if (state.Presence.SeenUntil is { } seenUntil) projectNode["agentSeenUntil"] = seenUntil.ToUniversalTime().ToString("O", System.Globalization.CultureInfo.InvariantCulture);
         var view = new JsonObject
         {
-            ["project"] = new JsonObject
-            {
-                ["name"] = project.Name,
-                ["paused"] = project.Paused,
-                ["agentOnline"] = state.Presence.Online,
-            },
+            ["project"] = projectNode,
             ["phases"] = Json.ToNode(s.Phases.All().Select(p => new
             {
                 name = p.Name,

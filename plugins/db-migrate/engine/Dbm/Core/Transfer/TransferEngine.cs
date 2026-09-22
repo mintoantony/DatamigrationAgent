@@ -1,6 +1,7 @@
 using Dbm.Core.Sql;
 using Dbm.Core.SqlGen;
 using Dbm.Core.State;
+using Microsoft.Data.SqlClient;
 
 namespace Dbm.Core.Transfer;
 
@@ -33,11 +34,107 @@ public sealed class TransferEngine
         return order;
     }
 
-    public long CreateRun(int sqlVersion, TransferOptions options)
+    private static readonly AsyncLocal<Action<RunLock>?> AfterLockTakenHook = new();
+
+    /// <summary>Test seam (open item 20): invoked with the run's lock right after it is taken, so a test can kill its session. Held in
+    /// an <see cref="AsyncLocal{T}"/> so one test's seam cannot reach another's run; null in production.</summary>
+    internal static Action<RunLock>? AfterLockTaken
+    {
+        get => AfterLockTakenHook.Value;
+        set => AfterLockTakenHook.Value = value;
+    }
+
+    /// <summary>Ruling 212: this workspace as the owner of checkpoint rows and of the target lock - its identity and its folder (a
+    /// path, never a connection detail).</summary>
+    internal static CheckpointOwner OwnerOf(DbmServices services) => new(services.Transfers.WorkspaceId(), services.Ws.Root);
+
+    /// <summary>
+    /// Ruling 212 (b). Refuses <c>run_in_progress</c> when the target's checkpoint table holds unfinished rows of another project: that
+    /// project's run is paused, failed or crashed part-way through this target and holds no lock while it waits, so the lock alone
+    /// cannot see it. Called with the target lock held (by the engine, and by the start probe). A missing table is no refusal.
+    /// </summary>
+    /// <param name="fresh">Ruling 215 (N-1): the run has never loaded a row (every task's <c>RowsBefore</c> is null). Such a run owns no
+    /// checkpoint yet, so a row this project already has for its run id was written by another copy of this workspace - a copied
+    /// project folder carries the state database, and with it the workspace identity - and is refused rather than adopted.</param>
+    /// <param name="endedRun">Ruling 217 (R3-2): whether this workspace's run with that id is cancelled or failed. Its unfinished rows,
+    /// written from this very folder, are this project's own leftovers - a cancel that could not reach the target leaves them - and are
+    /// deleted rather than taken for a copy's (Ruling 218, R4-1: deleted, never marked done).</param>
+    internal static async Task EnsureNoForeignCheckpointsAsync(SqlConnection tgt, CheckpointOwner owner, long runId, bool fresh,
+        string database, CancellationToken ct, Func<long, bool>? endedRun = null)
+    {
+        // N-1 and N-7 (Ruling 216): any row of this run, or any unfinished row of another run of this project, was written by a copy -
+        // unless this folder wrote it for a run of its own that has ended (R3-2), which nothing will resume or cancel again.
+        var retired = new HashSet<long>();
+        while (fresh && await ControlTable.CopiedWorkspaceRowAsync(tgt, owner, runId, ct) is { } copied)
+        {
+            if (copied.RunId != runId && ControlTable.IsOwnFolder(owner, copied.Folder) && endedRun?.Invoke(copied.RunId) == true
+                && retired.Add(copied.RunId))
+            {
+                // Ruling 218 (R4-1): deleted, not marked done - see DeleteRunAsync.
+                await ControlTable.DeleteRunAsync(tgt, owner, copied.RunId, ct);
+                continue;
+            }
+            throw new TransferException("run_in_progress",
+                $"The target database {database} already holds checkpoints of run {copied.RunId} of this project"
+                + (copied.Folder.Length > 0 ? $", written from the project folder {copied.Folder}" : "")
+                + (copied.RunId == runId ? ", although this run has not loaded anything yet" : ", which is part-way through this target")
+                + ". This project folder may be a copy of that one: both carry the same workspace, so their runs cannot be told apart in "
+                + "the target, and this run would take over or delete the other's checkpoints. Resume or cancel that run from its own "
+                + "folder, and work from one copy of the project only.");
+        }
+        if (await ControlTable.ForeignUnfinishedAsync(tgt, owner, ct) is not { } other) return;
+        // Ruling 216 (L-1): an earlier engine's rows under this very run id may be this run's own, just not matched to what it
+        // recorded - dropping the table would destroy them, so that advice is only given for rows that cannot be this run's.
+        bool maybeOurs = other.Legacy && !fresh && other.RunId == runId;
+        throw new TransferException("run_in_progress",
+            $"The target database {database} holds the unfinished checkpoints of {other.Description}"
+            + (maybeOurs
+                ? ". They may be this run's own checkpoints from before the upgrade, which could not be matched with what this run "
+                  + "recorded, so they are left as they are and the run is not continued over them: continuing from a checkpoint that "
+                  + "does not match could load rows twice or skip them. Cancel this run and start a new one; while those checkpoints "
+                  + "remain, the new run's refusal says what they are and what to do."
+                : ": that run is paused, failed or was interrupted part-way through loading this database. A run from here would load "
+                  + "beside it, and into the tables it has half-loaded, so it is refused before it copies a row. "
+                  + (other.Legacy
+                      ? $"Resume or cancel that run from its own project first; if no db-migrate project still uses this target, "
+                        + $"{ControlTable.Name} can be dropped."
+                      : "Resume or cancel that run from its own project first.")));
+    }
+
+    /// <summary>Rulings 215 (N-3) and 216 (L-1): what this run recorded per task, and the largest chunk it can commit - what an earlier
+    /// engine's row must match to be claimed as this run's. Ruling 217 (R3-1): only the tasks it had started - a pending task never
+    /// wrote a checkpoint, so it claims nothing, and a row under its (run, task) meets the "may be this run's own" refusal instead.</summary>
+    internal static LegacyClaim ClaimOf(long runId, TransferOptions options, IEnumerable<TransferTaskRow> tasks)
+        => new(runId, tasks.Where(Started).Select(t => (t.TaskId, t.RowsDone, t.RowsError)).ToList(), MaxChunk(options));
+
+    /// <summary>Ruling 217 (R3-1): the run had started this task - it left <c>pending</c>, or was stamped as started. A task that crashed
+    /// in its first chunk is started with 0 recorded, and keeps the one-chunk tolerance.</summary>
+    internal static bool Started(TransferTaskRow task) => task.Status != TransferTaskStatus.Pending || task.StartedAt is not null;
+
+    /// <summary>Ruling 217 (R3-2): whether this workspace's run <paramref name="runId"/> has ended as cancelled or failed. A run whose
+    /// record cannot be read is not taken as ended.</summary>
+    internal static bool EndedRun(DbmServices services, long runId)
+    {
+        try
+        {
+            return services.Transfers.GetRun(runId)?.Status is RunStatus.Cancelled or RunStatus.Failed;
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>The largest chunk a run with these options can commit in one transaction: its chunk size, and never less than the
+    /// 1,000-row chunks a task starts with.</summary>
+    internal static long MaxChunk(TransferOptions options) => Math.Max(options.Normalized().ChunkSize, 1_000);
+
+    /// <param name="target">Open item 22: recorded on the run - the server and database it loads into.</param>
+    public long CreateRun(int sqlVersion, TransferOptions options, (string Server, string Database)? target = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         return _services.Transfers.CreateRun(sqlVersion, options.Normalized(),
-            PlanOrder(_plan).Select(id => (id, _plan.Tasks[id].Target)).ToList());
+            PlanOrder(_plan).Select(id => (id, _plan.Tasks[id].Target)).ToList(), target);
     }
 
     /// <summary>Fresh or resume; hard cancellation of <paramref name="ct"/> throws and leaves the run "running" (crash semantics).</summary>
@@ -55,7 +152,40 @@ public sealed class TransferEngine
         // Ruling 103. A "running" run must stay resumable - that is what a crash leaves behind - so status alone cannot say whether a
         // runner is still alive. The lock can, and it is taken before anything is read or written, so a second runner is refused
         // before it copies a row rather than after it has doubled the table.
-        await using var runLock = await RunLock.AcquireAsync(_targetCs, runId, ct);
+        // Rulings 209/212: the lock is the target's, so a run of another project loading into this database is refused here as well,
+        // told which run and which project folder holds it.
+        var owner = OwnerOf(_services);
+        await using var runLock = await RunLock.AcquireAsync(_targetCs, runId, ct, owner);
+        AfterLockTaken?.Invoke(runLock);
+        // Ruling 212, review LOW-1: the database the lock session actually reached, against the one the run recorded. DB_NAME() only:
+        // @@SERVERNAME is not stable (LocalDB renames its instance pipe on every start; an availability-group failover changes it).
+        if (run.TargetDatabase is { } recorded && !string.Equals(runLock.Database, recorded, StringComparison.OrdinalIgnoreCase))
+            throw new TransferException("target_changed",
+                $"The target connection now reaches the database {runLock.Database}, but run {runId} loaded into {recorded}. Its "
+                + $"checkpoints and the {ControlTable.Name} table live in that database, so it is not continued here. Point the target "
+                + $"connection back at {recorded}, or cancel run {runId} and start a new one.");
+        // Every checkpoint read and write of this segment is this project's (it flows into the task workers).
+        ControlTable.CurrentOwner = owner;
+        await using (var tgt = await SqlConnect.OpenAsync(_targetCs, ct))
+        {
+            bool shapeOk = true;
+            try
+            {
+                await ControlTable.EnsureAsync(tgt, ct);   // creates, or upgrades an earlier engine's table in place
+            }
+            catch (TransferException ex) when (ex.Code == "control_table_mismatch")
+            {
+                shapeOk = false;                           // PrepareAsync meets it again and fails the run with it, as before
+            }
+            if (shapeOk)
+            {
+                // A resume segment claims the rows an earlier engine wrote for this very run (counters matching what it recorded); a
+                // fresh run never adopts a row.
+                bool fresh = tasks.All(t => t.RowsBefore is null);
+                if (!fresh) await ControlTable.ClaimLegacyAsync(tgt, owner, ClaimOf(runId, run.Options, tasks), ct);
+                await EnsureNoForeignCheckpointsAsync(tgt, owner, runId, fresh, runLock.Database, ct, id => EndedRun(_services, id));
+            }
+        }
 
         var rc = new RunContext
         {
@@ -64,11 +194,29 @@ public sealed class TransferEngine
             Progress = new TransferProgress(runId, _services.Sink, tasks),
             Secrets = Redactor.SecretsOf(_sourceCs).Concat(Redactor.SecretsOf(_targetCs)).ToList(),
         };
+        // Open item 20: after every chunk commit the lock session is asked whether it still holds the locks. A lost lock pauses the run
+        // after the current chunk (a runner elsewhere may already be loading) and says why; a resume takes the lock again.
+        int lockLost = 0;
+        void CheckLock(ChunkCommit _)
+        {
+            if (Volatile.Read(ref lockLost) != 0) return;
+            // Synchronous on purpose: ChunkCommitted is raised synchronously on the task worker right after its commit, and holding
+            // that worker for one short round trip is what makes the pause land before its next chunk. No deadlock: the worker runs on
+            // the thread pool with no synchronisation context, and LostAsync touches only the lock's own connection.
+            string? lost = runLock.LostAsync(CancellationToken.None).GetAwaiter().GetResult();
+            if (lost is null || Interlocked.Exchange(ref lockLost, 1) != 0) return;
+            string note = rc.Scrub(lost + " Without it another transfer could load into this target beside this one, so the run was "
+                                   + "paused after the current chunk. Resume takes the lock again and continues from the checkpoints.");
+            rc.AddNote(note);
+            rc.Log("error", note);
+            control.RequestPause();
+        }
         repo.SetRunStatus(runId, RunStatus.Running);
         _services.Sink.Publish("transfer_run_changed", new { runId, status = EnumText.ToText(RunStatus.Running) });
         rc.Log("info", $"Transfer run {runId}: {tasks.Count} tasks, parallelism {rc.Options.Parallelism}, errors: {rc.Options.ErrorMode}.");
         try
         {
+            control.ChunkCommitted += CheckLock;   // inside the try whose finally removes it
             await PrepareAsync(rc, tasks, ct);
             tasks = repo.Tasks(runId);
             foreach (var t in tasks) rc.Progress.SetSource(t.TaskId, t.RowsSource);
@@ -81,7 +229,7 @@ public sealed class TransferEngine
                 // Ruling 184: the plan's PreSql is not left in force behind a cancel. Best effort, one note per statement.
                 foreach (var note in await GlobalSql.RestoreAsync(_targetCs, _plan.PostSql, rc.Scrub, ct)) rc.AddNote(note);
                 _preSqlApplied = false;
-                await DropControlTableAsync(rc, ct);
+                await DropControlTableAsync(rc, ct, cancelled: true);
                 return Finish(rc, RunStatus.Cancelled, null);
             }
             if (!allDone) return Finish(rc, RunStatus.Paused, null);
@@ -101,6 +249,10 @@ public sealed class TransferEngine
         catch (Exception ex)
         {
             return Finish(rc, RunStatus.Failed, rc.Describe(ex));
+        }
+        finally
+        {
+            control.ChunkCommitted -= CheckLock;
         }
     }
 
@@ -180,13 +332,39 @@ public sealed class TransferEngine
     /// refuses to drop a foreign table (ruling H1) by throwing; uncaught here that would report a migration which loaded every row as a
     /// failed run, and swallowed it would leave the table standing with nothing saying why. The note goes into the run's summary.
     /// </summary>
-    private async Task DropControlTableAsync(RunContext rc, CancellationToken ct)
+    private async Task DropControlTableAsync(RunContext rc, CancellationToken ct, bool cancelled = false)
     {
-        if (rc.Options.KeepControlTable) return;
+        var owner = OwnerOf(_services);
+        if (rc.Options.KeepControlTable && !cancelled) return;   // a completed run's rows are all done: no claim on the target
         try
         {
             await using var tgt = await SqlConnect.OpenAsync(_targetCs, ct);
-            await ControlTable.DropAsync(tgt, ct);
+            if (cancelled)
+            {
+                // Ruling 215 (N-3): an earlier engine's rows of this run are this run's to end as well.
+                try
+                {
+                    await ControlTable.ClaimLegacyAsync(tgt, owner, ClaimOf(rc.RunId, rc.Options, rc.Repo.Tasks(rc.RunId)), ct);
+                }
+                catch (TransferException ex) when (ex.Code == "run_in_progress")
+                {
+                    rc.AddNote(ex.Message + " The earlier version's checkpoints were left as they are.");
+                }
+                if (rc.Options.KeepControlTable)
+                {
+                    // N-2: the option keeps the table for auditing, never a claim on the target - the rows are marked done.
+                    await ControlTable.RetireRunAsync(tgt, owner, rc.RunId, ct);
+                    return;
+                }
+            }
+            // Ruling 212 (c): this project's rows go; the table goes only if nothing of another project is left in it.
+            if (!await ControlTable.ReleaseAsync(tgt, owner, rc.RunId, ct))
+            {
+                string note = $"{ControlTable.Name} was left in the target: this run's checkpoints were removed, but it still holds "
+                              + $"{await ControlTable.KeptByAsync(tgt, owner, rc.RunId, ct)}.";
+                rc.AddNote(note);
+                rc.Log("info", note);
+            }
         }
         catch (TransferException ex) when (ex.Code == "control_table_mismatch")
         {

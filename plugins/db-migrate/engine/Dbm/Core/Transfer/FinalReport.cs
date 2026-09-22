@@ -6,7 +6,12 @@ namespace Dbm.Core.Transfer;
 /// <summary>One rejected row, as shown to an operator. A null <see cref="Key"/> means the task had no key at all; a keyed task whose key
 /// could not be encoded carries the reason inside <see cref="Error"/> instead (5.3 <c>TaskRunner.Capture</c>), so null keeps the two
 /// meanings it already had and gains no third.</summary>
-public sealed record ErrorSample(string? Key, string Error);
+public sealed record ErrorSample(string? Key, string Error)
+{
+    /// <summary>The row's SQL Server error number (Ruling 208); null - and so absent from the JSON - when the row was recorded without
+    /// one: its failure carried none, or it was recorded before the state database stored numbers.</summary>
+    public int? ErrorNumber { get; init; }
+}
 
 /// <summary>
 /// One task in the final report. The nullable fields are absences, and each one has a sibling that says why it is absent, because
@@ -48,6 +53,10 @@ public sealed record TaskReport(string TaskId, string Target, TransferTaskStatus
     /// <summary>Rows the target table held before this run loaded anything (after Truncate target first, when chosen); null when the
     /// run never counted. Ruling 186: above 0, the row counts compare rows <b>added</b>, not the table.</summary>
     public long? RowsBefore { get; init; }
+
+    /// <summary>Open item 44: set only on a task that loaded no row of a source that had rows (Ruling 192) - the sentence the report's
+    /// notes carry for it, so a screen names the task in the report's own words.</summary>
+    public string? LoadedNothingNote { get; init; }
 }
 
 /// <summary>
@@ -133,6 +142,14 @@ public static class FinalReportBuilder
         string counts = anyMismatch ? "row counts MISMATCH" : anyUnconfirmed ? "row counts NOT CONFIRMED" : "row counts validated";
         if (NonEmptyBefore(report))
             counts = anyMismatch || anyUnconfirmed ? counts + " (" + NotEmptyBefore + ")" : NotEmptyBefore;
+        // Ruling 192: counts that balance over a table that received nothing - every row rejected - are not a validation of anything,
+        // and "validated" over it is the green light open item 30 was about. Such tasks are named in place of the word.
+        var nothing = LoadedNothing(report.Tasks);
+        if (nothing.Count > 0)
+        {
+            string named = string.Join(", ", nothing.Select(t => $"{t.Target} loaded 0 of {N(t.RowsSource!.Value)} rows"));
+            counts = counts == "row counts validated" ? named : counts + "; " + named;
+        }
         return $"Transferred {N(report.RowsLoaded)} {of} {N(report.RowsSource)} rows into {tables} {(tables == 1 ? "table" : "tables")} "
                + $"in {duration}{rejected}; {counts}{checks}.";
     }
@@ -141,6 +158,13 @@ public static class FinalReportBuilder
     public const string NotEmptyBefore = "target tables were not empty before this run; counts compare rows added";
 
     public static bool NonEmptyBefore(FinalReport report) => report.Tasks.Any(t => t.RowsBefore > 0);
+
+    /// <summary>Ruling 192: the tasks that loaded no row of a source that had rows. A report never calls such a run "validated".</summary>
+    public static IReadOnlyList<TaskReport> LoadedNothing(IEnumerable<TaskReport> tasks)
+    {
+        ArgumentNullException.ThrowIfNull(tasks);
+        return tasks.Where(t => t.RowsLoaded == 0 && t.RowsSource > 0).ToList();
+    }
 
     public static string Dur(double seconds)
     {
@@ -153,7 +177,7 @@ public static class FinalReportBuilder
     {
         var v = t.ValidationJson is null ? null : Json.Deserialize<TaskValidation>(t.ValidationJson);
         double? duration = t.StartedAt is { } s && t.EndedAt is { } e ? Math.Round(Math.Max(0, (e - s).TotalSeconds), 1) : null;
-        var samples = errorRows(t.TaskId).Take(MaxErrorSamples).Select(r => new ErrorSample(r.KeyJson, r.Error)).ToList();
+        var samples = errorRows(t.TaskId).Take(MaxErrorSamples).Select(r => new ErrorSample(r.KeyJson, r.Error) { ErrorNumber = r.ErrorNumber }).ToList();
         long? rowsSource = t.RowsSource ?? v?.RowsSource;
         return new TaskReport(t.TaskId, t.Target, t.Status, rowsSource, t.RowsDone, t.RowsError, duration,
             v?.CountMatch, v?.Checksums ?? [], v is null ? RunValidator.NoValidation : v.ChecksumsSkipped, samples, t.Error)
@@ -167,7 +191,27 @@ public static class FinalReportBuilder
             ErrorSamplesNote = ErrorSamplesNote(t.RowsError, samples.Count, errorRowCount?.Invoke(t.TaskId)),
             StatusNote = StatusNote(t.Status, status),
             RowsBefore = t.RowsBefore,
+            LoadedNothingNote = t.RowsDone == 0 && rowsSource > 0 ? LoadedNothingNote(t.Target, rowsSource.Value, t.RowsError, t.RowsBefore) : null,
         };
+    }
+
+    /// <summary>
+    /// Ruling 192's note on a task that loaded no row of a source that had rows, worded by what else is known: rows rejected or none
+    /// (review F7), and whether the table already held rows before the run (Ruling 186) - the confirmed re-run Ruling 201 exempts when
+    /// its rejects are duplicate keys, which is then what the zero means.
+    /// </summary>
+    internal static string LoadedNothingNote(string target, long rowsSource, long rowsError, long? rowsBefore)
+    {
+        if (rowsError <= 0)
+            // Review F7: nothing loaded and nothing rejected - the source had rows when it was counted and none when it was read.
+            return $"{target} loaded 0 of {N(rowsSource)} source rows and rejected none: the source query returned no rows although the "
+                   + "source count said it had some - the source changed during the run, or the count and the query disagree.";
+        string head = $"{target} loaded 0 of {N(rowsSource)} source rows ({N(rowsError)} rejected).";
+        return rowsBefore > 0
+            ? head + $" The table already held {N(rowsBefore.Value)} rows before this run: if the rejected rows are duplicate keys, those "
+              + "rows were already there; any other error points at the mapping or SQL."
+            : head + " A table that received nothing is not validated by counts that balance: when every row is rejected, the mapping "
+              + "or SQL is the likelier cause than the data - read the rejected rows' errors.";
     }
 
     /// <summary>
@@ -244,9 +288,13 @@ public static class FinalReportBuilder
         if (before.Count > 0)
             notes.Add("Target tables were not empty before this run: " + string.Join(", ", before) + ". Their row counts compare the rows "
                       + "this run added against the source, not the table's contents; a table with no key can hold its rows twice.");
+        var nothing = LoadedNothing(tasks);
+        foreach (var t in nothing)
+            notes.Add(t.LoadedNothingNote ?? LoadedNothingNote(t.Target, t.RowsSource!.Value, t.RowsError, t.RowsBefore));
         if (mismatch.Count == 0 && notCompared.Count == 0 && notValidated.Count == 0 && tasks.Count > 0)
             notes.Add(before.Count > 0 ? $"Row counts balance for all {tasks.Count} tasks as rows added."
-                                       : $"Row counts validated for all {tasks.Count} tasks.");
+                      : nothing.Count > 0 ? $"Row counts balance for all {tasks.Count} tasks, but {nothing.Count} of them loaded nothing."
+                      : $"Row counts validated for all {tasks.Count} tasks.");
 
         var badSums = tasks.SelectMany(t => t.Checksums.Where(c => !c.Match).Select(c => $"{t.Target}.{c.Column}")).ToList();
         if (badSums.Count > 0) notes.Add("Column checksums differ for: " + string.Join(", ", badSums) + ".");

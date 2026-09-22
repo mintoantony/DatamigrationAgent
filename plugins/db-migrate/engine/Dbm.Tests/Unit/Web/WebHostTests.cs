@@ -238,7 +238,7 @@ public class WebHostTests
         modules.Analysis.BlockersFn = _ => ["2 critical findings have no decision"];
         await using var server = await StartInReviewAsync(tw, modules);
 
-        var (status, body) = await server.SendAsync(HttpMethod.Post, "/api/phase/analysis/approve");
+        var (status, body) = await server.SendAsync(HttpMethod.Post, "/api/phase/analysis/approve", new { version = 0 });
 
         Assert.Equal(HttpStatusCode.Conflict, status);
         Assert.Equal("blocked", body!["error"]!.GetValue<string>());
@@ -256,7 +256,7 @@ public class WebHostTests
         ApprovalGuards.All.Add(guard);
         try
         {
-            var (status, body) = await server.SendAsync(HttpMethod.Post, "/api/phase/analysis/approve");
+            var (status, body) = await server.SendAsync(HttpMethod.Post, "/api/phase/analysis/approve", new { version = 0 });
 
             Assert.Equal(HttpStatusCode.Conflict, status);
             Assert.Equal(("guard", "Source schema changed since discovery."), (body!["error"]!.GetValue<string>(), body["message"]!.GetValue<string>()));
@@ -266,7 +266,7 @@ public class WebHostTests
             ApprovalGuards.All.Remove(guard);
         }
 
-        Assert.Equal(HttpStatusCode.OK, (await server.SendAsync(HttpMethod.Post, "/api/phase/analysis/approve")).Status);
+        Assert.Equal(HttpStatusCode.OK, (await server.SendAsync(HttpMethod.Post, "/api/phase/analysis/approve", new { version = 0 })).Status);
         Assert.Equal(PhaseStatus.Approved, server.Services.Phases.Get(PhaseName.Analysis).Status);
     }
 

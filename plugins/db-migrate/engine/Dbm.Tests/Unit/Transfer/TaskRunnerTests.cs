@@ -156,4 +156,96 @@ public sealed class TaskRunnerTests
         Assert.Equal(", merge affected 1,234", TaskRunner.MergeNote(MergeStatus.Ran, 1234L));
         Assert.Equal(", the merge ran and reported no row count", TaskRunner.MergeNote(MergeStatus.Ran, null));
     }
+
+    private static TaskRunner.RejectTally Tally(params (int? Number, string Text)[] rejects)
+    {
+        var tally = new TaskRunner.RejectTally();
+        tally.Add(rejects.Select((r, i) => new RowFailure(i, r.Text) { ErrorNumber = r.Number }));
+        return tally;
+    }
+
+    private const string Dup = "Violation of PRIMARY KEY constraint 'PK_P'. Cannot insert duplicate key in object 'app.P'. The duplicate key value is (1).";
+    private const string Fk = "The INSERT statement conflicted with the FOREIGN KEY constraint \"FK_C_P\".";
+
+    /// <summary>The task's recorded rejects as <see cref="Dbm.Core.State.TransferRepo.ErrorNumberCounts"/> returns them.</summary>
+    private static Func<IReadOnlyList<Dbm.Core.State.ErrorNumberCount>> Recorded(params (int? Number, long Rows, string Text)[] groups)
+        => () => groups.Select(g => new Dbm.Core.State.ErrorNumberCount(g.Number, g.Rows, g.Text)).ToList();
+
+    /// <summary>
+    /// Ruling 201: the re-run exemption must be <b>shown</b>. With a tally that covers only part of the rejects, the recorded rows decide
+    /// (Ruling 208: by their error numbers), and only when there are as many of them as rejects and every one is 2627 or 2601.
+    /// <b>Harm:</b> an exemption taken on fewer recorded rows than rejects (ruling 105's crash window) would let an unrecorded FK reject
+    /// pass as a duplicate.
+    /// </summary>
+    [Fact]
+    public void The_rerun_exemption_needs_every_reject_shown_as_a_duplicate_key()
+    {
+        var partial = Tally((2627, Dup));   // this segment saw 1 of the 3 rejects
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 3, 10, partial, Recorded((2627, 3, Dup)), keyed: true) is null,
+            "a re-run whose 3 rejects are all recorded duplicate keys was judged: the recorded rows were not read, or not believed");
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 3, 10, partial, Recorded((2627, 1, Dup), (2601, 2, "x")), keyed: true) is null,
+            "a re-run whose recorded rejects are all 2627 and 2601 was judged");
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 3, 10, partial, Recorded((2627, 2, Dup)), keyed: true) is not null,
+            "the re-run exemption was taken on 2 recorded rows for 3 rejects: the unrecorded one was assumed to be a duplicate");
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 3, 10, partial, Recorded((2627, 2, Dup), (547, 1, Fk)), keyed: true) is not null,
+            "a recorded FK reject was read as a duplicate key");
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 3, 0, Tally((2627, Dup), (2627, Dup), (2627, Dup)), null, keyed: true) is not null,
+            "duplicate keys into a table that was empty before the run were exempted: the exemption is for the confirmed re-run only");
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 2, 10, Tally((2627, Dup), (547, Fk)), null, keyed: true) is not null,
+            "a tally holding a 547 beside duplicates was exempted");
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 2, 10, Tally((2627, Dup), (2601, "x")), null, keyed: true) is null,
+            "a re-run whose tally holds only 2627 and 2601 was judged: the confirmed re-run is stopped over its duplicate keys");
+        // Re-review N1: a reject with no server number (a client-side failure) is not shown to be a duplicate, alone or beside one.
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 1, 10, Tally((null, "client-side truncation")), null, keyed: true) is not null,
+            "a re-run whose only reject carried no error number was exempted as if it were a duplicate key");
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 2, 10, Tally((2627, Dup), (null, "x")), null, keyed: true) is not null,
+            "a re-run with a reject that carried no error number beside a duplicate was exempted: the unnumbered reject was assumed a duplicate");
+    }
+
+    /// <summary>
+    /// Ruling 208: rows recorded before migration step 2 have no error number, and a missing number never exempts - however exactly
+    /// the text reads like SQL Server's English duplicate-key message. <b>Harm</b> (decision A-6's text match, now gone): a recorded
+    /// text is not evidence of the error it names - a server in another language, or any row whose failure only looked like one.
+    /// </summary>
+    [Fact]
+    public void Recorded_rejects_without_an_error_number_never_exempt_a_rerun()
+    {
+        var partial = Tally((2627, Dup));
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 3, 10, partial, Recorded((null, 3, Dup)), keyed: true) is not null,
+            "a re-run whose recorded rejects carry no error number was exempted on their English duplicate-key text");
+        Assert.True(TaskRunner.LoadedNothingReason("app.P", 2, 0, 3, 10, partial, Recorded((2627, 2, Dup), (null, 1, Dup)), keyed: true) is not null,
+            "a re-run with one recorded reject that carries no error number beside duplicates was exempted");
+    }
+
+    /// <summary>
+    /// Re-review N2, now by number (Ruling 208): the recorded rows are grouped by error number, so duplicates of different values are
+    /// one error, and the sentence names the number as the tally's does. <b>Harm:</b> 100 duplicate rejects read "on 1 of 100 recorded
+    /// rows", which says the opposite of what happened; or the number is known and not said.
+    /// </summary>
+    [Fact]
+    public void The_recorded_rows_name_the_most_common_error_by_its_number()
+    {
+        string Row(int k) => $"Violation of PRIMARY KEY constraint 'PK_P'. Cannot insert duplicate key in object 'app.P'. The duplicate key value is ({k}).";
+        string? why = TaskRunner.LoadedNothingReason("app.P", 2, 0, 3, 0, Tally((2627, Row(3))), Recorded((2627, 3, Row(1))), keyed: true);
+        Assert.True(why is not null && why.Contains("The most common recorded error, on 3 of 3 recorded rows, was error 2627: " + Row(1), StringComparison.Ordinal),
+            "the recorded rows' most common error is not named by its number: " + why);
+
+        // A number says more than its absence: on a tie the numbered group is named, and the unnumbered one is worded as such.
+        why = TaskRunner.LoadedNothingReason("app.P", 2, 0, 4, 0, Tally((547, Fk)), Recorded((null, 2, "old"), (547, 2, Fk)), keyed: true);
+        Assert.True(why is not null && why.Contains("on 2 of 4 recorded rows, was error 547: " + Fk, StringComparison.Ordinal),
+            "a tie between recorded rows with and without a number did not name the number: " + why);
+        why = TaskRunner.LoadedNothingReason("app.P", 2, 0, 3, 0, Tally((547, Fk)), Recorded((null, 2, "old"), (547, 1, Fk)), keyed: true);
+        Assert.True(why is not null && why.Contains("on 2 of 3 recorded rows, was an error recorded with no server error number: old", StringComparison.Ordinal),
+            "rows recorded without a number were not said to have none: " + why);
+    }
+
+    /// <summary>Review F8: the doc says ties go to the lowest number, and a number says more than its absence. <b>Harm:</b> an equal
+    /// count of client-side failures hid the server's error number from the reason.</summary>
+    [Fact]
+    public void A_tie_between_a_number_and_no_number_names_the_number()
+    {
+        var best = Tally((null, "client-side"), (547, Fk)).MostCommon();
+        Assert.True(best?.Number == 547, $"a tie named {(best?.Number is int n ? n.ToString(System.Globalization.CultureInfo.InvariantCulture) : "no number")}, not error 547");
+        Assert.Null(Tally((null, "a"), (null, "b"), (547, Fk)).MostCommon()?.Number);   // strictly more rows still wins
+    }
 }

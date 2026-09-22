@@ -17,7 +17,9 @@ The launcher (`bin/dbm`, `bin/dbm.cmd`) writes plain text to stderr, not JSON:
 
 With the .NET SDK installed the launcher rebuilds `engine/dist` when it is missing, when its `VERSION` differs from
 `plugin.json`, or when asked (`DBM_REBUILD=1`, `dbm doctor --rebuild`). It prints "building the engine (…, about a
-minute)", and "waiting for another engine build to finish" while a second `dbm` builds. When the rebuild fails:
+minute)", and "waiting for another engine build to finish" while a second `dbm` builds. "removing engine/dist.tmp.<id>
+(or dist.old.<id>), left behind by a build that crashed" means it cleared the leftovers of a build that crashed;
+nothing to act on. When the rebuild fails:
 
 - **"dbm: warning: <reason>; running the previous engine/dist <version> instead."** — the command ran on the old build
   and its own output follows; nothing is lost and the rebuild is retried on the next command. The reason is one of
@@ -100,9 +102,15 @@ again and again.
   validation failed), `invalid_patch`, or `not_found` (no patch file): dispatch the same subagent once more with the
   packet plus `The previous patch was rejected: <message>`, then `dbm apply` again.
 - Rejected twice: stop retrying. One line to the user: "The <phase> patch was rejected twice: <short message>. Type
-  /db-migrate resume to let Claude try again." Then end your turn, with no `dbm await` (`dbm next` would hand back the
-  same agent work at once). Do not suggest editing or Request changes in the UI: while the phase is drafting or
-  reworking the UI refuses both.
+  /db-migrate resume to let Claude try again, or press Take over on the <phase> screen <way on>." - where <way on> is
+  "to edit it yourself" for Mapping or SQL, and "to send your guidance with Request changes" for Analysis (Analysis has
+  no hand editor, and a drafting Analysis cannot be approved until Claude has written its narrative). Then end your
+  turn, with no `dbm await` (`dbm next` would hand back the same agent work at once). While the phase is drafting or
+  reworking the UI refuses direct edits and Request changes; **Take over** is the way out: it discards the pending agent
+  work and puts the phase back to awaiting review on its current version (open comments stay open), after which
+  `dbm next` answers `await`/`review`. The UI refuses it while Claude counts as connected (an open `dbm await`), and
+  within 2 minutes of Claude's last `dbm next`/`dbm await`; a patch that arrives after a take-over is refused ("agent
+  patches are accepted only while drafting or reworking"): run `dbm next` and continue.
 
 **Approval blocked (409 `blocked` in the UI)** — mapping approval needs every source column mapped or dropped and every
 non-nullable target column without a default filled in. The UI lists the blockers; the user resolves them there.
@@ -182,9 +190,12 @@ and the user types `/db-migrate resume`.
   The message lists every step already taken on the server, then the step that failed and the server's text:
   "Failed <step>: <server text>. No database was created or dropped." when nothing had changed yet, otherwise
   "<Step>, <step>, …, then failed <step>: <server text>. Re-run with --force to start over." (for example "Dropped …,
-  created …, then failed creating …"). With `--attach`, a failure after both databases were seeded says "Created and
-  seeded <source> and <target>, then failed saving them as this project's connections: … Re-run with --force --attach
-  to start over." Relay the message, then the remedy it names.
+  created …, then failed creating …"). When a `--force` drop fails, the database is put back in multi-user mode and
+  the message says so before its last sentence; if even that fails it says the database "was left in single-user mode"
+  and gives the `ALTER DATABASE [<name>] SET MULTI_USER` that undoes it — relay that statement. With `--attach`, a
+  failure after both databases were seeded says "Created and seeded <source> and <target>, then failed saving them as
+  this project's connections: … Re-run with --force --attach to start over." Relay the message, then the remedy it
+  names.
 - **`not_found`** (`dbm export`) — the server has no export of that kind; the kinds are `analysis`, `sql`, `sqlpack`,
   `report`.
 - **`export_unavailable`** (`dbm export`) — that phase has nothing to export yet (e.g. `report` before a completed run).

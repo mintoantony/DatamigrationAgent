@@ -109,6 +109,86 @@ test('a sample\'s key does not run into its message, nor a target into its count
   assert.equal(D.text(D.query(root, '.card-b .row')), 'app.Orders 3 rejected rows; 1 sample below');
 });
 
+test('a sample shows its SQL Server error number beside the message, and one recorded without a number shows none (Ruling 208)', () => {
+  const tasks = report().tasks.map((t) => t.taskId !== 'T02' ? t : Object.assign({}, t, {
+    rowsError: 2,
+    errorSamples: [
+      { key: '{"Id":88213}', error: "Cannot insert the value NULL into column 'CustomerId'.", errorNumber: 515 },
+      { key: '{"Id":88214}', error: 'client-side truncation' },
+    ],
+  }));
+  const shown = D.texts(mount(report({ tasks: tasks })), '.rep-samples li').slice(0, 2);
+  assert.deepEqual(shown, [
+    "Id=88213 error 515: Cannot insert the value NULL into column 'CustomerId'.",
+    'Id=88214 client-side truncation',
+  ], 'the sample line does not carry the error number the engine stored: ' + JSON.stringify(shown));
+});
+
+/** Every count balances - app.Orders balances too, 3,005 source = 0 loaded + 3,005 rejected - but app.Orders received nothing. */
+function loadedNothing() {
+  const note = 'app.Orders loaded 0 of 3,005 source rows (3,005 rejected). A table that received nothing is not validated by counts '
+    + 'that balance: when every row is rejected, the mapping or SQL is the likelier cause than the data - read the rejected rows\' errors.';
+  return report({
+    rowsSource: 123005, rowsLoaded: 120000, rowsError: 3005, tasksWithoutSource: 0,
+    tasks: [
+      Object.assign({}, report().tasks[0]),
+      { taskId: 'T02', target: 'app.Orders', status: 'done', rowsSource: 3005, rowsLoaded: 0, rowsError: 3005, durationSec: 40,
+        countMatch: true, countCompared: true, checksums: [], checksumsSkipped: 'rows were rejected', errorSamples: [],
+        loadedNothingNote: note },
+    ],
+  });
+}
+
+function rowCountsKpi(root) {
+  return D.queryAll(root, '.kpi').find((k) => D.text(D.query(k, '.kpi-l')) === 'Row counts');
+}
+
+test('a task that loaded nothing turns the Row counts figure from green to a warning, and a notice names it (open item 44)', () => {
+  const root = mount(loadedNothing());
+  const kpi = rowCountsKpi(root);
+  const sub = D.text(D.query(kpi, '.kpi-s'));
+  assert.ok(sub.indexOf('every task matches') < 0,
+    'the Row counts figure says "every task matches" over a task that loaded 0 of 3,005 rows: ' + sub);
+  assert.equal(sub, '1 of 2 tasks loaded nothing');
+  const cls = kpi.getAttribute('class') || kpi.className;
+  assert.ok(String(cls).indexOf('rep-kpi-ok') < 0, 'the Row counts figure is green over a task that loaded nothing: ' + cls);
+  assert.ok(String(cls).indexOf('rep-kpi-warn') >= 0, 'the Row counts figure is not a warning: ' + cls);
+
+  const notices = D.queryAll(root, '.notice').map(D.text);
+  const named = notices.find((n) => n.indexOf('app.Orders loaded 0 of 3,005 source rows (3,005 rejected).') >= 0);
+  assert.ok(named, 'no warning notice names the task that loaded nothing: ' + JSON.stringify(notices));
+  assert.ok(named.indexOf('1 task loaded no row of a source that had rows') >= 0, 'the notice does not say what it is about: ' + named);
+});
+
+test('a re-run into a table that already held rows and loaded nothing is named in FinalReport\'s re-run words, still as a warning (review E L2)', () => {
+  const rerun = 'app.Products loaded 0 of 200 source rows (200 rejected). The table already held 200 rows before this run: if the '
+    + 'rejected rows are duplicate keys, those rows were already there; any other error points at the mapping or SQL.';
+  const r = loadedNothing();
+  r.tasks[1] = Object.assign({}, r.tasks[1], { target: 'app.Products', rowsSource: 200, rowsError: 200, rowsBefore: 200,
+    loadedNothingNote: rerun });
+  const root = mount(r);
+  const notices = D.queryAll(root, '.notice').map(D.text);
+  assert.ok(notices.some((n) => n.indexOf(rerun) >= 0),
+    'the re-run task that loaded nothing is not named with FinalReport\'s re-run note: ' + JSON.stringify(notices));
+  const cls = String(rowCountsKpi(root).getAttribute('class') || rowCountsKpi(root).className);
+  assert.ok(cls.indexOf('rep-kpi-warn') >= 0, 'the Row counts figure over a re-run that loaded nothing is not a warning: ' + cls);
+});
+
+test('a stored report without the per-task note still names the task, in the figures it has', () => {
+  const r = loadedNothing();
+  delete r.tasks[1].loadedNothingNote;
+  const notices = D.queryAll(mount(r), '.notice').map(D.text);
+  assert.ok(notices.some((n) => n.indexOf('app.Orders loaded 0 of 3,005 source rows (3,005 rejected).') >= 0),
+    'an older report\'s task that loaded nothing is not named: ' + JSON.stringify(notices));
+});
+
+test('a report whose every task loaded rows keeps the green figure and has no such notice', () => {
+  const r = report({ tasks: [report().tasks[0]], tasksWithoutSource: 0 });
+  const root = mount(r);
+  assert.equal(D.text(D.query(rowCountsKpi(root), '.kpi-s')), 'every task matches');
+  assert.ok(D.queryAll(root, '.notice').every((n) => D.text(n).indexOf('loaded no row') < 0));
+});
+
 test('the notes are rendered verbatim and in order', () => {
   const r = report();
   assert.deepEqual(D.texts(mount(r), '.rep-notes li'), r.notes);

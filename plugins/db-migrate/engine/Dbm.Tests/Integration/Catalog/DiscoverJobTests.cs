@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using Dbm.Core;
 using Dbm.Core.Catalog;
 using Dbm.Core.Jobs;
 using Dbm.Core.State;
@@ -59,6 +60,32 @@ public sealed class DiscoverJobTests(SamplePairFixture fixture) : IClassFixture<
         r = await CliRunner.RunAsync(project.Ws, null, "show", "dbo.NOPE");
         Assert.Equal(1, r.Exit);
         Assert.Equal("not_found", (string?)r.Json["error"]);
+    }
+
+    /// <summary>Ruling 199 (fix round 1, F4): the job read "on" when it started; the user switched sample values off while it ran.
+    /// Each side is saved as it finishes, so each save re-reads the setting and stores no sample value when it is off.</summary>
+    [Fact]
+    public async Task A_discovery_that_runs_while_sample_values_are_switched_off_stores_none()
+    {
+        using var project = await SampleProject.CreateAsync(fixture.Pair);
+        var services = project.Services;
+        var job = services.Jobs.Get(services.Jobs.Enqueue("discover", PhaseName.Discovery))!;
+        var switched = false;
+        void Log(string line)
+        {
+            if (switched || !line.StartsWith("src: profiled", StringComparison.Ordinal)) return;
+            switched = true;
+            SampleValuesSetting.Set(services, on: false);   // mid-job, after profiling began with the setting on
+        }
+
+        await new DiscoverJob().RunAsync(new JobContext { Services = services, Job = job, Log = Log }, CancellationToken.None);
+
+        Assert.True(switched, "the job never logged a profiled table, so the switch was never flipped mid-job");
+        var leaks = new[] { Side.Src, Side.Tgt }.SelectMany(side => services.Catalog.Get(side)!.Tables.SelectMany(t => t.Columns
+                .Where(c => c.Profile is { } p && (p.Samples.Count > 0 || (TypeTraits.IsString(c.DataType) && (p.Min ?? p.Max) is not null)))
+                .Select(c => $"{EnumText.ToText(side)} {t.Key}.{c.Name}: [{string.Join(", ", c.Profile!.Samples)}] {c.Profile.Min}..{c.Profile.Max}")))
+            .ToList();
+        Assert.True(leaks.Count == 0, "sample values were switched off during discovery, yet it stored: " + string.Join("; ", leaks.Take(5)));
     }
 
     [Fact]

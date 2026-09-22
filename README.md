@@ -206,11 +206,12 @@ unless noted: exit code 0 on success, and 1 with `{"error":"<code>","message":"â
 | `dbm status` | Project, phase, status, next action, UI URL |
 | `dbm next` / `dbm await [--timeout s]` | The orchestrator's next action; block until it changes (`0` = no timeout, the default) |
 | `dbm pause` / `dbm resume` | Pause or resume agent work |
+| `dbm config sample-values [off]` | Show whether the column profiles Claude reads include sample values, or switch them off; switching them back on is done only on the Setup screen (see Security) |
 | `dbm discover [--inline]` | Extract and profile both catalogs, rebuild the vector index |
 | `dbm search <query> [--side src\|tgt] [--kind table\|column] [-k n] [--json]` | Vector search over both catalogs (text output unless `--json`) |
 | `dbm show <schema.table[.column]\|F001> [--side src\|tgt] [--json]` | Compact view of a table, column or finding |
 | `dbm map auto [--inline]` | Re-run the auto-mapper |
-| `dbm sql gen [--inline]` / `dbm sql validate [--task <id>] [--patch <file>]` | Regenerate the plan; validate it live against both databases |
+| `dbm sql gen [--inline]` / `dbm sql validate [--task <id>] [--patch <file>]` | Regenerate the plan; validate it against both databases (bare carriage returns are reported offline too). Without `--patch`, a whole-plan pass over a version with no recorded validation stores it as a new version while SQL awaits review, like the screen's Validate live |
 | `dbm apply <patch.json> [--dry-run]` | Validate and apply a subagent patch as a new version |
 | `dbm artifact <phase> [--version n] [--path /pointer]` / `dbm feedback <phase> [--status s]` | Read a phase artifact or its feedback items |
 | `dbm transfer start --yes-target <db> [--chunk n] [--parallel n] [--skip-errors] [--truncate]` | Start the transfer (normally done from the UI) |
@@ -231,8 +232,15 @@ unless noted: exit code 0 on success, and 1 with `{"error":"<code>","message":"â
   which prints them with any password replaced by `***`) or anything sent to Claude. The one way a secret could reach
   the chat is you typing it there â€” so never do, not even for the demo.
 - **What Claude sees:** schema metadata (names, types, keys, row counts, sizes), column profiles (null share, distinct
-  ratio, lengths, value patterns and a few sample values while the project's `SampleValues` setting is on, which is the
-  default; v1 has no switch for it in the UI), rule findings, the mapping, the SQL plan and your feedback.
+  ratio, lengths, value patterns and a few sample values while the project's sample-values setting is on, which is the
+  default), rule findings, the mapping, the SQL plan and your feedback. Switch sample values off under **Privacy** on the
+  Setup screen or with `dbm config sample-values off`: the sample values and text min/max already collected are removed
+  from the project and its work packets, so no work packet and no `dbm show` carries any, and later discoveries
+  collect none. The state database is overwritten as far as SQLite allows; raw pages freed before the switch can still
+  hold old values until they are reused. Files you exported earlier to `.dbmigrate/exports` keep the values they
+  were written with. Claude still sees the statistics and patterns, so its analysis and mapping suggestions may be less
+  precise. Switching it back on is done only on the Setup screen (the CLI refuses it) and takes effect at the next
+  discovery (**Re-run discovery**).
 - **What Claude never sees:** credentials, connection strings or bulk row data. The transfer streams source â†’ target
   inside the local engine; Claude is not in the data path.
 - **Rejected rows** are stored in `<project>/.dbmigrate/state.db` for the final report, so treat the project folder like

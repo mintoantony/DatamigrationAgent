@@ -52,6 +52,25 @@ prune_natives() {
   find "$target" -type f -name '*msalruntime*' -delete
 }
 
+# A publish that crashed (killed, power cut) leaves its dist.tmp.<id> (~30 MB) behind, and a swap that crashed its
+# dist.old.<id>; nothing else ever removes them. Runs under the build lock, so no other build is using one - except a
+# build whose lock was broken as stale. Only entries older than the lock's own stale age go: that protects a live
+# build's dist.tmp.<id> (publish keeps its mtime fresh). It does NOT protect a dist.old.<id>, which keeps the old dist's
+# mtime after mv; what protects a live swap is the next rule: a dist.old.<id> is kept while engine/dist is missing (a
+# swap in progress, or the previous build a failed swap-back names). The ids are not all process ids (dbm.cmd uses
+# %RANDOM%, release.ps1 a GUID), so age is the one test every builder can apply.
+# Keep engine/release.* and bin/dbm.cmd in sync with this.
+sweep_abandoned() {
+  find "$engine" -maxdepth 1 -type d \( -name 'dist.tmp.*' -o -name 'dist.old.*' \) -mmin +"$lock_stale_minutes" 2>/dev/null |
+    while IFS= read -r leftover; do
+      case "$leftover" in
+        */dist.old.*) [ -f "$dll" ] || continue ;;
+      esac
+      echo "dbm: removing engine/${leftover##*/}, left behind by a build that crashed." >&2
+      rm -rf "$leftover" 2>/dev/null || true
+    done
+}
+
 # Why this is needed: the plugin ships a built engine/dist, so an update that changes plugin.json leaves a stale dist
 # behind in a checkout that has the SDK. Publishing into a per-process dist.tmp.<pid> and swapping keeps the old build
 # usable if anything fails (on Windows a running server keeps its DLLs locked, so the rename is the only safe way to
@@ -59,12 +78,17 @@ prune_natives() {
 build_engine() {
   echo "dbm: building the engine ($reason, about a minute)..." >&2
   if [ -f "$dll" ]; then dotnet "$dll" stop >/dev/null 2>&1 || true; fi
+  sweep_abandoned
   tmp="$engine/dist.tmp.$$"
   old="$engine/dist.old.$$"
   rm -rf "$tmp"
   # Compile from scratch, as engine/release.* do: publish would otherwise reuse an earlier Release compile in obj/
   # together with its PDB, and the build would differ from the committed one.
   rm -rf "$engine/Dbm/obj/Release" "$engine/Dbm/bin/Release"
+  # Static web assets record each wwwroot file's last-write time as Last-Modified in Dbm.staticwebassets.endpoints.json,
+  # so the time a checkout happened would reach engine/dist and git would show it modified (ruling 189, open item 42).
+  # Pin it exactly as engine/release.* do.
+  find "$engine/Dbm/wwwroot" -type f -exec env TZ=UTC touch -t 200001010000.00 {} +
   # -o reaches MSBuild as a property value, where ',' and ';' separate values (ruling 189): escape them, and '%' first.
   # sed, not ${var//x/y}: that is bash-only and dies with "Bad substitution" where /bin/sh is dash (Debian, Ubuntu).
   tmp_arg=$(printf '%s' "$tmp" | sed 's/%/%25/g; s/,/%2C/g; s/;/%3B/g')

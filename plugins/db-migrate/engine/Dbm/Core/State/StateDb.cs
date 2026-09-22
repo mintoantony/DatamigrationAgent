@@ -145,16 +145,52 @@ public sealed class StateDb : IDisposable
         return reader.ReadToEnd();
     }
 
+    /// <summary>
+    /// Ordered, independent steps, each additive and idempotent inside its own transaction and each re-reading the version inside it,
+    /// because another process may have won the race. <c>schema.sql</c> is the version-1 schema and stays that way: a new database
+    /// and one written by a released engine take the same steps from where they stand.
+    /// </summary>
     private void Migrate()
     {
-        if (Scalar<long>("PRAGMA user_version") >= 1) return;
+        Step(1, () => Execute(LoadSchema()));
+        // Ruling 208 (open item 46): the SQL Server error number of a rejected row. Nullable: rows recorded before this step, and rows
+        // whose failure carried no server error, have none - and a missing number never counts as a duplicate key. Keyed on the column
+        // as well as the version: steps were written on separate branches, so a database can stand at a later version without it.
+        Step(2, () =>
+        {
+            if (!HasColumn("error_row", "error_number")) Execute("ALTER TABLE error_row ADD COLUMN error_number INTEGER");
+        }, missing: () => !HasColumn("error_row", "error_number"));
+        // Step 3 (open item 22, Ruling 212): the target a run loaded into, and this workspace's identity in a target's checkpoint table.
+        Step(3, () =>
+        {
+            if (!HasColumn("transfer_run", "target_server")) Execute("ALTER TABLE transfer_run ADD COLUMN target_server TEXT");
+            if (!HasColumn("transfer_run", "target_database")) Execute("ALTER TABLE transfer_run ADD COLUMN target_database TEXT");
+            Execute("CREATE TABLE IF NOT EXISTS transfer_identity (id INTEGER PRIMARY KEY CHECK (id = 1), workspace_id TEXT NOT NULL)");
+            Execute("INSERT OR IGNORE INTO transfer_identity (id, workspace_id) VALUES (1, $Id)", new { Id = Guid.NewGuid().ToString("D") });
+        }, missing: () => !HasColumn("transfer_run", "target_server") || !HasColumn("transfer_run", "target_database") || IdentityMissing());
+    }
+
+    private bool IdentityMissing()
+        => Scalar<long>("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'transfer_identity'") == 0
+           || Scalar<long>("SELECT COUNT(*) FROM transfer_identity WHERE id = 1") == 0;
+
+    /// <summary>Applies one step when the database is below <paramref name="version"/>, or when <paramref name="missing"/> says what the
+    /// step adds is absent at any version. The version is only ever raised, never lowered.</summary>
+    private void Step(long version, Action apply, Func<bool>? missing = null)
+    {
+        bool Due() => Scalar<long>("PRAGMA user_version") < version || (missing?.Invoke() ?? false);
+        if (!Due()) return;
         InTransaction(() =>
         {
-            if (Scalar<long>("PRAGMA user_version") >= 1) return;   // another process won the race
-            Execute(LoadSchema());
-            Execute("PRAGMA user_version = 1");
+            if (!Due()) return;   // another process won the race
+            apply();
+            if (Scalar<long>("PRAGMA user_version") < version)
+                Execute(string.Create(CultureInfo.InvariantCulture, $"PRAGMA user_version = {version}"));
         });
     }
+
+    private bool HasColumn(string table, string column)
+        => Scalar<long>("SELECT COUNT(*) FROM pragma_table_info($Table) WHERE name = $Column", new { Table = table, Column = column }) > 0;
 
     private SqliteCommand Command(string sql, object? args)
     {

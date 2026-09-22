@@ -87,6 +87,28 @@ internal sealed class TaskRunner(RunContext rc)
 
     private const string NoKeyTypes = KeyFailedNote + ": the key column types were never read";
 
+    /// <summary>
+    /// Ruling 192 (open item 30): under skip-and-log, a task whose first this-many chunks - or its whole source, if that is fewer
+    /// chunks - loaded no row at all while rejecting rows is failed as <c>bad_task</c>. A constraint violation is a per-row reject
+    /// (ruling 147), so a plan defect that surfaces as one - an FK column bound to the wrong expression, a CHECK no row satisfies -
+    /// otherwise completes with the whole table rejected, one single-row attempt per row, under a headline that reads as success.
+    /// Ruling 201 exempts the re-run Ruling 186 lets a human confirm: a table that held rows before the run, whose rejects are all
+    /// duplicate keys (see <see cref="LoadedNothingReason"/>).
+    /// </summary>
+    internal const int ZeroLoadChunks = 3;
+
+    /// <summary>
+    /// Ruling 207 (open item 45): the most rows any of a task's first <see cref="ZeroLoadChunks"/> chunks holds, whatever the chunk size,
+    /// so the zero-load guard judges a task on about 3,000 rows instead of three full chunks (300,000 single-row rejects at the default
+    /// 100,000). Keyset paging does not persist a chunk size - the next read starts after the checkpoint's last key - so a small chunk
+    /// resumes like any other, and the size is chosen from the checkpoint's chunk number, the same on a resume as the first time.
+    /// </summary>
+    internal const int SmallChunkRows = 1_000;
+
+    /// <summary>The rows to read for the chunk after <paramref name="chunksDone"/> committed (keyed) or loaded (keyless) chunks.</summary>
+    internal static int ChunkRows(int chunkSize, int chunksDone)
+        => chunksDone < ZeroLoadChunks ? Math.Min(chunkSize, SmallChunkRows) : chunkSize;
+
     private static readonly AsyncLocal<Action<string, int>?> AfterChunkTransactionHook = new();
 
     /// <summary>
@@ -117,7 +139,9 @@ internal sealed class TaskRunner(RunContext rc)
         return Task.CompletedTask;
     }
 
-    internal sealed record ErrorRecord(string? Key, string Row, string Error);
+    /// <param name="Number">The row's SQL Server error number (<see cref="RowFailure.ErrorNumber"/>), null when its failure carried none;
+    /// stored beside the text (Ruling 208).</param>
+    internal sealed record ErrorRecord(string? Key, string Row, string Error, int? Number = null);
 
     private sealed record Pass(TransferTaskStatus Status, Checkpoint Checkpoint);
 
@@ -146,10 +170,12 @@ internal sealed class TaskRunner(RunContext rc)
                 var shape = await TargetShape.LoadAsync(tgt, task.Target, ct);
                 // Ruling 73: the loader has to know the target it is loading into, or a binding to a missing column and a binding to an
                 // identity column become a chunk of rejected rows and a table of silently renumbered ids respectively.
-                var loader = new BulkLoader(task, rc.Options, shape);
+                // Ruling 207 (open item 15): a chunk bigger than SmallChunkRows is not bisected across restarts; RunKeyedAsync reads it
+                // again in small chunks instead. (The keyless path cannot restart at all, so the limit never comes into play there.)
+                var loader = new BulkLoader(task, rc.Options, shape) { RestartRowLimit = SmallChunkRows };
                 var pass = task.KeyColumns.Count > 0
-                    ? await RunKeyedAsync(id, task, tgt, shape, loader, cp, ct)
-                    : await RunKeylessAsync(id, task, tgt, shape, loader, ct);
+                    ? await RunKeyedAsync(id, task, tgt, shape, loader, cp, row.RowsBefore, ct)
+                    : await RunKeylessAsync(id, task, tgt, shape, loader, row.RowsBefore, ct);
                 if (pass.Status == TransferTaskStatus.Paused)
                 {
                     rc.SetTaskStatus(id, TransferTaskStatus.Paused);
@@ -193,25 +219,37 @@ internal sealed class TaskRunner(RunContext rc)
     }
 
     private async Task<Pass> RunKeyedAsync(string id, TaskPlan task, SqlConnection tgt, TargetShape shape, BulkLoader loader,
-        Checkpoint cp, CancellationToken ct)
+        Checkpoint cp, long? rowsBefore, CancellationToken ct)
     {
         int chunkSize = Math.Max(1, task.ChunkSize ?? rc.Options.ChunkSize);
         KeyValue? last = cp.LastKeyJson is null ? null : KeyCodec.Decode(cp.LastKeyJson);
         IReadOnlyList<KeyType>? types = last?.Types;
+        var rejects = new RejectTally();
+        // Ruling 207 (open item 15): rows still to be read in SmallChunkRows chunks because a big chunk over them was handed back by the
+        // loader at a transaction-ending row error. One wasted big attempt per such row, then restarts of at most 1,000 rows, instead of
+        // up to ~17 reloads of the whole chunk. (Halving the chunk instead, with or without growing it back, measured no faster: the
+        // doomed big attempts, not the commits, are what cost.) Counted in rows, not keys: the same rows are read again from the same
+        // checkpoint, and once they are past the chunk size applies again. Not persisted - a resume reads full chunks, which only costs
+        // time.
+        long smallRowsLeft = 0;
+        // Review E N2: the window's chunks must never exceed the loader's restart limit - a window chunk over it would be handed back
+        // again, and the task would re-read the same rows forever. Derived from the limit, not merely equal to it by constant.
+        int windowRows = Math.Min(SmallChunkRows, loader.RestartRowLimit ?? SmallChunkRows);
         await using var src = await SqlConnect.OpenAsync(rc.SourceCs, ct);
         while (true)
         {
             if (rc.Control.StopRequested) return new Pass(TransferTaskStatus.Paused, cp);
 
+            int size = smallRowsLeft > 0 ? Math.Min(chunkSize, windowRows) : ChunkRows(chunkSize, cp.ChunkNo);
             DataTable table;
-            await using (var cmd = ChunkPlanner.Command(src, task, last, chunkSize))
+            await using (var cmd = ChunkPlanner.Command(src, task, last, size))
             await using (var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SequentialAccess, ct))
             {
                 // The key values are the reader's own, typed by GetFieldType: KeyCodec matches the .NET type to the SQL type exactly,
                 // so an int handed over for a bigint key is "bad_key". Nothing here converts them.
                 types ??= KeyCodec.TypesOf(reader, task.KeyColumns);
                 table = ChunkReader.NewTable(reader);
-                await ChunkReader.FillAsync(reader, table, chunkSize, ct);
+                await ChunkReader.FillAsync(reader, table, size, ct);
             }
 
             if (table.Rows.Count == 0)
@@ -219,6 +257,9 @@ internal sealed class TaskRunner(RunContext rc)
                 cp = cp with { Done = true };
                 await ControlTable.UpsertAsync(tgt, null, rc.RunId, id, cp, ct);
                 Mirror(id, cp);
+                // The source ended exactly on a chunk boundary: the chunks read were the whole source (ruling 192). A task that already
+                // reached ZeroLoadChunks was judged when that chunk committed, and a resume past that judgement must not be judged again.
+                if (cp.ChunkNo < ZeroLoadChunks) ThrowIfLoadedNothing(id, task.Target, rowsBefore, cp, rejects);
                 return new Pass(TransferTaskStatus.Done, cp);
             }
 
@@ -226,12 +267,25 @@ internal sealed class TaskRunner(RunContext rc)
             // BulkLoader does not normalize by itself: without this, datetime2(n)/time/datetimeoffset values are truncated where the
             // server's CAST rounds, and smalldatetime values are rounded on the fractional second (V8).
             shape.Normalize(table, task.Columns);
-            bool lastChunk = table.Rows.Count < chunkSize;
+            bool lastChunk = table.Rows.Count < size;
             ChunkOutcome outcome;
             Checkpoint next;
             await using (var scope = await TxScope.BeginAsync(tgt, ct))
             {
-                outcome = await loader.LoadAsync(scope, table, allowRestart: true, n => rc.Progress.InFlight(id, n), ct);
+                try
+                {
+                    outcome = await loader.LoadAsync(scope, table, allowRestart: true, n => rc.Progress.InFlight(id, n), ct);
+                }
+                catch (TransferException ex) when (ex.Code == BulkLoader.RestartCapped)
+                {
+                    // The scope holds a fresh transaction with none of this chunk in it, and nothing else was written in it (ruling 113:
+                    // the checkpoint is upserted after the load). Leaving the block rolls it back; the checkpoint has not moved, so the next
+                    // reads start at the same key.
+                    smallRowsLeft = table.Rows.Count;
+                    rc.Log("info", Inv($"{id} {task.Target}: a row error ended the transaction of a {table.Rows.Count:N0}-row chunk; reading ")
+                        + Inv($"those rows again in chunks of {windowRows:N0}."), persist: false);
+                    continue;
+                }
                 if (outcome.Failed.Count > 0 && !rc.Options.SkipErrors)
                 {
                     await scope.RollbackAsync();
@@ -255,6 +309,7 @@ internal sealed class TaskRunner(RunContext rc)
 
             cp = next;
             last = newLast;
+            smallRowsLeft = Math.Max(0, smallRowsLeft - table.Rows.Count);
             Write(id, Capture(task, table, outcome.Failed, types));   // after commit: a rolled-back chunk never leaves error rows
             Mirror(id, cp);
             rc.Control.OnChunkCommitted(new ChunkCommit(id, task.Target, cp.ChunkNo, cp.RowsDone, cp.RowsError)
@@ -264,12 +319,20 @@ internal sealed class TaskRunner(RunContext rc)
             });
             rc.Log("info", $"{id} {task.Target}: chunk {cp.ChunkNo} committed ({cp.RowsDone:N0} rows, {cp.RowsError:N0} rejected"
                 + MergeNote(outcome.MergeStatus, outcome.MergeRowsAffected) + ")", persist: false);
+            // Ruling 192, judged after the commit: the rejected rows are recorded, as skip-and-log promised, and the checkpoint is past
+            // them, so Resume carries on from the next chunk (the operator's "these rows really are bad") and never re-judges the same
+            // chunks, while Reopen is the way to fix the plan. A crash (or a hard stop) between chunk K's commit and this line skips
+            // the judgement for good: the resumed segment starts past chunk K and never meets it. That costs the early stop, not data -
+            // the task then runs on as it did before ruling 192, and the report still names it if it loads nothing (review F6).
+            rejects.Add(outcome.Failed);
+            if (cp.ChunkNo == ZeroLoadChunks || (lastChunk && cp.ChunkNo < ZeroLoadChunks))
+                ThrowIfLoadedNothing(id, task.Target, rowsBefore, cp, rejects);
             if (lastChunk) return new Pass(TransferTaskStatus.Done, cp);
         }
     }
 
     private async Task<Pass> RunKeylessAsync(string id, TaskPlan task, SqlConnection tgt, TargetShape shape, BulkLoader loader,
-        CancellationToken ct)
+        long? rowsBefore, CancellationToken ct)
     {
         int chunkSize = Math.Max(1, task.ChunkSize ?? rc.Options.ChunkSize);
         await using var src = await SqlConnect.OpenAsync(rc.SourceCs, ct);
@@ -285,6 +348,13 @@ internal sealed class TaskRunner(RunContext rc)
         long mergedTotal = 0;
         bool mergeCountUnknown = false;
         var errors = new List<ErrorRecord>();
+        var rejects = new RejectTally();
+        async Task GuardAsync()
+        {
+            if (LoadedNothingReason(task.Target, chunks, loaded, rejected, rowsBefore, rejects, null, keyed: false) is not { } why) return;
+            await scope.RollbackAsync();
+            throw new TransferException("bad_task", why);
+        }
         while (true)
         {
             if (rc.Control.Kind is StopKind.Cancel or StopKind.Fail)
@@ -292,8 +362,9 @@ internal sealed class TaskRunner(RunContext rc)
                 await scope.RollbackAsync();   // nothing of a keyless task is committed before it completes
                 return new Pass(TransferTaskStatus.Paused, Checkpoint.Start);
             }
+            int size = ChunkRows(chunkSize, chunks);
             var table = ChunkReader.NewTable(reader);
-            int n = await ChunkReader.FillAsync(reader, table, chunkSize, ct);
+            int n = await ChunkReader.FillAsync(reader, table, size, ct);
             if (n == 0) break;
             shape.Normalize(table, task.Columns);   // the keyless path needs its own call; the loader does not round by itself (V8)
             long before = loaded;
@@ -320,8 +391,13 @@ internal sealed class TaskRunner(RunContext rc)
             }
             errors.AddRange(Capture(task, table, outcome.Failed, null));
             rc.Progress.InFlight(id, loaded);
-            if (n < chunkSize) break;
+            rejects.Add(outcome.Failed);
+            // Ruling 192. Nothing of a keyless task is committed before it completes, so the judgement rolls the whole task back: a
+            // resume restarts it from zero and meets the same verdict, and Reopen is the way on.
+            if (chunks == ZeroLoadChunks) await GuardAsync();
+            if (n < size) break;
         }
+        if (chunks < ZeroLoadChunks) await GuardAsync();   // the source ended within the first chunks: that was all of it
         long? merged = mergeStatus == MergeStatus.Ran && !mergeCountUnknown ? mergedTotal : null;
         var done = new Checkpoint(chunks, null, loaded, rejected, true);
         await ControlTable.UpsertAsync(scope.Connection, scope.Tx, rc.RunId, id, done, ct);
@@ -336,6 +412,115 @@ internal sealed class TaskRunner(RunContext rc)
         rc.Log("info", $"{id} {task.Target}: committed in one transaction ({done.RowsDone:N0} rows, {done.RowsError:N0} rejected"
             + MergeNote(mergeStatus, merged) + ")", persist: false);
         return new Pass(TransferTaskStatus.Done, done);
+    }
+
+    /// <summary>The keyed path's judgement (ruling 192), with the task's recorded error rows as the fallback for the rejects this
+    /// segment's tally never saw - a task resumed after a pause, whose earlier chunks were rejected by an earlier segment.</summary>
+    private void ThrowIfLoadedNothing(string id, string target, long? rowsBefore, Checkpoint cp, RejectTally rejects)
+    {
+        var why = LoadedNothingReason(target, cp.ChunkNo, cp.RowsDone, cp.RowsError, rowsBefore, rejects,
+            () => rc.Repo.ErrorNumberCounts(rc.RunId, id), keyed: true);
+        if (why is not null) throw new TransferException("bad_task", why);
+    }
+
+    /// <summary>
+    /// Ruling 192's verdict on a task's first chunks, or null when they loaded a row or rejected none. The reason says that every row
+    /// was rejected, names the most common error with its number, and says what Resume and Reopen do for this kind of task.
+    /// <para>Ruling 201: also null for the re-run Ruling 186 lets a human confirm - a target table that already held rows
+    /// (<paramref name="rowsBefore"/> above 0) - when every reject is a duplicate key (2627 or 2601): those rows are already there, which
+    /// is what the confirmation said would happen, not a plan defect. The duplicates must be <b>shown</b>: from the segment's tally when
+    /// it covers every reject, otherwise from the error numbers of all of the task's <paramref name="recorded"/> rejects (Ruling 208).
+    /// Anything short of that - a reject that is not a duplicate, a recorded reject with no number (every row recorded before migration
+    /// step 2 has none), fewer recorded rows than rejects - is judged as before. An FK or CHECK reject (547) in a re-run still stops.</para>
+    /// </summary>
+    /// <param name="recorded">The task's recorded rejects counted by error number, read only when the tally does not cover every
+    /// reject; null when there are none to read (a keyless task records nothing before it completes, and its one segment's tally covers
+    /// everything).</param>
+    internal static string? LoadedNothingReason(string target, int chunks, long rowsDone, long rowsError, long? rowsBefore,
+        RejectTally rejects, Func<IReadOnlyList<ErrorNumberCount>>? recorded, bool keyed)
+    {
+        ArgumentNullException.ThrowIfNull(rejects);
+        if (rowsDone != 0 || rowsError <= 0) return null;
+        bool covered = rejects.Rows >= rowsError;
+        IReadOnlyList<ErrorNumberCount>? groups = covered ? null : recorded?.Invoke();
+        long recordedRows = groups?.Sum(g => g.Rows) ?? 0;
+        bool recordedDuplicatesOnly = groups is not null && recordedRows >= rowsError
+                                      && groups.All(g => g.Rows == 0 || g.Number is 2627 or 2601);
+        if (rowsBefore > 0 && (covered ? rejects.OnlyDuplicateKeys : recordedDuplicatesOnly)) return null;
+
+        string first = chunks == 1 ? "the first chunk" : Inv($"the first {chunks} chunks");
+        string common;
+        if (!covered && recordedRows > 0 && MostCommon(groups!.Select(g => (g.Number, g.Rows, g.FirstError))) is { } top)
+        {
+            // Ruling 192 review F3: the tally is this segment's only; the recorded rows cover the chunks earlier segments rejected.
+            // Grouped by number (Ruling 208), so duplicates naming different values are one error (re-review N2).
+            common = Inv($" The most common recorded error, on {top.Rows:N0} of {recordedRows:N0} recorded rows, was ")
+                     + (top.Number is int n ? Inv($"error {n}") : "an error recorded with no server error number") + ": " + top.Text;
+        }
+        else
+        {
+            common = rejects.MostCommon() is { } c
+                ? Inv($" The most common error, on {c.Rows:N0} of {rejects.Rows:N0} rows")
+                  + (rejects.Rows < rowsError ? " rejected since this segment of the run began" : "") + ", was "
+                  + (c.Number is int n ? Inv($"error {n}") : "an error with no server error number") + ": " + c.Text
+                : "";
+        }
+        string way = keyed
+            ? " The rejected rows are recorded. Reopen Mapping or SQL to fix the plan; if these rows really are bad, Resume carries on "
+              + "from the next chunk."
+            : " This task has no key, so it loads in one transaction and nothing of it was kept. Reopen Mapping or SQL to fix the plan.";
+        return "Every row of " + first + " of " + target + Inv($" was rejected ({rowsError:N0} rows) and none loaded, so the plan is the ")
+               + "likelier cause than the data - a column bound to the wrong expression, or a constraint no source row satisfies."
+               + common + way;
+    }
+
+    private static string Inv(FormattableString text) => FormattableString.Invariant(text);
+
+    /// <summary>The error number with the most rows, ties to the lowest number; the entry with no number wins only with strictly more
+    /// rows than every number (a number says more than its absence). Null when there is nothing with a row.</summary>
+    internal static (int? Number, long Rows, string Text)? MostCommon(IEnumerable<(int? Number, long Rows, string Text)> entries)
+    {
+        ArgumentNullException.ThrowIfNull(entries);
+        var list = entries.Where(e => e.Rows > 0).ToList();
+        (int? Number, long Rows, string Text)? best = null;
+        foreach (var e in list.Where(e => e.Number is not null).OrderBy(e => e.Number))
+            if (best is null || e.Rows > best.Value.Rows) best = e;
+        foreach (var e in list.Where(e => e.Number is null))
+            if (best is null || e.Rows > best.Value.Rows) best = e;
+        return best;
+    }
+
+    /// <summary>The rejected rows of a task's first chunks, counted by error number, with the first text seen for each (ruling 192).</summary>
+    internal sealed class RejectTally
+    {
+        private readonly Dictionary<int, (long Rows, string Text)> _byNumber = [];
+        private (long Rows, string Text)? _noNumber;
+
+        public long Rows { get; private set; }
+
+        /// <summary>Ruling 201: at least one reject, and every one of them a duplicate key (2627 or 2601) by its server error number.</summary>
+        public bool OnlyDuplicateKeys => Rows > 0 && _noNumber is null && _byNumber.Keys.All(n => n is 2627 or 2601);
+
+        public void Add(IEnumerable<RowFailure> failures)
+        {
+            ArgumentNullException.ThrowIfNull(failures);
+            foreach (var f in failures)
+            {
+                Rows++;
+                if (f.ErrorNumber is int n)
+                    _byNumber[n] = _byNumber.TryGetValue(n, out var e) ? (e.Rows + 1, e.Text) : (1, f.Error);
+                else
+                    _noNumber = _noNumber is { } e ? (e.Rows + 1, e.Text) : (1, f.Error);
+            }
+        }
+
+        /// <summary><see cref="TaskRunner.MostCommon"/> over this tally. Null when nothing was added.</summary>
+        public (int? Number, long Rows, string Text)? MostCommon()
+        {
+            var entries = _byNumber.Select(kv => ((int?)kv.Key, kv.Value.Rows, kv.Value.Text)).ToList();
+            if (_noNumber is { } x) entries.Add((null, x.Rows, x.Text));
+            return TaskRunner.MostCommon(entries);
+        }
     }
 
     /// <summary>
@@ -430,7 +615,7 @@ internal sealed class TaskRunner(RunContext rc)
                 }
             }
             string error = TransferFailure.NonBlank(f.Error, Bisector.NoErrorText);
-            list.Add(new ErrorRecord(key, RowSnapshot.Json(row, task.Columns), note is null ? error : $"{error} [{note}]"));
+            list.Add(new ErrorRecord(key, RowSnapshot.Json(row, task.Columns), note is null ? error : $"{error} [{note}]", f.ErrorNumber));
         }
         return list;
     }
@@ -445,6 +630,6 @@ internal sealed class TaskRunner(RunContext rc)
 
     private void Write(string id, IEnumerable<ErrorRecord> records)
     {
-        foreach (var e in records) rc.Repo.AddErrorRow(rc.RunId, id, e.Key, e.Row, ErrorText(e.Error, rc.Scrub));
+        foreach (var e in records) rc.Repo.AddErrorRow(rc.RunId, id, e.Key, e.Row, ErrorText(e.Error, rc.Scrub), e.Number);
     }
 }

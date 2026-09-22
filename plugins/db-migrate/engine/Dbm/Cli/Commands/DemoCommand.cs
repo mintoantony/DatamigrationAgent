@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Dbm.Core;
 using Dbm.Core.Samples;
 using Dbm.Core.Sql;
@@ -14,6 +15,16 @@ public sealed class DemoCommand : ICommand
 {
     public string Name => "demo";
     public string Help => "Create the LegacyShop/ShopV2 sample databases (--attach saves them as this project's connections)";
+
+    /// <summary>
+    /// Test seam, keyed by exact database name like DemoDatabases.CreateDatabaseSuffixOverrides: the connection string
+    /// --attach probes in place of that database's own, so a test can make the probe fail on the server after both
+    /// databases were created and seeded (e.g. one naming a database that does not exist).
+    /// </summary>
+    internal static readonly ConcurrentDictionary<string, string> ProbeConnectionStringOverrides = new(StringComparer.Ordinal);
+
+    private static string ProbeTarget(string database, string connectionString) =>
+        ProbeConnectionStringOverrides.TryGetValue(database, out var o) ? o : connectionString;
 
     /// <summary>What the CLI prints per side: the connection string with every secret replaced by ***.</summary>
     public static object ConnectionView(string database, string connectionString) => new
@@ -95,8 +106,8 @@ public sealed class DemoCommand : ICommand
     /// <summary>Saves both connections exactly like POST /api/connections/{side} does, then lets the workflow continue.</summary>
     private static async Task AttachAsync(CliContext ctx, Workspace ws, DemoResult result, CancellationToken ct)
     {
-        var sourceMeta = await SqlConnect.ProbeAsync(result.SourceConnectionString, ct);
-        var targetMeta = await SqlConnect.ProbeAsync(result.TargetConnectionString, ct);
+        var sourceMeta = await SqlConnect.ProbeAsync(ProbeTarget(result.SourceDatabase, result.SourceConnectionString), ct);
+        var targetMeta = await SqlConnect.ProbeAsync(ProbeTarget(result.TargetDatabase, result.TargetConnectionString), ct);
         using var services = ctx.OpenServices(ws);
         services.Connections.Save(Side.Src, result.SourceConnectionString, sourceMeta);
         services.Connections.Save(Side.Tgt, result.TargetConnectionString, targetMeta);
