@@ -101,14 +101,17 @@ CHECK constraint, an FK cycle, a trigger).
 
    For a local SQL Server use `--server "Server=localhost;Integrated Security=true;TrustServerCertificate=true"`.
    Only give Claude a string like these, with Windows authentication and no secret in it. If the server needs a SQL
-   login, run `dbm demo --server "…" --attach` yourself in a terminal outside Claude Code, in the project folder — not
-   with `!` in Claude Code, whose command and output land in the conversation — so the password never reaches the chat.
-   `dbm` is on the PATH only inside Claude Code, so first ask Claude for the launcher's full path (it holds no secret);
-   in PowerShell or cmd use the `dbm.cmd` next to it.
+   login, never put that string in the chat: on the **Setup** screen, save a connection to the server on either side
+   (any database, e.g. `master`), then ask Claude to `run: dbm demo --attach` with no `--server`. The demo then takes the
+   server and login from the saved connection (the source if saved, else the target) and replaces both connections
+   with the two demo databases, so the password is typed only into the browser. Do this only in a new project folder:
+   if both sides are already saved on different servers it refuses and asks for `--server`.
+   Either way `dbm demo` prints the two demo connection strings with the password replaced by `***`, so Claude sees
+   the server and login, never the password.
    `--attach` saves both connections into the project, so there is nothing to paste. Useful flags: `--force` (drop and
    recreate exactly those two demo databases — anything in them is lost), `--prefix Team_` (other names), `--scale 10`
    (ten times the rows).
-   Without `--attach`, `dbm demo` only prints the two connection strings, with any password replaced by `***`; with SQL
+   Without `--attach`, `dbm demo` only prints the two connection strings and saves nothing; with SQL
    authentication you would have to put the password back in yourself (in the browser, never in the chat), so prefer
    `--attach`, which saves the real strings encrypted.
 4. In the browser, discovery runs by itself. Then review each phase: **Analysis** (comment on a finding, press *Request
@@ -217,6 +220,7 @@ unless noted: exit code 0 on success, and 1 with `{"error":"<code>","message":"�
 | `dbm transfer start --yes-target <db> [--chunk n] [--parallel n] [--skip-errors] [--truncate]` | Start the transfer (normally done from the UI) |
 | `dbm transfer pause\|resume\|cancel\|status` | Control or inspect the running transfer |
 | `dbm demo --server "<conn>" [--attach] [--force] [--prefix p] [--scale n]` | Create the LegacyShop/ShopV2 sample databases |
+| `dbm demo --attach [--force] [--prefix p] [--scale n]` | The same, on the server of a connection saved on the Setup screen |
 | `dbm export <analysis\|sql\|sqlpack\|report> [--out path]` | Write a standalone export (see the [user guide](docs/README.md#exports)) |
 | `dbm run-jobs` | Run queued server jobs in this process and exit |
 | `dbm version` / `dbm help` | Engine and runtime versions; command list |
@@ -228,9 +232,10 @@ unless noted: exit code 0 on success, and 1 with `{"error":"<code>","message":"�
   `.dbmigrate/server.json`.
 - **Connection strings** are entered in the browser (or saved by `dbm demo --attach`) and encrypted at rest: DPAPI for
   the current user on Windows, AES-GCM with a key in `~/.dbmigrate/key` (mode 600) elsewhere. They are masked after
-  saving and never appear in logs, events, work packets, exports, CLI output (except `dbm demo` without `--attach`,
-  which prints them with any password replaced by `***`) or anything sent to Claude. The one way a secret could reach
-  the chat is you typing it there — so never do, not even for the demo.
+  saving and never appear in logs, events, work packets, exports, CLI output or anything sent to Claude — except that
+  `dbm demo`, with or without `--attach`, prints the two demo connection strings with the password replaced by `***`.
+  So when Claude runs the demo it sees the server and login of the connection the demo was built from, never the
+  password. The one way a secret could reach the chat is you typing it there — so never do, not even for the demo.
 - **What Claude sees:** schema metadata (names, types, keys, row counts, sizes), column profiles (null share, distinct
   ratio, lengths, value patterns and a few sample values while the project's sample-values setting is on, which is the
   default), rule findings, the mapping, the SQL plan and your feedback. Switch sample values off under **Privacy** on the
@@ -241,7 +246,8 @@ unless noted: exit code 0 on success, and 1 with `{"error":"<code>","message":"�
   were written with. Claude still sees the statistics and patterns, so its analysis and mapping suggestions may be less
   precise. Switching it back on is done only on the Setup screen (the CLI refuses it) and takes effect at the next
   discovery (**Re-run discovery**).
-- **What Claude never sees:** credentials, connection strings or bulk row data. The transfer streams source → target
+- **What Claude never sees:** passwords or other secrets, connection strings (apart from the masked demo strings above,
+  which show a server and login only) or bulk row data. The transfer streams source → target
   inside the local engine; Claude is not in the data path.
 - **Rejected rows** are stored in `<project>/.dbmigrate/state.db` for the final report, so treat the project folder like
   the data itself. `.dbmigrate/` carries its own `.gitignore` that excludes everything.

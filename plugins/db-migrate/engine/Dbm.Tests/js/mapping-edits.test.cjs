@@ -65,6 +65,7 @@ function get(url) {
   let body;
   if (url.indexOf('/api/mapping/context') === 0) server.contextGets = (server.contextGets || 0) + 1;
   if (url === '/api/state' && server.failStateOnce) { server.failStateOnce = false; return Promise.reject(new Error('network down')); }
+  if (url.indexOf('/api/mapping/context') === 0 && server.failContext) return Promise.reject(new Error('context down'));
   if (url.indexOf('/api/mapping/context') === 0 && server.contextDelay) {
     return new Promise((r) => setTimeout(() => r(context()), server.contextDelay));
   }
@@ -139,6 +140,7 @@ async function reset() {
   server.posts = [];
   server.onEdit = null;
   server.contextDelay = 0;
+  server.failContext = false;
   server.failStateOnce = false;
   server.agentOnline = true;
   // Leave whatever view the previous test left behind, then come back: every test starts from a first render.
@@ -529,11 +531,31 @@ test('16. a carried re-render reuses the context it carried: drawn at once, no r
   await editEmail('LOWER(s.[EMAIL_ADDR])');
   server.contextDelay = 300;
   const gets = server.contextGets;
+  const before = lastCtx;
+  const oldBar = find(view, (n) => /map-savebar/.test(n.className));
   server.feedback.push({ id: 31, status: 'draft', anchor: null, text: 'a' });
   await lastCtx.refresh();                      // resolves once the view is rendered, before any context GET could return
+  // A1-LOW-1: without these, a dirty same-version refresh that re-renders nothing passes every check below.
+  assert.notEqual(lastCtx, before, 'the dirty same-version refresh was a no-op: the view was not re-rendered');
+  assert.deepEqual(lastCtx.feedback.map((f) => f.id), [31], 'the re-render does not show the new comment');
+  assert.notEqual(find(view, (n) => /map-savebar/.test(n.className)), oldBar, 'the save bar on screen is the one drawn before the refresh: nothing was re-rendered');
   assert.equal(server.contextGets, gets, 'no context GET for a same-version carry');
   assert.equal(find(view, (n) => /is-loading/.test(n.className)), null, 'no "Loading mapping…" flicker over the edits');
   assert.equal(barStatus(), '1 unsaved change', 'the save bar is drawn immediately');
+  const ta = find(view, (n) => n.tagName === 'textarea' && n.attributes['aria-label'] === 'Expression for Email');
+  assert.equal(ta && ta.textContent, 'LOWER(s.[EMAIL_ADDR])', 'the re-rendered view shows the carried edit');
+});
+
+test('16b. A1-LOW-2: a dirty view always has a save bar, even when the re-render has to fetch its context and that fails', async () => {
+  await reset();
+  await editEmail('LOWER(s.[EMAIL_ADDR])');
+  server.failContext = true;                    // only reached if the carry drops the context (the regression this pins)
+  server.feedback.push({ id: 32, status: 'draft', anchor: null, text: 'b' });
+  await lastCtx.refresh();
+  await settle();
+  assert.equal(lastCtx.feedback.length, 1, 'the view was re-rendered');
+  assert.equal(barStatus(), '1 unsaved change',
+    'a dirty view has no save bar: its carried edits can be neither saved nor discarded (the carry dropped the context and its refetch failed)');
 });
 
 test('15. L1: the mapping view being replaced by another view (phase went stale) says the edits were discarded', async () => {
