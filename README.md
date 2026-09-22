@@ -223,9 +223,14 @@ unless noted: exit code 0 on success, and 1 with `{"error":"<code>","message":"â
 
 ## Security
 
-- **Local only.** The server binds to `127.0.0.1`, requires a random per-project token on every API call and rejects
-  foreign `Host` headers. The tokenised URL appears only in the output of local `dbm` commands and in
-  `.dbmigrate/server.json`.
+- **Local only.** The server binds to `127.0.0.1`, requires a random per-server token on every API call and rejects
+  foreign `Host` headers. The token is a fresh 16-byte random value generated each time the server starts (stopping
+  and restarting it, e.g. with `dbm stop` then reopening, invalidates the old one), so it is not a stable per-project
+  secret. The UI URL carries it in `?t=` (`http://127.0.0.1:<port>/?t=<token>`); the query form is accepted only for
+  GET requests, and only on `127.0.0.1`/`localhost` (`X-Dbm-Token` covers every other verb, including the state- and
+  file-changing POST calls). The tokenised URL appears only in the output of local `dbm` commands and in
+  `.dbmigrate/server.json` - and, because your browser visits it, it may also end up in this machine's browser
+  history.
 - **Connection strings** are entered in the browser (or saved by `dbm demo --attach`) and encrypted at rest: DPAPI for
   the current user on Windows, AES-GCM with a key in `~/.dbmigrate/key` (mode 600) elsewhere. They are masked after
   saving and never appear in logs, events, work packets, exports, CLI output (except `dbm demo` without `--attach`,
