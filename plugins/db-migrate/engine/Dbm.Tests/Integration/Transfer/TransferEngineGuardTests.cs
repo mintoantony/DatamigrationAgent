@@ -1046,7 +1046,7 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
     /// <summary>
     /// Open item 20 / ruling 209. The lock connection is idle for the whole run, so anything that drops it - an idle timeout between
     /// here and the server, a failover, a KILL - frees the target without a word, and a second runner could then load beside this
-    /// one. The seam kills the lock session after the first chunk: the run must notice at the next chunk commit and stop as
+    /// one. The seam kills the lock session after the first chunk: the run must notice before the next chunk commits and stop as
     /// <c>paused</c>, saying why, instead of loading the rest of the table unguarded. A resume takes the lock again and finishes.
     /// </summary>
     [KillSessionFact]
@@ -1087,6 +1087,78 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
         Assert.Equal(400, await rig.Tgt.CountAsync("app.Wide"));
         Assert.Equal(400, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Wide"));
     }
+
+    /// <summary>
+    /// Open item 48. The lock is checked inside each chunk's transaction, before its COMMIT, so a chunk that would commit after the
+    /// lock was lost is rolled back instead. The seam kills the lock session before any chunk commits: checked only after the commit,
+    /// the first chunk (100 rows) would land in the target unguarded before the run noticed; checked before it, nothing does.
+    /// </summary>
+    [KillSessionFact]
+    public async Task A_chunk_whose_lock_was_lost_before_its_commit_is_rolled_back_and_the_run_pauses()
+    {
+        await using var rig = await RigAsync(One(WidePlan()));
+        long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip" });
+        TransferOutcome outcome;
+        TransferEngine.AfterLockTaken = l => Kill(rig.Tgt, l.SessionId);
+        try
+        {
+            outcome = await rig.Engine.RunAsync(runId, new TransferControl(), default);
+        }
+        finally
+        {
+            TransferEngine.AfterLockTaken = null;
+        }
+
+        long rows = await rig.Tgt.CountAsync("app.Wide");
+        Assert.True(rows == 0, $"a chunk committed after the run's lock was lost: {rows} rows are in the target unguarded");
+        Assert.True(outcome.Status == RunStatus.Paused, $"a run whose lock was lost before a commit ended {outcome.Status}, not paused");
+        AssertSaysLockLost(rig.Repo.GetRun(runId)!.SummaryJson);
+
+        Assert.Equal(RunStatus.Completed, (await rig.Engine.RunAsync(runId, new TransferControl(), default)).Status);
+        Assert.Equal(400, await rig.Tgt.CountAsync("app.Wide"));
+        Assert.Equal(400, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Wide"));
+    }
+
+    /// <summary>Open item 48, keyless: the task loads in one transaction, so a lock lost at any point before its single COMMIT must roll
+    /// the whole table back. Checked only after the commit, the whole table lands unguarded and the one-task run even completes.</summary>
+    [KillSessionFact]
+    public async Task A_keyless_task_whose_lock_was_lost_before_its_commit_is_rolled_back_and_the_run_pauses()
+    {
+        await using var rig = await RigAsync(One(TaskOf("app.Wide", "SELECT s.[Id] AS [Id], s.[V] AS [V] FROM [dbo].[Wide] AS s", [],
+            [("Id", "Id"), ("V", "V")])));
+        long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip" });
+        TransferOutcome outcome;
+        TransferEngine.AfterLockTaken = l => Kill(rig.Tgt, l.SessionId);
+        try
+        {
+            outcome = await rig.Engine.RunAsync(runId, new TransferControl(), default);
+        }
+        finally
+        {
+            TransferEngine.AfterLockTaken = null;
+        }
+
+        long rows = await rig.Tgt.CountAsync("app.Wide");
+        Assert.True(rows == 0, $"a keyless task committed after the run's lock was lost: {rows} rows are in the target unguarded");
+        Assert.True(outcome.Status == RunStatus.Paused, $"a run whose lock was lost before a commit ended {outcome.Status}, not paused");
+        AssertSaysLockLost(rig.Repo.GetRun(runId)!.SummaryJson);
+
+        Assert.Equal(RunStatus.Completed, (await rig.Engine.RunAsync(runId, new TransferControl(), default)).Status);
+        Assert.Equal(400, await rig.Tgt.CountAsync("app.Wide"));
+    }
+
+    private static void Kill(TempDatabase tgt, int session)
+    {
+        using var killer = new SqlConnection(tgt.ConnectionString);
+        killer.Open();
+        using var kill = new SqlCommand($"KILL {session}", killer);
+        kill.ExecuteNonQuery();
+    }
+
+    private static void AssertSaysLockLost(string? summary)
+        => Assert.True((summary ?? "").Contains("lock on the target database", StringComparison.Ordinal)
+                       && (summary ?? "").Contains("was lost", StringComparison.Ordinal),
+            "the paused run does not say its lock was lost: " + summary);
 
     /// <summary>
     /// Harm: the chunk's rows and its checkpoint must commit in one transaction. Written afterwards instead, a crash in between leaves

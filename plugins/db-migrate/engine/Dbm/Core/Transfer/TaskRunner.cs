@@ -45,9 +45,37 @@ internal sealed class RunContext
     public required TransferProgress Progress { get; init; }
     public required IReadOnlyList<string> Secrets { get; init; }
 
+    /// <summary>Open item 48: asks the lock session whether it still holds the target lock - null while it does, otherwise the sentence
+    /// saying it is gone (<see cref="RunLock.LostAsync"/>). Null when the run holds no lock (tests of the runner alone).</summary>
+    public Func<CancellationToken, Task<string?>>? LockCheck { get; init; }
+
     private readonly List<string> _notes = [];
+    private int _lockLost;
 
     public TransferRepo Repo => Services.Transfers;
+
+    /// <summary>
+    /// Open items 20 and 48. Called inside a chunk's transaction, just before its COMMIT (and before a keyless task's single COMMIT):
+    /// true when the lock is gone, and the caller then rolls the chunk back instead of committing it. The first loss adds the note,
+    /// logs it and pauses the run; once lost, the lock stays lost for this segment, so every later commit is refused without asking.
+    /// One short round trip on the lock's own connection per commit, while the chunk's transaction waits.
+    /// </summary>
+    public async Task<bool> LockLostAsync(CancellationToken ct)
+    {
+        if (LockCheck is null) return false;
+        if (Volatile.Read(ref _lockLost) != 0) return true;
+        string? lost = await LockCheck(ct);
+        if (lost is null) return false;
+        if (Interlocked.Exchange(ref _lockLost, 1) == 0)
+        {
+            string note = Scrub(lost + " Without it another transfer could load into this target beside this one, so the run was "
+                                + "paused after the current chunk. Resume takes the lock again and continues from the checkpoints.");
+            AddNote(note);
+            Log("error", note);
+            Control.RequestPause();
+        }
+        return true;
+    }
 
     /// <summary>
     /// What this run has to carry out with it because nothing else will: a control table that was not ours, rejected rows that were
@@ -300,6 +328,13 @@ internal sealed class TaskRunner(RunContext rc)
                 next = new Checkpoint(cp.ChunkNo + 1, KeyCodec.Encode(newLast), cp.RowsDone + outcome.Loaded,
                     cp.RowsError + outcome.Failed.Count, lastChunk);
                 await ControlTable.UpsertAsync(scope.Connection, scope.Tx, rc.RunId, id, next, ct);
+                // Open item 48: the lock is asked inside the transaction, before the COMMIT - a chunk that would land after it was lost
+                // is rolled back, and the checkpoint stays where it was.
+                if (await rc.LockLostAsync(ct))
+                {
+                    await scope.RollbackAsync();
+                    return new Pass(TransferTaskStatus.Paused, cp);
+                }
                 // Ruling 114: the seam is raised from inside CommitAsync, on the statement after the COMMIT, rather than on the line
                 // after this one. The instant it fires is the instant the chunk's rows and its checkpoint are both durable or neither
                 // is. The callback is an expression, not a block, so this loop has no statement position between the two at all - the
@@ -401,6 +436,12 @@ internal sealed class TaskRunner(RunContext rc)
         long? merged = mergeStatus == MergeStatus.Ran && !mergeCountUnknown ? mergedTotal : null;
         var done = new Checkpoint(chunks, null, loaded, rejected, true);
         await ControlTable.UpsertAsync(scope.Connection, scope.Tx, rc.RunId, id, done, ct);
+        // Open item 48: the whole task is this one transaction, so a lock lost at any point before here rolls all of it back.
+        if (await rc.LockLostAsync(ct))
+        {
+            await scope.RollbackAsync();
+            return new Pass(TransferTaskStatus.Paused, Checkpoint.Start);
+        }
         await scope.CommitAsync(ct);
         Write(id, errors);
         Mirror(id, done);
