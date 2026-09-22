@@ -142,7 +142,8 @@
 
   /**
    * MIRROR of C# SqlPlanPayload.NotValidatedReasons (open item 10, Ruling 204): a version is validated only when it carries the
-   * engine's evidence ("validation": {at, ok}) and no stored "live validation skipped" line. Reasons = those lines, else NO_EVIDENCE.
+   * engine's evidence ("validation": {at, ok}) and no stored "live validation skipped" line. Reasons = those lines, else each stored
+   * connection failure as "live validation could not connect: …" (review L3), else NO_EVIDENCE.
    * → {validated, at, ok, reasons}
    */
   function validationState(plan) {
@@ -150,7 +151,11 @@
     var v = plan && plan.validation;
     var evidence = !!v && typeof v === 'object' && typeof v.at === 'string';
     if (evidence && !skipped.length) return { validated: true, at: v.at, ok: v.ok === true, reasons: [] };
-    return { validated: false, at: null, ok: null, reasons: skipped.length ? skipped : [NO_EVIDENCE] };
+    if (skipped.length) return { validated: false, at: null, ok: null, reasons: skipped };
+    var failed = ((plan && plan.errors) || []).filter(function (e) {
+      return typeof e === 'string' && (e.indexOf('source connection failed: ') === 0 || e.indexOf('target connection failed: ') === 0);
+    }).map(function (e) { return 'live validation could not connect: ' + e; });
+    return { validated: false, at: null, ok: null, reasons: failed.length ? failed : [NO_EVIDENCE] };
   }
 
   /* {taskId: string[]} — the contracted shape of taskErrors / taskWarnings. */
@@ -461,13 +466,16 @@
   }
 
   /* Ruling 204: the stored version's own validation fact - the one ApprovalBlockers reads - never inferred from warnings alone. */
-  function validationNote(plan) {
+  function validationNote(ctx, plan) {
     var v = validationState(plan);
     if (v.validated) {
       return el('p', { class: 'small muted sql-validated' }, ['Validated live ' + v.at + (v.ok ? '' : ' · errors found')]);
     }
+    // Review L1: an approved version without evidence was approved before the evidence was kept; it does not "block" anything now.
+    var approved = !!(ctx.phaseRow && ctx.phaseRow.status === 'approved');
     return el('section', { class: 'card sql-not-validated', 'aria-live': 'polite' }, [
-      el('div', { class: 'card-h row' }, [el('h3', { class: 'h3' }, ['Not validated']), el('span', { class: 'badge st-failed' }, ['blocks approval'])]),
+      el('div', { class: 'card-h row' }, [el('h3', { class: 'h3' }, ['Not validated']),
+        el('span', { class: 'badge ' + (approved ? 'st-stale' : 'st-failed') }, [approved ? 'approved before validation evidence was kept' : 'blocks approval'])]),
       el('div', { class: 'card-b' }, [list('sql-msgs-warn', v.reasons)]),
     ]);
   }
@@ -735,7 +743,7 @@
     }
 
     page.appendChild(kpis(plan));
-    page.appendChild(validationNote(plan));
+    page.appendChild(validationNote(ctx, plan));
     if (ui.report) page.appendChild(reportCard(plan));
     if ((plan.errors || []).length || (plan.warnings || []).length) {
       page.appendChild(el('section', { class: 'card' }, [

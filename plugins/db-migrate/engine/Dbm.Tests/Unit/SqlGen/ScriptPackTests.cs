@@ -233,9 +233,9 @@ public class ScriptPackTests
 
         var files = ScriptPack.BuildFiles(plan, "demo");
 
-        Assert.Contains("-- WARNING: NOT VALIDATED - no database checked this plan\n-- " + marker + "\n", files[0].Content);
+        Assert.Contains("-- WARNING: NOT VALIDATED - no live validation is recorded for this plan\n-- " + marker + "\n", files[0].Content);
         var readme = files.Single(f => f.Name == "README.md").Content;
-        Assert.Contains("## WARNING: NOT VALIDATED - no database checked this plan\n\n" + marker + "\n", readme);
+        Assert.Contains("## WARNING: NOT VALIDATED - no live validation is recorded for this plan\n\n" + marker + "\n", readme);
 
         foreach (var (name, content) in ScriptPack.BuildFiles(Plan(), "demo"))
             Assert.DoesNotContain("NOT VALIDATED", content, StringComparison.Ordinal);
@@ -245,7 +245,7 @@ public class ScriptPackTests
         var old = Plan();
         old.Validation = null;
         var oldPre = ScriptPack.BuildFiles(old, "demo")[0].Content;
-        Assert.True(oldPre.Contains("-- WARNING: NOT VALIDATED - no database checked this plan\n-- " + SqlModule.NoEvidence + "\n", StringComparison.Ordinal),
+        Assert.True(oldPre.Contains("-- WARNING: NOT VALIDATED - no live validation is recorded for this plan\n-- " + SqlModule.NoEvidence + "\n", StringComparison.Ordinal),
             "a pack of a version with no validation evidence does not say it is not validated:\n" + oldPre[..Math.Min(600, oldPre.Length)]);
 
         // The stored line is untrusted text like any other: it cannot start a line of its own.

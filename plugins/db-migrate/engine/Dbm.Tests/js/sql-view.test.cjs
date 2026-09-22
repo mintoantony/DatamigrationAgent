@@ -758,6 +758,20 @@ test('render: a version with no validation evidence says Not validated, and a va
     assert.ok(shown.includes('Not validated') && shown.includes(NO_EVIDENCE),
       'a version the engine refuses to approve as not validated looks validated on screen: ' + shown.slice(0, 300));
 
+    assert.ok(shown.includes('blocks approval'));
+
+    // Review L1: an old version that is already approved is not "blocked" - it was approved before the evidence was kept.
+    const approved = sampleCtx({ phaseRow: { name: 'sql', status: 'approved' } });
+    globalThis.DBM.views.sql.render(dom.root, approved.ctx);
+    shown = dom.text(dom.root);
+    assert.ok(!shown.includes('blocks approval') && shown.includes('approved before validation evidence was kept'),
+      'an approved version without evidence is shown as blocking approval: ' + shown.slice(0, 300));
+
+    // Review L3, mirrored: a version whose live validation could not connect names that, as the engine does.
+    const failed = sampleCtx();
+    failed.plan.errors = ['target connection failed: timeout'];
+    assert.deepEqual(V.validationState(failed.plan).reasons, ['live validation could not connect: target connection failed: timeout']);
+
     const ok = sampleCtx();
     ok.plan.validation = { at: '2026-09-18T09:30:00+00:00', ok: true };
     globalThis.DBM.views.sql.render(dom.root, ok.ctx);

@@ -14,8 +14,9 @@ namespace Dbm.Core.SqlGen;
 public static class ScriptPack
 {
     const string Rule = "-- =====================================================================";
-    /// <summary>Heading over <see cref="SqlPlanPayload.NotValidatedReasons"/>, which follow verbatim.</summary>
-    const string NotValidatedTitle = "WARNING: NOT VALIDATED - no database checked this plan";
+    /// <summary>Heading over <see cref="SqlPlanPayload.NotValidatedReasons"/>, which follow verbatim.
+    /// Review L1: worded from the evidence - an old version may well have been checked, but no validation of it is recorded.</summary>
+    const string NotValidatedTitle = "WARNING: NOT VALIDATED - no live validation is recorded for this plan";
     const string MismatchTitle ="WARNING: this pack does not match the plan's execution order";
     /// <summary>Open item 19: the task file's heading over its errors. Not "last validation": Ruling 96 makes the pack derive bare
     /// carriage returns itself, and those lines come from the export's own check, not from any validation.</summary>
