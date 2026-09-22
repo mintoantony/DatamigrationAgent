@@ -767,6 +767,38 @@ test('render: a version with no validation evidence says Not validated, and a va
   });
 });
 
+/* Review M1 (Rulings 210/211): Validate live names the version on screen, and its toast agrees with the Not validated card - a
+   stored validation says so and refreshes onto the new version; a passing one that stored nothing does not say "passed" over a
+   version that is still not validated. */
+test('render: Validate live names the version, and a pass over a not-validated version never contradicts the card', async () => {
+  const clean = { version: 2, ok: true, taskErrors: { T01: [], T02: [] }, taskWarnings: { T01: [], T02: [] }, globalErrors: [], globalWarnings: [] };
+  await withFakeDom(async dom => {
+    const toasts = [];
+    let refreshed = 0;
+    let sent = null;
+    const s = sampleCtx({ toast: (m, k) => toasts.push(k + ': ' + m), refresh() { refreshed++; } });
+    const storedReply = Promise.resolve(Object.assign({}, clean, { stored: true, storedVersion: 3 }));
+    s.ctx.api = Object.assign({}, s.ctx.api, { post: (url, b) => { sent = b; return storedReply; } });
+    globalThis.DBM.views.sql.render(dom.root, s.ctx);
+    click(dom, t => t === 'Validate live');
+    await storedReply;
+    await tick();
+    assert.deepEqual(sent, { version: 2 }, 'Validate live must name the version on screen');
+    assert.equal(refreshed, 1, 'a stored validation refreshes onto the new version');
+    assert.ok(toasts.some(t => /^ok: .*saved as v3/.test(t)), 'toasts: ' + JSON.stringify(toasts));
+
+    toasts.length = 0;
+    const notStored = Promise.resolve(Object.assign({}, clean, { stored: false, storeNote: 'sql is drafting; a validation is stored as a new version only while it awaits review' }));
+    s.ctx.api.post = () => notStored;
+    click(dom, t => t === 'Validate live');
+    await notStored;
+    await tick();
+    assert.ok(!toasts.some(t => /^ok: Validation passed$/.test(t)),
+      'the toast said "Validation passed" while the card says Not validated: ' + JSON.stringify(toasts));
+    assert.ok(toasts.some(t => /^warn: .*still not validated.*drafting/.test(t)), 'toasts: ' + JSON.stringify(toasts));
+  });
+});
+
 test('the view is registered', () => {
   assert.equal(globalThis.DBM.views.sql.title, 'SQL');
   assert.equal(typeof globalThis.DBM.views.sql.render, 'function');

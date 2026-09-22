@@ -294,6 +294,32 @@ public sealed class WorkflowEngine(DbmServices services)
         });
     }
 
+    /// <summary>Summary of a version <see cref="Revalidate"/> stores.</summary>
+    public const string RevalidatedSummary = "validation, no SQL change";
+
+    /// <summary>
+    /// Rulings 210/211 (open item 10 fix round): re-runs the module's own <see cref="IPhaseModule.Validate"/> over the current version
+    /// unchanged (an empty patch) and stores what it writes - for SQL, the validation evidence - as a new version (author "script",
+    /// <see cref="RevalidatedSummary"/>), in one transaction. <paramref name="seenVersion"/> must be the current version
+    /// (<see cref="WorkflowException.StaleVersion"/> otherwise). It stores ONLY while the phase awaits review: while drafting or
+    /// reworking the agent holds the current version as its patch's baseVersion, and a new version would reject its next apply.
+    /// Returns Ok false with the reason (nothing stored) otherwise, or when validation finds errors.
+    /// </summary>
+    public ApplyResult Revalidate(PhaseName phase, int seenVersion) => services.Db.InTransaction(() =>
+    {
+        if (!services.Modules.TryGetValue(phase, out var module)) return ApplyResult.Fail($"phase '{phase.Text()}' has no module to validate");
+        EnsureCurrentVersion(phase, seenVersion);
+        var row = services.Phases.Get(phase);
+        if (row.Status != PhaseStatus.AwaitingReview)
+            return ApplyResult.Fail($"{phase.Text()} is {EnumText.ToText(row.Status)}; a validation is stored as a new version only while it awaits review");
+        var baseRow = services.Artifacts.Get(phase, seenVersion)!;
+        var updated = JsonNode.Parse(baseRow.PayloadJson)!;
+        var check = module.Validate(new ModuleContext { Services = services, Current = baseRow, OpenFeedback = [] }, updated);
+        if (!check.Ok) return new ApplyResult(false, null, check.Errors, check.Warnings);
+        var version = StoreArtifact(phase, updated, "script", RevalidatedSummary);
+        return new ApplyResult(true, version, [], check.Warnings);
+    });
+
     private static List<string> CheckResponses(IReadOnlyList<FeedbackRow> open, IReadOnlyList<FeedbackResponse> responses)
     {
         var errors = new List<string>();

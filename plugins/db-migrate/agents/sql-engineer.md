@@ -96,7 +96,7 @@ are **not** a pass. Read them, and say in your summary which ones remain.
    with `--task` it holds `"global preSql/postSql: not checked: single-task validation"` — the globals were **not**
    checked, so finish with one run without `--task`. Bare carriage returns are reported as errors too, offline: without
    connections the command still prints them (with a `live validation skipped: … missing` line in `globalWarnings`)
-   instead of refusing. Fix and repeat until `"ok":true`.
+   instead of refusing. With `--patch` it never stores anything (`"stored":false`). Fix and repeat until `"ok":true`.
 2. `dbm apply <patchPath> --dry-run` — must print `"ok":true` (it re-validates live and checks that every feedback id has
    a response). Fix and repeat until it does. Do **not** run `dbm apply` without `--dry-run`; the orchestrator applies.
    Its `warnings` carry every `: not checked: ` line of that validation — global ones and `<taskId>: <field>: not checked: …`

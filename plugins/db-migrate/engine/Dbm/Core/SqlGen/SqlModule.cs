@@ -18,8 +18,8 @@ public sealed class SqlModule : IPhaseModule
     public const string NotValidatedBlocker = "plan is not validated: ";
 
     /// <summary>Ruling 204: why a version is not validated when it has no evidence and no stored "live validation skipped" line - a
-    /// version stored before the evidence existed. A new version stored while both connections and the target catalog exist records it.</summary>
-    public const string NoEvidence = "no live validation is recorded for this version; a new version saved while both connections and the target catalog exist records one";
+    /// version stored before the evidence existed. Validate live (or `dbm sql validate`) while Sql awaits review records it (Ruling 211).</summary>
+    public const string NoEvidence = "no live validation is recorded for this version; press Validate live on the SQL screen (or run `dbm sql validate`) while it awaits review to record one";
 
     public PhaseName Phase => PhaseName.Sql;
     public string Agent => "sql-engineer";

@@ -138,7 +138,7 @@
 
   var SKIPPED_PREFIX = 'live validation skipped: ';
   /* Verbatim copy of C# SqlModule.NoEvidence (sql-view.test.cjs reads the C# source and compares). */
-  var NO_EVIDENCE = 'no live validation is recorded for this version; a new version saved while both connections and the target catalog exist records one';
+  var NO_EVIDENCE = 'no live validation is recorded for this version; press Validate live on the SQL screen (or run `dbm sql validate`) while it awaits review to record one';
 
   /**
    * MIRROR of C# SqlPlanPayload.NotValidatedReasons (open item 10, Ruling 204): a version is validated only when it carries the
@@ -353,11 +353,20 @@
   function runValidate(ctx) {
     ui.busy = true;
     rerender();
-    ctx.api.post('/api/sql/validate', {}).then(function (report) {
+    // Rulings 210/211: the version on screen is named; a whole-plan pass over a version without evidence is stored by the server
+    // as a new version (only while Sql awaits review), and the screen moves onto it.
+    ctx.api.post('/api/sql/validate', { version: versionOf(ctx) }).then(function (report) {
       ui.busy = false;
       if (!mounted) return;   // the view was left while validating
       var toast = mounted.ctx.toast || ctx.toast;
       ui.reportFailure = null;
+      if (report && report.stored === true) {
+        ui.report = null;
+        rerender();
+        toast('Validation passed and was recorded: saved as v' + report.storedVersion + ' (no SQL change)', 'ok');
+        (mounted.ctx.refresh || ctx.refresh)();
+        return;
+      }
       if (!reportFits(report)) {
         ui.report = null;
         rerender();
@@ -368,7 +377,12 @@
       ui.report = report;
       rerender();
       var s = reportSummary(report);
-      if (s.state === 'clean') toast('Validation passed', 'ok');
+      var still = payloadOf(mounted.ctx) && !validationState(payloadOf(mounted.ctx)).validated;
+      if (still && (s.state === 'clean' || s.state === 'warnings')) {
+        // Never "passed" beside a card that says Not validated: this pass recorded nothing.
+        toast('Validation passed, but nothing was recorded, so v' + report.version + ' is still not validated'
+          + (report.storeNote ? ': ' + report.storeNote : '') + '.', 'warn');
+      } else if (s.state === 'clean') toast('Validation passed', 'ok');
       else if (s.state === 'warnings') toast('Validation passed with ' + plural(s.warnings, 'warning') + ' — read them before approving', 'warn');
       else if (s.state === 'unreported') toast('Validation passed, but the server did not report what it checked', 'warn');
       else toast('Validation found ' + plural(s.errors, 'error'), 'err');

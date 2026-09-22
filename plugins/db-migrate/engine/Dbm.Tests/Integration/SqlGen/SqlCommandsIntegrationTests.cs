@@ -42,4 +42,31 @@ public sealed class SqlCommandsIntegrationTests
         Assert.False((bool)cr.Json["ok"]!);
         Assert.Contains(cr.Json["taskErrors"]!["T05"]!.AsArray(), e => ((string?)e)!.Contains(SqlValidator.BareCarriageReturnMarker, StringComparison.Ordinal));
     }
+
+    /// <summary>Rulings 210/211: `dbm sql validate` without --patch records the evidence exactly as Validate live does - a new version
+    /// while Sql awaits review, nothing while the agent is drafting (its self-check must not move its baseVersion).</summary>
+    [Fact]
+    public async Task Validate_stores_evidence_only_while_awaiting_review()
+    {
+        await using var pair = await SampleDatabases.CreateAsync(1, seed: false);
+        using var project = await SampleProject.CreateAsync(pair);
+        var s = project.Services;
+        SqlGenJobTests.Prepare(s);
+        var plan = SqlGenerator.Generate(SampleMappings.Approved(), SampleCatalogs.Source(), SampleCatalogs.Target());
+        s.Artifacts.Add(PhaseName.Sql, 0, Json.Serialize(plan), "script", "old draft");   // no evidence
+        s.Phases.SetCurrentVersion(PhaseName.Sql, 0);
+
+        s.Phases.SetStatus(PhaseName.Sql, PhaseStatus.Drafting);
+        var drafting = await CliRunner.RunAsync(project.Ws, null, "sql", "validate");
+        Assert.True(drafting.Exit == 0, drafting.Out);
+        Assert.True(drafting.Json["stored"] is not null && !(bool)drafting.Json["stored"]!, "the agent's self-check stored a version: " + drafting.Out);
+        Assert.Equal(0, s.Phases.Get(PhaseName.Sql).CurrentVersion);
+
+        s.Phases.SetStatus(PhaseName.Sql, PhaseStatus.AwaitingReview);
+        var review = await CliRunner.RunAsync(project.Ws, null, "sql", "validate");
+        Assert.True(review.Exit == 0, review.Out);
+        Assert.True(review.Json["stored"] is not null && (bool)review.Json["stored"]!, "sql validate on a not-validated version awaiting review stored nothing: " + review.Out);
+        Assert.Equal(1, s.Phases.Get(PhaseName.Sql).CurrentVersion);
+        Assert.True(Json.Deserialize<SqlPlanPayload>(s.Artifacts.Get(PhaseName.Sql, 1)!.PayloadJson).Validation is { Ok: true });
+    }
 }
