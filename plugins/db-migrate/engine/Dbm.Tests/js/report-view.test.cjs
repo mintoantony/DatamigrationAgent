@@ -160,6 +160,20 @@ test('a task that loaded nothing turns the Row counts figure from green to a war
   assert.ok(named.indexOf('1 task loaded no row of a source that had rows') >= 0, 'the notice does not say what it is about: ' + named);
 });
 
+test('a re-run into a table that already held rows and loaded nothing is named in FinalReport\'s re-run words, still as a warning (review E L2)', () => {
+  const rerun = 'app.Products loaded 0 of 200 source rows (200 rejected). The table already held 200 rows before this run: if the '
+    + 'rejected rows are duplicate keys, those rows were already there; any other error points at the mapping or SQL.';
+  const r = loadedNothing();
+  r.tasks[1] = Object.assign({}, r.tasks[1], { target: 'app.Products', rowsSource: 200, rowsError: 200, rowsBefore: 200,
+    loadedNothingNote: rerun });
+  const root = mount(r);
+  const notices = D.queryAll(root, '.notice').map(D.text);
+  assert.ok(notices.some((n) => n.indexOf(rerun) >= 0),
+    'the re-run task that loaded nothing is not named with FinalReport\'s re-run note: ' + JSON.stringify(notices));
+  const cls = String(rowCountsKpi(root).getAttribute('class') || rowCountsKpi(root).className);
+  assert.ok(cls.indexOf('rep-kpi-warn') >= 0, 'the Row counts figure over a re-run that loaded nothing is not a warning: ' + cls);
+});
+
 test('a stored report without the per-task note still names the task, in the figures it has', () => {
   const r = loadedNothing();
   delete r.tasks[1].loadedNothingNote;
