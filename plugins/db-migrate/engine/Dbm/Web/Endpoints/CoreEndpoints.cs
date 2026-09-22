@@ -292,13 +292,19 @@ public static class CoreEndpoints
         }
     }
 
-    private static Task WriteEventAsync(HttpResponse response, SseMessage m, CancellationToken ct)
+    private static Task WriteEventAsync(HttpResponse response, SseMessage m, CancellationToken ct) =>
+        WriteAsync(response, FrameEvent(m), ct);
+
+    /// <summary>Builds one SSE frame's text. Public seam so the framing rules (line-ending handling) are testable directly.</summary>
+    internal static string FrameEvent(SseMessage m)
     {
         var sb = new StringBuilder();
         if (m.Id is long id) sb.Append("id: ").Append(id).Append('\n');
         sb.Append("event: ").Append(m.Type).Append('\n');
-        sb.Append("data: ").Append(m.Data.Replace("\n", " ")).Append("\n\n");
-        return WriteAsync(response, sb.ToString(), ct);
+        // The SSE spec treats a bare \r the same as \n (both end a "data:" line), so both must be replaced -
+        // \r\n is one line break and collapses to a single space, not two.
+        sb.Append("data: ").Append(m.Data.Replace("\r\n", " ", StringComparison.Ordinal).Replace('\r', ' ').Replace('\n', ' ')).Append("\n\n");
+        return sb.ToString();
     }
 
     private static async Task WriteAsync(HttpResponse response, string text, CancellationToken ct)
