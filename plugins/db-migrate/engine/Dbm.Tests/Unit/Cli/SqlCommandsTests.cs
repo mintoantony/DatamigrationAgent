@@ -76,6 +76,42 @@ public sealed class SqlCommandsTests : IDisposable
         Assert.Equal("patch.phase must be 'sql'.", (string?)r.Json["message"]);
     }
 
+    /// <summary>Open item 8: `not_found` (SqlCommands.cs) had no test - the --patch file itself is missing.</summary>
+    [Fact]
+    public async Task Validate_reports_a_missing_patch_file()
+    {
+        WithSqlVersion();
+        var missing = Path.Combine(_workspace.Root, "does-not-exist.json");
+        var r = await CliRunner.RunAsync(_workspace.Ws, null, "sql", "validate", "--patch", missing);
+        Assert.Equal(1, r.Exit);
+        Assert.Equal("not_found", (string?)r.Json["error"]);
+        Assert.Contains(missing, (string?)r.Json["message"]);
+    }
+
+    /// <summary>Open item 8: the OTHER `invalid_patch` emitter (Patch.Parse's PatchException on malformed JSON), distinct from
+    /// the phase-mismatch path above, which is the only one previously covered.</summary>
+    [Fact]
+    public async Task Validate_refuses_a_patch_file_that_is_not_valid_json()
+    {
+        WithSqlVersion();
+        var r = await CliRunner.RunAsync(_workspace.Ws, null, "sql", "validate", "--patch", PatchFile("not json"));
+        Assert.Equal(1, r.Exit);
+        Assert.Equal("invalid_patch", (string?)r.Json["error"]);
+        Assert.Contains("not valid JSON", (string?)r.Json["message"]);
+    }
+
+    /// <summary>Open item 8: `bad_payload` (SqlCommands.cs) had no test - a structurally valid patch produces a payload that
+    /// does not deserialize into SqlPlanPayload (chunkSize expects a number).</summary>
+    [Fact]
+    public async Task Validate_reports_a_patch_that_produces_an_undeserialisable_payload()
+    {
+        WithSqlVersion();
+        var patch = PatchFile("{\"phase\":\"sql\",\"baseVersion\":0,\"ops\":[{\"op\":\"replace\",\"path\":\"/tasks/T01/identityInsert\",\"value\":\"not-a-bool\"}]}");
+        var r = await CliRunner.RunAsync(_workspace.Ws, null, "sql", "validate", "--patch", patch);
+        Assert.Equal(1, r.Exit);
+        Assert.Equal("bad_payload", (string?)r.Json["error"]);
+    }
+
     [Fact]
     public async Task Validate_refuses_a_stale_patch()
     {
