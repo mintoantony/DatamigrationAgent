@@ -21,9 +21,12 @@ public sealed class GuardSourceFixture : IAsyncLifetime
             CREATE TABLE dbo.Ident (Id int NOT NULL PRIMARY KEY, V nvarchar(20) NOT NULL);
             CREATE TABLE dbo.Uni (Id int NOT NULL PRIMARY KEY, Qty int NOT NULL);
             CREATE TABLE dbo.Tkey (At datetime2(7) NOT NULL PRIMARY KEY, Qty int NOT NULL);
+            CREATE TABLE dbo.Big (Id int NOT NULL PRIMARY KEY, V nvarchar(20) NOT NULL);
             GO
             WITH n AS (SELECT TOP (400) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects a CROSS JOIN sys.all_objects b)
             INSERT dbo.Wide (Id, V) SELECT i, CONCAT('v', i) FROM n;
+            WITH n AS (SELECT TOP (3500) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects a CROSS JOIN sys.all_objects b)
+            INSERT dbo.Big (Id, V) SELECT i, CONCAT('v', i) FROM n;
             -- .6 of a second: CAST to datetime2(0) rounds up, plain truncation rounds down, and the two answers never coincide here.
             INSERT dbo.Stamp (Id, At) VALUES
               (1, '2020-01-01T10:00:01.6000000'), (2, '2020-01-01T10:00:03.6000000'), (3, '2020-01-01T10:00:05.6000000'),
@@ -55,6 +58,7 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
         CREATE TABLE app.Tkey (At datetime2(0) NOT NULL PRIMARY KEY, Qty int NOT NULL CONSTRAINT CK_Tkey_Qty CHECK (Qty > 0));
         CREATE TABLE app.Okay (Id int NOT NULL PRIMARY KEY, V nvarchar(20) NOT NULL CONSTRAINT CK_Okay_V CHECK (V = N'ok'));
         CREATE TABLE app.FlatOkay (V nvarchar(20) NOT NULL CONSTRAINT CK_FlatOkay_V CHECK (V = N'ok'));
+        CREATE TABLE app.Big (Id int NOT NULL PRIMARY KEY, V nvarchar(20) NOT NULL CONSTRAINT CK_Big_V CHECK (V = N'ok'));
         """;
 
     private sealed class Rig(XferServices svc, TempDatabase tgt, TransferEngine engine) : IAsyncDisposable
@@ -367,6 +371,78 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
             "the keyless task was not failed after its first 3 empty chunks: " + task.Error);
         Assert.Equal(0, await rig.Tgt.CountAsync("app.FlatOkay"));
         Assert.Equal(0, rig.Repo.ErrorRowCount(runId, "T01"));
+    }
+
+    private static TaskPlan Big(string vExpression, string where = "") => TaskOf("app.Big",
+        $"SELECT s.[Id] AS [Id], {vExpression} AS [V], s.[Id] AS [__k0] FROM [dbo].[Big] AS s{where}", ["__k0"], [("Id", "Id"), ("V", "V")]);
+
+    /// <summary>
+    /// Ruling 207 (open item 45): the first <see cref="TaskRunner.ZeroLoadChunks"/> chunks of every task hold at most
+    /// <see cref="TaskRunner.SmallChunkRows"/> rows, whatever the chunk size, so the zero-load guard judges a task on ~3,000 rows.
+    /// <b>Harm</b> (sweep A review F5): at the default 100,000 a wrong FK on a big table stops only after 300,000 single-row rejects,
+    /// about an hour. Good tables go on at full size from chunk 4.
+    /// </summary>
+    [Fact]
+    public async Task The_first_three_chunks_of_a_task_hold_at_most_1000_rows_whatever_the_chunk_size()
+    {
+        await using var rig = await RigAsync(One(Big("N'ok'")));
+        long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 100_000, ErrorMode = "skip" });
+        var done = new List<long>();
+        var control = new TransferControl();
+        control.ChunkCommitted += c => done.Add(c.RowsDone);
+
+        Assert.Equal(RunStatus.Completed, (await rig.Engine.RunAsync(runId, control, default)).Status);
+
+        Assert.True(done.SequenceEqual(new long[] { 1_000, 2_000, 3_000, 3_500 }),
+            "expected three chunks of 1,000 rows and then the other 500 (1000, 2000, 3000, 3500 done); rows done after each chunk were "
+            + string.Join(", ", done));
+        Assert.Equal(3_500, await rig.Tgt.CountAsync("app.Big"));
+        Assert.Equal(3_500, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Big"));
+    }
+
+    /// <summary>
+    /// Keyset paging does not persist the chunk size, so a checkpoint taken after a small first chunk resumes correctly: the resumed
+    /// segment reads chunks 2 and 3 small as well (by the checkpoint's chunk number) and loads every row exactly once. <b>Harm:</b> a
+    /// resume that skipped or repeated the rows between a small chunk's last key and the next read.
+    /// </summary>
+    [Fact]
+    public async Task A_resume_after_a_small_first_chunk_loads_every_row_exactly_once()
+    {
+        await using var rig = await RigAsync(One(Big("N'ok'")));
+        long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 100_000, ErrorMode = "skip" });
+        var control = new TransferControl();
+        control.ChunkCommitted += c => { if (c.ChunkNo == 1) control.RequestPause(); };
+        var first = await rig.Engine.RunAsync(runId, control, default);
+        Assert.True(first.Status == RunStatus.Paused && await rig.Tgt.CountAsync("app.Big") == 1_000,
+            $"the run did not pause after a first chunk of 1,000 rows: {first.Status}, {await rig.Tgt.CountAsync("app.Big")} rows in the target");
+
+        var done = new List<long>();
+        var again = new TransferControl();
+        again.ChunkCommitted += c => done.Add(c.RowsDone);
+        Assert.Equal(RunStatus.Completed, (await rig.Engine.RunAsync(runId, again, default)).Status);
+
+        Assert.True(done.SequenceEqual(new long[] { 2_000, 3_000, 3_500 }), "the resumed chunks were " + string.Join(", ", done));
+        Assert.Equal(3_500, await rig.Tgt.CountAsync("app.Big"));
+        Assert.Equal(3_500, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Big"));
+        Assert.Equal(3_500, rig.Repo.Task(runId, "T01")!.RowsDone);
+    }
+
+    /// <summary>
+    /// The same cap on the keyless path, which judges its first chunks inside its one transaction: 3,001 rows no row of which satisfies
+    /// the CHECK, at the default chunk size, are judged on the first 3,000. <b>Harm:</b> judged on the whole of a 100,000-row first chunk.
+    /// </summary>
+    [Fact]
+    public async Task A_keyless_task_is_judged_on_its_first_3000_rows_at_the_default_chunk_size()
+    {
+        await using var rig = await RigAsync(One(TaskOf("app.FlatOkay", "SELECT s.[V] AS [V] FROM [dbo].[Big] AS s WHERE s.[Id] <= 3001", [], [("V", "V")])));
+        long runId = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 100_000, ErrorMode = "skip" });
+
+        Assert.Equal(RunStatus.Failed, (await rig.Engine.RunAsync(runId, new TransferControl(), default)).Status);
+
+        string error = rig.Repo.Task(runId, "T01")!.Error!;
+        Assert.True(error.StartsWith("Every row of the first 3 chunks of app.FlatOkay was rejected (3,000 rows)", StringComparison.Ordinal),
+            "the keyless task was not judged on its first three 1,000-row chunks: " + error);
+        Assert.Equal(0, await rig.Tgt.CountAsync("app.FlatOkay"));
     }
 
     /// <summary>

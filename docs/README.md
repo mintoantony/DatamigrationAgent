@@ -149,7 +149,7 @@ that needs reasoning (splits, merges, lookups, T-SQL transforms).
 
    | Option | Default | Meaning |
    |---|---|---|
-   | Chunk size (rows) | 100 000 | rows per committed chunk (tasks with LOB columns use 5 000) |
+   | Chunk size (rows) | 100 000 | rows per committed chunk (tasks with LOB columns use 5 000); the first 3 chunks of every task hold at most 1 000 rows |
    | Parallel tasks | 4 | tasks loaded at the same time; a task starts once the tables it depends on are loaded |
    | When a row is rejected | Stop at the first bad row | **Stop at the first bad row** = the chunk is rolled back and its task stops; **Skip and log bad rows** = bad rows are isolated, recorded and skipped |
    | Truncate target first | off | deletes **every** row in each target table of the plan before loading — also rows that were never this migration's |
@@ -190,7 +190,8 @@ error:
 
 **A task that loads nothing is a mapping problem.** Because constraint violations are always per-row rejects, a wrong
 foreign-key or CHECK mapping under *Skip and log bad rows* shows as a task whose rows are all rejected. Once a task's
-first 3 chunks (or its whole source, if it is smaller) have loaded no row at all, the task fails (`bad_task`) with a
+first 3 chunks - at most 1 000 rows each, whatever the chunk size - (or its whole source, if it is smaller) have loaded
+no row at all, the task fails (`bad_task`) with a
 reason that says every row was rejected and names the most common error and its number, and the run stops - rather than
 rejecting the whole table one row at a time. The rejected rows are logged. Usually the fix is to reopen Mapping, fix it
 and run again with **Truncate target first**, as above. If the rows really are bad, **Resume** carries on from the next

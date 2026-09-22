@@ -54,7 +54,8 @@ run loaded into — that one is for the human to fix in the UI, never by re-poin
 
 ## Facts worth knowing
 
-- Chunks are keyset pages of the task's source key; each chunk and its checkpoint commit in one target transaction.
+- Chunks are keyset pages of the task's source key; each chunk and its checkpoint commit in one target transaction. The first 3
+  chunks of every task hold at most 1,000 rows, then the chunk size applies.
 - Tasks without a usable key load in a single transaction: a pause waits for them to finish, a failure restarts them from scratch.
   So a pause can take as long as the biggest keyless table does. Until it takes effect the Execute screen shows **pausing…** and
   `dbm transfer status` still reports `running` — that is the pause working, not a pause being ignored.
@@ -67,7 +68,7 @@ run loaded into — that one is for the human to fix in the UI, never by re-poin
   counts and column checksums.
 - Under skip-and-log, constraint violations (FOREIGN KEY, CHECK, PRIMARY KEY, UNIQUE) are always per-row rejects, even when every
   row of a chunk fails alike. A wrong FK or CHECK mapping therefore shows as a task whose first chunks reject everything: once its
-  first 3 chunks (or its whole source, if smaller) have loaded no row, the task fails with `bad_task` instead of rejecting the
+  first 3 chunks (at most 1,000 rows each, whatever the chunk size; or its whole source, if smaller) have loaded no row, the task fails with `bad_task` instead of rejecting the
   whole table one row at a time. The exception is a re-run into a table that already held rows whose rejects are all duplicate
   keys (PRIMARY KEY / UNIQUE, by error number 2627 / 2601; a recorded reject without a number never counts): those rows were
   already there, so the task runs on. A task that still ends with 0 rows loaded of a

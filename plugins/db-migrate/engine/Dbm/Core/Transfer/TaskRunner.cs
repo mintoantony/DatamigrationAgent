@@ -97,6 +97,18 @@ internal sealed class TaskRunner(RunContext rc)
     /// </summary>
     internal const int ZeroLoadChunks = 3;
 
+    /// <summary>
+    /// Ruling 207 (open item 45): the most rows any of a task's first <see cref="ZeroLoadChunks"/> chunks holds, whatever the chunk size,
+    /// so the zero-load guard judges a task on about 3,000 rows instead of three full chunks (300,000 single-row rejects at the default
+    /// 100,000). Keyset paging does not persist a chunk size - the next read starts after the checkpoint's last key - so a small chunk
+    /// resumes like any other, and the size is chosen from the checkpoint's chunk number, the same on a resume as the first time.
+    /// </summary>
+    internal const int SmallChunkRows = 1_000;
+
+    /// <summary>The rows to read for the chunk after <paramref name="chunksDone"/> committed (keyed) or loaded (keyless) chunks.</summary>
+    internal static int ChunkRows(int chunkSize, int chunksDone)
+        => chunksDone < ZeroLoadChunks ? Math.Min(chunkSize, SmallChunkRows) : chunkSize;
+
     private static readonly AsyncLocal<Action<string, int>?> AfterChunkTransactionHook = new();
 
     /// <summary>
@@ -216,15 +228,16 @@ internal sealed class TaskRunner(RunContext rc)
         {
             if (rc.Control.StopRequested) return new Pass(TransferTaskStatus.Paused, cp);
 
+            int size = ChunkRows(chunkSize, cp.ChunkNo);
             DataTable table;
-            await using (var cmd = ChunkPlanner.Command(src, task, last, chunkSize))
+            await using (var cmd = ChunkPlanner.Command(src, task, last, size))
             await using (var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SequentialAccess, ct))
             {
                 // The key values are the reader's own, typed by GetFieldType: KeyCodec matches the .NET type to the SQL type exactly,
                 // so an int handed over for a bigint key is "bad_key". Nothing here converts them.
                 types ??= KeyCodec.TypesOf(reader, task.KeyColumns);
                 table = ChunkReader.NewTable(reader);
-                await ChunkReader.FillAsync(reader, table, chunkSize, ct);
+                await ChunkReader.FillAsync(reader, table, size, ct);
             }
 
             if (table.Rows.Count == 0)
@@ -242,7 +255,7 @@ internal sealed class TaskRunner(RunContext rc)
             // BulkLoader does not normalize by itself: without this, datetime2(n)/time/datetimeoffset values are truncated where the
             // server's CAST rounds, and smalldatetime values are rounded on the fractional second (V8).
             shape.Normalize(table, task.Columns);
-            bool lastChunk = table.Rows.Count < chunkSize;
+            bool lastChunk = table.Rows.Count < size;
             ChunkOutcome outcome;
             Checkpoint next;
             await using (var scope = await TxScope.BeginAsync(tgt, ct))
@@ -323,8 +336,9 @@ internal sealed class TaskRunner(RunContext rc)
                 await scope.RollbackAsync();   // nothing of a keyless task is committed before it completes
                 return new Pass(TransferTaskStatus.Paused, Checkpoint.Start);
             }
+            int size = ChunkRows(chunkSize, chunks);
             var table = ChunkReader.NewTable(reader);
-            int n = await ChunkReader.FillAsync(reader, table, chunkSize, ct);
+            int n = await ChunkReader.FillAsync(reader, table, size, ct);
             if (n == 0) break;
             shape.Normalize(table, task.Columns);   // the keyless path needs its own call; the loader does not round by itself (V8)
             long before = loaded;
@@ -355,7 +369,7 @@ internal sealed class TaskRunner(RunContext rc)
             // Ruling 192. Nothing of a keyless task is committed before it completes, so the judgement rolls the whole task back: a
             // resume restarts it from zero and meets the same verdict, and Reopen is the way on.
             if (chunks == ZeroLoadChunks) await GuardAsync();
-            if (n < chunkSize) break;
+            if (n < size) break;
         }
         if (chunks < ZeroLoadChunks) await GuardAsync();   // the source ended within the first chunks: that was all of it
         long? merged = mergeStatus == MergeStatus.Ran && !mergeCountUnknown ? mergedTotal : null;

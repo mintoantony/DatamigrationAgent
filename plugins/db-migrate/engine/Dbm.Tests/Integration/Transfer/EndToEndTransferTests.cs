@@ -328,7 +328,8 @@ public sealed class EndToEndTransferTests(SamplePlanFixture fx) : IClassFixture<
         var single = Assert.Single(rig.Repo.ErrorRows(runId, orders.TaskId, 100));
         Assert.True(KeyOf(single) == (3001, null) && single.Error.Contains("FK_Orders_Customers", StringComparison.Ordinal),
             $"stop mode recorded {single.KeyJson} ({single.Error}), not the first bad row, order 3001 on FK_Orders_Customers");
-        Assert.Equal(0, await rig.Tgt.CountAsync("[app].[Orders]"));                          // one chunk, rolled back
+        // Ruling 207: chunks 1-3 hold 1,000 rows each (orders 1-3000, all good) and commit; chunk 4, holding order 3001, rolls back.
+        Assert.Equal(3000, await rig.Tgt.CountAsync("[app].[Orders]"));
         Assert.Equal(TransferTaskStatus.Pending, rig.Repo.Task(runId, rig.TaskOf("app.OrderLines"))!.Status);   // depends on Orders
         Assert.Equal(RunStatus.Failed, rig.Repo.GetRun(runId)!.Status);
     }
@@ -541,8 +542,9 @@ public sealed class EndToEndTransferTests(SamplePlanFixture fx) : IClassFixture<
     /// Ruling 192 (open item 30), the 5.7 reviewer's reproduction: the real plan with app.Orders.CustomerId bound to an expression no
     /// customer matches, skip mode, default options. Every order is an FK reject. <b>Harm</b> (5.7 review F1, measured): the run
     /// <b>completed</b> in 2 m 37 s (3 m 11 s in this sweep's baseline) with Orders 0 / 3 005 and, by cascade, OrderLines 0 / 9 002, under
-    /// "row counts validated, checksums 23/23 matched". Now the Orders task fails as soon as its whole source (one chunk) has loaded
-    /// nothing, naming FK_Orders_Customers and error 547; its rejects are recorded; OrderLines depends on Orders and never starts.
+    /// "row counts validated, checksums 23/23 matched". Now the Orders task fails as soon as its first 3 chunks - 1,000 rows each at any
+    /// chunk size (Ruling 207, open item 45) - have loaded nothing, naming FK_Orders_Customers and error 547; the 3,000 rejects are
+    /// recorded; OrderLines depends on Orders and never starts.
     /// </summary>
     [Fact]
     public async Task A_wrong_FK_mapping_fails_its_task_instead_of_completing_with_the_table_rejected()
@@ -561,14 +563,14 @@ public sealed class EndToEndTransferTests(SamplePlanFixture fx) : IClassFixture<
             $"a wrong FK mapping ended {outcome.Status}: the whole table was rejected row by row and the run reported as finished");
         var row = rig.Repo.Task(runId, ordersTask)!;
         Assert.Equal(TransferTaskStatus.Failed, row.Status);
-        Assert.True(row.Error!.StartsWith("Every row of the first chunk of app.Orders was rejected (3,005 rows) and none loaded", StringComparison.Ordinal)
-                    // 3 002, not 3 005: the three planted 300-character comments fail client-side first, with no server number
-                    && row.Error.Contains("on 3,002 of 3,005 rows, was error 547", StringComparison.Ordinal)
+        // The three planted 300-character comments sit past order 3000, so all 3,000 judged rows carry 547.
+        Assert.True(row.Error!.StartsWith("Every row of the first 3 chunks of app.Orders was rejected (3,000 rows) and none loaded", StringComparison.Ordinal)
+                    && row.Error.Contains("on 3,000 of 3,000 rows, was error 547", StringComparison.Ordinal)
                     && row.Error.Contains("FK_Orders_Customers", StringComparison.Ordinal),
-            "the failure does not say every row was rejected and name the FK with its error number: " + row.Error);
-        Assert.Contains($"{ordersTask}: Every row of the first chunk", outcome.Error!, StringComparison.Ordinal);
+            "the failure does not say every row of the first three 1,000-row chunks was rejected and name the FK with its error number: " + row.Error);
+        Assert.Contains($"{ordersTask}: Every row of the first 3 chunks", outcome.Error!, StringComparison.Ordinal);
         Assert.Equal(0, await rig.Tgt.CountAsync("[app].[Orders]"));
-        Assert.Equal(3005, rig.Repo.ErrorRowCount(runId, ordersTask));                 // skip-and-log still recorded every reject
+        Assert.Equal(3000, rig.Repo.ErrorRowCount(runId, ordersTask));                 // skip-and-log still recorded every reject judged
         var lines = rig.Repo.Task(runId, rig.TaskOf("app.OrderLines"))!;
         Assert.True(lines.Status == TransferTaskStatus.Pending && lines.RowsError == 0,
             $"OrderLines, which depends on Orders, ran anyway: {lines.Status}, {lines.RowsError} rejected");
