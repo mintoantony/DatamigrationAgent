@@ -19,7 +19,8 @@ public class HelpCommandTests
 
         Assert.Equal(0, exit);
         var text = sw.ToString();
-        Assert.Single(text.Split('\n', StringSplitOptions.RemoveEmptyEntries));   // one compact line
+        Assert.True(text.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length == 1,
+            $"dbm help --json ignored the flag and printed prose: \"{text}\"");
         var json = JsonNode.Parse(text)!;
         var commands = json["commands"]!.AsArray();
         Assert.Equal(CommandRegistry.All().Count, commands.Count);

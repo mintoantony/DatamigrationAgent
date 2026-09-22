@@ -275,9 +275,12 @@ public class StateDbTests
     [Fact]
     public void ToDb_throws_naming_the_kind_for_an_unspecified_DateTime()
     {
-        var ex = Assert.Throws<ArgumentException>(() => StateDb.ToDb(new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Unspecified)));
+        var ex = Record.Exception(() => StateDb.ToDb(new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Unspecified)));
 
-        Assert.Contains("Unspecified", ex.Message, StringComparison.Ordinal);
+        Assert.True(ex is ArgumentException,
+            $"ToDb silently shifted an Unspecified-kind DateTime by the machine's offset instead of refusing it: " +
+            $"{(ex is null ? "no exception was thrown" : ex.GetType().Name)}.");
+        Assert.Contains("Unspecified", ex!.Message, StringComparison.Ordinal);
     }
 
     [Theory]

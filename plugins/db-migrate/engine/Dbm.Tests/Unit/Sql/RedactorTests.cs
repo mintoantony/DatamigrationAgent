@@ -44,7 +44,10 @@ public class RedactorTests
     public void SecretsOf_handles_doubled_single_quotes_the_same_way_as_doubled_double_quotes()
     {
         Assert.Equal(new[] { "ab\"cd" }, Redactor.SecretsOf("this is ; not = valid ; Password=\"ab\"\"cd\""));
-        Assert.Equal(new[] { "ab'cd" }, Redactor.SecretsOf("this is ; not = valid ; Password='ab''cd'"));
+        var sqSecrets = Redactor.SecretsOf("this is ; not = valid ; Password='ab''cd'").ToList();
+        Assert.True(sqSecrets.SequenceEqual(new[] { "ab'cd" }),
+            $"SecretsOf did not unescape a doubled single quote ('') the way it already unescapes a doubled double " +
+            $"quote (\"\"): got [{string.Join(", ", sqSecrets)}], expected [ab'cd].");
     }
 
     [Fact]
@@ -54,7 +57,8 @@ public class RedactorTests
 
         var scrubbed = Redactor.Scrub("connect failed: password ab'cd was rejected", secrets);
 
-        Assert.Equal("connect failed: password *** was rejected", scrubbed);
+        Assert.True(scrubbed == "connect failed: password *** was rejected",
+            $"Scrub did not redact the password recovered from a doubled-single-quote capture: got \"{scrubbed}\".");
     }
 
     [Fact]

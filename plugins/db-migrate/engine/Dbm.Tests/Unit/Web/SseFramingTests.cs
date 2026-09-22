@@ -23,7 +23,10 @@ public class SseFramingTests
     {
         var framed = CoreEndpoints.FrameEvent(new SseMessage(1, "test", data));
 
-        Assert.Equal($"id: 1\nevent: test\ndata: {expectedData}\n\n", framed);
+        static string Escape(string s) => s.Replace("\r", "\\r").Replace("\n", "\\n");
+        var expected = $"id: 1\nevent: test\ndata: {expectedData}\n\n";
+        Assert.True(framed == expected,
+            $"a bare \\r survived into the SSE data line and would end it early: expected \"{Escape(expected)}\", got \"{Escape(framed)}\".");
     }
 
     [Fact]

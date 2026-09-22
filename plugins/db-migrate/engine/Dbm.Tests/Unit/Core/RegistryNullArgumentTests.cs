@@ -14,14 +14,22 @@ public class RegistryNullArgumentTests
     [Fact]
     public void ModuleRegistry_Create_throws_immediately_for_a_null_services_argument()
     {
-        var ex = Assert.Throws<ArgumentNullException>(() => ModuleRegistry.Create(null!));
-        Assert.Equal("s", ex.ParamName);
+        var ex = Record.Exception(() => ModuleRegistry.Create(null!));
+
+        Assert.True(ex is ArgumentNullException,
+            $"ModuleRegistry.Create(null) did not throw immediately - a null DbmServices was swallowed by a deferred " +
+            $"or missing iterator guard instead of failing fast: {(ex is null ? "no exception was thrown" : ex.GetType().Name)}.");
+        Assert.Equal("s", ((ArgumentNullException)ex!).ParamName);
     }
 
     [Fact]
     public void JobRegistry_Create_throws_immediately_for_a_null_services_argument()
     {
-        var ex = Assert.Throws<ArgumentNullException>(() => JobRegistry.Create(null!));
-        Assert.Equal("s", ex.ParamName);
+        var ex = Record.Exception(() => JobRegistry.Create(null!));
+
+        Assert.True(ex is ArgumentNullException,
+            $"JobRegistry.Create(null) did not throw immediately - a null DbmServices was swallowed by a deferred " +
+            $"or missing iterator guard instead of failing fast: {(ex is null ? "no exception was thrown" : ex.GetType().Name)}.");
+        Assert.Equal("s", ((ArgumentNullException)ex!).ParamName);
     }
 }
