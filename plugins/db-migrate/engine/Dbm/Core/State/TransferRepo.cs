@@ -69,6 +69,11 @@ public sealed class TransferRepo(StateDb db)
         });
     }
 
+    /// <summary>Ruling 212: this workspace's identity (a GUID created by migration step 3), which owns its checkpoint rows in a target.</summary>
+    public string WorkspaceId()
+        => _db.Scalar<string>("SELECT workspace_id FROM transfer_identity WHERE id = 1")
+           ?? throw new InvalidOperationException("The state database has no workspace identity (migration step 3 did not run).");
+
     public TransferRunRow? Latest()
         => _db.Query($"SELECT {RunCols} FROM transfer_run ORDER BY id DESC LIMIT 1", MapRun).FirstOrDefault();
 

@@ -21,12 +21,13 @@ see rows or connection strings, and never start a transfer on your own initiativ
 | `dbm transfer status` | `{"runId","status","done","total","errors","tasksDone","tasksTotal","tasks":[running/paused/failed tasks]}` |
 | `dbm transfer pause` | Running tasks finish their current chunk, commit its checkpoint, then stop. |
 | `dbm transfer resume` | Continues a paused **or failed** run from the last committed checkpoint of every task — no duplicates, no gaps. |
-| `dbm transfer cancel` | Running: stop after the current chunk. Paused/failed: cancel now. Either way the plan's post-load SQL then runs (best effort) to undo its pre-load SQL, and the checkpoint table is dropped unless the run was started with "Keep the checkpoint table". |
+| `dbm transfer cancel` | Running: stop after the current chunk. Paused/failed: cancel now. Either way the plan's post-load SQL then runs (best effort) to undo its pre-load SQL, and this project's checkpoints are removed (the checkpoint table is dropped once no other project's are left in it) unless the run was started with "Keep the checkpoint table". Cancelling a paused or failed run is refused `busy` while another transfer is loading the target. |
 | `dbm transfer start --yes-target <db> [--chunk n] [--parallel n] [--skip-errors] [--truncate]` | Only when the human explicitly asks you to start from the CLI **and** gave you the target database name. Into target tables that already hold rows it is refused with `target_not_empty` unless `--truncate` is given; the confirmation by name exists only in the Execute screen's start dialog. |
 
 Every one of them can come back as a refusal — `{"error":"<code>","message":"<sentence>"}` and exit 1. The message is written for the
-human: report it as it stands rather than rewording it. The codes you will actually see are `busy` (another runner has this run, or another transfer - from any project folder - is
-loading the same target database; the message names the target and what holds it),
+human: report it as it stands rather than rewording it. The codes you will actually see are `busy` (another runner has this run; another transfer - from any project folder - is
+loading the same target database; or another project folder's run is paused, failed or interrupted part-way through it and
+must be resumed or cancelled from that project first; the message names the target and what holds it),
 `not_running`, `not_resumable`, `not_cancellable`, `paused_run` (a paused run must be resumed or cancelled first), `not_ready` (no
 approved SQL plan, or it cannot be read), `preflight_failed`, `target_not_empty` (the details list each non-empty table and whether it
 has a key), `confirm_required` / `confirm_mismatch`, `no_connection`, `no_plan`, and

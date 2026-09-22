@@ -478,6 +478,23 @@ public sealed class TransferService
         string targetCs = ConnectionStrings().Target;
         var notes = new List<string>();
         if (note is not null) notes.Add(note);
+        // Ruling 212 (c): the PostSql and the checkpoint rows are the target's business, so they happen under the target lock. A live
+        // runner of another project refuses the cancel (busy) and nothing changes; a target that cannot be reached at all is no reason
+        // to keep a run from being cancelled - what could not be done there is noted below, as before.
+        RunLock? held = null;
+        try
+        {
+            held = await RunLock.AcquireAsync(targetCs, run.Id, ct, TransferEngine.OwnerOf(_services));
+        }
+        catch (TransferException ex) when (ex.Code == "run_in_progress")
+        {
+            throw new TransferException("busy", ex.Message + " The cancel changed nothing; try again when it is free.");
+        }
+        catch (SqlException)
+        {
+            // unreachable: RestoreAsync and the release below each note their own failure
+        }
+        await using var _ = held;
         try
         {
             var plan = _services.Artifacts.Get(PhaseName.Sql, run.SqlVersion) is { } artifact
@@ -669,8 +686,12 @@ public sealed class TransferService
     {
         try
         {
-            var probe = await RunLock.AcquireAsync(targetCs, runId, ct, TransferEngine.HolderText(_services, runId));
-            await probe.DisposeAsync();
+            var owner = TransferEngine.OwnerOf(_services);
+            await using var probe = await RunLock.AcquireAsync(targetCs, runId, ct, owner);
+            // Ruling 212 (b), asked here as well so another project's paused run reaches the operator as busy, not as a run that
+            // started and was then refused.
+            await using var tgt = await SqlConnect.OpenAsync(targetCs, ct);
+            await TransferEngine.EnsureNoForeignCheckpointsAsync(tgt, owner, probe.Database, ct);
         }
         catch (TransferException ex) when (ex.Code == "run_in_progress")
         {
@@ -710,7 +731,7 @@ public sealed class TransferService
             throw new TransferException("target_unknown",
                 $"Because {problem}, it cannot be confirmed that {saved.Database} on {saved.Server} is the database run {run.Id} "
                 + "loaded into. Re-run discovery, or cancel this run and start a new one.");
-        if (Same(saved.Database, discovered.Database) && Same(saved.Server, discovered.Server)) return;
+        if (Preflight.SameTarget(saved, discovered)) return;
         throw new TransferException("target_changed",
             $"The saved target connection now points at {saved.Database} on {saved.Server}, but run {run.Id} loaded into "
             + $"{discovered.Database} on {discovered.Server}. Its checkpoints and the {ControlTable.Name} table live in that database, "
@@ -744,7 +765,7 @@ public sealed class TransferService
             throw new TransferException("not_ready",
                 $"The transfer cannot start because {problem}: the SQL plan was generated against the discovered target, and there is "
                 + "nothing to check the saved connection against. Re-run discovery.");
-        if (Same(saved.Database, discovered.Database) && Same(saved.Server, discovered.Server)) return;
+        if (Preflight.SameTarget(saved, discovered)) return;
         throw new TransferException("not_ready",
             $"The saved target connection no longer matches the discovered catalog ({saved.Database} on {saved.Server} against "
             + $"{discovered.Database} on {discovered.Server}); re-run discovery. The SQL plan was generated for "
@@ -759,17 +780,9 @@ public sealed class TransferService
     /// </summary>
     private (ServerMeta? Meta, string? Problem) DiscoveredTarget()
     {
-        try
-        {
-            var meta = _services.Catalog.Get(Side.Tgt)?.Server;
-            return meta is null || string.IsNullOrWhiteSpace(meta.Database)
-                ? (null, "no discovered target catalog is recorded in this workspace")
-                : (meta, null);
-        }
-        catch (JsonException ex)
-        {
-            return (null, "the discovered target catalog could not be read (" + Describe(ex) + ")");
-        }
+        // Ruling 212 (MED-2): the same predicate pre-flight uses, so the checklist and this door cannot disagree about one record.
+        var (catalog, problem) = Preflight.DiscoveredCatalog(_services, Side.Tgt);
+        return (catalog?.Server, problem);
     }
 
     /// <summary>The saved target's server details. A row that will not parse is a refusal, not a 500 (ruling 123 at the start door).</summary>
@@ -842,8 +855,10 @@ public sealed class TransferService
             {
                 return;   // server shutting down: the run stays 'running' and RecoverInterrupted pauses it on the next start
             }
-            catch (TransferException ex) when (ex.Code == "run_in_progress")
+            catch (TransferException ex) when (ex.Code is "run_in_progress" or "target_changed")
             {
+                // target_changed (Ruling 212, LOW-1): the lock session reached a different database than the run recorded - refused
+                // before anything was read or written, so it is recorded exactly like a lock refusal.
                 // The lock refused this runner after EnsureNoOtherRunnerAsync let it through - another process took the run's lock in
                 // between. Nothing of it ran here, so it is not a failed run: it is put back exactly where this attempt found it
                 // (ruling 134), carrying the lock's sentence.
@@ -1336,7 +1351,11 @@ public sealed class TransferService
         try
         {
             await using var conn = await SqlConnect.OpenAsync(targetCs, ct);
-            await ControlTable.DropAsync(conn, ct);
+            // Ruling 212 (c): only this project's rows; the table stays while another project's are in it.
+            if (!await ControlTable.ReleaseAsync(conn, TransferEngine.OwnerOf(_services), ct))
+                _services.Sink.Publish("log", new { level = "info",
+                    message = $"{ControlTable.Name} was left in the target: this project's checkpoints were removed, but it still holds "
+                              + "another project's checkpoints." });
         }
         catch (Exception ex) when (ex is SqlException or TransferException)
         {

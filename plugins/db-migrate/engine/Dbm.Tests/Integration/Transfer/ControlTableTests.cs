@@ -222,11 +222,53 @@ public sealed class ControlTableTests
         Assert.Equal("customer", await db.ScalarAsync<string>("SELECT owner FROM dbo.__dbm_checkpoint"));
         Assert.Equal(5, await db.ScalarAsync<int>("SELECT chunk_no FROM dbo.__dbm_checkpoint"));
 
-        // The harm the shape check prevents: nothing else stops the checkpoint statements from overwriting and adding to that data.
-        await ControlTable.UpsertAsync(conn, null, 1, "T01", Checkpoint.Start, default);
-        await ControlTable.UpsertAsync(conn, null, 1, "T02", Checkpoint.Start, default);
-        Assert.Equal(0, await db.ScalarAsync<int>("SELECT chunk_no FROM dbo.__dbm_checkpoint WHERE task_id = N'T01'"));
-        Assert.Equal(2L, await db.CountAsync("dbo.__dbm_checkpoint"));
+        // Ruling 212: the end-of-run release (delete our rows, drop when empty) refuses it the same way and leaves its rows alone. (The
+        // upsert-into-it demonstration this test used to end with no longer applies: the checkpoint statements now name the project
+        // columns, which this table does not have.)
+        var release = await Assert.ThrowsAsync<TransferException>(() => ControlTable.ReleaseAsync(conn, CheckpointOwner.Unowned, default));
+        Assert.Equal("control_table_mismatch", release.Code);
+        Assert.Equal(1L, await db.CountAsync("dbo.__dbm_checkpoint"));
+    }
+
+    /// <summary>
+    /// Ruling 212: a checkpoint table an earlier engine created (no project columns) is upgraded in place, keeping its rows, which are
+    /// then claimable only by a resume of the same run - and until claimed they count as another project's unfinished rows, never as
+    /// rows a fresh run may adopt.
+    /// </summary>
+    [Fact]
+    public async Task An_earlier_engines_checkpoint_table_is_upgraded_in_place_and_its_rows_are_claimed_only_by_their_run()
+    {
+        await using var db = await TempDatabase.CreateAsync("dbm_ctlold");
+        await db.ExecAsync("""
+            CREATE TABLE dbo.__dbm_checkpoint (
+              run_id bigint NOT NULL, task_id nvarchar(64) COLLATE Latin1_General_100_BIN2 NOT NULL, chunk_no int NOT NULL,
+              last_key nvarchar(max) COLLATE Latin1_General_100_BIN2 NULL,
+              rows_done bigint NOT NULL, rows_error bigint NOT NULL, done bit NOT NULL, updated_at datetime2(3) NOT NULL,
+              PRIMARY KEY (run_id, task_id));
+            INSERT dbo.__dbm_checkpoint VALUES (1, N'T01', 2, N'[200]', 200, 0, 0, SYSUTCDATETIME());
+            """);
+        await using var conn = new SqlConnection(db.ConnectionString);
+        await conn.OpenAsync();
+        var me = new CheckpointOwner(Guid.NewGuid().ToString("D"), @"D:\me");
+
+        await ControlTable.EnsureAsync(conn, default);
+
+        Assert.Equal(1L, await db.CountAsync("dbo.__dbm_checkpoint"));
+        string? foreign = await ControlTable.ForeignUnfinishedAsync(conn, me, default);
+        Assert.True(foreign is not null, "an earlier engine's unfinished checkpoint was not counted as another project's");
+        await ControlTable.ClaimLegacyAsync(conn, me, 1, ["T01"], default);
+        Assert.Null(await ControlTable.ForeignUnfinishedAsync(conn, me, default));
+        ControlTable.CurrentOwner = me;
+        try
+        {
+            Assert.Equal(200, (await ControlTable.ReadAsync(conn, 1, "T01", default))!.RowsDone);
+        }
+        finally
+        {
+            ControlTable.CurrentOwner = null;
+        }
+        Assert.True(await ControlTable.ReleaseAsync(conn, me, default));
+        Assert.False(await ControlTable.ExistsAsync(conn, default));
     }
 
     [Fact]

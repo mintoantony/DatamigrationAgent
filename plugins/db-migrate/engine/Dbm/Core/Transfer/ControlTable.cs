@@ -10,13 +10,45 @@ public sealed record Checkpoint(int ChunkNo, string? LastKeyJson, long RowsDone,
 }
 
 /// <summary>
+/// Whose checkpoint rows these are (Ruling 212, review HIGH-1). Run ids start at 1 in every project folder and task ids are positional,
+/// so (run_id, task_id) alone let a second project's run 1 adopt the first project's checkpoint in a shared target.
+/// </summary>
+/// <param name="ProjectId">The workspace's own identity (<c>TransferRepo.WorkspaceId</c>, a GUID created once per state database).
+/// Empty for rows written by an engine from before this column existed.</param>
+/// <param name="Folder">The project folder, so a refusal can say whose rows they are. Never a connection detail.</param>
+public sealed record CheckpointOwner(string ProjectId, string? Folder)
+{
+    /// <summary>The owner of rows written before project identity existed, and of calls made with no owner set (unit tests).</summary>
+    public static CheckpointOwner Unowned { get; } = new("", null);
+}
+
+/// <summary>
 /// dbo.__dbm_checkpoint in the TARGET: written in the same transaction as each chunk (exactly-once).
 /// This is the one persistent object the engine creates in a customer database. Nothing here touches any other object, and
 /// nothing here writes into or drops a table of that name whose shape has not been verified as ours.
+/// <para>Every row belongs to one project (<see cref="CheckpointOwner"/>): checkpoints are read and written under
+/// <see cref="CurrentOwner"/>, a finished or cancelled run removes only its own project's rows, and the table is dropped only once it
+/// is empty (Ruling 212).</para>
 /// </summary>
 public static class ControlTable
 {
     public const string Name = "[dbo].[__dbm_checkpoint]";
+
+    private static readonly AsyncLocal<CheckpointOwner?> AmbientOwner = new();
+
+    /// <summary>
+    /// The project whose checkpoints <see cref="ReadAsync"/> and <see cref="UpsertAsync"/> read and write. Set by
+    /// <c>TransferEngine.RunAsync</c> for the whole segment (it flows into every task worker); ambient because the per-chunk callers
+    /// already take a run id and a task id, and the owner is the same for every call of a segment. Unset reads as
+    /// <see cref="CheckpointOwner.Unowned"/>.
+    /// </summary>
+    internal static CheckpointOwner? CurrentOwner
+    {
+        get => AmbientOwner.Value;
+        set => AmbientOwner.Value = value;
+    }
+
+    private static CheckpointOwner Owner => AmbientOwner.Value ?? CheckpointOwner.Unowned;
 
     /// <summary>nvarchar(64): longer ids would be silently truncated by the parameter and collide, so they are refused.</summary>
     private const int MaxTaskIdLength = 64;
@@ -30,9 +62,15 @@ public static class ControlTable
     private const string Collation = "Latin1_General_100_BIN2";
 
     // name|type|max_length(bytes)|scale|nullable|collation, in column order — what EnsureAsync creates.
-    private const string ExpectedShape =
+    private const string LegacyColumns =
         "run_id|bigint|8|0|0|,task_id|nvarchar|128|0|0|" + Collation + ",chunk_no|int|4|0|0|,last_key|nvarchar|-1|0|1|" + Collation + "," +
-        "rows_done|bigint|8|0|0|,rows_error|bigint|8|0|0|,done|bit|1|0|0|,updated_at|datetime2|7|3|0|;pk=run_id,task_id";
+        "rows_done|bigint|8|0|0|,rows_error|bigint|8|0|0|,done|bit|1|0|0|,updated_at|datetime2|7|3|0|";
+
+    /// <summary>The shape before Ruling 212: no project columns, keyed (run_id, task_id). EnsureAsync upgrades it in place.</summary>
+    private const string LegacyShape = LegacyColumns + ";pk=run_id,task_id";
+
+    private const string ExpectedShape = LegacyColumns + ",project_id|nvarchar|72|0|0|" + Collation
+                                          + ",project_folder|nvarchar|800|0|1|" + Collation + ";pk=project_id,run_id,task_id";
 
     private const string MissingShape = "(table missing)";
 
@@ -53,13 +91,113 @@ public static class ControlTable
                     run_id bigint NOT NULL, task_id nvarchar(64) COLLATE {Collation} NOT NULL, chunk_no int NOT NULL,
                     last_key nvarchar(max) COLLATE {Collation} NULL,
                     rows_done bigint NOT NULL, rows_error bigint NOT NULL, done bit NOT NULL, updated_at datetime2(3) NOT NULL,
-                    PRIMARY KEY (run_id, task_id));
+                    project_id nvarchar(36) COLLATE {Collation} NOT NULL, project_folder nvarchar(400) COLLATE {Collation} NULL,
+                    PRIMARY KEY (project_id, run_id, task_id));
                 """, ct);
             string shape = await ShapeAsync(conn, tx, ct);
+            if (string.Equals(shape, LegacyShape, StringComparison.Ordinal))
+            {
+                // A table an earlier engine created (a run paused across the upgrade). Its rows keep an empty project: whose they are
+                // was never recorded, so they are claimed only by a resume of the same run (ClaimLegacyAsync), and until then they
+                // count as another project's (ForeignUnfinishedAsync), never as rows a fresh run may adopt.
+                await ExecAsync(conn, tx, $"ALTER TABLE {Name} ADD project_id nvarchar(36) COLLATE {Collation} NOT NULL "
+                                          + $"CONSTRAINT DF___dbm_checkpoint_project_id DEFAULT N'', "
+                                          + $"project_folder nvarchar(400) COLLATE {Collation} NULL;", ct);
+                await ExecAsync(conn, tx, $"""
+                    DECLARE @pk sysname = (SELECT name FROM sys.key_constraints WHERE parent_object_id = OBJECT_ID(N'{Name}', N'U') AND type = 'PK');
+                    DECLARE @sql nvarchar(400) = N'ALTER TABLE {Name} DROP CONSTRAINT ' + QUOTENAME(@pk);
+                    EXEC sys.sp_executesql @sql;
+                    """, ct);
+                await ExecAsync(conn, tx, $"ALTER TABLE {Name} ADD PRIMARY KEY (project_id, run_id, task_id);", ct);
+                shape = await ShapeAsync(conn, tx, ct);
+            }
             if (!string.Equals(shape, ExpectedShape, StringComparison.Ordinal))
                 throw Mismatch(shape, "it was left untouched. Rename or drop it and retry.");
         }, ct);
     }
+
+    /// <summary>
+    /// Ruling 212 (b). The first unfinished checkpoint in the target that is not <paramref name="owner"/>'s, described for a refusal
+    /// ("run 1 of the project in D:\x"), or null when there is none or no table. Unfinished rows of another project mean that project's
+    /// run is paused, failed or crashed part-way through loading this target; a run of ours now would load beside it and, where the
+    /// plans share tables, into rows it has half-loaded.
+    /// </summary>
+    public static async Task<string?> ForeignUnfinishedAsync(SqlConnection conn, CheckpointOwner owner, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(conn);
+        ArgumentNullException.ThrowIfNull(owner);
+        await using var cmd = new SqlCommand($"""
+            IF OBJECT_ID(N'{Name}', N'U') IS NOT NULL AND COL_LENGTH(N'{Name}', N'project_id') IS NOT NULL
+              EXEC sys.sp_executesql N'SELECT TOP (1) project_id, project_folder, run_id FROM {Name}
+                                       WHERE project_id <> @p AND done = 0 ORDER BY updated_at DESC', N'@p nvarchar(36)', @p = @p;
+            """, conn);
+        cmd.Parameters.Add(new SqlParameter("@p", SqlDbType.NVarChar, 36) { Value = owner.ProjectId });
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        if (!await r.ReadAsync(ct)) return null;
+        string run = r.GetInt64(2).ToString(CultureInfo.InvariantCulture);
+        if (r.GetString(0).Length == 0) return $"run {run} of a project whose folder an earlier db-migrate version did not record";
+        return r.IsDBNull(1) ? $"run {run} of another project" : $"run {run} of the project in {r.GetString(1)}";
+    }
+
+    /// <summary>
+    /// Rows an earlier engine wrote for <paramref name="runId"/> (empty project) become <paramref name="owner"/>'s. Called only on a
+    /// resume segment - a run with recorded progress - so a fresh run never adopts a row it did not write.
+    /// </summary>
+    public static async Task ClaimLegacyAsync(SqlConnection conn, CheckpointOwner owner, long runId, IReadOnlyCollection<string> taskIds,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(conn);
+        ArgumentNullException.ThrowIfNull(owner);
+        if (owner.ProjectId.Length == 0 || taskIds.Count == 0) return;
+        foreach (var taskId in taskIds)
+        {
+            CheckTaskId(taskId);
+            await using var cmd = new SqlCommand($"""
+                IF OBJECT_ID(N'{Name}', N'U') IS NOT NULL
+                  UPDATE {Name} SET project_id = @p, project_folder = @f WHERE project_id = N'' AND run_id = @r AND task_id = @t;
+                """, conn);
+            AddKey(cmd, runId, taskId);
+            cmd.Parameters.Add(new SqlParameter("@p", SqlDbType.NVarChar, 36) { Value = owner.ProjectId });
+            cmd.Parameters.Add(new SqlParameter("@f", SqlDbType.NVarChar, 400) { Value = (object?)Folder(owner) ?? DBNull.Value });
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+    }
+
+    /// <summary>
+    /// Ruling 212 (c): a finished or cancelled run's end. Deletes <paramref name="owner"/>'s rows (every run of that project: at most
+    /// one of its runs is ever live, and an abandoned one's rows are dead) and drops the table only when nothing else is left in it.
+    /// Returns true when the table is gone (or was never there); false when another project's rows kept it. A table of that name that
+    /// is not ours is refused as in <see cref="DropAsync"/>.
+    /// </summary>
+    public static async Task<bool> ReleaseAsync(SqlConnection conn, CheckpointOwner owner, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(conn);
+        ArgumentNullException.ThrowIfNull(owner);
+        bool dropped = true;
+        await UnderAppLockAsync(conn, async tx =>
+        {
+            string shape = await ShapeAsync(conn, tx, ct);
+            if (shape == MissingShape) return;
+            if (!string.Equals(shape, ExpectedShape, StringComparison.Ordinal))
+                throw Mismatch(shape, "it was not dropped.");
+            await using (var del = new SqlCommand($"DELETE FROM {Name} WHERE project_id = @p;", conn, tx))
+            {
+                del.Parameters.Add(new SqlParameter("@p", SqlDbType.NVarChar, 36) { Value = owner.ProjectId });
+                await del.ExecuteNonQueryAsync(ct);
+            }
+            await using var left = new SqlCommand($"SELECT COUNT_BIG(*) FROM {Name};", conn, tx);
+            if (Convert.ToInt64(await left.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture) > 0)
+            {
+                dropped = false;
+                return;
+            }
+            await ExecAsync(conn, tx, $"DROP TABLE {Name};", ct);
+        }, ct);
+        return dropped;
+    }
+
+    private static string? Folder(CheckpointOwner owner)
+        => owner.Folder is { Length: > 400 } f ? f[..400] : owner.Folder;
 
     public static async Task<bool> ExistsAsync(SqlConnection conn, CancellationToken ct)
     {
@@ -77,8 +215,9 @@ public static class ControlTable
         ArgumentNullException.ThrowIfNull(conn);
         CheckTaskId(taskId);
         await using var cmd = new SqlCommand(
-            $"SELECT chunk_no, last_key, rows_done, rows_error, done FROM {Name} WHERE run_id = @r AND task_id = @t", conn);
+            $"SELECT chunk_no, last_key, rows_done, rows_error, done FROM {Name} WHERE project_id = @p AND run_id = @r AND task_id = @t", conn);
         AddKey(cmd, runId, taskId);
+        AddOwner(cmd, Owner);
         await using var r = await cmd.ExecuteReaderAsync(ct);
         if (!await r.ReadAsync(ct)) return null;
         return new Checkpoint(r.GetInt32(0), r.IsDBNull(1) ? null : r.GetString(1), r.GetInt64(2), r.GetInt64(3), r.GetBoolean(4));
@@ -101,12 +240,13 @@ public static class ControlTable
         await using var cmd = new SqlCommand($"""
             UPDATE {Name}
               SET chunk_no = @c, last_key = @k, rows_done = @d, rows_error = @e, done = @f, updated_at = SYSUTCDATETIME()
-            WHERE run_id = @r AND task_id = @t;
+            WHERE project_id = @p AND run_id = @r AND task_id = @t;
             IF @@ROWCOUNT = 0
-              INSERT {Name} (run_id, task_id, chunk_no, last_key, rows_done, rows_error, done, updated_at)
-              VALUES (@r, @t, @c, @k, @d, @e, @f, SYSUTCDATETIME());
+              INSERT {Name} (run_id, task_id, chunk_no, last_key, rows_done, rows_error, done, updated_at, project_id, project_folder)
+              VALUES (@r, @t, @c, @k, @d, @e, @f, SYSUTCDATETIME(), @p, @pf);
             """, conn, tx);
         AddKey(cmd, runId, taskId);
+        AddOwner(cmd, Owner);
         cmd.Parameters.Add(new SqlParameter("@c", SqlDbType.Int) { Value = cp.ChunkNo });
         cmd.Parameters.Add(new SqlParameter("@k", SqlDbType.NVarChar, -1) { Value = (object?)cp.LastKeyJson ?? DBNull.Value });
         cmd.Parameters.Add(new SqlParameter("@d", SqlDbType.BigInt) { Value = cp.RowsDone });
@@ -265,6 +405,12 @@ public static class ControlTable
     {
         cmd.Parameters.Add(new SqlParameter("@r", SqlDbType.BigInt) { Value = runId });
         cmd.Parameters.Add(new SqlParameter("@t", SqlDbType.NVarChar, MaxTaskIdLength) { Value = taskId });
+    }
+
+    private static void AddOwner(SqlCommand cmd, CheckpointOwner owner)
+    {
+        cmd.Parameters.Add(new SqlParameter("@p", SqlDbType.NVarChar, 36) { Value = owner.ProjectId });
+        cmd.Parameters.Add(new SqlParameter("@pf", SqlDbType.NVarChar, 400) { Value = (object?)Folder(owner) ?? DBNull.Value });
     }
 
     private static async Task ExecAsync(SqlConnection conn, SqlTransaction tx, string sql, CancellationToken ct)

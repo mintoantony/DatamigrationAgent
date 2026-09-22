@@ -258,7 +258,8 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
     {
         await using var rig = await RigAsync();
         long willBe = (rig.S.Transfers.Latest()?.Id ?? 0) + 1;
-        await using var held = await RunLock.AcquireAsync(rig.Tgt.ConnectionString, willBe, default);
+        // This project's own runner of that run (Ruling 212: the lock is the target's; the holder row says whose run holds it).
+        await using var held = await RunLock.AcquireAsync(rig.Tgt.ConnectionString, willBe, default, TransferEngine.OwnerOf(rig.S));
 
         var thrown = await Record.ExceptionAsync(() => rig.Service.StartAsync(Skip, rig.Tgt.Name, default));
         await rig.Service.Current;
@@ -279,25 +280,59 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
     }
 
     /// <summary>
-    /// Open item 23 at the start door: another project's run holds the target (a different run id, so the run lock alone would not
-    /// see it). The start is refused <c>busy</c> naming the target and the holder, nothing is loaded, and the operator can retry.
+    /// Open item 23 at the start door: another project's run 1 holds the target - the same run id this project's first run gets, which
+    /// is the ordinary case, since run ids start at 1 in every project (review MED-1). The start is refused <c>busy</c> naming the
+    /// target and the holder, not "run 1 is already being run", nothing is loaded, and the operator can retry.
     /// </summary>
     [Fact]
     public async Task A_start_while_another_project_loads_the_target_is_busy_naming_the_holder()
     {
         await using var rig = await RigAsync();
-        await using var held = await RunLock.AcquireAsync(rig.Tgt.ConnectionString, 999, default, @"run 999 of the project in D:\elsewhere");
+        var elsewhere = new CheckpointOwner(Guid.NewGuid().ToString("D"), @"D:\elsewhere");
+        await using var held = await RunLock.AcquireAsync(rig.Tgt.ConnectionString, 1, default, elsewhere);
 
         var thrown = await Record.ExceptionAsync(() => rig.Service.StartAsync(Skip, rig.Tgt.Name, default));
         await rig.Service.Current;
 
         long parents = await rig.Tgt.CountAsync("app.Parent");
         Assert.True(parents == 0, $"a start went ahead while another project was loading the same target: app.Parent holds {parents} rows");
+        Assert.Equal(1, rig.S.Transfers.Latest()!.Id);                                // the premise: both are run 1
         var ex = Assert.IsType<TransferException>(thrown);
         Assert.Equal("busy", ex.Code);
-        Assert.True(ex.Message.Contains(rig.Tgt.Name, StringComparison.Ordinal) && ex.Message.Contains(@"run 999 of the project in D:\elsewhere",
+        Assert.True(ex.Message.Contains(rig.Tgt.Name, StringComparison.Ordinal) && ex.Message.Contains(@"run 1 of the project in D:\elsewhere",
             StringComparison.Ordinal), "the refusal does not name the target and what holds it: " + ex.Message);
+        Assert.True(ex.Message.Contains("already being loaded by another transfer", StringComparison.Ordinal),
+            "another project's run 1 was reported as this project's own run 1 already being run: " + ex.Message);
         Assert.True(rig.Service.View().CanStart, rig.Service.View().CannotStart ?? "");
+    }
+
+    /// <summary>
+    /// Ruling 212 (c). Cancelling a paused run runs the plan's PostSql and removes checkpoints in the target, so it happens under the
+    /// target lock: while another project's runner holds it the cancel is refused <c>busy</c> and changes nothing - before, it ran the
+    /// PostSql and dropped the shared checkpoint table under the live runner.
+    /// </summary>
+    [Fact]
+    public async Task A_cancel_while_another_project_holds_the_target_changes_nothing()
+    {
+        await using var rig = await RigAsync();
+        rig.Service.ChunkCommitted += c => { if (c.TaskId == "T01" && c.ChunkNo == 1) rig.Service.Pause(); };
+        long runId = await rig.Service.StartAsync(Skip, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Paused, rig.S.Transfers.GetRun(runId)!.Status);
+
+        Exception? thrown;
+        await using (await RunLock.AcquireAsync(rig.Tgt.ConnectionString, 1, default, new CheckpointOwner(Guid.NewGuid().ToString("D"), @"D:\other")))
+            thrown = await Record.ExceptionAsync(() => rig.Service.CancelAsync(default));
+
+        int table = await rig.Tgt.ScalarAsync<int>("SELECT CASE WHEN OBJECT_ID(N'dbo.__dbm_checkpoint') IS NULL THEN 0 ELSE 1 END");
+        var status = rig.S.Transfers.GetRun(runId)!.Status;
+        Assert.True(table == 1 && status == RunStatus.Paused,
+            $"a cancel ran against the target while another project held it: the checkpoint table {(table == 1 ? "is there" : "was dropped")}, "
+            + $"the run is {EnumText.ToText(status)}");
+        Assert.Equal("busy", Assert.IsType<TransferException>(thrown).Code);
+
+        await rig.Service.CancelAsync(default);                                     // free again: the cancel goes through
+        Assert.Equal(RunStatus.Cancelled, rig.S.Transfers.GetRun(runId)!.Status);
     }
 
     /// <summary>
@@ -643,7 +678,7 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
 
         var before = rig.Service.View().Run!;
 
-        await using (await RunLock.AcquireAsync(rig.Tgt.ConnectionString, runId, default))
+        await using (await RunLock.AcquireAsync(rig.Tgt.ConnectionString, runId, default, TransferEngine.OwnerOf(rig.S)))
         {
             Assert.Equal(runId, rig.Service.Resume());
             await rig.Service.Current;
@@ -716,7 +751,7 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
         Assert.Equal(RunStatus.Paused, rig.S.Transfers.GetRun(runId)!.Status);
         var before = rig.Service.View().Run!;
 
-        await using (await RunLock.AcquireAsync(rig.Tgt.ConnectionString, runId, default))
+        await using (await RunLock.AcquireAsync(rig.Tgt.ConnectionString, runId, default, TransferEngine.OwnerOf(rig.S)))
         {
             Assert.Equal(runId, rig.Service.Resume());
             await rig.Service.Current;

@@ -1,6 +1,7 @@
 using Dbm.Core.Sql;
 using Dbm.Core.SqlGen;
 using Dbm.Core.State;
+using Microsoft.Data.SqlClient;
 
 namespace Dbm.Core.Transfer;
 
@@ -43,10 +44,24 @@ public sealed class TransferEngine
         set => AfterLockTakenHook.Value = value;
     }
 
-    /// <summary>What a runner of <paramref name="runId"/> calls itself in the target's holder record: the run and the project folder.
-    /// A path, never a connection detail.</summary>
-    internal static string HolderText(DbmServices services, long runId)
-        => string.Create(System.Globalization.CultureInfo.InvariantCulture, $"run {runId} of the project in {services.Ws.Root}");
+    /// <summary>Ruling 212: this workspace as the owner of checkpoint rows and of the target lock - its identity and its folder (a
+    /// path, never a connection detail).</summary>
+    internal static CheckpointOwner OwnerOf(DbmServices services) => new(services.Transfers.WorkspaceId(), services.Ws.Root);
+
+    /// <summary>
+    /// Ruling 212 (b). Refuses <c>run_in_progress</c> when the target's checkpoint table holds unfinished rows of another project: that
+    /// project's run is paused, failed or crashed part-way through this target and holds no lock while it waits, so the lock alone
+    /// cannot see it. Called with the target lock held (by the engine, and by the start probe). A missing table is no refusal.
+    /// </summary>
+    internal static async Task EnsureNoForeignCheckpointsAsync(SqlConnection tgt, CheckpointOwner owner, string database,
+        CancellationToken ct)
+    {
+        if (await ControlTable.ForeignUnfinishedAsync(tgt, owner, ct) is not { } other) return;
+        throw new TransferException("run_in_progress",
+            $"The target database {database} holds the unfinished checkpoints of {other}: that run is paused, failed or was interrupted "
+            + "part-way through loading this database. A run from here would load beside it, and into the tables it has half-loaded, so "
+            + "it is refused before it copies a row. Resume or cancel that run from its own project first.");
+    }
 
     /// <param name="target">Open item 22: recorded on the run - the server and database it loads into.</param>
     public long CreateRun(int sqlVersion, TransferOptions options, (string Server, string Database)? target = null)
@@ -71,10 +86,39 @@ public sealed class TransferEngine
         // Ruling 103. A "running" run must stay resumable - that is what a crash leaves behind - so status alone cannot say whether a
         // runner is still alive. The lock can, and it is taken before anything is read or written, so a second runner is refused
         // before it copies a row rather than after it has doubled the table.
-        // Ruling 209: the same call takes the target's lock too, so a run of another project loading into this database is refused
-        // here as well, told which run and which project folder holds it.
-        await using var runLock = await RunLock.AcquireAsync(_targetCs, runId, ct, HolderText(_services, runId));
+        // Rulings 209/212: the lock is the target's, so a run of another project loading into this database is refused here as well,
+        // told which run and which project folder holds it.
+        var owner = OwnerOf(_services);
+        await using var runLock = await RunLock.AcquireAsync(_targetCs, runId, ct, owner);
         AfterLockTaken?.Invoke(runLock);
+        // Ruling 212, review LOW-1: the database the lock session actually reached, against the one the run recorded. DB_NAME() only:
+        // @@SERVERNAME is not stable (LocalDB renames its instance pipe on every start; an availability-group failover changes it).
+        if (run.TargetDatabase is { } recorded && !string.Equals(runLock.Database, recorded, StringComparison.OrdinalIgnoreCase))
+            throw new TransferException("target_changed",
+                $"The target connection now reaches the database {runLock.Database}, but run {runId} loaded into {recorded}. Its "
+                + $"checkpoints and the {ControlTable.Name} table live in that database, so it is not continued here. Point the target "
+                + $"connection back at {recorded}, or cancel run {runId} and start a new one.");
+        // Every checkpoint read and write of this segment is this project's (it flows into the task workers).
+        ControlTable.CurrentOwner = owner;
+        await using (var tgt = await SqlConnect.OpenAsync(_targetCs, ct))
+        {
+            bool shapeOk = true;
+            try
+            {
+                await ControlTable.EnsureAsync(tgt, ct);   // creates, or upgrades an earlier engine's table in place
+            }
+            catch (TransferException ex) when (ex.Code == "control_table_mismatch")
+            {
+                shapeOk = false;                           // PrepareAsync meets it again and fails the run with it, as before
+            }
+            if (shapeOk)
+            {
+                // A resume segment claims the rows an earlier engine wrote for this very run; a fresh run never adopts a row.
+                if (tasks.Any(t => t.RowsBefore is not null))
+                    await ControlTable.ClaimLegacyAsync(tgt, owner, runId, tasks.Select(t => t.TaskId).ToList(), ct);
+                await EnsureNoForeignCheckpointsAsync(tgt, owner, runLock.Database, ct);
+            }
+        }
 
         var rc = new RunContext
         {
@@ -89,20 +133,23 @@ public sealed class TransferEngine
         void CheckLock(ChunkCommit _)
         {
             if (Volatile.Read(ref lockLost) != 0) return;
+            // Synchronous on purpose: ChunkCommitted is raised synchronously on the task worker right after its commit, and holding
+            // that worker for one short round trip is what makes the pause land before its next chunk. No deadlock: the worker runs on
+            // the thread pool with no synchronisation context, and LostAsync touches only the lock's own connection.
             string? lost = runLock.LostAsync(CancellationToken.None).GetAwaiter().GetResult();
             if (lost is null || Interlocked.Exchange(ref lockLost, 1) != 0) return;
-            string note = lost + " Without it another transfer could load into this target beside this one, so the run was paused "
-                          + "after the current chunk. Resume takes the lock again and continues from the checkpoints.";
+            string note = rc.Scrub(lost + " Without it another transfer could load into this target beside this one, so the run was "
+                                   + "paused after the current chunk. Resume takes the lock again and continues from the checkpoints.");
             rc.AddNote(note);
             rc.Log("error", note);
             control.RequestPause();
         }
-        control.ChunkCommitted += CheckLock;
         repo.SetRunStatus(runId, RunStatus.Running);
         _services.Sink.Publish("transfer_run_changed", new { runId, status = EnumText.ToText(RunStatus.Running) });
         rc.Log("info", $"Transfer run {runId}: {tasks.Count} tasks, parallelism {rc.Options.Parallelism}, errors: {rc.Options.ErrorMode}.");
         try
         {
+            control.ChunkCommitted += CheckLock;   // inside the try whose finally removes it
             await PrepareAsync(rc, tasks, ct);
             tasks = repo.Tasks(runId);
             foreach (var t in tasks) rc.Progress.SetSource(t.TaskId, t.RowsSource);
@@ -224,7 +271,14 @@ public sealed class TransferEngine
         try
         {
             await using var tgt = await SqlConnect.OpenAsync(_targetCs, ct);
-            await ControlTable.DropAsync(tgt, ct);
+            // Ruling 212 (c): this project's rows go; the table goes only if nothing of another project is left in it.
+            if (!await ControlTable.ReleaseAsync(tgt, OwnerOf(_services), ct))
+            {
+                string note = $"{ControlTable.Name} was left in the target: this run's checkpoints were removed, but it still holds "
+                              + "another project's checkpoints.";
+                rc.AddNote(note);
+                rc.Log("info", note);
+            }
         }
         catch (TransferException ex) when (ex.Code == "control_table_mismatch")
         {

@@ -174,7 +174,12 @@ backup); never edit it by hand.
 **One transfer per target database.** While a run is loading, it holds a lock in the target database itself, so a second
 transfer into the same database — from another project folder, another terminal or the CLI beside the UI — is refused
 (`busy`) before it copies a row, with a message naming the target and the run and project folder that hold it. The lock
-goes away when that run finishes, pauses or its process ends, so a resume after a crash is not affected. The run checks
+goes away when that run finishes, pauses or its process ends, so a resume after a crash is not affected. A run of another
+project folder that is paused, failed or was interrupted part-way still leaves its checkpoints in the target, and a new
+transfer from here is refused (`busy`, naming that project folder) until that run is resumed to the end or cancelled from
+its own project. Each project's checkpoint rows are its own: a finished or cancelled run removes only them, and
+`dbo.__dbm_checkpoint` is dropped only when nothing else is left in it. Cancelling a paused or failed run also takes the
+lock, so it is refused while another transfer is loading that target. The run checks
 after every committed chunk that it still holds the lock; if its lock connection was dropped (a network or failover
 fault), it pauses after the current chunk and says so in its notes, and **Resume** takes the lock again.
 

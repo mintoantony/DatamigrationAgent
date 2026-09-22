@@ -17,7 +17,7 @@ public class StateDbTests
         Assert.Equal(3L, db.Scalar<long>("PRAGMA user_version"));
         var tables = db.Query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name", r => r.GetString(0));
         Assert.Equal(new[] { "artifact", "catalog", "connection", "error_row", "event", "feedback", "job", "phase", "project",
-            "transfer_run", "transfer_task", "vector" }, tables);
+            "transfer_identity", "transfer_run", "transfer_task", "vector" }, tables);
     }
 
     /// <summary>

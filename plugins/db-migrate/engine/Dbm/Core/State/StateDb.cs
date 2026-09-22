@@ -158,6 +158,10 @@ public sealed class StateDb : IDisposable
             var columns = Query("SELECT name FROM pragma_table_info('transfer_run')", r => r.GetString(0));
             if (!columns.Contains("target_server")) Execute("ALTER TABLE transfer_run ADD COLUMN target_server TEXT");
             if (!columns.Contains("target_database")) Execute("ALTER TABLE transfer_run ADD COLUMN target_database TEXT");
+            // Ruling 212: this workspace's identity in a target's checkpoint table, created once and never rewritten. Its own table,
+            // because project.settings_json is rewritten whole by the settings screen.
+            Execute("CREATE TABLE IF NOT EXISTS transfer_identity (id INTEGER PRIMARY KEY CHECK (id = 1), workspace_id TEXT NOT NULL)");
+            Execute("INSERT OR IGNORE INTO transfer_identity (id, workspace_id) VALUES (1, $Id)", new { Id = Guid.NewGuid().ToString("D") });
         });
     }
 
