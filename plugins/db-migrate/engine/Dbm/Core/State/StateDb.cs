@@ -145,14 +145,30 @@ public sealed class StateDb : IDisposable
         return reader.ReadToEnd();
     }
 
+    /// <summary>
+    /// Ordered, independent steps, each additive and idempotent in its own transaction: a step runs when the database is below its
+    /// version, re-reads the version inside the transaction (another process may have won the race) and ends by setting it.
+    /// </summary>
     private void Migrate()
     {
-        if (Scalar<long>("PRAGMA user_version") >= 1) return;
+        Step(1, () => Execute(LoadSchema()));
+        // Step 3 (open item 22): the target a run loaded into, as its connection resolved it. Never a credential.
+        Step(3, () =>
+        {
+            var columns = Query("SELECT name FROM pragma_table_info('transfer_run')", r => r.GetString(0));
+            if (!columns.Contains("target_server")) Execute("ALTER TABLE transfer_run ADD COLUMN target_server TEXT");
+            if (!columns.Contains("target_database")) Execute("ALTER TABLE transfer_run ADD COLUMN target_database TEXT");
+        });
+    }
+
+    private void Step(long version, Action apply)
+    {
+        if (Scalar<long>("PRAGMA user_version") >= version) return;
         InTransaction(() =>
         {
-            if (Scalar<long>("PRAGMA user_version") >= 1) return;   // another process won the race
-            Execute(LoadSchema());
-            Execute("PRAGMA user_version = 1");
+            if (Scalar<long>("PRAGMA user_version") >= version) return;   // another process won the race
+            apply();
+            Execute("PRAGMA user_version = " + version.ToString(CultureInfo.InvariantCulture));
         });
     }
 

@@ -31,7 +31,8 @@ loading the same target database; the message names the target and what holds it
 approved SQL plan, or it cannot be read), `preflight_failed`, `target_not_empty` (the details list each non-empty table and whether it
 has a key), `confirm_required` / `confirm_mismatch`, `no_connection`, `no_plan`, and
 `target_changed` / `target_unknown` (the saved target connection no longer points, or cannot be shown to point, at the database the
-run loaded into — that one is for the human to fix in the UI, never by re-pointing it yourself).
+run loaded into — each run records its target server and database, and a resume or a re-run after a failed or cancelled run is
+refused when the target now resolves elsewhere; that one is for the human to fix in the UI, never by re-pointing it yourself).
 
 ## After a failure
 

@@ -27,6 +27,12 @@ public sealed record TransferRunView(long Id, int SqlVersion, RunStatus Status, 
     /// <summary>Ruling 184: the plan's pre-load statements still in force in the target - a paused or failed run keeps them on purpose
     /// (Resume expects them), and the Execute screen names them. Empty for every other run, and when the plan has none.</summary>
     public List<string> PreSqlInForce { get; init; } = [];
+
+    /// <summary>Open item 22: the server and database this run loaded into, as recorded when it was created. Null (omitted) for a run
+    /// from before the record existed.</summary>
+    public string? TargetServer { get; init; }
+
+    public string? TargetDatabase { get; init; }
 }
 
 /// <summary>
@@ -267,6 +273,12 @@ public sealed class TransferService
             if (savedTarget?.Database is not { } database || !string.Equals((confirmTarget ?? "").Trim(), database, StringComparison.Ordinal))
                 throw new TransferException("confirm_mismatch", "Type the target database name exactly to confirm the transfer.");
             EnsureTargetMatchesTheDiscoveredCatalog(savedTarget);
+            // Open item 22: a re-run continues the migration a failed or cancelled run left part-loaded, so it goes where that run went.
+            if (restart && latest is { TargetDatabase: not null })
+                EnsureRecordedTarget(latest, savedTarget,
+                    $"and it left that database part-loaded, so a new run here would load this migration into a different one. Point "
+                    + $"the target connection back at {latest.TargetDatabase}; to migrate into {savedTarget.Database} instead, re-run "
+                    + "discovery against it and approve the plan again.");
             ApprovedPlan approved;
             try
             {
@@ -305,7 +317,7 @@ public sealed class TransferService
                 EnsureNonEmptyTargetsConfirmed(await LiveNonEmptyTargetsAsync(tgtCs, approved.Plan, ct), confirmNonEmpty);
 
             var engine = new TransferEngine(_services, approved.Plan, srcCs, tgtCs);
-            long runId = engine.CreateRun(approved.Version, options);
+            long runId = engine.CreateRun(approved.Version, options, (savedTarget.Server, database));
             // Ruling 190: a checklist taken before this run says nothing about the target after it - never reused for another start.
             // (The new run id changes WorkflowStamp too; the result itself stays readable as LastPreflight for the screen.)
             lock (_lock) _preflightStamp = null;
@@ -572,6 +584,8 @@ public sealed class TransferService
         {
             Notes = RunNotes(run),
             PreSqlInForce = run.Status is RunStatus.Paused or RunStatus.Failed ? GlobalSql.Statements(plan?.PreSql) : [],
+            TargetServer = run.TargetServer,
+            TargetDatabase = run.TargetDatabase,
         };
         return new TransferView(runView, tasks, totals, active, cannotStart is null, targetDatabase,
             approved?.Version, LastPreflight, new TransferOptions())
@@ -680,6 +694,15 @@ public sealed class TransferService
         var saved = SavedTargetMeta()
             ?? throw new TransferException("no_connection", "The target connection is not saved, so run "
                                                             + $"{run.Id} cannot be continued against the database it started in.");
+        // Open item 22: the run's own record is exact, and needs no discovered catalog to vouch for it. The catalog proxy below is
+        // kept for a run created before the record existed (migration step 3), which has none.
+        if (run.TargetDatabase is not null)
+        {
+            EnsureRecordedTarget(run, saved,
+                "so resuming against this one would load every row again from the beginning. Point the target connection back at "
+                + $"{run.TargetDatabase}, or cancel run {run.Id} and start a new one.");
+            return;
+        }
         var (discovered, problem) = DiscoveredTarget();
         // Ruling 127, fail closed: "there is nothing to compare against" is not "they match". Failing open here would resume the run
         // into whatever the target connection happens to point at today, which is the one thing this guard exists to stop.
@@ -693,6 +716,19 @@ public sealed class TransferService
             + $"{discovered.Database} on {discovered.Server}. Its checkpoints and the {ControlTable.Name} table live in that database, "
             + "so resuming against this one would load every row again from the beginning. Point the target connection back at "
             + $"{discovered.Database}, or cancel run {run.Id} and start a new one.");
+    }
+
+    /// <summary>
+    /// Open item 22: refuses <c>target_changed</c> when the saved target connection no longer resolves to the server and database
+    /// <paramref name="run"/> recorded when it was created. <paramref name="consequence"/> finishes the sentence for the caller's door.
+    /// </summary>
+    private static void EnsureRecordedTarget(TransferRunRow run, ServerMeta saved, string consequence)
+    {
+        if (Same(saved.Database, run.TargetDatabase) && Same(saved.Server, run.TargetServer)) return;
+        throw new TransferException("target_changed",
+            $"The saved target connection now points at {saved.Database} on {saved.Server}, but run {run.Id} loaded into "
+            + $"{run.TargetDatabase} on {run.TargetServer}. Its checkpoints and the {ControlTable.Name} table live in that database, "
+            + consequence);
     }
 
     /// <summary>

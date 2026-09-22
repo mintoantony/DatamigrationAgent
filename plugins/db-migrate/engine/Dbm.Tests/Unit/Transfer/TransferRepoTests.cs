@@ -46,6 +46,20 @@ public sealed class TransferRepoTests : IDisposable
         Assert.Equal("pending", _db.Scalar<string>("SELECT status FROM transfer_task WHERE run_id = $Id AND task_id = 'T01'", new { Id = id }));
     }
 
+    /// <summary>Open item 22: the target is recorded at creation and read back exactly; a run created without one reads null, never "".</summary>
+    [Fact]
+    public void CreateRun_records_the_target_it_will_load_into()
+    {
+        long with = _repo.CreateRun(1, new TransferOptions(), [("T01", "app.A")], (@"HOST\SQL", "Shop"));
+        long without = _repo.CreateRun(1, new TransferOptions(), [("T01", "app.A")]);
+
+        var run = _repo.GetRun(with)!;
+        Assert.True(run.TargetServer == @"HOST\SQL" && run.TargetDatabase == "Shop",
+            $"the run did not record its target: {run.TargetServer}/{run.TargetDatabase}");
+        Assert.Null(_repo.GetRun(without)!.TargetDatabase);
+        Assert.Null(_repo.Latest()!.TargetServer);
+    }
+
     [Fact]
     public void Task_status_transitions_set_timestamps_and_error()
     {

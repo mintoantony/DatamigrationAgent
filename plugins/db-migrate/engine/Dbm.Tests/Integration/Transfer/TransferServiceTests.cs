@@ -734,6 +734,88 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
         Assert.Equal(1998, await rig.Tgt.CountAsync("app.Child"));
     }
 
+    // ------------------------------------------------------------------ open item 22: the run records its target
+
+    /// <summary>A failed run (stop at the first bad row), then the target connection AND its discovered catalog repointed at a second
+    /// database with the plan's schema - the one shape the catalog proxy (ruling 127) cannot see, because both of its sides moved.</summary>
+    private async Task<(long RunId, TempDatabase Other)> FailedRunThenRepointedAsync(Rig rig)
+    {
+        long runId = await rig.Service.StartAsync(Skip with { ErrorMode = "stop", ChunkSize = 500 }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Failed, rig.S.Transfers.GetRun(runId)!.Status);
+        var other = await TempDatabase.CreateAsync("dbm_svc_other");
+        await other.ExecAsync(TransferEngineTests.TargetSchema);
+        await SaveSideAsync(rig.S, Side.Tgt, other.ConnectionString);
+        return (runId, other);
+    }
+
+    /// <summary>
+    /// Harm: a resume continues a run from checkpoints that live in the database it loaded into. With the connection and the catalog
+    /// both repointed, the proxy guard compares the new target with itself and lets the resume load the rest of the migration - from
+    /// row one, since there are no checkpoints there - into a database nobody reviewed. The run's own record says where it loaded.
+    /// </summary>
+    [Fact]
+    public async Task A_resume_is_refused_when_the_target_no_longer_resolves_to_the_database_the_run_recorded()
+    {
+        await using var rig = await RigAsync();
+        var (runId, other) = await FailedRunThenRepointedAsync(rig);
+        await using var _ = other;
+        var recorded = rig.Service.View().Run!;
+        Assert.True(recorded.TargetDatabase == rig.Tgt.Name && !string.IsNullOrEmpty(recorded.TargetServer),
+            $"the run does not show the target it loaded into: {recorded.TargetServer}/{recorded.TargetDatabase}");
+
+        var thrown = Record.Exception(() => rig.Service.Resume());
+        await rig.Service.Current;
+
+        // T01 finished in the first segment, so the resume's work is T02 and T03 - and before any row it creates its checkpoint table.
+        long loaded = await other.CountAsync("app.Child") + await other.CountAsync("app.Log");
+        int touched = await other.ScalarAsync<int>("SELECT CASE WHEN OBJECT_ID(N'dbo.__dbm_checkpoint') IS NULL THEN 0 ELSE 1 END");
+        Assert.True(loaded == 0 && touched == 0,
+            $"a resume ran run {runId} against a database it never loaded into: {other.Name} got {loaded} rows"
+            + (touched == 1 ? " and a checkpoint table" : ""));
+        var ex = Assert.IsType<TransferException>(thrown);
+        Assert.Equal("target_changed", ex.Code);
+        Assert.True(ex.Message.Contains(rig.Tgt.Name, StringComparison.Ordinal) && ex.Message.Contains(other.Name, StringComparison.Ordinal),
+            "the refusal does not name both the recorded and the current target: " + ex.Message);
+    }
+
+    /// <summary>The same guard at a re-run (a new run id after a failed run, ruling 185's restart): refused, nothing loaded.</summary>
+    [Fact]
+    public async Task A_rerun_is_refused_when_the_target_no_longer_resolves_to_the_database_the_last_run_recorded()
+    {
+        await using var rig = await RigAsync();
+        var (runId, other) = await FailedRunThenRepointedAsync(rig);
+        await using var _ = other;
+
+        var thrown = await Record.ExceptionAsync(() => rig.Service.StartAsync(Skip, other.Name, default));
+        await rig.Service.Current;
+
+        long loaded = await other.CountAsync("app.Parent");
+        Assert.True(loaded == 0, $"a re-run after run {runId} loaded into a different database: {other.Name}.app.Parent holds {loaded} rows");
+        var ex = Assert.IsType<TransferException>(thrown);
+        Assert.Equal("target_changed", ex.Code);
+        Assert.Contains(rig.Tgt.Name, ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The other half of ruling 127's cost: with the run's own record there is no need for the discovered catalog to vouch for the
+    /// target, so a workspace whose catalog rows are gone can still resume its run into the database it recorded.
+    /// </summary>
+    [Fact]
+    public async Task A_resume_needs_no_discovered_catalog_when_the_run_recorded_its_target()
+    {
+        await using var rig = await RigAsync();
+        long runId = await rig.Service.StartAsync(Skip with { ErrorMode = "stop", ChunkSize = 500 }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        rig.S.Db.Execute("DELETE FROM catalog");
+
+        var thrown = Record.Exception(() => rig.Service.Resume());
+        await rig.Service.Current;
+
+        Assert.True(thrown is null, "a resume into the very database the run recorded was refused: " + thrown?.Message);
+        Assert.NotEqual(RunStatus.Paused, rig.S.Transfers.GetRun(runId)!.Status);
+    }
+
     /// <summary>
     /// F6 / R6. The typed confirmation is the last gate before a database is written to, so it is exact. The brief's own test types
     /// <c>Name.ToUpperInvariant() + "X"</c>, which differs by the trailing X whatever the comparison is; this one differs by case

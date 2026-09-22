@@ -6,7 +6,7 @@ namespace Dbm.Tests.Unit.State;
 public class StateDbTests
 {
     [Fact]
-    public void Open_applies_pragmas_and_schema_version_1()
+    public void Open_applies_pragmas_and_the_schema_up_to_version_3()
     {
         using var tw = new TestWorkspace();
         using var db = StateDb.Open(tw.Ws.StateDbPath);
@@ -14,10 +14,47 @@ public class StateDbTests
         Assert.True(File.Exists(tw.Ws.StateDbPath));
         Assert.Equal("wal", db.Scalar<string>("PRAGMA journal_mode"));
         Assert.Equal(1L, db.Scalar<long>("PRAGMA foreign_keys"));
-        Assert.Equal(1L, db.Scalar<long>("PRAGMA user_version"));
+        Assert.Equal(3L, db.Scalar<long>("PRAGMA user_version"));
         var tables = db.Query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name", r => r.GetString(0));
         Assert.Equal(new[] { "artifact", "catalog", "connection", "error_row", "event", "feedback", "job", "phase", "project",
             "transfer_run", "transfer_task", "vector" }, tables);
+    }
+
+    /// <summary>
+    /// Open item 22's migration step 3. A workspace written by an earlier engine is at user_version 1; opening it must add the run's
+    /// target columns and keep every row it had. <b>Harm:</b> a migration that stops at "version &gt;= 1" leaves the columns out, and the
+    /// first run on the upgraded workspace dies on "no such column" - or one that re-applies the schema drops the run history.
+    /// </summary>
+    [Fact]
+    public void A_version_1_database_upgrades_to_3_with_its_rows_intact()
+    {
+        using var tw = new TestWorkspace();
+        Directory.CreateDirectory(Path.GetDirectoryName(tw.Ws.StateDbPath)!);
+        using (var raw = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={tw.Ws.StateDbPath};Pooling=False"))
+        {
+            raw.Open();
+            using var cmd = raw.CreateCommand();
+            cmd.CommandText = StateDb.LoadSchema() + """
+
+                PRAGMA user_version = 1;
+                INSERT INTO transfer_run (sql_version, status, options_json, started_at) VALUES (4, 'failed', '{}', '2026-09-01T00:00:00.0000000+00:00');
+                INSERT INTO transfer_task (run_id, task_id, target, ordinal, status) VALUES (1, 'T01', 'app.X', 0, 'failed');
+                """;
+            cmd.ExecuteNonQuery();
+        }
+
+        using var db = StateDb.Open(tw.Ws.StateDbPath);
+
+        var columns = db.Query("SELECT name FROM pragma_table_info('transfer_run')", r => r.GetString(0));
+        Assert.True(columns.Contains("target_server") && columns.Contains("target_database"),
+            "a version-1 workspace was not upgraded: transfer_run has no target columns (" + string.Join(", ", columns) + ")");
+        Assert.Equal(3L, db.Scalar<long>("PRAGMA user_version"));
+        Assert.Equal(1L, db.Scalar<long>("SELECT COUNT(*) FROM transfer_run WHERE sql_version = 4 AND status = 'failed' AND target_database IS NULL"));
+        Assert.Equal(1L, db.Scalar<long>("SELECT COUNT(*) FROM transfer_task WHERE task_id = 'T01'"));
+        db.Dispose();
+
+        using var again = StateDb.Open(tw.Ws.StateDbPath);                            // the step is idempotent: reopening changes nothing
+        Assert.Equal(1L, again.Scalar<long>("SELECT COUNT(*) FROM transfer_run"));
     }
 
     [Fact]

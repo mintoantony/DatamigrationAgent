@@ -48,11 +48,12 @@ public sealed class TransferEngine
     internal static string HolderText(DbmServices services, long runId)
         => string.Create(System.Globalization.CultureInfo.InvariantCulture, $"run {runId} of the project in {services.Ws.Root}");
 
-    public long CreateRun(int sqlVersion, TransferOptions options)
+    /// <param name="target">Open item 22: recorded on the run - the server and database it loads into.</param>
+    public long CreateRun(int sqlVersion, TransferOptions options, (string Server, string Database)? target = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         return _services.Transfers.CreateRun(sqlVersion, options.Normalized(),
-            PlanOrder(_plan).Select(id => (id, _plan.Tasks[id].Target)).ToList());
+            PlanOrder(_plan).Select(id => (id, _plan.Tasks[id].Target)).ToList(), target);
     }
 
     /// <summary>Fresh or resume; hard cancellation of <paramref name="ct"/> throws and leaves the run "running" (crash semantics).</summary>
