@@ -32,7 +32,7 @@ public class StateDbTests
     }
 
     /// <summary>A state database exactly as a released engine left it: the version-1 schema, user_version 1, and one rejected row.</summary>
-    private static void WriteVersion1(string path, bool withErrorNumberColumn = false)
+    private static void WriteVersion1(string path, bool withErrorNumberColumn = false, int stampVersion = 1)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
         using var c = new Microsoft.Data.Sqlite.SqliteConnection(
@@ -45,7 +45,7 @@ public class StateDbTests
             + "INSERT INTO error_row (run_id, task_id, key_json, row_json, error, ts) VALUES "
             + "(1, 'T01', '{\"Id\":7}', '{\"Id\":7}', 'Violation of PRIMARY KEY constraint ''PK_P''.', '2026-09-17T09:01:00.0000000+00:00');"
             + (withErrorNumberColumn ? "ALTER TABLE error_row ADD COLUMN error_number INTEGER;" : "")
-            + "PRAGMA user_version = 1;";
+            + $"PRAGMA user_version = {stampVersion};";
         cmd.ExecuteNonQuery();
     }
 
@@ -87,6 +87,28 @@ public class StateDbTests
         Assert.True(db.Scalar<long>("PRAGMA user_version") == 2,
             "a version-1 database that already had error_number was not brought to version 2");
         Assert.Equal(1, Columns(db, "error_row").Count(c => c == "error_number"));
+        Assert.Equal(1L, db.Scalar<long>("SELECT COUNT(*) FROM error_row"));
+    }
+
+    /// <summary>
+    /// Steps are joined from branches that were developed apart (batch F's step 3 beside this step 2), so a database can reach a
+    /// later version without step 2's column - one opened by a build that had step 3 and not step 2. Step 2 is keyed on the column,
+    /// not only on the version, and never lowers the version. <b>Harm:</b> a version gate alone skips it there, and the first rejected
+    /// row recorded with its number fails on a missing column and ends the run.
+    /// </summary>
+    [Fact]
+    public void A_later_version_database_without_the_column_gains_it_and_keeps_its_version()
+    {
+        using var tw = new TestWorkspace();
+        WriteVersion1(tw.Ws.StateDbPath, stampVersion: 3);
+
+        using var db = StateDb.Open(tw.Ws.StateDbPath);
+
+        Assert.True(Columns(db, "error_row").Contains("error_number"),
+            "a version-3 database without error_row.error_number was left without it: step 2 is gated on the version alone");
+        long v = db.Scalar<long>("PRAGMA user_version");
+        Assert.True(v == 3, "step 2 lowered a version-3 database to version "
+            + v.ToString(System.Globalization.CultureInfo.InvariantCulture) + ", so step 3 would run again");
         Assert.Equal(1L, db.Scalar<long>("SELECT COUNT(*) FROM error_row"));
     }
 

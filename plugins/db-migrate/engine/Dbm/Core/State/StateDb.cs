@@ -154,21 +154,26 @@ public sealed class StateDb : IDisposable
     {
         Step(1, () => Execute(LoadSchema()));
         // Ruling 208 (open item 46): the SQL Server error number of a rejected row. Nullable: rows recorded before this step, and rows
-        // whose failure carried no server error, have none - and a missing number never counts as a duplicate key.
+        // whose failure carried no server error, have none - and a missing number never counts as a duplicate key. Keyed on the column
+        // as well as the version: steps were written on separate branches, so a database can stand at a later version without it.
         Step(2, () =>
         {
             if (!HasColumn("error_row", "error_number")) Execute("ALTER TABLE error_row ADD COLUMN error_number INTEGER");
-        });
+        }, missing: () => !HasColumn("error_row", "error_number"));
     }
 
-    private void Step(long version, Action apply)
+    /// <summary>Applies one step when the database is below <paramref name="version"/>, or when <paramref name="missing"/> says what the
+    /// step adds is absent at any version. The version is only ever raised, never lowered.</summary>
+    private void Step(long version, Action apply, Func<bool>? missing = null)
     {
-        if (Scalar<long>("PRAGMA user_version") >= version) return;
+        bool Due() => Scalar<long>("PRAGMA user_version") < version || (missing?.Invoke() ?? false);
+        if (!Due()) return;
         InTransaction(() =>
         {
-            if (Scalar<long>("PRAGMA user_version") >= version) return;   // another process won the race
+            if (!Due()) return;   // another process won the race
             apply();
-            Execute(string.Create(CultureInfo.InvariantCulture, $"PRAGMA user_version = {version}"));
+            if (Scalar<long>("PRAGMA user_version") < version)
+                Execute(string.Create(CultureInfo.InvariantCulture, $"PRAGMA user_version = {version}"));
         });
     }
 
