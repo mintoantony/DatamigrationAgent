@@ -10,6 +10,7 @@ namespace Dbm.Tests.Unit.Cli;
 /// Dbm.csproj, then forces a build: the launcher sweeps, the real `dotnet publish` fails at once on the missing project,
 /// and the launcher gives up. Nothing is built and the repository's own engine/ is never touched.
 /// </summary>
+[Trait("Category", "Launcher")]
 public sealed class LauncherSweepTests : IDisposable
 {
     private static readonly DateTime Aged = new(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc);
