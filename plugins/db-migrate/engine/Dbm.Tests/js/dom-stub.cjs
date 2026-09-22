@@ -10,7 +10,8 @@
  *
  * Open item 25: this is the suite's one DOM stub. mapping-edits.test.cjs (T3.5) used to carry a private fake DOM of its own, whose
  * classList did nothing and whose `disabled` never followed the attribute; it now installs this one. A third stub is how fidelity
- * drifts - extend this file instead.
+ * drifts - extend this file instead. The one named exception (review N2) is sql-view.test.cjs's fakeDom(): it builds no `document`,
+ * it swaps DBM.h for a plain-object tree its render tests assert against; one-dom-stub.test.cjs lists it and fails on any other.
  */
 
 /** Boolean content attributes whose IDL property the browser keeps in step with the attribute. */

@@ -228,6 +228,8 @@ test('openCommentsByTask counts draft and open comments per task through parseAn
 
 /* ------------------------------------------------------------------ render over a minimal fake DOM */
 
+/* The one named exception to dom-stub.cjs (review N2; one-dom-stub.test.cjs lists it): no `document`, DBM.h itself is swapped for a
+   plain-object tree, and the render tests below assert against that tree's attrs/children. */
 function fakeDom() {
   function node(tag, attrs, kids) {
     let value = '';
