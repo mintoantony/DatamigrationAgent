@@ -234,8 +234,11 @@ the task is not stopped and the headline's "loaded 0 of N" is expected - it is n
 CHECK error in such a run still stops the task.
 
 **Live view**: overall and per-task progress bars, rows per second, ETA, a throughput sparkline, the rejected-row count
-and a log tail. **Pause** lets every task commit its current chunk and stops; **Resume** continues from the checkpoints,
+and a log tail, plus the database and server the run actually loaded into (runs recorded before this was added show
+neither). **Pause** lets every task commit its current chunk and stops; **Resume** continues from the checkpoints,
 also after a failure, a crash or a reboot; **Cancel run** stops for good, and rows already committed stay in the target.
+Each task's rejected-row count opens a drawer of the rows themselves, each with its error and, when the row was
+recorded with one, SQL Server's error number.
 
 **What Cancel restores.** The plan's pre-load SQL can switch things off in the target for the load - for a foreign-key
 cycle it disables the cut constraint (`NOCHECK`). While a run is running, paused or failed that stays in force (Resume

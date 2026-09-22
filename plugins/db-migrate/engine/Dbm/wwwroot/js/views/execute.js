@@ -355,6 +355,8 @@
     const wrap = h('div', { class: 'stack' });
     const banner = runBanner(run, d);
     if (banner) wrap.appendChild(banner);
+    const target = runTargetLine(run);
+    if (target) wrap.appendChild(target);
     if (run.notes && run.notes.length) wrap.appendChild(notesCard(run.notes));
 
     const eta = X.etaInfo(agg.done + agg.errors, agg.total, rate, missing);
@@ -385,6 +387,23 @@
   function doneSub(agg, missing) {
     const total = X.totalText(agg.total, missing);
     return agg.total > 0 ? total + ' · ' + X.pct(agg.done + agg.errors, agg.total) + '%' : total;
+  }
+
+  /** Item 47: the target this run actually loaded into (never credentials), recorded once at start - not the same thing as the
+   *  server's current Setup target, which can move after the run started. A run saved before this field existed carries neither
+   *  property, and the compact line is silent rather than reading "Loading into undefined".
+   *  Fix round 1 (MED): once the run has ended (completed, failed or cancelled) it can no longer add rows, so the verb switches
+   *  to the engine's own past tense for this fact (TransferService.cs:692, EnsureTargetIsTheOneTheRunStartedIn: "run N loaded
+   *  into ..."). Running and paused - the run can still resume and add rows - keep the present tense. */
+  function runTargetLine(run) {
+    const db = run.targetDatabase, srv = run.targetServer;
+    if (!db && !srv) return null;
+    const ended = run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled';
+    const verb = ended ? 'Loaded' : 'Loading';
+    // Defensive only: batch F always records targetServer and targetDatabase together or omits both, never one alone - but a
+    // run recorded some other way should still read as a sentence rather than naming a database with no server, or vice versa.
+    const text = db && srv ? verb + ' into ' + db + ' on ' + srv : db ? verb + ' into ' + db : verb + ' into a database on ' + srv;
+    return h('div', { class: 'muted small exe-run-target' }, text);
   }
 
   function runBanner(run, d) {
@@ -620,10 +639,13 @@
           list.appendChild(h('div', { class: 'muted small' }, 'Showing the first ' + p.rows.length + ' of ' + X.num(t.rowsError) + '.'));
         }
         p.rows.forEach(function (r) {
+          // Ruling 208 / E-4: the server's error number, when the row was recorded with one - a row recorded without one shows
+          // none, never a 0. Mirrors the Report screen's samples (views/report.js samplesList).
+          const n = typeof r.errorNumber === 'number' ? 'error ' + r.errorNumber + ': ' : '';
           list.appendChild(h('div', { class: 'exe-err-item stack' },
             h('div', { class: 'row' }, h('span', { class: 'mono small' }, X.keyText(r.keyJson)), h('div', { class: 'spacer' }),
               h('span', { class: 'muted small' }, ts(r.ts))),
-            h('div', { class: 'small' }, r.error),
+            h('div', { class: 'small' }, n + r.error),
             r.rowJson ? h('pre', { class: 'code exe-row-json' }, X.prettyJson(r.rowJson)) : null));
         });
       })

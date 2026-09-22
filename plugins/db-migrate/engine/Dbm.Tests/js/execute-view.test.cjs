@@ -462,6 +462,56 @@ test('the cancelled banner says what a new run does and how to avoid duplicates 
     'the cancelled banner still invites a plain new run: ' + banner);
 });
 
+/* ------------------------------------------------------------------ item 47: the run's recorded target */
+
+test('the live run names the database and server it actually loaded into, and says nothing for a run recorded before the field existed (item 47)', async () => {
+  const withTarget = runningView({ run: Object.assign({}, runningView().run, { targetServer: 'sql1.internal', targetDatabase: 'ShopV2' }) });
+  const m = await mount(withTarget);
+  assert.equal(D.text(D.query(m.root, '.exe-run-target')), 'Loading into ShopV2 on sql1.internal');
+
+  // A run recorded before batch F added these fields carries neither property: the line must be absent, not "Loading into undefined".
+  const withoutTarget = runningView();
+  const m2 = await mount(withoutTarget);
+  assert.equal(D.query(m2.root, '.exe-run-target'), null,
+    'a run recorded before the target fields existed must show nothing, not "undefined" or an empty label');
+});
+
+test('a finished run says "Loaded into", the engine\'s own past-tense wording (TransferService.cs:692); running or paused stays present tense (fix round 1, MED)', async () => {
+  const withStatus = function (status) {
+    return runningView({ run: Object.assign({}, runningView().run, { targetServer: 'sql1.internal', targetDatabase: 'ShopV2', status: status, notes: [] }) });
+  };
+  for (const status of ['completed', 'failed', 'cancelled']) {
+    const m = await mount(withStatus(status));
+    assert.equal(D.text(D.query(m.root, '.exe-run-target')), 'Loaded into ShopV2 on sql1.internal',
+      'a ' + status + ' run still says it is loading, not that it loaded (' + status + ')');
+  }
+  for (const status of ['running', 'paused']) {
+    const m = await mount(withStatus(status));
+    assert.equal(D.text(D.query(m.root, '.exe-run-target')), 'Loading into ShopV2 on sql1.internal',
+      'a ' + status + ' run must still read present tense, not "Loaded into" before it has finished (' + status + ')');
+  }
+});
+
+/* ------------------------------------------------------------------ E-4: the error drawer shows the SQL Server error number */
+
+test('the error drawer shows the SQL Server error number beside the text, and nothing extra when it is absent (E-4)', async () => {
+  const m = await mount(runningView(), {
+    errors: [
+      { keyJson: '{"Id":88213}', ts: '2026-09-17T09:05:00+00:00', error: 'Cannot insert duplicate key row.', errorNumber: 2627 },
+      { keyJson: '{"Id":88214}', ts: '2026-09-17T09:05:01+00:00', error: 'String or binary data would be truncated.' },
+    ],
+  });
+  D.query(m.root, '.exe-err-btn').fire('click');
+  await D.settle();
+  await D.settle();
+  const items = D.queryAll(dom.ids.drawer, '.exe-err-item');
+  assert.equal(items.length, 2, 'both rejected rows should be listed in the drawer');
+  assert.equal(D.text(items[0].children[1]), 'error 2627: Cannot insert duplicate key row.',
+    'a row recorded with a SQL Server error number must show it beside the text');
+  assert.equal(D.text(items[1].children[1]), 'String or binary data would be truncated.',
+    'a row recorded without an error number must show none, never a 0 or "error undefined:"');
+});
+
 /* Open item 32: the completed-run banner sends the operator to the stepper step by the name the stepper shows. */
 test('the completed-run banner names the final-report step exactly as the stepper labels it', async () => {
   const m = await mount(runningView({
