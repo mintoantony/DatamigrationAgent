@@ -28,7 +28,9 @@ public sealed class GuardSourceFixture : IAsyncLifetime
             INSERT dbo.Many (Id, V) SELECT i, CASE WHEN i = 7000 THEN N'bad' ELSE N'ok' END FROM n;
             WITH n AS (SELECT TOP (400) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects a CROSS JOIN sys.all_objects b)
             INSERT dbo.Wide (Id, V) SELECT i, CONCAT('v', i) FROM n;
-            WITH n AS (SELECT TOP (3500) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects a CROSS JOIN sys.all_objects b)
+            -- 4,500 rows: past chunk 4 at 1,000 rows, so the sizes pin K = 3 exactly and a resume's sizes pin the checkpoint's chunk
+            -- number (a per-segment counter would read chunks 2-4 small on resume).
+            WITH n AS (SELECT TOP (4500) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects a CROSS JOIN sys.all_objects b)
             INSERT dbo.Big (Id, V) SELECT i, CONCAT('v', i) FROM n;
             -- .6 of a second: CAST to datetime2(0) rounds up, plain truncation rounds down, and the two answers never coincide here.
             INSERT dbo.Stamp (Id, At) VALUES
@@ -399,11 +401,11 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
 
         Assert.Equal(RunStatus.Completed, (await rig.Engine.RunAsync(runId, control, default)).Status);
 
-        Assert.True(done.SequenceEqual(new long[] { 1_000, 2_000, 3_000, 3_500 }),
-            "expected three chunks of 1,000 rows and then the other 500 (1000, 2000, 3000, 3500 done); rows done after each chunk were "
-            + string.Join(", ", done));
-        Assert.Equal(3_500, await rig.Tgt.CountAsync("app.Big"));
-        Assert.Equal(3_500, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Big"));
+        Assert.True(done.SequenceEqual(new long[] { 1_000, 2_000, 3_000, 4_500 }),
+            "expected exactly three chunks of 1,000 rows and then the other 1,500 in one (1000, 2000, 3000, 4500 done); rows done "
+            + "after each chunk were " + string.Join(", ", done));
+        Assert.Equal(4_500, await rig.Tgt.CountAsync("app.Big"));
+        Assert.Equal(4_500, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Big"));
     }
 
     /// <summary>
@@ -427,10 +429,12 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
         again.ChunkCommitted += c => done.Add(c.RowsDone);
         Assert.Equal(RunStatus.Completed, (await rig.Engine.RunAsync(runId, again, default)).Status);
 
-        Assert.True(done.SequenceEqual(new long[] { 2_000, 3_000, 3_500 }), "the resumed chunks were " + string.Join(", ", done));
-        Assert.Equal(3_500, await rig.Tgt.CountAsync("app.Big"));
-        Assert.Equal(3_500, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Big"));
-        Assert.Equal(3_500, rig.Repo.Task(runId, "T01")!.RowsDone);
+        Assert.True(done.SequenceEqual(new long[] { 2_000, 3_000, 4_500 }),
+            "expected the resumed segment to size chunks 2 and 3 small by the checkpoint's chunk number and then read the rest at the "
+            + "chunk size (2000, 3000, 4500 done); the resumed chunks were " + string.Join(", ", done));
+        Assert.Equal(4_500, await rig.Tgt.CountAsync("app.Big"));
+        Assert.Equal(4_500, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Big"));
+        Assert.Equal(4_500, rig.Repo.Task(runId, "T01")!.RowsDone);
     }
 
     /// <summary>
