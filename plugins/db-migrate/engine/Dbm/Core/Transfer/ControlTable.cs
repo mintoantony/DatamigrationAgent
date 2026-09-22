@@ -304,6 +304,25 @@ public static class ControlTable
     }
 
     /// <summary>
+    /// Ruling 218 (R4-1): deletes every row of <paramref name="owner"/>'s run <paramref name="runId"/>. For the rows a fresh run finds
+    /// from its own folder for a run of its own that has ended (R3-2) - deleted, never marked done: if they are really another copy's
+    /// (a project moved away and a copy left at its path), marking them done would let that copy's resume read its task as finished
+    /// and complete short without a word, while a missing row makes it fail loudly for want of its checkpoint.
+    /// </summary>
+    public static async Task DeleteRunAsync(SqlConnection conn, CheckpointOwner owner, long runId, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(conn);
+        ArgumentNullException.ThrowIfNull(owner);
+        await using var cmd = new SqlCommand($"""
+            IF OBJECT_ID(N'{Name}', N'U') IS NOT NULL AND COL_LENGTH(N'{Name}', N'project_id') IS NOT NULL
+              EXEC sys.sp_executesql N'DELETE FROM {Name} WHERE project_id = @p AND run_id = @r', N'@p nvarchar(36), @r bigint', @p = @p, @r = @r;
+            """, conn);
+        cmd.Parameters.Add(new SqlParameter("@p", SqlDbType.NVarChar, 36) { Value = owner.ProjectId });
+        cmd.Parameters.Add(new SqlParameter("@r", SqlDbType.BigInt) { Value = runId });
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>
     /// Ruling 212 (c): a finished or cancelled run's end. Deletes <paramref name="owner"/>'s rows (every run of that project: at most
     /// one of its runs is ever live, and an abandoned one's rows are dead) and drops the table only when nothing else is left in it.
     /// Returns true when the table is gone (or was never there); false when another project's rows kept it. A table of that name that

@@ -58,7 +58,7 @@ public sealed class TransferEngine
     /// project folder carries the state database, and with it the workspace identity - and is refused rather than adopted.</param>
     /// <param name="endedRun">Ruling 217 (R3-2): whether this workspace's run with that id is cancelled or failed. Its unfinished rows,
     /// written from this very folder, are this project's own leftovers - a cancel that could not reach the target leaves them - and are
-    /// retired rather than taken for a copy's.</param>
+    /// deleted rather than taken for a copy's (Ruling 218, R4-1: deleted, never marked done).</param>
     internal static async Task EnsureNoForeignCheckpointsAsync(SqlConnection tgt, CheckpointOwner owner, long runId, bool fresh,
         string database, CancellationToken ct, Func<long, bool>? endedRun = null)
     {
@@ -70,7 +70,8 @@ public sealed class TransferEngine
             if (copied.RunId != runId && ControlTable.IsOwnFolder(owner, copied.Folder) && endedRun?.Invoke(copied.RunId) == true
                 && retired.Add(copied.RunId))
             {
-                await ControlTable.RetireRunAsync(tgt, owner, copied.RunId, ct);
+                // Ruling 218 (R4-1): deleted, not marked done - see DeleteRunAsync.
+                await ControlTable.DeleteRunAsync(tgt, owner, copied.RunId, ct);
                 continue;
             }
             throw new TransferException("run_in_progress",

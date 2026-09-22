@@ -773,6 +773,45 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
         Assert.Equal(400, await rig.Tgt.CountAsync("app.Wide"));
     }
 
+    /// <summary>
+    /// Ruling 218, R4-1 (probe REVF_M). The original project is paused at 200 of 400 on run 1; it is moved, and a copy is left at the
+    /// old path whose run 1 is cancelled (a busy-refused start cancels the run it created). The copy's fresh run 2 took the original's
+    /// row for its own ended run's and marked it done - and the original's resume then read the task as finished and ended Completed
+    /// with 200 of 400 rows, saying nothing. The R3-2 path deletes the ended run's rows instead: nothing of this folder resumes an
+    /// ended run, and a mistaken delete makes the victim's resume fail loudly for want of its checkpoint.
+    /// </summary>
+    [Fact]
+    public async Task A_copy_at_the_old_path_never_lets_the_originals_resume_complete_short()
+    {
+        var plan = One(WidePlan());
+        await using var rig = await RigAsync(plan);
+        using var copy = new XferServices();
+        copy.Services.Db.Execute("UPDATE transfer_identity SET workspace_id = $W", new { W = rig.Svc.Services.Transfers.WorkspaceId() });
+        var engineCopy = new TransferEngine(copy.Services, plan, fx.Src.ConnectionString, rig.Tgt.ConnectionString);
+        var options = new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip" };
+        long run = rig.Engine.CreateRun(1, options);
+        var pause = new TransferControl();
+        pause.ChunkCommitted += c => { if (c.ChunkNo == 2) pause.RequestPause(); };
+        Assert.Equal(RunStatus.Paused, (await rig.Engine.RunAsync(run, pause, default)).Status);
+        // The original wrote its row from the path the copy now occupies (it has since been moved).
+        await rig.Tgt.ExecAsync($"UPDATE dbo.__dbm_checkpoint SET project_folder = N'{copy.Root.Replace("'", "''")}';");
+        long cancelled = engineCopy.CreateRun(1, options);
+        Assert.Equal(run, cancelled);
+        copy.Services.Transfers.SetRunStatus(cancelled, RunStatus.Cancelled);
+        long copyRun = engineCopy.CreateRun(1, options);
+        var stopAtOnce = new TransferControl();
+        stopAtOnce.RequestPause();                                      // its start checks run, then it stops before loading
+        await Record.ExceptionAsync(() => engineCopy.RunAsync(copyRun, stopAtOnce, default));
+
+        var resumed = await rig.Engine.RunAsync(run, new TransferControl(), default);
+
+        long rows = await rig.Tgt.CountAsync("app.Wide");
+        Assert.True(resumed.Status != RunStatus.Completed || rows == 400,
+            $"a retired copy's checkpoint let the original's resume end Completed with {rows} of 400 rows and no error");
+        Assert.True(resumed.Status == RunStatus.Failed && (resumed.Error ?? "").Contains("has no checkpoint row", StringComparison.Ordinal),
+            $"the original's resume did not fail for want of its checkpoint ({EnumText.ToText(resumed.Status)}): {resumed.Error}");
+    }
+
     /// <summary>Ruling 217, R3-2: only this folder's own ENDED run is retired. A paused run of this folder is still a live claim (a
     /// fresh run beside it is refused, and its rows stay unfinished).</summary>
     [Fact]

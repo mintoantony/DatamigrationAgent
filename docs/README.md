@@ -183,7 +183,7 @@ lock, so it is refused while another transfer is loading that target. A copy of 
 project identity; its new run is refused if the original's run has checkpoints in the target, so work from one copy.
 "Keep the checkpoint table" keeps the table for auditing, but a cancelled or abandoned run's rows in it are marked done
 and never block another run. A cancel that could not reach the target leaves the run's checkpoints behind; the next new run
-from the same project folder retires them.
+from the same project folder removes them.
 
 **Upgrading from an earlier db-migrate version.** Earlier versions took a different lock and do not see this one, so do
 not run an earlier version and this one against the same target at the same time. The first run of this version upgrades
