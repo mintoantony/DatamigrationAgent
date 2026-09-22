@@ -279,6 +279,28 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
     }
 
     /// <summary>
+    /// Open item 23 at the start door: another project's run holds the target (a different run id, so the run lock alone would not
+    /// see it). The start is refused <c>busy</c> naming the target and the holder, nothing is loaded, and the operator can retry.
+    /// </summary>
+    [Fact]
+    public async Task A_start_while_another_project_loads_the_target_is_busy_naming_the_holder()
+    {
+        await using var rig = await RigAsync();
+        await using var held = await RunLock.AcquireAsync(rig.Tgt.ConnectionString, 999, default, @"run 999 of the project in D:\elsewhere");
+
+        var thrown = await Record.ExceptionAsync(() => rig.Service.StartAsync(Skip, rig.Tgt.Name, default));
+        await rig.Service.Current;
+
+        long parents = await rig.Tgt.CountAsync("app.Parent");
+        Assert.True(parents == 0, $"a start went ahead while another project was loading the same target: app.Parent holds {parents} rows");
+        var ex = Assert.IsType<TransferException>(thrown);
+        Assert.Equal("busy", ex.Code);
+        Assert.True(ex.Message.Contains(rig.Tgt.Name, StringComparison.Ordinal) && ex.Message.Contains(@"run 999 of the project in D:\elsewhere",
+            StringComparison.Ordinal), "the refusal does not name the target and what holds it: " + ex.Message);
+        Assert.True(rig.Service.View().CanStart, rig.Service.View().CannotStart ?? "");
+    }
+
+    /// <summary>
     /// Carry-forward 5, the half that fixes the comparison's shape. <c>Skip</c> is normalised into a fresh instance on every call, so a
     /// reference comparison would re-run the checklist every time; the same run of checks has to be recognised as the same.
     /// </summary>

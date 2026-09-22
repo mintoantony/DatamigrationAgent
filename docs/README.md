@@ -171,6 +171,11 @@ start dialog, which names the non-empty tables and the keyless ones. Without eit
 rows added" instead of "validated". If neither choice is right, the target has to be restored (for example from a
 backup); never edit it by hand.
 
+**One transfer per target database.** While a run is loading, it holds a lock in the target database itself, so a second
+transfer into the same database — from another project folder, another terminal or the CLI beside the UI — is refused
+(`busy`) before it copies a row, with a message naming the target and the run and project folder that hold it. The lock
+goes away when that run finishes, pauses or its process ends, so a resume after a crash is not affected.
+
 **Chunk keys.** When a task's source query joins other tables, pre-flight checks that its chunk key is still unique in
 that query. A join that repeats rows (one order per order line, say) would make the key repeat and lose rows at chunk
 boundaries, so it blocks the run with the task and one repeated key named; fix the key or the join in the SQL phase.

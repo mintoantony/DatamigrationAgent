@@ -33,6 +33,11 @@ public sealed class TransferEngine
         return order;
     }
 
+    /// <summary>What a runner of <paramref name="runId"/> calls itself in the target's holder record: the run and the project folder.
+    /// A path, never a connection detail.</summary>
+    internal static string HolderText(DbmServices services, long runId)
+        => string.Create(System.Globalization.CultureInfo.InvariantCulture, $"run {runId} of the project in {services.Ws.Root}");
+
     public long CreateRun(int sqlVersion, TransferOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -55,7 +60,9 @@ public sealed class TransferEngine
         // Ruling 103. A "running" run must stay resumable - that is what a crash leaves behind - so status alone cannot say whether a
         // runner is still alive. The lock can, and it is taken before anything is read or written, so a second runner is refused
         // before it copies a row rather than after it has doubled the table.
-        await using var runLock = await RunLock.AcquireAsync(_targetCs, runId, ct);
+        // Ruling 209: the same call takes the target's lock too, so a run of another project loading into this database is refused
+        // here as well, told which run and which project folder holds it.
+        await using var runLock = await RunLock.AcquireAsync(_targetCs, runId, ct, HolderText(_services, runId));
 
         var rc = new RunContext
         {

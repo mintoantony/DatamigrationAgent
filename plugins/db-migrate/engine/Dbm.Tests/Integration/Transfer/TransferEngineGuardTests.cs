@@ -472,6 +472,58 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
     }
 
     /// <summary>
+    /// Open item 23 / ruling 209. Two project folders - two terminals, or the CLI beside a desktop session - each create their own run
+    /// against one target. A run-scoped lock excludes neither: the run ids differ, so both load, and on a table with no key every row
+    /// arrives twice. The lock is target-scoped: the second is refused before it copies a row, told which target and what holds it,
+    /// and the target is free again once the first is done.
+    /// </summary>
+    [Fact]
+    public async Task A_second_project_loading_the_same_target_is_refused_naming_the_target_and_the_holder()
+    {
+        var plan = One(WidePlan());
+        await using var rig = await RigAsync(plan);
+        using var otherProject = new XferServices();
+        var second = new TransferEngine(otherProject.Services, plan, fx.Src.ConnectionString, rig.Tgt.ConnectionString);
+        var options = new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip", KeepControlTable = true };
+        long runId = rig.Engine.CreateRun(1, options);
+        second.CreateRun(1, options);                                   // so the two run ids differ, as they do in real life
+        long otherRunId = second.CreateRun(1, options);
+        Assert.NotEqual(runId, otherRunId);
+
+        var holding = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var control = new TransferControl();
+        control.ChunkCommitted += _ =>
+        {
+            holding.TrySetResult();
+            release.Task.GetAwaiter().GetResult();
+        };
+        var first = Task.Run(() => rig.Engine.RunAsync(runId, control, default));
+        await holding.Task;
+
+        var refusal = await Record.ExceptionAsync(() => second.RunAsync(otherRunId, new TransferControl(), default));
+        long rowsWhileHeld = await rig.Tgt.CountAsync("app.Wide");
+        release.TrySetResult();
+        var outcome = await first;
+
+        long rows = await rig.Tgt.CountAsync("app.Wide");
+        Assert.True(rows == 400,
+            $"a second project's run loaded into the target another project was loading: app.Wide holds {rows} rows, not 400");
+        Assert.Equal(RunStatus.Completed, outcome.Status);
+        var refused = Assert.IsType<TransferException>(refusal);
+        Assert.Equal("run_in_progress", refused.Code);
+        Assert.True(refused.Message.Contains(rig.Tgt.Name, StringComparison.Ordinal),
+            "the refusal does not name the target database: " + refused.Message);
+        Assert.True(refused.Message.Contains($"run {runId}", StringComparison.Ordinal)
+                    && refused.Message.Contains(rig.Svc.Root, StringComparison.OrdinalIgnoreCase),
+            "the refusal does not name what holds the target (its run and project folder): " + refused.Message);
+        Assert.True(rowsWhileHeld <= 100, $"rows were loaded by the refused runner: {rowsWhileHeld}");
+
+        // Not a permanent refusal: once the first run is done the target is free for the other project.
+        await using (await RunLock.AcquireAsync(rig.Tgt.ConnectionString, otherRunId, default)) { }
+    }
+
+    /// <summary>
     /// Harm: the chunk's rows and its checkpoint must commit in one transaction. Written afterwards instead, a crash in between leaves
     /// rows in the target that no checkpoint knows about, and the resume loads them again - on a target with no unique key, silently.
     /// The staged crash is the only place this is visible: between chunks both writes have always happened.

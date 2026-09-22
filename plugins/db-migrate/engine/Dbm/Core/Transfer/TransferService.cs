@@ -655,7 +655,7 @@ public sealed class TransferService
     {
         try
         {
-            var probe = await RunLock.AcquireAsync(targetCs, runId, ct);
+            var probe = await RunLock.AcquireAsync(targetCs, runId, ct, TransferEngine.HolderText(_services, runId));
             await probe.DisposeAsync();
         }
         catch (TransferException ex) when (ex.Code == "run_in_progress")
