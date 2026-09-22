@@ -47,8 +47,10 @@ started; after that the connections are locked.
   server needs a SQL login, save a connection to that server here first, on either side and to any database (e.g.
   `master`), then ask Claude to run `dbm demo --attach` with no `--server`: it uses the server and login of the saved
   connection (the source if saved, else the target) and replaces both connections with the two demo databases, so the
-  password is typed only here and never reaches the chat. Without `--attach` the
-  command only prints the two connection strings with any password replaced by `***`, and you would have to put the
+  password is typed only here and never reaches the chat. Do this only in a new project: if both sides are saved on
+  different servers the command refuses and asks for `--server`. With or without `--attach`, `dbm demo` prints the two
+  demo connection strings with the password replaced by `***`, so Claude sees the server and login it was built from,
+  never the password. Without `--attach` the command only prints them and saves nothing, and you would have to put the
   password back in here yourself, so `--attach` is the easier way.
 - A certificate error on Test: add `TrustServerCertificate=True` for test servers, or install the server's CA certificate.
 - Entra ID: for example `Authentication=Active Directory Default` (uses your `az login` or IDE sign-in) or

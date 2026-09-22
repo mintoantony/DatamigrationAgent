@@ -157,6 +157,50 @@ public class DemoCommandTests
         Assert.True(b.TrustServerCertificate, $"ForDatabase dropped TrustServerCertificate from the connection string: '{cs}'.");
     }
 
+    /// <summary>
+    /// Sweep K review HIGH-1: a password under 4 characters, and one with both quote kinds (which the builder re-quotes as
+    /// "Pa""ss'word1"), both came back in clear from text scrubbing.
+    /// </summary>
+    [Theory]
+    [InlineData("ab1")]
+    [InlineData("Pa\"ss'word1")]
+    [InlineData("x")]
+    public void ConnectionView_never_shows_a_short_or_quoted_password(string password)
+    {
+        var cs = new SqlConnectionStringBuilder
+        {
+            DataSource = "srv1", InitialCatalog = "DbmDemo_LegacyShop", UserID = "demo", Password = password, TrustServerCertificate = true,
+        }.ConnectionString;
+
+        var view = Json.ToNode(DemoCommand.ConnectionView("DbmDemo_LegacyShop", cs));
+        var shown = view["connectionString"]!.GetValue<string>();
+
+        var b = new SqlConnectionStringBuilder(shown);
+        Assert.True(b.Password == "***", $"demo output printed the SQL login's password {password} in clear: {shown}");
+        Assert.Equal("demo", b.UserID);
+        Assert.Equal("DbmDemo_LegacyShop", b.InitialCatalog);
+    }
+
+    /// <summary>HIGH-1, the messages: every text DemoCommand prints masks the password whatever its length or quotes.</summary>
+    [Theory]
+    [InlineData("ab1")]
+    [InlineData("Pa\"ss'word1")]
+    public void MaskSecrets_masks_a_short_or_quoted_password_in_any_message(string password)
+    {
+        var cs = new SqlConnectionStringBuilder { DataSource = "srv1", UserID = "demo", Password = password }.ConnectionString;
+        var quoted = new SqlConnectionStringBuilder(cs).ConnectionString;   // the builder's own quoting of the value
+        var text = $"Failed connecting to the server: login demo with {password} rejected; string was {quoted}.";
+
+        var masked = DemoCommand.MaskSecrets(text, cs);
+
+        foreach (var form in new[] { password, password.Replace("\"", "\"\""), password.Replace("'", "''") })
+        {
+            Assert.True(!masked.Contains(form, StringComparison.Ordinal),
+                $"a demo message printed the SQL login's password {password} in clear (as {form}): {masked}");
+        }
+        Assert.Contains("***", masked);
+    }
+
     [Fact]
     public void ConnectionView_never_shows_the_password()
     {

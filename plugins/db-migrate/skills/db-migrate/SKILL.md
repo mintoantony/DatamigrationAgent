@@ -15,7 +15,8 @@ report or an error.
 - NEVER ask for, accept, print or repeat a connection string. Connections are entered only in the browser UI — or, for
   the sample databases, `dbm demo --server "<string the user gave you>" --attach`, only if it holds no password
   (Windows authentication). With a password, the user saves a connection to that server on the Setup screen (either
-  side, any database); then run `dbm demo --attach` with no `--server`, which uses the saved one.
+  side, any database); then run `dbm demo --attach` with no `--server`, which uses the saved one — only in a new
+  project, since it replaces both saved connections. Its output masks the password as `***`.
 - Do not read `.dbmigrate/state.db`, `server.json` or work packets yourself — subagents read their packet.
 - Do not edit artifacts yourself; changes come only from subagent patches applied with `dbm apply`.
 - When a `dbm` command fails (non-zero exit, or `{"error":...}`), read `reference/troubleshooting.md` and follow its

@@ -29,13 +29,66 @@ public sealed class DemoCommand : ICommand
     private static string ProbeTarget(string database, string connectionString) =>
         ProbeConnectionStringOverrides.TryGetValue(database, out var o) ? o : connectionString;
 
-    /// <summary>What the CLI prints per side: the connection string with every secret replaced by ***.</summary>
+    /// <summary>
+    /// What the CLI prints per side: the connection string with its password set to *** through the builder (sweep K
+    /// review HIGH-1). Never by text replacement: Redactor.Scrub skips a password under 4 characters, and the builder
+    /// re-quotes one holding both quote kinds, so its text never matches.
+    /// </summary>
     public static object ConnectionView(string database, string connectionString) => new
     {
         database,
-        connectionString = Redactor.Scrub(connectionString, Redactor.SecretsOf(connectionString)),
+        connectionString = MaskedConnectionString(connectionString),
         describe = Redactor.Describe(connectionString),
     };
+
+    private static string? ServerOf(string connectionString)
+    {
+        try
+        {
+            return new SqlConnectionStringBuilder(connectionString).DataSource;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    private static string MaskedConnectionString(string connectionString)
+    {
+        try
+        {
+            var b = new SqlConnectionStringBuilder(connectionString);
+            if (!string.IsNullOrEmpty(b.Password)) b.Password = "***";
+            return b.ConnectionString;
+        }
+        catch (Exception)
+        {
+            return "(not shown: the connection string could not be parsed)";
+        }
+    }
+
+    /// <summary>
+    /// Masks the password of <paramref name="connectionString"/> in any text DemoCommand prints, whatever its length, both
+    /// as typed and as a connection string builder quotes it ("…""…" or '…''…').
+    /// </summary>
+    internal static string MaskSecrets(string text, string connectionString)
+    {        foreach (var secret in Redactor.SecretsOf(connectionString))
+        {
+            if (string.IsNullOrEmpty(secret)) continue;
+            foreach (var form in new[]
+                     {
+                         "\"" + secret.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"",
+                         "'" + secret.Replace("'", "''", StringComparison.Ordinal) + "'",
+                         secret.Replace("\"", "\"\"", StringComparison.Ordinal),
+                         secret.Replace("'", "''", StringComparison.Ordinal),
+                         secret,
+                     })
+            {
+                text = text.Replace(form, "***", StringComparison.Ordinal);
+            }
+        }
+        return text;
+    }
 
     private const string Usage =
         "dbm demo --server \"<connection string to any database on the server>\" [--scale n] [--prefix name] [--force] [--attach], " +
@@ -67,10 +120,19 @@ public sealed class DemoCommand : ICommand
             }
             // Open item 38: without --server the server comes from a connection saved on the Setup screen (the source if
             // saved, else the target), so a SQL-auth password is typed only into the browser and never passes through
-            // the chat or a terminal command line.
+            // the chat or a terminal command line. Sweep K review LOW-1: when both are saved on different servers there
+            // is no right choice, so it refuses rather than pick one.
             if (string.IsNullOrWhiteSpace(server))
             {
-                server = project.Connections.GetConnectionString(Side.Src) ?? project.Connections.GetConnectionString(Side.Tgt);
+                var src = project.Connections.GetConnectionString(Side.Src);
+                var tgt = project.Connections.GetConnectionString(Side.Tgt);
+                if (src is not null && tgt is not null && !string.Equals(ServerOf(src), ServerOf(tgt), StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new CliFailure("usage",
+                        "The source and target connections saved in this project name different servers, so dbm demo --attach " +
+                        "cannot tell which one to build the demo on: pass --server, or run the demo in a new project folder. Usage: " + Usage);
+                }
+                server = src ?? tgt;
                 if (server is null)
                 {
                     throw new CliFailure("usage",
@@ -92,10 +154,10 @@ public sealed class DemoCommand : ICommand
                 }
                 catch (SqlException ex)
                 {
-                    throw new CliFailure("sql_error", Redactor.Scrub(
+                    throw new CliFailure("sql_error", MaskSecrets(
                         $"Created and seeded {result.SourceDatabase} and {result.TargetDatabase}, then failed saving them as this " +
                         $"project's connections: {ex.Message.Trim().TrimEnd('.')}. Re-run with --force --attach to start over.",
-                        Redactor.SecretsOf(serverText)));
+                        serverText));
                 }
             }
             return Output.Ok(ctx, new
@@ -112,12 +174,12 @@ public sealed class DemoCommand : ICommand
         }
         catch (DemoExistsException ex)
         {
-            throw new CliFailure("demo_exists", ex.Message);
+            throw new CliFailure("demo_exists", MaskSecrets(ex.Message, serverText));
         }
         catch (DemoFailedException ex)
         {
             // Ruling 157: names both databases, what happened to each, the server's text and the remedy.
-            throw new CliFailure("sql_error", Redactor.Scrub(ex.Message, Redactor.SecretsOf(serverText)));
+            throw new CliFailure("sql_error", MaskSecrets(ex.Message, serverText));
         }
     }
 
