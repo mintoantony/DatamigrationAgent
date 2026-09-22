@@ -27,6 +27,37 @@ public class SqlConnectTests
         Assert.Equal("integrated", meta.AuthSummary);
     }
 
+    /// <summary>Open item 49: a LocalDB connection's probe records the stable <c>(localdb)\Name</c> the connection string names - the
+    /// server name it reports changes on every instance start - and a probe of any other server records none.</summary>
+    [Fact]
+    public async Task Probe_records_the_stable_LocalDB_data_source_and_no_other()
+    {
+        await using var db = await TempDatabase.CreateAsync();
+        string named = new SqlConnectionStringBuilder(db.ConnectionString).DataSource.Trim();
+        string? expected = named.StartsWith(@"(localdb)\", StringComparison.OrdinalIgnoreCase) ? @"(localdb)\" + named[10..] : null;
+
+        var meta = await SqlConnect.ProbeAsync(db.ConnectionString, CancellationToken.None);
+
+        Assert.True(meta.DataSource == expected,
+            $"the probe recorded the data source '{meta.DataSource}', but the connection string names '{expected}'");
+    }
+
+    [Theory]
+    [InlineData(@"Data Source=(localdb)\MSSQLLocalDB;Initial Catalog=Shop;Integrated Security=true", @"(localdb)\MSSQLLocalDB")]
+    [InlineData(@"Server=(LocalDB)\Dev2 ;Database=Shop;User ID=sa;Password=Secr3t!x", @"(localdb)\Dev2")]
+    [InlineData(@"Server= (localdb)\.\Shared ;Database=Shop", @"(localdb)\.\Shared")]
+    [InlineData(@"Server=SQL01;Database=Shop;User ID=sa;Password=Secr3t!x", null)]
+    [InlineData(@"Server=tcp:sql01.internal,1433;Database=Shop", null)]
+    [InlineData(@"Server=np:\\.\pipe\LOCALDB#1A254D6D\tsql\query;Database=Shop", null)]
+    [InlineData(@"Server=(localdb)\;Database=Shop", null)]
+    public void LocalDbDataSource_is_the_instance_the_connection_string_names_and_never_a_credential(string cs, string? expected)
+    {
+        string? actual = SqlConnect.LocalDbDataSource(cs);
+
+        Assert.True(actual == expected, $"the LocalDB data source of '{cs}' came out as '{actual}', not '{expected}'");
+        Assert.True(actual is null || !actual.Contains("Secr3t", StringComparison.Ordinal), "the data source carries the password");
+    }
+
     [Fact]
     public async Task Open_tags_the_session_with_application_name_dbm()
     {

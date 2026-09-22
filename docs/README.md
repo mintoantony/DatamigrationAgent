@@ -194,8 +194,10 @@ before; only checkpoints of tasks that run had started, matching what it recorde
 checkpoints hold the target for every other project, and they are never taken over while they are
 still changing (within 10 minutes of the last write). If no db-migrate project still uses the target, the table can be
 dropped. The run checks
-after every committed chunk that it still holds the lock; if its lock connection was dropped (a network or failover
-fault), it pauses after the current chunk and says so in its notes, and **Resume** takes the lock again.
+that it still holds the lock before each chunk commits (and before a keyless task's single commit, and between its
+chunks). If its lock connection was dropped (a network or failover fault), the run is paused and the chunk about to
+commit is rolled back - for a keyless task, everything it had loaded of its table - and its notes say so.
+**Resume** takes the lock again and continues from the checkpoints, loading that chunk (or table) again.
 
 **Chunk keys.** When a task's source query joins other tables, pre-flight checks that its chunk key is still unique in
 that query. A join that repeats rows (one order per order line, say) would make the key repeat and lose rows at chunk

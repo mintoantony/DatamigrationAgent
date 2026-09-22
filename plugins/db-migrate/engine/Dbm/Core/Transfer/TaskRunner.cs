@@ -45,9 +45,49 @@ internal sealed class RunContext
     public required TransferProgress Progress { get; init; }
     public required IReadOnlyList<string> Secrets { get; init; }
 
+    /// <summary>Open item 48: asks the lock session whether it still holds the target lock - null while it does, otherwise the sentence
+    /// saying it is gone (<see cref="RunLock.LostAsync"/>). Null when the run holds no lock (tests of the runner alone).</summary>
+    public Func<CancellationToken, Task<string?>>? LockCheck { get; init; }
+
+    /// <summary>What the lock-lost note says after the lock's own sentence (review J, LOW-2); docs/README.md uses the same words.</summary>
+    internal const string LockLostConsequence = "Without it another transfer could load into this target beside this one, so the run "
+        + "was paused and the chunk about to commit was rolled back. Resume takes the lock again and continues from the checkpoints.";
+
     private readonly List<string> _notes = [];
+    private int _lockLost;
 
     public TransferRepo Repo => Services.Transfers;
+
+    /// <summary>
+    /// Open items 20 and 48. Called inside a chunk's transaction, just before its COMMIT (and before a keyless task's single COMMIT):
+    /// true when the lock is gone, and the caller then rolls the chunk back instead of committing it. The first loss adds the note,
+    /// logs it and pauses the run; once lost, the lock stays lost for this segment, so every later commit is refused without asking.
+    /// One short round trip on the lock's own connection per commit, while the chunk's transaction waits.
+    /// <para>Review J, NIT-1: a window remains, and it is inherent. The lock can be lost between this answer and the COMMIT that
+    /// follows it - no statement can make a check on one session and a commit on another atomic - so at most one chunk per task can
+    /// land after a loss. The next commit of that task, and of every other, is refused.</para>
+    /// <para>Review J, LOW-3: <paramref name="ct"/> is deliberately not handed to the lock question. A hard stop that cancelled it would
+    /// read as a lost session - the run told its lock was lost when it was only stopped. The question carries its own timeout (15 s);
+    /// a hard stop is thrown as the cancellation it is (crash semantics, like every other statement of the run), before the question
+    /// and after it, and never becomes a verdict on the lock.</para>
+    /// </summary>
+    public async Task<bool> LockLostAsync(CancellationToken ct)
+    {
+        if (LockCheck is null) return false;
+        if (Volatile.Read(ref _lockLost) != 0) return true;
+        ct.ThrowIfCancellationRequested();
+        string? lost = await LockCheck(CancellationToken.None);
+        ct.ThrowIfCancellationRequested();
+        if (lost is null) return false;
+        if (Interlocked.Exchange(ref _lockLost, 1) == 0)
+        {
+            string note = Scrub(lost + " " + LockLostConsequence);
+            AddNote(note);
+            Log("error", note);
+            Control.RequestPause();
+        }
+        return true;
+    }
 
     /// <summary>
     /// What this run has to carry out with it because nothing else will: a control table that was not ours, rejected rows that were
@@ -300,6 +340,13 @@ internal sealed class TaskRunner(RunContext rc)
                 next = new Checkpoint(cp.ChunkNo + 1, KeyCodec.Encode(newLast), cp.RowsDone + outcome.Loaded,
                     cp.RowsError + outcome.Failed.Count, lastChunk);
                 await ControlTable.UpsertAsync(scope.Connection, scope.Tx, rc.RunId, id, next, ct);
+                // Open item 48: the lock is asked inside the transaction, before the COMMIT - a chunk that would land after it was lost
+                // is rolled back, and the checkpoint stays where it was.
+                if (await rc.LockLostAsync(ct))
+                {
+                    await scope.RollbackAsync();
+                    return new Pass(TransferTaskStatus.Paused, cp);
+                }
                 // Ruling 114: the seam is raised from inside CommitAsync, on the statement after the COMMIT, rather than on the line
                 // after this one. The instant it fires is the instant the chunk's rows and its checkpoint are both durable or neither
                 // is. The callback is an expression, not a block, so this loop has no statement position between the two at all - the
@@ -362,6 +409,14 @@ internal sealed class TaskRunner(RunContext rc)
                 await scope.RollbackAsync();   // nothing of a keyless task is committed before it completes
                 return new Pass(TransferTaskStatus.Paused, Checkpoint.Start);
             }
+            // Review J, LOW-4 (decision J-6): asked before every chunk, not only before the commit. Once the lock is lost, everything
+            // this transaction holds will be rolled back, so reading the rest of the source first would only cost its whole length. One
+            // round trip per chunk of at least 1,000 rows; answered from the flag once any task has seen the loss.
+            if (await rc.LockLostAsync(ct))
+            {
+                await scope.RollbackAsync();
+                return new Pass(TransferTaskStatus.Paused, Checkpoint.Start);
+            }
             int size = ChunkRows(chunkSize, chunks);
             var table = ChunkReader.NewTable(reader);
             int n = await ChunkReader.FillAsync(reader, table, size, ct);
@@ -401,6 +456,12 @@ internal sealed class TaskRunner(RunContext rc)
         long? merged = mergeStatus == MergeStatus.Ran && !mergeCountUnknown ? mergedTotal : null;
         var done = new Checkpoint(chunks, null, loaded, rejected, true);
         await ControlTable.UpsertAsync(scope.Connection, scope.Tx, rc.RunId, id, done, ct);
+        // Open item 48: the whole task is this one transaction, so a lock lost at any point before here rolls all of it back.
+        if (await rc.LockLostAsync(ct))
+        {
+            await scope.RollbackAsync();
+            return new Pass(TransferTaskStatus.Paused, Checkpoint.Start);
+        }
         await scope.CommitAsync(ct);
         Write(id, errors);
         Mirror(id, done);
