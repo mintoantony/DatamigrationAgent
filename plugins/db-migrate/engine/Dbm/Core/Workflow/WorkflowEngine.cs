@@ -305,7 +305,9 @@ public sealed class WorkflowEngine(DbmServices services)
     /// reworking the agent holds the current version as its patch's baseVersion, and a new version would reject its next apply.
     /// Returns Ok false with the reason (nothing stored) otherwise, or when validation finds errors.
     /// </summary>
-    public ApplyResult Revalidate(PhaseName phase, int seenVersion) => services.Db.InTransaction(() =>
+    /// <param name="accept">Re-review R4: when given, the re-validated payload is stored only if it returns true (for SQL: the result
+    /// really is validated); otherwise nothing is stored and the result carries <paramref name="refusal"/>.</param>
+    public ApplyResult Revalidate(PhaseName phase, int seenVersion, Func<JsonNode, bool>? accept = null, string? refusal = null) => services.Db.InTransaction(() =>
     {
         if (!services.Modules.TryGetValue(phase, out var module)) return ApplyResult.Fail($"phase '{phase.Text()}' has no module to validate");
         EnsureCurrentVersion(phase, seenVersion);
@@ -316,6 +318,7 @@ public sealed class WorkflowEngine(DbmServices services)
         var updated = JsonNode.Parse(baseRow.PayloadJson)!;
         var check = module.Validate(new ModuleContext { Services = services, Current = baseRow, OpenFeedback = [] }, updated);
         if (!check.Ok) return new ApplyResult(false, null, check.Errors, check.Warnings);
+        if (accept is not null && !accept(updated)) return new ApplyResult(false, null, [refusal ?? "the re-validation was not accepted"], check.Warnings);
         var version = StoreArtifact(phase, updated, "script", RevalidatedSummary);
         return new ApplyResult(true, version, [], check.Warnings);
     });

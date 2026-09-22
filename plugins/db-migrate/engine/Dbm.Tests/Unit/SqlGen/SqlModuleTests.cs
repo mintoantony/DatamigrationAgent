@@ -37,6 +37,57 @@ public sealed class SqlModuleTests : IDisposable
 
     private static readonly SqlValidation Evidence = SqlValidation.From(new DateTimeOffset(2026, 9, 18, 9, 30, 0, TimeSpan.Zero), true);
 
+    private static readonly ValidationReport CleanReport = new(true, [], [], [], []);
+
+    /// <summary>Two stored versions without evidence, v(n-1) and v(n), Sql awaiting review on v(n). Returns n.</summary>
+    private int TwoVersionsAwaitingReview()
+    {
+        var plan = Plan();
+        plan.Validation = null;
+        Ctx(plan);
+        Ctx(plan);
+        _services.Phases.SetStatus(PhaseName.Sql, PhaseStatus.AwaitingReview);
+        return _services.Phases.Get(PhaseName.Sql).CurrentVersion!.Value;
+    }
+
+    /// <summary>Re-review R1: Revalidate checks the seen version INSIDE its transaction. An edit saved in another tab while a slow live
+    /// validation ran must not be silently replaced by a re-stored copy of the version the validation started from.</summary>
+    [Fact]
+    public void Revalidate_refuses_a_version_that_is_no_longer_current_and_stores_nothing()
+    {
+        var current = TwoVersionsAwaitingReview();
+        var ex = Record.Exception(() => _services.Workflow.Revalidate(PhaseName.Sql, current - 1));
+        Assert.True(ex is WorkflowException { Code: WorkflowException.StaleVersion },
+            "Revalidate stored over a newer version instead of refusing the stale one: " + (ex?.Message ?? "no exception"));
+        Assert.Equal(current, _services.Phases.Get(PhaseName.Sql).CurrentVersion);
+    }
+
+    /// <summary>Re-review R3: that refusal reaches StoreEvidence's callers as a store note, not an exception - the report still prints
+    /// (CLI) and the screen still shows it (web).</summary>
+    [Fact]
+    public void StoreEvidence_turns_a_stale_version_into_a_note()
+    {
+        var current = TwoVersionsAwaitingReview();
+        SqlPlanSource.StoreOutcome? outcome = null;
+        var ex = Record.Exception(() => outcome = SqlPlanSource.StoreEvidence(_services, current - 1, CleanReport, null));
+        Assert.True(ex is null, "StoreEvidence let the stale-version refusal escape: " + ex?.Message);
+        Assert.False(outcome!.Stored);
+        Assert.Contains("current version", outcome.Note!, StringComparison.Ordinal);
+        Assert.Equal(current, _services.Phases.Get(PhaseName.Sql).CurrentVersion);
+    }
+
+    /// <summary>Re-review R4: Revalidate stores only a result that IS validated. This fixture has no connections, so the re-run is
+    /// offline and records no evidence - storing it would add an unvalidated "validation, no SQL change" version.</summary>
+    [Fact]
+    public void A_revalidation_that_records_no_evidence_stores_nothing()
+    {
+        var current = TwoVersionsAwaitingReview();
+        var outcome = SqlPlanSource.StoreEvidence(_services, current, CleanReport, null);
+        Assert.True(!outcome.Stored && _services.Phases.Get(PhaseName.Sql).CurrentVersion == current,
+            "a re-validation that recorded no evidence was stored as a new version: v" + _services.Phases.Get(PhaseName.Sql).CurrentVersion);
+        Assert.Contains("not recorded", outcome.Note!, StringComparison.Ordinal);
+    }
+
     /// <summary>Review N3: the evidence time is written like every other stored time - UTC, ISO-8601 "O" - not System.Text.Json's
     /// default, which drops the fraction digits.</summary>
     [Fact]

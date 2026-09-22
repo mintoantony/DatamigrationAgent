@@ -69,4 +69,34 @@ public sealed class SqlCommandsIntegrationTests
         Assert.Equal(1, s.Phases.Get(PhaseName.Sql).CurrentVersion);
         Assert.True(Json.Deserialize<SqlPlanPayload>(s.Artifacts.Get(PhaseName.Sql, 1)!.PayloadJson).Validation is { Ok: true });
     }
+
+    /// <summary>Re-review R3: a version saved while `dbm sql validate` ran makes the store stale; the command still prints its report,
+    /// with stored false and a note, instead of a generic internal error.</summary>
+    [Fact]
+    public async Task A_version_saved_during_sql_validate_is_reported_not_overwritten()
+    {
+        await using var pair = await SampleDatabases.CreateAsync(1, seed: false);
+        using var project = await SampleProject.CreateAsync(pair);
+        var s = project.Services;
+        SqlGenJobTests.Prepare(s);
+        var plan = SqlGenerator.Generate(SampleMappings.Approved(), SampleCatalogs.Source(), SampleCatalogs.Target());
+        s.Artifacts.Add(PhaseName.Sql, 0, Json.Serialize(plan), "script", "old draft");
+        s.Phases.SetCurrentVersion(PhaseName.Sql, 0);
+        s.Phases.SetStatus(PhaseName.Sql, PhaseStatus.AwaitingReview);
+        SqlPlanSource.BeforeStoreOverrides[project.Ws.Root] = other =>
+        {
+            other.Artifacts.Add(PhaseName.Sql, 1, Json.Serialize(plan), "human", "edited in another tab");
+            other.Phases.SetCurrentVersion(PhaseName.Sql, 1);
+        };
+        try
+        {
+            var r = await CliRunner.RunAsync(project.Ws, null, "sql", "validate");
+
+            Assert.True(r.Exit == 0 && r.Json["error"] is null, "a version saved during sql validate lost the report: " + r.Out[..Math.Min(300, r.Out.Length)]);
+            Assert.False((bool)r.Json["stored"]!);
+            Assert.Contains("current version", (string?)r.Json["storeNote"], StringComparison.Ordinal);
+            Assert.Equal(1, s.Phases.Get(PhaseName.Sql).CurrentVersion);
+        }
+        finally { SqlPlanSource.BeforeStoreOverrides.TryRemove(project.Ws.Root, out _); }
+    }
 }
