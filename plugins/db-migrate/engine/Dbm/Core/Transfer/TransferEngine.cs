@@ -56,11 +56,23 @@ public sealed class TransferEngine
     /// <param name="fresh">Ruling 215 (N-1): the run has never loaded a row (every task's <c>RowsBefore</c> is null). Such a run owns no
     /// checkpoint yet, so a row this project already has for its run id was written by another copy of this workspace - a copied
     /// project folder carries the state database, and with it the workspace identity - and is refused rather than adopted.</param>
+    /// <param name="endedRun">Ruling 217 (R3-2): whether this workspace's run with that id is cancelled or failed. Its unfinished rows,
+    /// written from this very folder, are this project's own leftovers - a cancel that could not reach the target leaves them - and are
+    /// retired rather than taken for a copy's.</param>
     internal static async Task EnsureNoForeignCheckpointsAsync(SqlConnection tgt, CheckpointOwner owner, long runId, bool fresh,
-        string database, CancellationToken ct)
+        string database, CancellationToken ct, Func<long, bool>? endedRun = null)
     {
-        // N-1 and N-7 (Ruling 216): any row of this run, or any unfinished row of another run of this project, was written by a copy.
-        if (fresh && await ControlTable.CopiedWorkspaceRowAsync(tgt, owner, runId, ct) is { } copied)
+        // N-1 and N-7 (Ruling 216): any row of this run, or any unfinished row of another run of this project, was written by a copy -
+        // unless this folder wrote it for a run of its own that has ended (R3-2), which nothing will resume or cancel again.
+        var retired = new HashSet<long>();
+        while (fresh && await ControlTable.CopiedWorkspaceRowAsync(tgt, owner, runId, ct) is { } copied)
+        {
+            if (copied.RunId != runId && ControlTable.IsOwnFolder(owner, copied.Folder) && endedRun?.Invoke(copied.RunId) == true
+                && retired.Add(copied.RunId))
+            {
+                await ControlTable.RetireRunAsync(tgt, owner, copied.RunId, ct);
+                continue;
+            }
             throw new TransferException("run_in_progress",
                 $"The target database {database} already holds checkpoints of run {copied.RunId} of this project"
                 + (copied.Folder.Length > 0 ? $", written from the project folder {copied.Folder}" : "")
@@ -68,6 +80,7 @@ public sealed class TransferEngine
                 + ". This project folder may be a copy of that one: both carry the same workspace, so their runs cannot be told apart in "
                 + "the target, and this run would take over or delete the other's checkpoints. Resume or cancel that run from its own "
                 + "folder, and work from one copy of the project only.");
+        }
         if (await ControlTable.ForeignUnfinishedAsync(tgt, owner, ct) is not { } other) return;
         // Ruling 216 (L-1): an earlier engine's rows under this very run id may be this run's own, just not matched to what it
         // recorded - dropping the table would destroy them, so that advice is only given for rows that cannot be this run's.
@@ -88,9 +101,28 @@ public sealed class TransferEngine
     }
 
     /// <summary>Rulings 215 (N-3) and 216 (L-1): what this run recorded per task, and the largest chunk it can commit - what an earlier
-    /// engine's row must match to be claimed as this run's.</summary>
+    /// engine's row must match to be claimed as this run's. Ruling 217 (R3-1): only the tasks it had started - a pending task never
+    /// wrote a checkpoint, so it claims nothing, and a row under its (run, task) meets the "may be this run's own" refusal instead.</summary>
     internal static LegacyClaim ClaimOf(long runId, TransferOptions options, IEnumerable<TransferTaskRow> tasks)
-        => new(runId, tasks.Select(t => (t.TaskId, t.RowsDone, t.RowsError)).ToList(), MaxChunk(options));
+        => new(runId, tasks.Where(Started).Select(t => (t.TaskId, t.RowsDone, t.RowsError)).ToList(), MaxChunk(options));
+
+    /// <summary>Ruling 217 (R3-1): the run had started this task - it left <c>pending</c>, or was stamped as started. A task that crashed
+    /// in its first chunk is started with 0 recorded, and keeps the one-chunk tolerance.</summary>
+    internal static bool Started(TransferTaskRow task) => task.Status != TransferTaskStatus.Pending || task.StartedAt is not null;
+
+    /// <summary>Ruling 217 (R3-2): whether this workspace's run <paramref name="runId"/> has ended as cancelled or failed. A run whose
+    /// record cannot be read is not taken as ended.</summary>
+    internal static bool EndedRun(DbmServices services, long runId)
+    {
+        try
+        {
+            return services.Transfers.GetRun(runId)?.Status is RunStatus.Cancelled or RunStatus.Failed;
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return false;
+        }
+    }
 
     /// <summary>The largest chunk a run with these options can commit in one transaction: its chunk size, and never less than the
     /// 1,000-row chunks a task starts with.</summary>
@@ -150,7 +182,7 @@ public sealed class TransferEngine
                 // fresh run never adopts a row.
                 bool fresh = tasks.All(t => t.RowsBefore is null);
                 if (!fresh) await ControlTable.ClaimLegacyAsync(tgt, owner, ClaimOf(runId, run.Options, tasks), ct);
-                await EnsureNoForeignCheckpointsAsync(tgt, owner, runId, fresh, runLock.Database, ct);
+                await EnsureNoForeignCheckpointsAsync(tgt, owner, runId, fresh, runLock.Database, ct, id => EndedRun(_services, id));
             }
         }
 
@@ -328,7 +360,7 @@ public sealed class TransferEngine
             if (!await ControlTable.ReleaseAsync(tgt, owner, rc.RunId, ct))
             {
                 string note = $"{ControlTable.Name} was left in the target: this run's checkpoints were removed, but it still holds "
-                              + "another project's checkpoints.";
+                              + $"{await ControlTable.KeptByAsync(tgt, owner, rc.RunId, ct)}.";
                 rc.AddNote(note);
                 rc.Log("info", note);
             }

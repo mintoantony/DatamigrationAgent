@@ -31,6 +31,9 @@ public sealed record ForeignCheckpoint(string Description, bool Legacy, long Run
 /// (Ruling 215 N-3, Ruling 216 L-1): same run id and task id, and the row's rows_done + rows_error at most one chunk ahead of the
 /// recorded counts - a crash between a chunk's commit and the state database's progress update leaves exactly that gap, and the
 /// checkpoint row, committed with the chunk, is the one to trust.
+/// <para>Ruling 217 (R3-1): <see cref="Tasks"/> lists only the tasks the run had started (<c>TransferEngine.ClaimOf</c>). A task still
+/// pending never wrote a checkpoint, so a row under its (run, task) cannot be its own, whatever the counters say - with 0 recorded,
+/// "one chunk ahead" would otherwise take any other run's row of up to a chunk's worth and continue from that run's key.</para>
 /// </summary>
 /// <param name="MaxChunk">The largest chunk the run can commit in one transaction; 0 demands an exact match.</param>
 public sealed record LegacyClaim(long RunId, IReadOnlyList<(string TaskId, long RowsDone, long RowsError)> Tasks, long MaxChunk)
@@ -191,6 +194,28 @@ public static class ControlTable
         foreach (var row in await RowsAsync(conn, "project_id = @p AND (run_id = @r OR done = 0)", owner.ProjectId, runId, ct))
             return (row.Folder ?? "", row.RunId);
         return null;
+    }
+
+    /// <summary>Ruling 217 (R3-2): whether <paramref name="folder"/>, as a checkpoint row recorded it, is <paramref name="owner"/>'s own
+    /// project folder (compared as written, truncated the same way; case-insensitive on Windows, whose paths are).</summary>
+    public static bool IsOwnFolder(CheckpointOwner owner, string? folder)
+    {
+        ArgumentNullException.ThrowIfNull(owner);
+        return folder is { Length: > 0 } && Folder(owner) is { } own
+               && string.Equals(folder, own, OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Ruling 217 (R3-3): what kept the table after <see cref="ReleaseAsync"/> of <paramref name="runId"/> returned false, for the note -
+    /// the unfinished checkpoints of another run of this very project (which can only be a copy of this workspace's, part-way through
+    /// the target) or, otherwise, another project's checkpoints.
+    /// </summary>
+    public static async Task<string> KeptByAsync(SqlConnection conn, CheckpointOwner owner, long runId, CancellationToken ct)
+    {
+        if (await CopiedWorkspaceRowAsync(conn, owner, runId, ct) is not { } own) return "another project's checkpoints";
+        return $"the unfinished checkpoints of run {own.RunId.ToString(CultureInfo.InvariantCulture)} of this project"
+               + (own.Folder.Length > 0 ? $", written from the project folder {own.Folder}" : "")
+               + " (a copy of this project folder may be part-way through this target)";
     }
 
     private sealed record CheckpointRowInfo(string ProjectId, string? Folder, long RunId, string TaskId, long RowsDone, long RowsError);

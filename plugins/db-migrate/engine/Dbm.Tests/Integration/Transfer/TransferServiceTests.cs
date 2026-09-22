@@ -450,6 +450,36 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
     }
 
     /// <summary>
+    /// Ruling 217, R3-2 (probe REVF_K). A failed run cancelled while the target was unreachable leaves its unfinished rows (F-16); after
+    /// a reopen the next start is not a re-run, so nothing abandons that run under the lock, and the start door refused this folder's
+    /// own fresh run 2 as "may be a copy" of itself - for good, with no way out. This folder's ended run's rows are retired instead.
+    /// </summary>
+    [Fact]
+    public async Task After_a_reopen_a_fresh_run_retires_its_own_cancelled_runs_unfinished_checkpoints_and_starts()
+    {
+        await using var rig = await RigAsync();
+        long failed = await rig.Service.StartAsync(Skip with { ErrorMode = "stop", ChunkSize = 500 }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Failed, rig.S.Transfers.GetRun(failed)!.Status);
+        // The cancel that could not reach the target: the run is cancelled, its checkpoints are still unfinished.
+        rig.S.Transfers.SetRunStatus(failed, RunStatus.Cancelled);
+        Assert.True(await rig.Tgt.ScalarAsync<int>($"SELECT COUNT(*) FROM dbo.__dbm_checkpoint WHERE run_id = {failed} AND done = 0") > 0);
+        // What a reopen and a new approval leave: Transfer back to pending, Ready awaiting review - a start, not a re-run.
+        rig.S.Phases.SetStatus(PhaseName.Transfer, PhaseStatus.Pending);
+        rig.S.Phases.SetStatus(PhaseName.Ready, PhaseStatus.AwaitingReview);
+
+        var refused = await Record.ExceptionAsync(() => rig.Service.StartAsync(Skip with { TruncateTarget = true, ChunkSize = 1000 }, rig.Tgt.Name, default));
+        await rig.Service.Current;
+
+        Assert.True(refused is null,
+            $"a fresh run of this folder was refused over its own cancelled run {failed}'s checkpoints as if the folder were a copy: "
+            + refused?.Message);
+        var latest = rig.S.Transfers.Latest()!;
+        Assert.True(latest.Id != failed && latest.Status == RunStatus.Completed, $"run {latest.Id} ended {EnumText.ToText(latest.Status)}");
+        Assert.Equal(300, await rig.Tgt.CountAsync("app.Parent"));
+    }
+
+    /// <summary>
     /// Ruling 216, L-4: the service's cancel with "Keep the checkpoint table" (REVF_F pins the engine's). The rows are retired and the
     /// table kept, and another project can then load the target.
     /// </summary>

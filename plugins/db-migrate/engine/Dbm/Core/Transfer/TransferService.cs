@@ -700,7 +700,8 @@ public sealed class TransferService
             }
             // Ruling 212 (b), asked here as well so another project's paused run reaches the operator as busy, not as a run that
             // started and was then refused. The run was created a moment ago, so it is fresh (N-1).
-            await TransferEngine.EnsureNoForeignCheckpointsAsync(tgt, owner, runId, fresh: true, probe.Database, ct);
+            await TransferEngine.EnsureNoForeignCheckpointsAsync(tgt, owner, runId, fresh: true, probe.Database, ct,
+                id => TransferEngine.EndedRun(_services, id));
         }
         catch (TransferException ex) when (ex.Code == "run_in_progress")
         {
@@ -1381,8 +1382,8 @@ public sealed class TransferService
             // Ruling 212 (c): only this project's rows; the table stays while another project's are in it.
             if (!await ControlTable.ReleaseAsync(conn, owner, run.Id, ct))
                 _services.Sink.Publish("log", new { level = "info",
-                    message = $"{ControlTable.Name} was left in the target: this project's checkpoints were removed, but it still holds "
-                              + "another project's checkpoints." });
+                    message = $"{ControlTable.Name} was left in the target: run {run.Id}'s checkpoints were removed, but it still holds "
+                              + $"{await ControlTable.KeptByAsync(conn, owner, run.Id, ct)}." });
         }
         catch (Exception ex) when (ex is SqlException or TransferException)
         {

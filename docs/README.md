@@ -182,12 +182,14 @@ its own project. Each project's checkpoint rows are its own: a finished or cance
 lock, so it is refused while another transfer is loading that target. A copy of a project folder carries the same
 project identity; its new run is refused if the original's run has checkpoints in the target, so work from one copy.
 "Keep the checkpoint table" keeps the table for auditing, but a cancelled or abandoned run's rows in it are marked done
-and never block another run.
+and never block another run. A cancel that could not reach the target leaves the run's checkpoints behind; the next new run
+from the same project folder retires them.
 
 **Upgrading from an earlier db-migrate version.** Earlier versions took a different lock and do not see this one, so do
 not run an earlier version and this one against the same target at the same time. The first run of this version upgrades
 `dbo.__dbm_checkpoint` in place; a run paused under the earlier version resumes, or is cancelled, from its own project as
-before. Until then its checkpoints hold the target for every other project, and they are never taken over while they are
+before; only checkpoints of tasks that run had started, matching what it recorded, are taken as its own. Until then its
+checkpoints hold the target for every other project, and they are never taken over while they are
 still changing (within 10 minutes of the last write). If no db-migrate project still uses the target, the table can be
 dropped. The run checks
 after every committed chunk that it still holds the lock; if its lock connection was dropped (a network or failover
