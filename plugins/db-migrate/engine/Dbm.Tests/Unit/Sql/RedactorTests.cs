@@ -30,6 +30,33 @@ public class RedactorTests
         Assert.Equal(new[] { "p;w=x" }, Redactor.SecretsOf("Server=a;Bogus Key=1;Pwd='p;w=x'"));
     }
 
+    /// <summary>
+    /// Open item 3.3: the double-quoted capture <c>"(?&lt;dq&gt;[^"]*)"</c> already handles a doubled quote inside a
+    /// double-quoted value (<c>""</c> is the SQL-connection-string escape for a literal <c>"</c>), so
+    /// <c>Password="ab""cd"</c> redacts the whole <c>ab"cd</c>. The single-quoted capture did not have the matching
+    /// escape, so <c>Password='ab''cd'</c> only captured <c>ab</c>: the true secret (7 characters with the escaped
+    /// quote) never reached <c>Scrub</c>, and the truncated 2-character capture fell under the length-4 floor, so
+    /// <b>nothing was redacted at all</b>. Reachable only on the fallback (unparsable connection string) path.
+    /// <b>Harm:</b> a message built from an unparsable connection string with a single-quoted, quote-escaped
+    /// password would print the password in full.
+    /// </summary>
+    [Fact]
+    public void SecretsOf_handles_doubled_single_quotes_the_same_way_as_doubled_double_quotes()
+    {
+        Assert.Equal(new[] { "ab\"cd" }, Redactor.SecretsOf("this is ; not = valid ; Password=\"ab\"\"cd\""));
+        Assert.Equal(new[] { "ab'cd" }, Redactor.SecretsOf("this is ; not = valid ; Password='ab''cd'"));
+    }
+
+    [Fact]
+    public void Scrub_redacts_a_single_quoted_password_with_a_doubled_quote_through_the_public_entry_point()
+    {
+        var secrets = Redactor.SecretsOf("this is ; not = valid ; Password='ab''cd'");
+
+        var scrubbed = Redactor.Scrub("connect failed: password ab'cd was rejected", secrets);
+
+        Assert.Equal("connect failed: password *** was rejected", scrubbed);
+    }
+
     [Fact]
     public void Scrub_replaces_each_secret_of_four_or_more_characters()
     {

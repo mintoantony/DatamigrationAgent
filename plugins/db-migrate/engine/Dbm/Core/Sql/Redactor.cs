@@ -57,7 +57,9 @@ public static partial class Redactor
         catch (Exception)
         {
             return PasswordPattern().Matches(connectionString)
-                .Select(m => m.Groups["dq"].Success ? m.Groups["dq"].Value : m.Groups["sq"].Success ? m.Groups["sq"].Value : m.Groups["raw"].Value)
+                .Select(m => m.Groups["dq"].Success ? m.Groups["dq"].Value.Replace("\"\"", "\"", StringComparison.Ordinal)
+                    : m.Groups["sq"].Success ? m.Groups["sq"].Value.Replace("''", "'", StringComparison.Ordinal)
+                    : m.Groups["raw"].Value)
                 .Where(v => v.Length > 0)
                 .ToList();
         }
@@ -70,6 +72,6 @@ public static partial class Redactor
         return string.IsNullOrEmpty(b.UserID) ? "default" : "sql";
     }
 
-    [GeneratedRegex("""(?i)(?:password|pwd)\s*=\s*(?:"(?<dq>[^"]*)"|'(?<sq>[^']*)'|(?<raw>[^;]*))""")]
+    [GeneratedRegex("""(?i)(?:password|pwd)\s*=\s*(?:"(?<dq>(?:[^"]|"")*)"|'(?<sq>(?:[^']|'')*)'|(?<raw>[^;]*))""")]
     private static partial Regex PasswordPattern();
 }
