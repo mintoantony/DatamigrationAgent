@@ -462,6 +462,20 @@ test('the cancelled banner says what a new run does and how to avoid duplicates 
     'the cancelled banner still invites a plain new run: ' + banner);
 });
 
+/* ------------------------------------------------------------------ item 47: the run's recorded target */
+
+test('the live run names the database and server it actually loaded into, and says nothing for a run recorded before the field existed (item 47)', async () => {
+  const withTarget = runningView({ run: Object.assign({}, runningView().run, { targetServer: 'sql1.internal', targetDatabase: 'ShopV2' }) });
+  const m = await mount(withTarget);
+  assert.equal(D.text(D.query(m.root, '.exe-run-target')), 'Loading into ShopV2 on sql1.internal');
+
+  // A run recorded before batch F added these fields carries neither property: the line must be absent, not "Loading into undefined".
+  const withoutTarget = runningView();
+  const m2 = await mount(withoutTarget);
+  assert.equal(D.query(m2.root, '.exe-run-target'), null,
+    'a run recorded before the target fields existed must show nothing, not "undefined" or an empty label');
+});
+
 /* Open item 32: the completed-run banner sends the operator to the stepper step by the name the stepper shows. */
 test('the completed-run banner names the final-report step exactly as the stepper labels it', async () => {
   const m = await mount(runningView({

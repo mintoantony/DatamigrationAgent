@@ -355,6 +355,8 @@
     const wrap = h('div', { class: 'stack' });
     const banner = runBanner(run, d);
     if (banner) wrap.appendChild(banner);
+    const target = runTargetLine(run);
+    if (target) wrap.appendChild(target);
     if (run.notes && run.notes.length) wrap.appendChild(notesCard(run.notes));
 
     const eta = X.etaInfo(agg.done + agg.errors, agg.total, rate, missing);
@@ -385,6 +387,16 @@
   function doneSub(agg, missing) {
     const total = X.totalText(agg.total, missing);
     return agg.total > 0 ? total + ' · ' + X.pct(agg.done + agg.errors, agg.total) + '%' : total;
+  }
+
+  /** Item 47: the target this run actually loaded into (never credentials), recorded once at start - not the same thing as the
+   *  server's current Setup target, which can move after the run started. A run saved before this field existed carries neither
+   *  property, and the compact line is silent rather than reading "Loading into undefined". */
+  function runTargetLine(run) {
+    const db = run.targetDatabase, srv = run.targetServer;
+    if (!db && !srv) return null;
+    const text = db && srv ? 'Loading into ' + db + ' on ' + srv : db ? 'Loading into ' + db : 'Loading into a database on ' + srv;
+    return h('div', { class: 'muted small exe-run-target' }, text);
   }
 
   function runBanner(run, d) {
