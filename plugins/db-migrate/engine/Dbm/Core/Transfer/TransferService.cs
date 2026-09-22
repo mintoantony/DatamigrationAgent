@@ -694,7 +694,8 @@ public sealed class TransferService
             await using var tgt = await SqlConnect.OpenAsync(targetCs, ct);
             if (abandoned is not null)
             {
-                await ControlTable.ClaimLegacyAsync(tgt, owner, abandoned.Id, TransferEngine.Recorded(_services.Transfers.Tasks(abandoned.Id)), ct);
+                await ControlTable.ClaimLegacyAsync(tgt, owner,
+                    TransferEngine.ClaimOf(abandoned.Id, abandoned.Options, _services.Transfers.Tasks(abandoned.Id)), ct);
                 await ControlTable.RetireRunAsync(tgt, owner, abandoned.Id, ct);
             }
             // Ruling 212 (b), asked here as well so another project's paused run reaches the operator as busy, not as a run that
@@ -1366,7 +1367,7 @@ public sealed class TransferService
             await using var conn = await SqlConnect.OpenAsync(targetCs, ct);
             try
             {
-                await ControlTable.ClaimLegacyAsync(conn, owner, run.Id, TransferEngine.Recorded(_services.Transfers.Tasks(run.Id)), ct);
+                await ControlTable.ClaimLegacyAsync(conn, owner, TransferEngine.ClaimOf(run.Id, run.Options, _services.Transfers.Tasks(run.Id)), ct);
             }
             catch (TransferException ex) when (ex.Code == "run_in_progress")
             {
@@ -1378,7 +1379,7 @@ public sealed class TransferService
                 return;
             }
             // Ruling 212 (c): only this project's rows; the table stays while another project's are in it.
-            if (!await ControlTable.ReleaseAsync(conn, owner, ct))
+            if (!await ControlTable.ReleaseAsync(conn, owner, run.Id, ct))
                 _services.Sink.Publish("log", new { level = "info",
                     message = $"{ControlTable.Name} was left in the target: this project's checkpoints were removed, but it still holds "
                               + "another project's checkpoints." });

@@ -340,6 +340,8 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
 
         long parents = await rig.Tgt.CountAsync("app.Parent");
         Assert.True(parents == 0, $"a start loaded {parents} rows into a target another project's run is part-way through");
+        Assert.True(thrown is not null,
+            "a start over another project's unfinished checkpoints was accepted; it should be refused busy at the door");
         var ex = Assert.IsType<TransferException>(thrown);
         Assert.True(ex.Code == "busy" && ex.Message.Contains(@"run 1 of the project in D:\other-project", StringComparison.Ordinal),
             $"the start was not refused busy naming the other project ({ex.Code}): {ex.Message}");
@@ -367,7 +369,7 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
         {
             await conn.OpenAsync();
             var other = new CheckpointOwner(Guid.NewGuid().ToString("D"), @"D:\other");
-            await ControlTable.ClaimLegacyAsync(conn, other, runId, [("T01", 999, 0)], default);
+            await ControlTable.ClaimLegacyAsync(conn, other, new LegacyClaim(runId, [("T01", 999, 0)], 1_000), default);
             Assert.True(await ControlTable.ForeignUnfinishedAsync(conn, other, default) is { Legacy: true },
                 "another project's run 1 claimed checkpoints its recorded counters do not match");
         }
@@ -380,6 +382,96 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
             "the owner's cancel left its earlier-engine checkpoints behind, and they refused its own next run: " + refused?.Message);
         Assert.Equal(RunStatus.Completed, rig.S.Transfers.Latest()!.Status);
         Assert.Equal(300, await rig.Tgt.CountAsync("app.Parent"));
+    }
+
+    /// <summary>
+    /// Ruling 216, L-1 (probe REVF_I). A crash between a chunk's commit and the state database's progress update leaves the
+    /// checkpoint a chunk ahead of what the run recorded. Such a row, written by an earlier engine, used to be unclaimable, so the
+    /// owner's resume was refused - with advice to drop the table, which would have destroyed its checkpoints. A row at most one chunk
+    /// ahead is the run's own and the checkpoint is trusted; a row further off is left alone, and the refusal does not advise dropping.
+    /// </summary>
+    [Fact]
+    public async Task A_resume_claims_an_earlier_engines_checkpoint_one_chunk_ahead_of_what_the_run_recorded()
+    {
+        await using var rig = await RigAsync();
+        int pauses = 0;
+        rig.Service.ChunkCommitted += c => { if (c.TaskId == "T01" && c.ChunkNo == 2 && Interlocked.Increment(ref pauses) == 1) rig.Service.Pause(); };
+        long runId = await rig.Service.StartAsync(Skip, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(200, rig.S.Transfers.Task(runId, "T01")!.RowsDone);
+        // The crash: the chunk and its checkpoint committed (200), the state database still says 100. Then the upgrade.
+        rig.S.Transfers.UpdateTaskProgress(runId, "T01", 100, 0, null);
+        await rig.Tgt.ExecAsync("UPDATE dbo.__dbm_checkpoint SET project_id = N'', project_folder = NULL, updated_at = DATEADD(HOUR, -1, SYSUTCDATETIME());");
+
+        // Further off than one chunk: not this run's to take, and not a table to drop.
+        await rig.Tgt.ExecAsync("UPDATE dbo.__dbm_checkpoint SET rows_done = 5000 WHERE task_id = N'T01';");
+        rig.Service.Resume();
+        await rig.Service.Current;
+        var notes = rig.Service.View().Run!.Notes;
+        Assert.Equal(RunStatus.Paused, rig.S.Transfers.GetRun(runId)!.Status);
+        Assert.True(notes.Any(n => n.Contains("may be this run's own checkpoints", StringComparison.Ordinal))
+                    && !notes.Any(n => n.Contains("can be dropped", StringComparison.Ordinal)),
+            "a refusal over checkpoints that may be the run's own advises dropping the table: " + string.Join(" | ", notes));
+
+        // One chunk ahead: the run's own; the resume continues from the checkpoint and loads nothing twice.
+        await rig.Tgt.ExecAsync("UPDATE dbo.__dbm_checkpoint SET rows_done = 200 WHERE task_id = N'T01';");
+        rig.Service.Resume();
+        await rig.Service.Current;
+        var status = rig.S.Transfers.GetRun(runId)!.Status;
+        Assert.True(status == RunStatus.Completed,
+            $"the owner's resume over its own earlier-engine checkpoint one chunk ahead of its record ended {EnumText.ToText(status)}: "
+            + string.Join(" | ", rig.Service.View().Run!.Notes));
+        Assert.Equal(300, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Parent"));
+        Assert.Equal(300, await rig.Tgt.CountAsync("app.Parent"));
+    }
+
+    /// <summary>
+    /// Ruling 216, L-3. A re-run abandons this project's failed run, and the start door claims and retires that run's earlier-engine
+    /// rows under the lock - but pre-flight, which runs first, reported them as another project's and blocked the re-run before the
+    /// door could. Rows matching the latest failed or cancelled run's record are this project's own on the checklist too.
+    /// </summary>
+    [Fact]
+    public async Task Pre_flight_counts_its_own_failed_runs_earlier_engine_checkpoints_as_its_own_and_the_rerun_starts()
+    {
+        await using var rig = await RigAsync();
+        long failed = await rig.Service.StartAsync(Skip with { ErrorMode = "stop", ChunkSize = 500 }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Failed, rig.S.Transfers.GetRun(failed)!.Status);
+        await rig.Tgt.ExecAsync("UPDATE dbo.__dbm_checkpoint SET project_id = N'', project_folder = NULL, updated_at = DATEADD(HOUR, -1, SYSUTCDATETIME());");
+        Assert.True(await rig.Tgt.ScalarAsync<int>("SELECT COUNT(*) FROM dbo.__dbm_checkpoint WHERE done = 0") > 0);   // the premise
+
+        var pre = await rig.Service.PreflightAsync(Skip with { TruncateTarget = true, ChunkSize = 1000 }, default);
+
+        var line = pre.Checks.Single(c => c.Name == "control_table");
+        Assert.True(line.Ok, $"pre-flight reported this project's own failed run's checkpoints as another project's: {line.Detail}");
+        long second = await rig.Service.StartAsync(Skip with { TruncateTarget = true, ChunkSize = 1000 }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Completed, rig.S.Transfers.GetRun(second)!.Status);
+    }
+
+    /// <summary>
+    /// Ruling 216, L-4: the service's cancel with "Keep the checkpoint table" (REVF_F pins the engine's). The rows are retired and the
+    /// table kept, and another project can then load the target.
+    /// </summary>
+    [Fact]
+    public async Task A_service_cancel_with_the_table_kept_retires_the_rows_and_another_project_can_run()
+    {
+        await using var rig = await RigAsync();
+        rig.Service.ChunkCommitted += c => { if (c.TaskId == "T01" && c.ChunkNo == 1) rig.Service.Pause(); };
+        long runId = await rig.Service.StartAsync(Skip with { KeepControlTable = true }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Paused, rig.S.Transfers.GetRun(runId)!.Status);
+
+        await rig.Service.CancelAsync(default);
+
+        int unfinished = await rig.Tgt.ScalarAsync<int>("SELECT COUNT(*) FROM dbo.__dbm_checkpoint WHERE done = 0");
+        int kept = await rig.Tgt.ScalarAsync<int>("SELECT COUNT(*) FROM dbo.__dbm_checkpoint");
+        Assert.True(unfinished == 0 && kept > 0,
+            $"a cancel with the table kept left {unfinished} unfinished checkpoints ({kept} kept): a claim on the target for ever");
+        using var other = new XferServices();
+        var engine = new TransferEngine(other.Services, TransferEngineTests.Plan(), fx.Src.ConnectionString, rig.Tgt.ConnectionString);
+        long otherRun = engine.CreateRun(1, Skip with { TruncateTarget = true, ChunkSize = 1000 });
+        Assert.Equal(RunStatus.Completed, (await engine.RunAsync(otherRun, new TransferControl(), default)).Status);
     }
 
     /// <summary>

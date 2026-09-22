@@ -632,6 +632,48 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
     }
 
     /// <summary>
+    /// Ruling 216, N-7 (probe REVF_H). Copies' run ids drift apart - a busy refusal cancels the run it just created and uses up an id -
+    /// so the copy's fresh run is run 2 while the original's run 1 is paused at 200 of 400. Keyed on its own run id, the copy was not
+    /// refused, loaded the table, and its release deleted the original's checkpoints; the original's resume then failed. Any unfinished
+    /// row of this project under any run id refuses a fresh run.
+    /// </summary>
+    [Fact]
+    public async Task A_copied_project_folder_whose_run_ids_have_drifted_is_refused_while_the_original_is_part_way()
+    {
+        var plan = One(WidePlan());
+        await using var rig = await RigAsync(plan);
+        using var copy = new XferServices();
+        copy.Services.Db.Execute("UPDATE transfer_identity SET workspace_id = $W", new { W = rig.Svc.Services.Transfers.WorkspaceId() });
+        var engineCopy = new TransferEngine(copy.Services, plan, fx.Src.ConnectionString, rig.Tgt.ConnectionString);
+        var options = new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip" };
+        long run = rig.Engine.CreateRun(1, options);
+        var pause = new TransferControl();
+        pause.ChunkCommitted += c => { if (c.ChunkNo == 2) pause.RequestPause(); };
+        Assert.Equal(RunStatus.Paused, (await rig.Engine.RunAsync(run, pause, default)).Status);
+        long refusedEarlier = engineCopy.CreateRun(1, options);                              // the id a busy refusal used up
+        copy.Services.Transfers.SetRunStatus(refusedEarlier, RunStatus.Cancelled);
+        long copyRun = engineCopy.CreateRun(1, options);
+        Assert.NotEqual(run, copyRun);
+
+        var refusal = await Record.ExceptionAsync(() => engineCopy.RunAsync(copyRun, new TransferControl(), default));
+
+        long rows = await rig.Tgt.CountAsync("app.Wide");
+        Assert.True(rows == 200,
+            $"a copy of the project folder on run {copyRun} loaded into the target while the original's run {run} was paused at 200: "
+            + $"app.Wide holds {rows} rows; {(refusal is null ? "it ran" : "refused: " + refusal.Message)}");
+        var refused = Assert.IsType<TransferException>(refusal);
+        Assert.Equal("run_in_progress", refused.Code);
+        Assert.True(refused.Message.Contains($"run {run} of this project", StringComparison.Ordinal)
+                    && refused.Message.Contains(rig.Svc.Root, StringComparison.OrdinalIgnoreCase)
+                    && refused.Message.Contains("may be a copy", StringComparison.Ordinal),
+            "the refusal does not name the original's run and folder and say this one may be a copy: " + refused.Message);
+
+        var resumed = await rig.Engine.RunAsync(run, new TransferControl(), default);
+        Assert.True(resumed.Status == RunStatus.Completed, $"the original's resume ended {resumed.Status}: {resumed.Error}");
+        Assert.Equal(400, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Wide"));
+    }
+
+    /// <summary>
     /// Ruling 215, N-2 (probe REVF_F). A run cancelled with "Keep the checkpoint table" left its unfinished rows behind, and they
     /// blocked every other project's run on that target for good, with advice (resume or cancel it) that could no longer be followed.
     /// The option keeps the table, never a claim on the target: the cancelled run's rows are marked done.

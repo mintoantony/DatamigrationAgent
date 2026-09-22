@@ -143,7 +143,8 @@ public static class Preflight
             {
                 try
                 {
-                    checks.AddRange(await TargetChecksAsync(tgt, approved.Plan, options, ct, nonEmptyTargets, TransferEngine.OwnerOf(s)));
+                    checks.AddRange(await TargetChecksAsync(tgt, approved.Plan, options, ct, nonEmptyTargets, TransferEngine.OwnerOf(s),
+                        OwnLegacyClaim(s)));
                 }
                 catch (Exception ex) when (ex is SqlException or InvalidOperationException or TimeoutException)
                 {
@@ -258,6 +259,22 @@ public static class Preflight
         return LocalDbServer.Match(s) is { Success: true } m ? m.Groups["machine"].Value + @"\LOCALDB" : s;
     }
 
+    /// <summary>Ruling 216 (L-3): this project's latest run, when it is failed or cancelled - the run a re-run abandons, whose earlier-engine
+    /// rows the start door claims - as a claim; null otherwise, or when the run cannot be read.</summary>
+    private static LegacyClaim? OwnLegacyClaim(DbmServices s)
+    {
+        try
+        {
+            return s.Transfers.Latest() is { Status: RunStatus.Failed or RunStatus.Cancelled } last
+                ? TransferEngine.ClaimOf(last.Id, last.Options, s.Transfers.Tasks(last.Id))
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>Open item 26: why a discovered catalog cannot vouch for the schemas, or null when both are usable. One sentence per side
     /// at fault, joined.</summary>
     private static string? CatalogProblem(DbmServices s)
@@ -322,8 +339,10 @@ public static class Preflight
     /// </summary>
     /// <param name="owner">This workspace, so the checkpoint-table line can report another project's unfinished checkpoints; null skips
     /// that part (callers with no workspace).</param>
+    /// <param name="ownLegacy">Ruling 216 (L-3): an earlier engine's rows that are this project's latest failed or cancelled run's -
+    /// the start door claims and retires them for a re-run, so they are not reported as another project's.</param>
     public static async Task<List<PreflightCheck>> TargetChecksAsync(SqlConnection tgt, SqlPlanPayload plan, TransferOptions options,
-        CancellationToken ct, List<NonEmptyTarget>? nonEmptyTargets = null, CheckpointOwner? owner = null)
+        CancellationToken ct, List<NonEmptyTarget>? nonEmptyTargets = null, CheckpointOwner? owner = null, LegacyClaim? ownLegacy = null)
     {
         ArgumentNullException.ThrowIfNull(tgt);
         ArgumentNullException.ThrowIfNull(plan);
@@ -428,7 +447,7 @@ public static class Preflight
             }
             // Ruling 215 (concern 3): the start refuses while another project's run has unfinished checkpoints here, so the checklist
             // says so first, naming that project.
-            var foreign = ctlExists == 1 && owner is not null ? await ControlTable.ForeignUnfinishedAsync(tgt, owner, ct) : null;
+            var foreign = ctlExists == 1 && owner is not null ? await ControlTable.ForeignUnfinishedAsync(tgt, owner, ct, ownLegacy) : null;
             checks.Add(foreign is not null
                 ? Err("control_table", $"{ControlTable.Name} holds the unfinished checkpoints of {foreign.Description}: that run is paused, "
                                        + "failed or was interrupted part-way through this target, and a new run here is refused until it is "

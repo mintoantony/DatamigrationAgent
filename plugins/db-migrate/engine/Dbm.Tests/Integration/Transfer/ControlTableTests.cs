@@ -250,7 +250,7 @@ public sealed class ControlTableTests
         // Ruling 212: the end-of-run release (delete our rows, drop when empty) refuses it the same way and leaves its rows alone. (The
         // upsert-into-it demonstration this test used to end with no longer applies: the checkpoint statements now name the project
         // columns, which this table does not have.)
-        var release = await Assert.ThrowsAsync<TransferException>(() => ControlTable.ReleaseAsync(conn, CheckpointOwner.Unowned, default));
+        var release = await Assert.ThrowsAsync<TransferException>(() => ControlTable.ReleaseAsync(conn, CheckpointOwner.Unowned, 1, default));
         Assert.Equal("control_table_mismatch", release.Code);
         Assert.Equal(1L, await db.CountAsync("dbo.__dbm_checkpoint"));
     }
@@ -282,10 +282,10 @@ public sealed class ControlTableTests
         var foreign = await ControlTable.ForeignUnfinishedAsync(conn, me, default);
         Assert.True(foreign is { Legacy: true }, "an earlier engine's unfinished checkpoint was not counted as another project's");
         // N-3: a run whose recorded counters differ (another project's run 1, T01) cannot take them.
-        await ControlTable.ClaimLegacyAsync(conn, me, 1, [("T01", 150, 0)], default);
+        await ControlTable.ClaimLegacyAsync(conn, me, new LegacyClaim(1, [("T01", 150, 0)], 0), default);
         Assert.True(await ControlTable.ForeignUnfinishedAsync(conn, me, default) is not null,
             "a run whose recorded rows_done (150) differ from the legacy row's (200) claimed it");
-        await ControlTable.ClaimLegacyAsync(conn, me, 1, [("T01", 200, 0)], default);
+        await ControlTable.ClaimLegacyAsync(conn, me, new LegacyClaim(1, [("T01", 200, 0)], 0), default);
         Assert.Null(await ControlTable.ForeignUnfinishedAsync(conn, me, default));
         ControlTable.CurrentOwner = me;
         try
@@ -296,8 +296,35 @@ public sealed class ControlTableTests
         {
             ControlTable.CurrentOwner = TestOwner;
         }
-        Assert.True(await ControlTable.ReleaseAsync(conn, me, default));
+        Assert.True(await ControlTable.ReleaseAsync(conn, me, 1, default));
         Assert.False(await ControlTable.ExistsAsync(conn, default));
+    }
+
+    /// <summary>
+    /// Ruling 216, N-7 (b). A run's end removes its own rows and this project's finished rows - never another unfinished run of the
+    /// same project, which can only be a copy of this workspace's part-way through the target (REVF_H's second harm: the copy's
+    /// release deleted the original's checkpoints).
+    /// </summary>
+    [Fact]
+    public async Task Release_keeps_another_unfinished_run_of_the_same_project()
+    {
+        await using var db = await TempDatabase.CreateAsync("dbm_ctlrel");
+        await using var conn = new SqlConnection(db.ConnectionString);
+        await conn.OpenAsync();
+        await ControlTable.EnsureAsync(conn, default);
+        await db.ExecAsync($"""
+            INSERT dbo.__dbm_checkpoint (run_id, task_id, chunk_no, last_key, rows_done, rows_error, done, updated_at, project_id, project_folder)
+            VALUES (1, N'T01', 2, NULL, 200, 0, 0, SYSUTCDATETIME(), N'{TestOwner.ProjectId}', N'D:\original'),
+                   (2, N'T01', 4, NULL, 400, 0, 0, SYSUTCDATETIME(), N'{TestOwner.ProjectId}', N'D:\copy'),
+                   (3, N'T01', 4, NULL, 400, 0, 1, SYSUTCDATETIME(), N'{TestOwner.ProjectId}', N'D:\copy');
+            """);
+
+        bool dropped = await ControlTable.ReleaseAsync(conn, TestOwner, 2, default);
+
+        int original = dropped ? 0 : await db.ScalarAsync<int>("SELECT COUNT(*) FROM dbo.__dbm_checkpoint WHERE run_id = 1");
+        Assert.True(!dropped && original == 1,
+            $"run 2's release deleted run 1's unfinished checkpoint of the same project (table {(dropped ? "dropped" : "kept")}, {original} rows of run 1 left)");
+        Assert.Equal(1, await db.ScalarAsync<int>("SELECT COUNT(*) FROM dbo.__dbm_checkpoint"));   // run 2 and the finished run 3 went
     }
 
     /// <summary>
@@ -318,7 +345,7 @@ public sealed class ControlTableTests
             """);
         var me = new CheckpointOwner(Guid.NewGuid().ToString("D"), @"D:\me");
 
-        var refusal = await Record.ExceptionAsync(() => ControlTable.ClaimLegacyAsync(conn, me, 1, [("T01", 200, 0)], default));
+        var refusal = await Record.ExceptionAsync(() => ControlTable.ClaimLegacyAsync(conn, me, new LegacyClaim(1, [("T01", 200, 0)], 0), default));
 
         Assert.True(await ControlTable.ForeignUnfinishedAsync(conn, me, default) is not null,
             "legacy checkpoints written moments ago were claimed: an earlier engine may be loading them right now");

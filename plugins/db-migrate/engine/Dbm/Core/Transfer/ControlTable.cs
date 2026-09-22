@@ -22,8 +22,31 @@ public sealed record CheckpointOwner(string ProjectId, string? Folder)
     public static CheckpointOwner Unowned { get; } = new("", null);
 }
 
-/// <summary>Another project's unfinished checkpoints in a target: who (for the refusal) and whether an earlier engine wrote them.</summary>
-public sealed record ForeignCheckpoint(string Description, bool Legacy);
+/// <summary>Another project's unfinished checkpoints in a target: who (for the refusal), whether an earlier engine wrote them, and the
+/// run id they carry.</summary>
+public sealed record ForeignCheckpoint(string Description, bool Legacy, long RunId);
+
+/// <summary>
+/// What one of this project's runs recorded, which is what an earlier engine's (ownerless) row must match to be this run's
+/// (Ruling 215 N-3, Ruling 216 L-1): same run id and task id, and the row's rows_done + rows_error at most one chunk ahead of the
+/// recorded counts - a crash between a chunk's commit and the state database's progress update leaves exactly that gap, and the
+/// checkpoint row, committed with the chunk, is the one to trust.
+/// </summary>
+/// <param name="MaxChunk">The largest chunk the run can commit in one transaction; 0 demands an exact match.</param>
+public sealed record LegacyClaim(long RunId, IReadOnlyList<(string TaskId, long RowsDone, long RowsError)> Tasks, long MaxChunk)
+{
+    public bool Matches(long runId, string taskId, long rowsDone, long rowsError)
+    {
+        if (runId != RunId) return false;
+        foreach (var t in Tasks)
+        {
+            if (!string.Equals(t.TaskId, taskId, StringComparison.Ordinal)) continue;
+            long ahead = rowsDone + rowsError - (t.RowsDone + t.RowsError);
+            return ahead >= 0 && ahead <= MaxChunk && rowsDone >= t.RowsDone && rowsError >= t.RowsError;
+        }
+        return false;
+    }
+}
 
 /// <summary>
 /// dbo.__dbm_checkpoint in the TARGET: written in the same transaction as each chunk (exactly-once).
@@ -132,72 +155,87 @@ public static class ControlTable
     /// run is paused, failed or crashed part-way through loading this target; a run of ours now would load beside it and, where the
     /// plans share tables, into rows it has half-loaded.
     /// </summary>
-    public static async Task<ForeignCheckpoint?> ForeignUnfinishedAsync(SqlConnection conn, CheckpointOwner owner, CancellationToken ct)
+    /// <param name="ownLegacy">Ruling 216 (L-3): an earlier engine's rows that are this project's own run's (pre-flight passes the
+    /// latest failed or cancelled run, whose rows the start door claims and retires) - not counted as another project's.</param>
+    public static async Task<ForeignCheckpoint?> ForeignUnfinishedAsync(SqlConnection conn, CheckpointOwner owner, CancellationToken ct,
+        LegacyClaim? ownLegacy = null)
     {
         ArgumentNullException.ThrowIfNull(conn);
         ArgumentNullException.ThrowIfNull(owner);
-        await using var cmd = new SqlCommand($"""
-            IF OBJECT_ID(N'{Name}', N'U') IS NOT NULL AND COL_LENGTH(N'{Name}', N'project_id') IS NOT NULL
-              EXEC sys.sp_executesql N'SELECT TOP (1) project_id, project_folder, run_id FROM {Name}
-                                       WHERE project_id <> @p AND done = 0 ORDER BY updated_at DESC', N'@p nvarchar(36)', @p = @p;
-            """, conn);
-        cmd.Parameters.Add(new SqlParameter("@p", SqlDbType.NVarChar, 36) { Value = owner.ProjectId });
-        await using var r = await cmd.ExecuteReaderAsync(ct);
-        if (!await r.ReadAsync(ct)) return null;
-        string run = r.GetInt64(2).ToString(CultureInfo.InvariantCulture);
-        if (r.GetString(0).Length == 0)
-            return new ForeignCheckpoint($"run {run} of a project whose folder an earlier db-migrate version did not record", Legacy: true);
-        return new ForeignCheckpoint(r.IsDBNull(1) ? $"run {run} of another project" : $"run {run} of the project in {r.GetString(1)}",
-            Legacy: false);
-    }
-
-    /// <summary>
-    /// Ruling 215 (N-1). The folder recorded on a row this project already has for <paramref name="runId"/> - "" when the row records
-    /// none - or null when there is no such row. A fresh run has never written a checkpoint, so such a row was written by another copy
-    /// of this workspace (a copied project folder carries its state database, and with it the workspace identity).
-    /// </summary>
-    public static async Task<string?> OwnRunRowFolderAsync(SqlConnection conn, CheckpointOwner owner, long runId, CancellationToken ct)
-    {
-        ArgumentNullException.ThrowIfNull(conn);
-        ArgumentNullException.ThrowIfNull(owner);
-        await using var cmd = new SqlCommand($"""
-            IF OBJECT_ID(N'{Name}', N'U') IS NOT NULL AND COL_LENGTH(N'{Name}', N'project_id') IS NOT NULL
-              EXEC sys.sp_executesql N'SELECT TOP (1) ISNULL(project_folder, N'''') FROM {Name} WHERE project_id = @p AND run_id = @r',
-                                     N'@p nvarchar(36), @r bigint', @p = @p, @r = @r;
-            """, conn);
-        cmd.Parameters.Add(new SqlParameter("@p", SqlDbType.NVarChar, 36) { Value = owner.ProjectId });
-        cmd.Parameters.Add(new SqlParameter("@r", SqlDbType.BigInt) { Value = runId });
-        return await cmd.ExecuteScalarAsync(ct) as string;
-    }
-
-    /// <summary>
-    /// Rows an earlier engine wrote for <paramref name="runId"/> (empty project) become <paramref name="owner"/>'s - only those whose
-    /// counters equal what this run recorded for that task (Ruling 215, N-3), so another project's run with the same id and task ids
-    /// cannot take them. Called for a run with recorded progress (a resume, a cancel, a re-run abandoning it), never for a fresh one.
-    /// Refuses <c>run_in_progress</c> when any legacy row changed within <see cref="LegacyQuietPeriod"/>: an earlier engine may be
-    /// loading this target right now (N-5).
-    /// </summary>
-    public static async Task ClaimLegacyAsync(SqlConnection conn, CheckpointOwner owner, long runId,
-        IReadOnlyCollection<(string TaskId, long RowsDone, long RowsError)> tasks, CancellationToken ct)
-    {
-        ArgumentNullException.ThrowIfNull(conn);
-        ArgumentNullException.ThrowIfNull(owner);
-        ArgumentNullException.ThrowIfNull(tasks);
-        if (owner.ProjectId.Length == 0 || tasks.Count == 0) return;
-        await EnsureNoLiveLegacyEngineAsync(conn, ct);
-        foreach (var (taskId, rowsDone, rowsError) in tasks)
+        foreach (var row in await RowsAsync(conn, "project_id <> @p AND done = 0", owner.ProjectId, null, ct))
         {
-            CheckTaskId(taskId);
+            string run = row.RunId.ToString(CultureInfo.InvariantCulture);
+            if (row.ProjectId.Length == 0)
+            {
+                if (ownLegacy?.Matches(row.RunId, row.TaskId, row.RowsDone, row.RowsError) == true) continue;
+                return new ForeignCheckpoint($"run {run} of a project whose folder an earlier db-migrate version did not record", true, row.RunId);
+            }
+            return new ForeignCheckpoint(row.Folder is null ? $"run {run} of another project" : $"run {run} of the project in {row.Folder}",
+                false, row.RunId);
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Rulings 215 (N-1) and 216 (N-7). A row of this project that a fresh run cannot have written: any row of its own run id, or any
+    /// unfinished row of another of its run ids. The first has never been possible for a fresh run; the second means another run of
+    /// this project is part-way through the target - and only one can be, so it was started from another copy of this workspace (a
+    /// copied project folder carries its state database and with it the workspace identity, and the copies' run ids drift apart as
+    /// each creates runs). Returns (folder or "", run id), or null when there is none.
+    /// </summary>
+    public static async Task<(string Folder, long RunId)?> CopiedWorkspaceRowAsync(SqlConnection conn, CheckpointOwner owner, long runId,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(conn);
+        ArgumentNullException.ThrowIfNull(owner);
+        foreach (var row in await RowsAsync(conn, "project_id = @p AND (run_id = @r OR done = 0)", owner.ProjectId, runId, ct))
+            return (row.Folder ?? "", row.RunId);
+        return null;
+    }
+
+    private sealed record CheckpointRowInfo(string ProjectId, string? Folder, long RunId, string TaskId, long RowsDone, long RowsError);
+
+    private static async Task<List<CheckpointRowInfo>> RowsAsync(SqlConnection conn, string where, string projectId, long? runId,
+        CancellationToken ct)
+    {
+        await using var cmd = new SqlCommand($"""
+            IF OBJECT_ID(N'{Name}', N'U') IS NOT NULL AND COL_LENGTH(N'{Name}', N'project_id') IS NOT NULL
+              EXEC sys.sp_executesql N'SELECT project_id, project_folder, run_id, task_id, rows_done, rows_error FROM {Name}
+                                       WHERE {where} ORDER BY updated_at DESC', N'@p nvarchar(36), @r bigint', @p = @p, @r = @r;
+            """, conn);
+        cmd.Parameters.Add(new SqlParameter("@p", SqlDbType.NVarChar, 36) { Value = projectId });
+        cmd.Parameters.Add(new SqlParameter("@r", SqlDbType.BigInt) { Value = (object?)runId ?? DBNull.Value });
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        var rows = new List<CheckpointRowInfo>();
+        while (await r.ReadAsync(ct))
+            rows.Add(new CheckpointRowInfo(r.GetString(0), r.IsDBNull(1) ? null : r.GetString(1), r.GetInt64(2), r.GetString(3),
+                r.GetInt64(4), r.GetInt64(5)));
+        return rows;
+    }
+
+    /// <summary>
+    /// Rows an earlier engine wrote for the claim's run (empty project) become <paramref name="owner"/>'s - only those that
+    /// <see cref="LegacyClaim.Matches"/> what this run recorded (Rulings 215 N-3, 216 L-1), so another project's run with the same id
+    /// and task ids cannot take them. Called for a run with recorded progress (a resume, a cancel, a re-run abandoning it), never for
+    /// a fresh one. Refuses <c>run_in_progress</c> when any legacy row changed within <see cref="LegacyQuietPeriod"/>: an earlier
+    /// engine may be loading this target right now (N-5).
+    /// </summary>
+    public static async Task ClaimLegacyAsync(SqlConnection conn, CheckpointOwner owner, LegacyClaim claim, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(conn);
+        ArgumentNullException.ThrowIfNull(owner);
+        ArgumentNullException.ThrowIfNull(claim);
+        if (owner.ProjectId.Length == 0 || claim.Tasks.Count == 0) return;
+        await EnsureNoLiveLegacyEngineAsync(conn, ct);
+        foreach (var row in await RowsAsync(conn, "project_id = N'''' AND run_id = @r", "", claim.RunId, ct))
+        {
+            if (!claim.Matches(row.RunId, row.TaskId, row.RowsDone, row.RowsError)) continue;
             await using var cmd = new SqlCommand($"""
-                IF OBJECT_ID(N'{Name}', N'U') IS NOT NULL
-                  UPDATE {Name} SET project_id = @p, project_folder = @f
-                  WHERE project_id = N'' AND run_id = @r AND task_id = @t AND rows_done = @d AND rows_error = @e;
+                UPDATE {Name} SET project_id = @p, project_folder = @f WHERE project_id = N'' AND run_id = @r AND task_id = @t;
                 """, conn);
-            AddKey(cmd, runId, taskId);
+            AddKey(cmd, row.RunId, row.TaskId);
             cmd.Parameters.Add(new SqlParameter("@p", SqlDbType.NVarChar, 36) { Value = owner.ProjectId });
             cmd.Parameters.Add(new SqlParameter("@f", SqlDbType.NVarChar, 400) { Value = (object?)Folder(owner) ?? DBNull.Value });
-            cmd.Parameters.Add(new SqlParameter("@d", SqlDbType.BigInt) { Value = rowsDone });
-            cmd.Parameters.Add(new SqlParameter("@e", SqlDbType.BigInt) { Value = rowsError });
             await cmd.ExecuteNonQueryAsync(ct);
         }
     }
@@ -246,7 +284,10 @@ public static class ControlTable
     /// Returns true when the table is gone (or was never there); false when another project's rows kept it. A table of that name that
     /// is not ours is refused as in <see cref="DropAsync"/>.
     /// </summary>
-    public static async Task<bool> ReleaseAsync(SqlConnection conn, CheckpointOwner owner, CancellationToken ct)
+    /// <param name="runId">Ruling 216 (N-7): the run that is ending. Its rows go, and so do this project's finished (done) rows of any
+    /// run; another <b>unfinished</b> run of the same project - which can only be a copy of this workspace's, part-way through the
+    /// target - is never deleted.</param>
+    public static async Task<bool> ReleaseAsync(SqlConnection conn, CheckpointOwner owner, long runId, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(conn);
         ArgumentNullException.ThrowIfNull(owner);
@@ -257,9 +298,10 @@ public static class ControlTable
             if (shape == MissingShape) return;
             if (!string.Equals(shape, ExpectedShape, StringComparison.Ordinal))
                 throw Mismatch(shape, "it was not dropped.");
-            await using (var del = new SqlCommand($"DELETE FROM {Name} WHERE project_id = @p;", conn, tx))
+            await using (var del = new SqlCommand($"DELETE FROM {Name} WHERE project_id = @p AND (run_id = @r OR done = 1);", conn, tx))
             {
                 del.Parameters.Add(new SqlParameter("@p", SqlDbType.NVarChar, 36) { Value = owner.ProjectId });
+                del.Parameters.Add(new SqlParameter("@r", SqlDbType.BigInt) { Value = runId });
                 await del.ExecuteNonQueryAsync(ct);
             }
             await using var left = new SqlCommand($"SELECT COUNT_BIG(*) FROM {Name};", conn, tx);
