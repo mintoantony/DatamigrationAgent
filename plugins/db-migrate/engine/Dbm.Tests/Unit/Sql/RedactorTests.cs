@@ -69,6 +69,77 @@ public class RedactorTests
         Assert.Equal("login failed for *** and abc", text);
     }
 
+    /// <summary>
+    /// Open item 51 (sweep K review HIGH-1), measured on LocalDB: <c>dbm demo --attach</c> printed
+    /// <c>Password=ab1</c> in clear. <c>Scrub</c>'s per-secret substring replacement keeps a 4-character floor
+    /// (Ruling: a 1-character secret must not mangle every occurrence of that character in a message), so a
+    /// short secret like <c>ab1</c> was never masked at all. Decision H-3: the floor stays for bare substring
+    /// replacement, but <c>Scrub</c> now also masks any <c>Password=</c>/<c>Pwd=</c> key/value pair visible in
+    /// the text itself, whatever its length - that is what a short secret still inside a live connection
+    /// string looks like. <b>Harm:</b> a 1-, 2- or 3-character password survives every log line, error message
+    /// and CLI printout that echoes the connection string.
+    /// </summary>
+    [Fact]
+    public void Scrub_masks_a_password_value_under_the_four_character_floor_via_its_key_value_pair()
+    {
+        var text = "dbm demo --attach failed for Server=a;Password=ab1;Encrypt=true";
+
+        var scrubbed = Redactor.Scrub(text, Redactor.SecretsOf("Server=a;Password=ab1;Encrypt=true"));
+
+        Assert.True(!scrubbed.Contains("ab1", StringComparison.Ordinal),
+            $"Scrub left a password shorter than the 4-character floor in clear text, because only the " +
+            $"per-secret substring replacement (which skips it) ran: \"{scrubbed}\".");
+        Assert.True(scrubbed.Contains("Password=***", StringComparison.Ordinal),
+            $"Scrub did not replace the short Password= key/value pair with Password=***: \"{scrubbed}\".");
+    }
+
+    /// <summary>
+    /// Open item 51: measured on LocalDB, <c>dbm demo --attach</c> also printed <c>Password="Pa""ss'word1"</c> -
+    /// <see cref="SqlConnectionStringBuilder"/> re-quotes a value containing both a <c>"</c> and a <c>'</c> by
+    /// wrapping it in double quotes and doubling the internal <c>"</c> (verified directly against the builder:
+    /// <c>Pa"ss'word1</c> renders as <c>"Pa""ss'word1"</c>). The bare secret <c>Pa"ss'word1</c> never matches
+    /// that rendered text as a substring, so it slipped through when it appeared without a <c>Password=</c>
+    /// prefix (e.g. quoted on its own inside a driver error message). <b>Harm:</b> a re-quoted password printed
+    /// by anything other than a literal <c>Password=</c> key/value pair reaches the log in clear text.
+    /// </summary>
+    [Fact]
+    public void Scrub_redacts_the_builders_re_quoted_rendering_of_a_secret_with_both_quote_characters()
+    {
+        var secret = "Pa\"ss'word1";
+        var rendered = new SqlConnectionStringBuilder { DataSource = "a", Password = secret }.ConnectionString;
+        var quotedValueOnly = rendered[rendered.IndexOf('"', StringComparison.Ordinal)..];   // "Pa""ss'word1" (no Password= prefix)
+
+        var scrubbed = Redactor.Scrub($"driver reported value {quotedValueOnly} was rejected", [secret]);
+
+        Assert.True(!scrubbed.Contains("ss'word1", StringComparison.Ordinal),
+            $"Scrub did not redact the builder's doubled-quote rendering of a secret that appeared without a " +
+            $"Password= prefix: \"{scrubbed}\" (rendered form was {quotedValueOnly}).");
+    }
+
+    /// <summary>
+    /// Open item 51 / sweep H review "Pre-existing": for an unterminated quote (<c>Password="abcdEFGH</c>, no
+    /// closing <c>"</c>), the dq and sq alternatives both fail to close, so the match falls through to the raw
+    /// alternative, which captures from right after "=" - including the opening quote that started the failed
+    /// attempt. <see cref="Redactor.SecretsOf"/> now strips that leading unmatched quote so the real secret
+    /// value is what gets returned (and later matched as a substring elsewhere); <see cref="Redactor.Scrub"/>'s
+    /// key/value pass masks the whole malformed key/value pair directly, regardless. <b>Harm:</b> without the
+    /// strip, the "secret" SecretsOf hands to any other Scrub call is <c>"abcdEFGH</c> (with the leading quote),
+    /// which never matches the bare password text (no leading quote) anywhere else it might be echoed.
+    /// </summary>
+    [Fact]
+    public void SecretsOf_strips_the_leading_quote_of_an_unterminated_quoted_password()
+    {
+        var text = "connection failed: Password=\"abcdEFGH";
+
+        var secrets = Redactor.SecretsOf(text).ToList();
+        Assert.True(secrets.Contains("abcdEFGH"),
+            $"SecretsOf's raw fallback kept the leading unmatched quote instead of stripping it: [{string.Join(", ", secrets)}].");
+
+        var scrubbed = Redactor.Scrub(text, secrets);
+        Assert.True(!scrubbed.Contains("abcdEFGH", StringComparison.Ordinal),
+            $"Scrub did not redact an unterminated-quote password: \"{scrubbed}\".");
+    }
+
     [Fact]
     public void Normalize_sets_application_name_only_when_left_default()
     {
