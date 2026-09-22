@@ -321,7 +321,7 @@ public sealed class TransferService
             // Ruling 190: a checklist taken before this run says nothing about the target after it - never reused for another start.
             // (The new run id changes WorkflowStamp too; the result itself stays readable as LastPreflight for the screen.)
             lock (_lock) _preflightStamp = null;
-            await EnsureNoOtherRunnerAsync(runId, tgtCs, ct);
+            await EnsureNoOtherRunnerAsync(runId, tgtCs, ct, restart ? latest : null);
             if (!restart) _services.Workflow.OnTransferStarted();
             Launch(engine, runId, srcCs, tgtCs, RunOrigin.Created);
             return runId;
@@ -510,7 +510,8 @@ public sealed class TransferService
             notes.Add($"{GlobalSql.RestorePrefix} it could not run, because SQL plan v{run.SqlVersion} could not be read ({Describe(ex)}); "
                       + "whatever its pre-load SQL disabled in the target is still disabled.");
         }
-        if (!run.Options.KeepControlTable) await DropControlTableAsync(targetCs, ct);
+        // Ruling 215 (N-2): a cancelled run's checkpoints stop being a claim on the target whatever "Keep the checkpoint table" says.
+        await DropControlTableAsync(targetCs, ct, run, notes);
         _services.Transfers.SetRunStatus(run.Id, RunStatus.Cancelled, WithNotes(_services.Transfers.GetRun(run.Id)?.SummaryJson, notes));
         _services.Sink.Publish("transfer_run_changed", new { runId = run.Id, status = EnumText.ToText(RunStatus.Cancelled) });
         _services.Workflow.OnTransferFinished("cancelled", null);
@@ -682,16 +683,23 @@ public sealed class TransferService
     /// <para>The lock is released again immediately and the engine re-takes it, so a runner that appears in between is still refused -
     /// by <see cref="RunBackgroundAsync"/>, which leaves the run <c>paused</c> and carries the same sentence in its notes.</para>
     /// </summary>
-    private async Task EnsureNoOtherRunnerAsync(long runId, string targetCs, CancellationToken ct)
+    /// <param name="abandoned">Ruling 215 (N-2, N-3): the failed or cancelled run a re-run abandons. Its checkpoints stop being a claim on
+    /// the target here, under the lock - an earlier engine's rows of it claimed first - whatever "Keep the checkpoint table" says.</param>
+    private async Task EnsureNoOtherRunnerAsync(long runId, string targetCs, CancellationToken ct, TransferRunRow? abandoned = null)
     {
         try
         {
             var owner = TransferEngine.OwnerOf(_services);
             await using var probe = await RunLock.AcquireAsync(targetCs, runId, ct, owner);
-            // Ruling 212 (b), asked here as well so another project's paused run reaches the operator as busy, not as a run that
-            // started and was then refused.
             await using var tgt = await SqlConnect.OpenAsync(targetCs, ct);
-            await TransferEngine.EnsureNoForeignCheckpointsAsync(tgt, owner, probe.Database, ct);
+            if (abandoned is not null)
+            {
+                await ControlTable.ClaimLegacyAsync(tgt, owner, abandoned.Id, TransferEngine.Recorded(_services.Transfers.Tasks(abandoned.Id)), ct);
+                await ControlTable.RetireRunAsync(tgt, owner, abandoned.Id, ct);
+            }
+            // Ruling 212 (b), asked here as well so another project's paused run reaches the operator as busy, not as a run that
+            // started and was then refused. The run was created a moment ago, so it is fresh (N-1).
+            await TransferEngine.EnsureNoForeignCheckpointsAsync(tgt, owner, runId, fresh: true, probe.Database, ct);
         }
         catch (TransferException ex) when (ex.Code == "run_in_progress")
         {
@@ -745,7 +753,9 @@ public sealed class TransferService
     /// </summary>
     private static void EnsureRecordedTarget(TransferRunRow run, ServerMeta saved, string consequence)
     {
-        if (Same(saved.Database, run.TargetDatabase) && Same(saved.Server, run.TargetServer)) return;
+        // N-4: a LocalDB server name changes on every instance start, so it is compared by its machine part (Preflight's rule).
+        if (Same(saved.Database, run.TargetDatabase)
+            && Same(Preflight.ServerIdentity(saved.Server), Preflight.ServerIdentity(run.TargetServer))) return;
         throw new TransferException("target_changed",
             $"The saved target connection now points at {saved.Database} on {saved.Server}, but run {run.Id} loaded into "
             + $"{run.TargetDatabase} on {run.TargetServer}. Its checkpoints and the {ControlTable.Name} table live in that database, "
@@ -1346,13 +1356,29 @@ public sealed class TransferService
         return connectionString ?? throw new TransferException("no_connection", $"The {which} connection is not saved.");
     }
 
-    private async Task DropControlTableAsync(string targetCs, CancellationToken ct)
+    /// <summary>The end of a cancelled run's checkpoints: an earlier engine's rows of it claimed (N-3), then marked done when the table is
+    /// kept (N-2), or removed with the table dropped once empty (Ruling 212 c).</summary>
+    private async Task DropControlTableAsync(string targetCs, CancellationToken ct, TransferRunRow run, List<string> notes)
     {
+        var owner = TransferEngine.OwnerOf(_services);
         try
         {
             await using var conn = await SqlConnect.OpenAsync(targetCs, ct);
+            try
+            {
+                await ControlTable.ClaimLegacyAsync(conn, owner, run.Id, TransferEngine.Recorded(_services.Transfers.Tasks(run.Id)), ct);
+            }
+            catch (TransferException ex) when (ex.Code == "run_in_progress")
+            {
+                notes.Add(ex.Message + " The earlier version's checkpoints were left as they are.");
+            }
+            if (run.Options.KeepControlTable)
+            {
+                await ControlTable.RetireRunAsync(conn, owner, run.Id, ct);
+                return;
+            }
             // Ruling 212 (c): only this project's rows; the table stays while another project's are in it.
-            if (!await ControlTable.ReleaseAsync(conn, TransferEngine.OwnerOf(_services), ct))
+            if (!await ControlTable.ReleaseAsync(conn, owner, ct))
                 _services.Sink.Publish("log", new { level = "info",
                     message = $"{ControlTable.Name} was left in the target: this project's checkpoints were removed, but it still holds "
                               + "another project's checkpoints." });

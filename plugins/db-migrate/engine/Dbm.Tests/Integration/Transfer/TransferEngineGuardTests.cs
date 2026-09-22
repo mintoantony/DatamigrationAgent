@@ -592,6 +592,73 @@ public sealed class TransferEngineGuardTests(GuardSourceFixture fx) : IClassFixt
     }
 
     /// <summary>
+    /// Ruling 215, N-1 (probe REVF_E). A copied project folder carries its state database, and with it the workspace identity, so the
+    /// copy's run 1 is indistinguishable from the original's in the target: the copy's fresh run adopted the original's paused
+    /// checkpoint, completed, and the original's resume then failed. A fresh run owns no checkpoint yet, so one already there for its
+    /// (project, run) is refused, naming the folder that wrote it and saying this folder may be a copy.
+    /// </summary>
+    [Fact]
+    public async Task A_copied_project_folders_fresh_run_is_refused_rather_than_adopting_the_originals_checkpoint()
+    {
+        var plan = One(WidePlan());
+        await using var rig = await RigAsync(plan);
+        using var copy = new XferServices();
+        copy.Services.Db.Execute("UPDATE transfer_identity SET workspace_id = $W", new { W = rig.Svc.Services.Transfers.WorkspaceId() });
+        var engineCopy = new TransferEngine(copy.Services, plan, fx.Src.ConnectionString, rig.Tgt.ConnectionString);
+        var options = new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip" };
+        long run = rig.Engine.CreateRun(1, options);
+        var pause = new TransferControl();
+        pause.ChunkCommitted += c => { if (c.ChunkNo == 2) pause.RequestPause(); };
+        Assert.Equal(RunStatus.Paused, (await rig.Engine.RunAsync(run, pause, default)).Status);
+        long copyRun = engineCopy.CreateRun(1, options);
+        Assert.Equal(run, copyRun);
+
+        var refusal = await Record.ExceptionAsync(() => engineCopy.RunAsync(copyRun, new TransferControl(), default));
+
+        long rows = await rig.Tgt.CountAsync("app.Wide");
+        var copied = copy.Services.Transfers.Task(copyRun, "T01")!;
+        Assert.True(rows == 200 && copied.RowsDone == 0,
+            $"a copy of the project folder took over the original's paused checkpoint: app.Wide holds {rows} rows, the copy recorded "
+            + $"{copied.RowsDone} loaded; {(refusal is null ? "it ran" : "refused: " + refusal.Message)}");
+        var refused = Assert.IsType<TransferException>(refusal);
+        Assert.Equal("run_in_progress", refused.Code);
+        Assert.True(refused.Message.Contains(rig.Svc.Root, StringComparison.OrdinalIgnoreCase)
+                    && refused.Message.Contains("may be a copy", StringComparison.Ordinal),
+            "the refusal does not name the folder that wrote the checkpoint and say this one may be a copy: " + refused.Message);
+
+        var resumed = await rig.Engine.RunAsync(run, new TransferControl(), default);
+        Assert.True(resumed.Status == RunStatus.Completed, $"the original's resume ended {resumed.Status}: {resumed.Error}");
+        Assert.Equal(400, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(DISTINCT Id) FROM app.Wide"));
+    }
+
+    /// <summary>
+    /// Ruling 215, N-2 (probe REVF_F). A run cancelled with "Keep the checkpoint table" left its unfinished rows behind, and they
+    /// blocked every other project's run on that target for good, with advice (resume or cancel it) that could no longer be followed.
+    /// The option keeps the table, never a claim on the target: the cancelled run's rows are marked done.
+    /// </summary>
+    [Fact]
+    public async Task A_run_cancelled_with_the_table_kept_leaves_no_claim_on_the_target()
+    {
+        var plan = One(WidePlan());
+        await using var rig = await RigAsync(plan);
+        using var projectB = new XferServices();
+        var engineB = new TransferEngine(projectB.Services, plan, fx.Src.ConnectionString, rig.Tgt.ConnectionString);
+        long runA = rig.Engine.CreateRun(1, new TransferOptions { ChunkSize = 100, Parallelism = 1, ErrorMode = "skip", KeepControlTable = true });
+        var cancel = new TransferControl();
+        cancel.ChunkCommitted += c => { if (c.ChunkNo == 2) cancel.RequestCancel(); };
+        Assert.Equal(RunStatus.Cancelled, (await rig.Engine.RunAsync(runA, cancel, default)).Status);
+        Assert.Equal(1, await rig.Tgt.ScalarAsync<int>("SELECT COUNT(*) FROM dbo.__dbm_checkpoint"));   // kept, as asked
+        long runB = engineB.CreateRun(1, new TransferOptions { ChunkSize = 100, ErrorMode = "skip", TruncateTarget = true });
+
+        var outcome = await Record.ExceptionAsync(async () =>
+            Assert.Equal(RunStatus.Completed, (await engineB.RunAsync(runB, new TransferControl(), default)).Status));
+
+        Assert.True(outcome is null,
+            "a run cancelled with its checkpoint table kept still blocks another project's run on the target: " + outcome?.Message);
+        Assert.Equal(400, await rig.Tgt.CountAsync("app.Wide"));
+    }
+
+    /// <summary>
     /// Ruling 212 (c). A run's end removes its own project's checkpoint rows and drops the table only when it is then empty. Project A
     /// completed keeping its checkpoint table for auditing; project B's run then completes and, before, dropped the shared table with
     /// A's rows in it.

@@ -53,15 +53,33 @@ public sealed class TransferEngine
     /// project's run is paused, failed or crashed part-way through this target and holds no lock while it waits, so the lock alone
     /// cannot see it. Called with the target lock held (by the engine, and by the start probe). A missing table is no refusal.
     /// </summary>
-    internal static async Task EnsureNoForeignCheckpointsAsync(SqlConnection tgt, CheckpointOwner owner, string database,
-        CancellationToken ct)
+    /// <param name="fresh">Ruling 215 (N-1): the run has never loaded a row (every task's <c>RowsBefore</c> is null). Such a run owns no
+    /// checkpoint yet, so a row this project already has for its run id was written by another copy of this workspace - a copied
+    /// project folder carries the state database, and with it the workspace identity - and is refused rather than adopted.</param>
+    internal static async Task EnsureNoForeignCheckpointsAsync(SqlConnection tgt, CheckpointOwner owner, long runId, bool fresh,
+        string database, CancellationToken ct)
     {
+        if (fresh && await ControlTable.OwnRunRowFolderAsync(tgt, owner, runId, ct) is { } folder)
+            throw new TransferException("run_in_progress",
+                $"The target database {database} already holds checkpoints of run {runId} of this project"
+                + (folder.Length > 0 ? $", written from the project folder {folder}" : "") + ", although this run has not loaded anything "
+                + "yet. This project folder may be a copy of that one: both carry the same workspace, so their runs cannot be told apart "
+                + "in the target, and this run would take over the other's checkpoints. Resume or cancel that run from its own folder, "
+                + "and work from one copy of the project only.");
         if (await ControlTable.ForeignUnfinishedAsync(tgt, owner, ct) is not { } other) return;
         throw new TransferException("run_in_progress",
-            $"The target database {database} holds the unfinished checkpoints of {other}: that run is paused, failed or was interrupted "
-            + "part-way through loading this database. A run from here would load beside it, and into the tables it has half-loaded, so "
-            + "it is refused before it copies a row. Resume or cancel that run from its own project first.");
+            $"The target database {database} holds the unfinished checkpoints of {other.Description}: that run is paused, failed or was "
+            + "interrupted part-way through loading this database. A run from here would load beside it, and into the tables it has "
+            + "half-loaded, so it is refused before it copies a row. "
+            + (other.Legacy
+                ? $"Resume or cancel that run from its own project first; if no db-migrate project still uses this target, {ControlTable.Name} "
+                  + "can be dropped."
+                : "Resume or cancel that run from its own project first."));
     }
+
+    /// <summary>Ruling 215 (N-3): what this run recorded per task, which is what a legacy row must match to be claimed.</summary>
+    internal static List<(string TaskId, long RowsDone, long RowsError)> Recorded(IEnumerable<TransferTaskRow> tasks)
+        => tasks.Select(t => (t.TaskId, t.RowsDone, t.RowsError)).ToList();
 
     /// <param name="target">Open item 22: recorded on the run - the server and database it loads into.</param>
     public long CreateRun(int sqlVersion, TransferOptions options, (string Server, string Database)? target = null)
@@ -113,10 +131,11 @@ public sealed class TransferEngine
             }
             if (shapeOk)
             {
-                // A resume segment claims the rows an earlier engine wrote for this very run; a fresh run never adopts a row.
-                if (tasks.Any(t => t.RowsBefore is not null))
-                    await ControlTable.ClaimLegacyAsync(tgt, owner, runId, tasks.Select(t => t.TaskId).ToList(), ct);
-                await EnsureNoForeignCheckpointsAsync(tgt, owner, runLock.Database, ct);
+                // A resume segment claims the rows an earlier engine wrote for this very run (counters matching what it recorded); a
+                // fresh run never adopts a row.
+                bool fresh = tasks.All(t => t.RowsBefore is null);
+                if (!fresh) await ControlTable.ClaimLegacyAsync(tgt, owner, runId, Recorded(tasks), ct);
+                await EnsureNoForeignCheckpointsAsync(tgt, owner, runId, fresh, runLock.Database, ct);
             }
         }
 
@@ -162,7 +181,7 @@ public sealed class TransferEngine
                 // Ruling 184: the plan's PreSql is not left in force behind a cancel. Best effort, one note per statement.
                 foreach (var note in await GlobalSql.RestoreAsync(_targetCs, _plan.PostSql, rc.Scrub, ct)) rc.AddNote(note);
                 _preSqlApplied = false;
-                await DropControlTableAsync(rc, ct);
+                await DropControlTableAsync(rc, ct, cancelled: true);
                 return Finish(rc, RunStatus.Cancelled, null);
             }
             if (!allDone) return Finish(rc, RunStatus.Paused, null);
@@ -265,14 +284,33 @@ public sealed class TransferEngine
     /// refuses to drop a foreign table (ruling H1) by throwing; uncaught here that would report a migration which loaded every row as a
     /// failed run, and swallowed it would leave the table standing with nothing saying why. The note goes into the run's summary.
     /// </summary>
-    private async Task DropControlTableAsync(RunContext rc, CancellationToken ct)
+    private async Task DropControlTableAsync(RunContext rc, CancellationToken ct, bool cancelled = false)
     {
-        if (rc.Options.KeepControlTable) return;
+        var owner = OwnerOf(_services);
+        if (rc.Options.KeepControlTable && !cancelled) return;   // a completed run's rows are all done: no claim on the target
         try
         {
             await using var tgt = await SqlConnect.OpenAsync(_targetCs, ct);
+            if (cancelled)
+            {
+                // Ruling 215 (N-3): an earlier engine's rows of this run are this run's to end as well.
+                try
+                {
+                    await ControlTable.ClaimLegacyAsync(tgt, owner, rc.RunId, Recorded(rc.Repo.Tasks(rc.RunId)), ct);
+                }
+                catch (TransferException ex) when (ex.Code == "run_in_progress")
+                {
+                    rc.AddNote(ex.Message + " The earlier version's checkpoints were left as they are.");
+                }
+                if (rc.Options.KeepControlTable)
+                {
+                    // N-2: the option keeps the table for auditing, never a claim on the target - the rows are marked done.
+                    await ControlTable.RetireRunAsync(tgt, owner, rc.RunId, ct);
+                    return;
+                }
+            }
             // Ruling 212 (c): this project's rows go; the table goes only if nothing of another project is left in it.
-            if (!await ControlTable.ReleaseAsync(tgt, OwnerOf(_services), ct))
+            if (!await ControlTable.ReleaseAsync(tgt, owner, ct))
             {
                 string note = $"{ControlTable.Name} was left in the target: this run's checkpoints were removed, but it still holds "
                               + "another project's checkpoints.";

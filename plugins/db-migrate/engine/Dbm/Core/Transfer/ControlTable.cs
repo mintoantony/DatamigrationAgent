@@ -22,6 +22,9 @@ public sealed record CheckpointOwner(string ProjectId, string? Folder)
     public static CheckpointOwner Unowned { get; } = new("", null);
 }
 
+/// <summary>Another project's unfinished checkpoints in a target: who (for the refusal) and whether an earlier engine wrote them.</summary>
+public sealed record ForeignCheckpoint(string Description, bool Legacy);
+
 /// <summary>
 /// dbo.__dbm_checkpoint in the TARGET: written in the same transaction as each chunk (exactly-once).
 /// This is the one persistent object the engine creates in a customer database. Nothing here touches any other object, and
@@ -39,8 +42,8 @@ public static class ControlTable
     /// <summary>
     /// The project whose checkpoints <see cref="ReadAsync"/> and <see cref="UpsertAsync"/> read and write. Set by
     /// <c>TransferEngine.RunAsync</c> for the whole segment (it flows into every task worker); ambient because the per-chunk callers
-    /// already take a run id and a task id, and the owner is the same for every call of a segment. Unset reads as
-    /// <see cref="CheckpointOwner.Unowned"/>.
+    /// already take a run id and a task id, and the owner is the same for every call of a segment. Unset is a programming error
+    /// (Ruling 215, N-6): falling back to the empty owner would write rows that look like an earlier engine's.
     /// </summary>
     internal static CheckpointOwner? CurrentOwner
     {
@@ -48,7 +51,14 @@ public static class ControlTable
         set => AmbientOwner.Value = value;
     }
 
-    private static CheckpointOwner Owner => AmbientOwner.Value ?? CheckpointOwner.Unowned;
+    private static CheckpointOwner Owner => AmbientOwner.Value
+        ?? throw new InvalidOperationException("ControlTable.CurrentOwner is not set: checkpoint rows are read and written for a project, "
+                                               + "and TransferEngine.RunAsync sets it for the segment.");
+
+    /// <summary>Ruling 215 (N-5): legacy rows written this recently may belong to an earlier engine loading this target right now - it
+    /// takes the run-scoped lock this engine no longer contends for - so they are never claimed. A live engine commits a chunk far more
+    /// often than this.</summary>
+    public static readonly TimeSpan LegacyQuietPeriod = TimeSpan.FromMinutes(10);
 
     /// <summary>nvarchar(64): longer ids would be silently truncated by the parameter and collide, so they are refused.</summary>
     private const int MaxTaskIdLength = 64;
@@ -122,7 +132,7 @@ public static class ControlTable
     /// run is paused, failed or crashed part-way through loading this target; a run of ours now would load beside it and, where the
     /// plans share tables, into rows it has half-loaded.
     /// </summary>
-    public static async Task<string?> ForeignUnfinishedAsync(SqlConnection conn, CheckpointOwner owner, CancellationToken ct)
+    public static async Task<ForeignCheckpoint?> ForeignUnfinishedAsync(SqlConnection conn, CheckpointOwner owner, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(conn);
         ArgumentNullException.ThrowIfNull(owner);
@@ -135,32 +145,99 @@ public static class ControlTable
         await using var r = await cmd.ExecuteReaderAsync(ct);
         if (!await r.ReadAsync(ct)) return null;
         string run = r.GetInt64(2).ToString(CultureInfo.InvariantCulture);
-        if (r.GetString(0).Length == 0) return $"run {run} of a project whose folder an earlier db-migrate version did not record";
-        return r.IsDBNull(1) ? $"run {run} of another project" : $"run {run} of the project in {r.GetString(1)}";
+        if (r.GetString(0).Length == 0)
+            return new ForeignCheckpoint($"run {run} of a project whose folder an earlier db-migrate version did not record", Legacy: true);
+        return new ForeignCheckpoint(r.IsDBNull(1) ? $"run {run} of another project" : $"run {run} of the project in {r.GetString(1)}",
+            Legacy: false);
     }
 
     /// <summary>
-    /// Rows an earlier engine wrote for <paramref name="runId"/> (empty project) become <paramref name="owner"/>'s. Called only on a
-    /// resume segment - a run with recorded progress - so a fresh run never adopts a row it did not write.
+    /// Ruling 215 (N-1). The folder recorded on a row this project already has for <paramref name="runId"/> - "" when the row records
+    /// none - or null when there is no such row. A fresh run has never written a checkpoint, so such a row was written by another copy
+    /// of this workspace (a copied project folder carries its state database, and with it the workspace identity).
     /// </summary>
-    public static async Task ClaimLegacyAsync(SqlConnection conn, CheckpointOwner owner, long runId, IReadOnlyCollection<string> taskIds,
-        CancellationToken ct)
+    public static async Task<string?> OwnRunRowFolderAsync(SqlConnection conn, CheckpointOwner owner, long runId, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(conn);
         ArgumentNullException.ThrowIfNull(owner);
-        if (owner.ProjectId.Length == 0 || taskIds.Count == 0) return;
-        foreach (var taskId in taskIds)
+        await using var cmd = new SqlCommand($"""
+            IF OBJECT_ID(N'{Name}', N'U') IS NOT NULL AND COL_LENGTH(N'{Name}', N'project_id') IS NOT NULL
+              EXEC sys.sp_executesql N'SELECT TOP (1) ISNULL(project_folder, N'''') FROM {Name} WHERE project_id = @p AND run_id = @r',
+                                     N'@p nvarchar(36), @r bigint', @p = @p, @r = @r;
+            """, conn);
+        cmd.Parameters.Add(new SqlParameter("@p", SqlDbType.NVarChar, 36) { Value = owner.ProjectId });
+        cmd.Parameters.Add(new SqlParameter("@r", SqlDbType.BigInt) { Value = runId });
+        return await cmd.ExecuteScalarAsync(ct) as string;
+    }
+
+    /// <summary>
+    /// Rows an earlier engine wrote for <paramref name="runId"/> (empty project) become <paramref name="owner"/>'s - only those whose
+    /// counters equal what this run recorded for that task (Ruling 215, N-3), so another project's run with the same id and task ids
+    /// cannot take them. Called for a run with recorded progress (a resume, a cancel, a re-run abandoning it), never for a fresh one.
+    /// Refuses <c>run_in_progress</c> when any legacy row changed within <see cref="LegacyQuietPeriod"/>: an earlier engine may be
+    /// loading this target right now (N-5).
+    /// </summary>
+    public static async Task ClaimLegacyAsync(SqlConnection conn, CheckpointOwner owner, long runId,
+        IReadOnlyCollection<(string TaskId, long RowsDone, long RowsError)> tasks, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(conn);
+        ArgumentNullException.ThrowIfNull(owner);
+        ArgumentNullException.ThrowIfNull(tasks);
+        if (owner.ProjectId.Length == 0 || tasks.Count == 0) return;
+        await EnsureNoLiveLegacyEngineAsync(conn, ct);
+        foreach (var (taskId, rowsDone, rowsError) in tasks)
         {
             CheckTaskId(taskId);
             await using var cmd = new SqlCommand($"""
                 IF OBJECT_ID(N'{Name}', N'U') IS NOT NULL
-                  UPDATE {Name} SET project_id = @p, project_folder = @f WHERE project_id = N'' AND run_id = @r AND task_id = @t;
+                  UPDATE {Name} SET project_id = @p, project_folder = @f
+                  WHERE project_id = N'' AND run_id = @r AND task_id = @t AND rows_done = @d AND rows_error = @e;
                 """, conn);
             AddKey(cmd, runId, taskId);
             cmd.Parameters.Add(new SqlParameter("@p", SqlDbType.NVarChar, 36) { Value = owner.ProjectId });
             cmd.Parameters.Add(new SqlParameter("@f", SqlDbType.NVarChar, 400) { Value = (object?)Folder(owner) ?? DBNull.Value });
+            cmd.Parameters.Add(new SqlParameter("@d", SqlDbType.BigInt) { Value = rowsDone });
+            cmd.Parameters.Add(new SqlParameter("@e", SqlDbType.BigInt) { Value = rowsError });
             await cmd.ExecuteNonQueryAsync(ct);
         }
+    }
+
+    /// <summary>Ruling 215 (N-5): refuses <c>run_in_progress</c> when a row with no project (an earlier engine's) changed within
+    /// <see cref="LegacyQuietPeriod"/>. An earlier engine takes a run-scoped lock this one does not contend for, so its table changing
+    /// is the only sign that it is loading this target now.</summary>
+    public static async Task EnsureNoLiveLegacyEngineAsync(SqlConnection conn, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(conn);
+        await using var cmd = new SqlCommand($"""
+            IF OBJECT_ID(N'{Name}', N'U') IS NOT NULL AND COL_LENGTH(N'{Name}', N'project_id') IS NOT NULL
+              EXEC sys.sp_executesql N'SELECT MAX(updated_at) FROM {Name} WHERE project_id = N''''
+                                       AND updated_at > DATEADD(SECOND, -@quiet, SYSUTCDATETIME())', N'@quiet int', @quiet = @quiet;
+            """, conn);
+        cmd.Parameters.Add(new SqlParameter("@quiet", SqlDbType.Int) { Value = (int)LegacyQuietPeriod.TotalSeconds });
+        if (await cmd.ExecuteScalarAsync(ct) is DateTime at)
+            throw new TransferException("run_in_progress",
+                $"{Name} in the target holds checkpoints written by an earlier db-migrate version at "
+                + $"{DateTime.SpecifyKind(at, DateTimeKind.Utc):O}, less than {LegacyQuietPeriod.TotalMinutes:0} minutes ago: that version may be "
+                + "loading this target right now, and it does not see this version's lock. Stop it (or wait until it has finished), then "
+                + "try again.");
+    }
+
+    /// <summary>
+    /// Ruling 215 (N-2): <paramref name="runId"/>'s rows stop being a claim on the target - marked done, kept for auditing - because
+    /// the run was cancelled or abandoned for a new one. "Keep the checkpoint table" keeps the table, never a claim.
+    /// </summary>
+    public static async Task RetireRunAsync(SqlConnection conn, CheckpointOwner owner, long runId, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(conn);
+        ArgumentNullException.ThrowIfNull(owner);
+        await using var cmd = new SqlCommand($"""
+            IF OBJECT_ID(N'{Name}', N'U') IS NOT NULL AND COL_LENGTH(N'{Name}', N'project_id') IS NOT NULL
+              EXEC sys.sp_executesql N'UPDATE {Name} SET done = 1, updated_at = SYSUTCDATETIME() WHERE project_id = @p AND run_id = @r AND done = 0',
+                                     N'@p nvarchar(36), @r bigint', @p = @p, @r = @r;
+            """, conn);
+        cmd.Parameters.Add(new SqlParameter("@p", SqlDbType.NVarChar, 36) { Value = owner.ProjectId });
+        cmd.Parameters.Add(new SqlParameter("@r", SqlDbType.BigInt) { Value = runId });
+        await cmd.ExecuteNonQueryAsync(ct);
     }
 
     /// <summary>

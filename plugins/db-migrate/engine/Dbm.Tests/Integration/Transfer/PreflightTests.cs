@@ -274,9 +274,11 @@ public sealed class PreflightTests(EngineSourceFixture fx) : IClassFixture<Engin
         await using var __ = tgt;
         svc.Services.Db.Execute("UPDATE catalog SET snapshot_json = $J WHERE side = 'tgt'", new { J = snapshot });
 
-        var result = await Preflight.RunAsync(svc.Services, new TransferOptions(), default);
+        PreflightResult? result = null;
+        var crash = await Record.ExceptionAsync(async () => result = await Preflight.RunAsync(svc.Services, new TransferOptions(), default));
+        Assert.True(crash is null, $"pre-flight crashed over a catalog that names no database ({snapshot}): {crash}");
 
-        var drift = Check(result.Checks, "schema_drift");
+        var drift = Check(result!.Checks, "schema_drift");
         Assert.True(!drift.Ok && drift.NotRun && drift.Severity == "error",
             $"pre-flight passed the schema check over a discovered target catalog that names no database ({snapshot}): ok={drift.Ok}, "
             + $"notRun={drift.NotRun}, {drift.Severity}: {drift.Detail}");
@@ -305,6 +307,53 @@ public sealed class PreflightTests(EngineSourceFixture fx) : IClassFixture<Engin
             $"pre-flight passed a saved target that is not the database discovery read: ok={identity.Ok}, {identity.Severity}: {identity.Detail}");
         Assert.Contains("SomeOtherDb", identity.Detail, StringComparison.Ordinal);
         Assert.Contains(tgt.Name, identity.Detail, StringComparison.Ordinal);
+        Assert.False(result.Passed);
+    }
+
+    /// <summary>
+    /// Ruling 215, N-4. LocalDB's server name is <c>&lt;machine&gt;\LOCALDB#&lt;hex&gt;</c>, and the hex changes every time the instance
+    /// starts, so the name the connection was saved against and the one discovery read differ for one database: a red line and a
+    /// 409 at Start that re-running discovery cannot cure. Two LocalDB names compare by machine; a different database still fails.
+    /// </summary>
+    [Fact]
+    public void Two_LocalDB_instance_names_of_one_machine_are_the_same_server_but_a_different_database_is_not()
+    {
+        var saved = TestCatalogs.Meta("Shop") with { Server = @"6DQWGK4\LOCALDB#51E04DEF" };
+        var discovered = saved with { Server = @"6dqwgk4\LocalDB#1A254D6D" };
+
+        Assert.True(Preflight.SameTarget(saved, discovered),
+            $"one LocalDB database read before and after an instance restart ({saved.Server} / {discovered.Server}) is not the same target");
+        Assert.False(Preflight.SameTarget(saved, discovered with { Database = "Other" }), "a different database on LocalDB is the same target");
+        Assert.False(Preflight.SameTarget(saved, discovered with { Server = @"OTHERBOX\LOCALDB#1A254D6D" }), "another machine's LocalDB is the same");
+        Assert.False(Preflight.SameTarget(saved with { Server = "SQL01" }, discovered with { Server = "SQL02" }), "two servers are the same");
+        Assert.False(Preflight.SameTarget(saved, null));
+    }
+
+    /// <summary>
+    /// Ruling 215 (re-review concern 3). The start refuses while another project's run has unfinished checkpoints in the target; the
+    /// checklist says so first, on its checkpoint-table line, naming that project's folder - instead of a green list above a busy Start.
+    /// </summary>
+    [Fact]
+    public async Task The_checkpoint_table_line_names_another_projects_unfinished_run()
+    {
+        var (svc, tgt) = await DiscoveredRigAsync();
+        using var _ = svc;
+        await using var __ = tgt;
+        await using (var conn = new SqlConnection(tgt.ConnectionString))
+        {
+            await conn.OpenAsync();
+            await ControlTable.EnsureAsync(conn, default);
+        }
+        await tgt.ExecAsync($"""
+            INSERT dbo.__dbm_checkpoint (run_id, task_id, chunk_no, last_key, rows_done, rows_error, done, updated_at, project_id, project_folder)
+            VALUES (3, N'T01', 1, NULL, 10, 0, 0, SYSUTCDATETIME(), N'{Guid.NewGuid():D}', N'D:\other-project');
+            """);
+
+        var result = await Preflight.RunAsync(svc.Services, new TransferOptions(), default);
+
+        var line = Check(result.Checks, "control_table");
+        Assert.True(!line.Ok && line.Severity == "error" && line.Detail.Contains(@"run 3 of the project in D:\other-project", StringComparison.Ordinal),
+            $"pre-flight did not report another project's unfinished checkpoints: {line.Ok}, {line.Severity}: {line.Detail}");
         Assert.False(result.Passed);
     }
 

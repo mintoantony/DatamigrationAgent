@@ -179,7 +179,17 @@ project folder that is paused, failed or was interrupted part-way still leaves i
 transfer from here is refused (`busy`, naming that project folder) until that run is resumed to the end or cancelled from
 its own project. Each project's checkpoint rows are its own: a finished or cancelled run removes only them, and
 `dbo.__dbm_checkpoint` is dropped only when nothing else is left in it. Cancelling a paused or failed run also takes the
-lock, so it is refused while another transfer is loading that target. The run checks
+lock, so it is refused while another transfer is loading that target. A copy of a project folder carries the same
+project identity; its new run is refused if the original's run has checkpoints in the target, so work from one copy.
+"Keep the checkpoint table" keeps the table for auditing, but a cancelled or abandoned run's rows in it are marked done
+and never block another run.
+
+**Upgrading from an earlier db-migrate version.** Earlier versions took a different lock and do not see this one, so do
+not run an earlier version and this one against the same target at the same time. The first run of this version upgrades
+`dbo.__dbm_checkpoint` in place; a run paused under the earlier version resumes, or is cancelled, from its own project as
+before. Until then its checkpoints hold the target for every other project, and they are never taken over while they are
+still changing (within 10 minutes of the last write). If no db-migrate project still uses the target, the table can be
+dropped. The run checks
 after every committed chunk that it still holds the lock; if its lock connection was dropped (a network or failover
 fault), it pauses after the current chunk and says so in its notes, and **Resume** takes the lock again.
 

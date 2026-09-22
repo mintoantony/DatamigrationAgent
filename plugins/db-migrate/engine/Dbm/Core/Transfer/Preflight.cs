@@ -143,7 +143,7 @@ public static class Preflight
             {
                 try
                 {
-                    checks.AddRange(await TargetChecksAsync(tgt, approved.Plan, options, ct, nonEmptyTargets));
+                    checks.AddRange(await TargetChecksAsync(tgt, approved.Plan, options, ct, nonEmptyTargets, TransferEngine.OwnerOf(s)));
                 }
                 catch (Exception ex) when (ex is SqlException or InvalidOperationException or TimeoutException)
                 {
@@ -235,13 +235,27 @@ public static class Preflight
         return (catalog, null);
     }
 
-    /// <summary>Ruling 128's identity rule, shared with the start door: same server and database, ignoring case.</summary>
-    public static bool SameTarget(ServerMeta a, ServerMeta b)
+    /// <summary>
+    /// Ruling 128's identity rule, shared with the start door: same server and database, ignoring case. Never throws: a missing side
+    /// is simply not the same target.
+    /// <para>Ruling 215 (N-4): a LocalDB server reports <c>&lt;machine&gt;\LOCALDB#&lt;hex&gt;</c>, and the hex changes every time the
+    /// instance starts - so the server a connection was saved against and the one discovery read differ for the same database, a
+    /// false red that "re-run discovery" cannot cure. Two LocalDB names are compared by their machine part.</para>
+    /// </summary>
+    public static bool SameTarget(ServerMeta? a, ServerMeta? b)
     {
-        ArgumentNullException.ThrowIfNull(a);
-        ArgumentNullException.ThrowIfNull(b);
+        if (a is null || b is null) return false;
         return string.Equals(a.Database ?? "", b.Database ?? "", StringComparison.OrdinalIgnoreCase)
-               && string.Equals(a.Server ?? "", b.Server ?? "", StringComparison.OrdinalIgnoreCase);
+               && string.Equals(ServerIdentity(a.Server), ServerIdentity(b.Server), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex LocalDbServer = new(@"^(?<machine>[^\\]+)\\LOCALDB#[0-9A-F]+$",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    internal static string ServerIdentity(string? server)
+    {
+        string s = server ?? "";
+        return LocalDbServer.Match(s) is { Success: true } m ? m.Groups["machine"].Value + @"\LOCALDB" : s;
     }
 
     /// <summary>Open item 26: why a discovered catalog cannot vouch for the schemas, or null when both are usable. One sentence per side
@@ -261,9 +275,10 @@ public static class Preflight
     {
         var (discovered, problem) = DiscoveredCatalog(s, Side.Tgt);
         // What makes this unknowable is already an error elsewhere in the list: schema_drift says the catalog is unusable, or the
-        // connection lines say why that check could not run.
-        if (discovered is null)
-            return NotRun("target_identity", $"Not checked: {problem}, so it is unknown whether the saved target is the database the "
+        // connection lines say why that check could not run. Guarded on the server as well as the catalog, so a looser predicate can
+        // never turn this line into an exception that loses the checklist (Ruling 119).
+        if (discovered?.Server is not { } d)
+            return NotRun("target_identity", $"Not checked: {problem ?? "the discovered target catalog records no server"}, so it is unknown whether the saved target is the database the "
                                              + "plan was generated for.", causeIsAlreadyAnError: true);
         ServerMeta? saved;
         try
@@ -276,7 +291,6 @@ public static class Preflight
                                              + Describe(ex) + "). Re-test the target connection on the Setup screen.",
                 causeIsAlreadyAnError: false);
         }
-        var d = discovered.Server!;
         if (saved is null)
             return NotRun("target_identity", "Not checked: the target connection is not saved.", causeIsAlreadyAnError: true);
         return SameTarget(saved, d)
@@ -306,8 +320,10 @@ public static class Preflight
     /// not cover: "INSERT permission on every target table" pronounced over a set that silently excludes one is the same lie as no
     /// check at all.</para>
     /// </summary>
+    /// <param name="owner">This workspace, so the checkpoint-table line can report another project's unfinished checkpoints; null skips
+    /// that part (callers with no workspace).</param>
     public static async Task<List<PreflightCheck>> TargetChecksAsync(SqlConnection tgt, SqlPlanPayload plan, TransferOptions options,
-        CancellationToken ct, List<NonEmptyTarget>? nonEmptyTargets = null)
+        CancellationToken ct, List<NonEmptyTarget>? nonEmptyTargets = null, CheckpointOwner? owner = null)
     {
         ArgumentNullException.ThrowIfNull(tgt);
         ArgumentNullException.ThrowIfNull(plan);
@@ -410,7 +426,15 @@ public static class Preflight
                 await r.ReadAsync(ct);
                 (ctlExists, canCreate, canAlterDbo) = (r.GetInt32(0), r.GetInt32(1), r.GetInt32(2));
             }
-            checks.Add(ctlExists == 1 ? Ok("control_table", $"The checkpoint table {ControlTable.Name} already exists and will be reused.")
+            // Ruling 215 (concern 3): the start refuses while another project's run has unfinished checkpoints here, so the checklist
+            // says so first, naming that project.
+            var foreign = ctlExists == 1 && owner is not null ? await ControlTable.ForeignUnfinishedAsync(tgt, owner, ct) : null;
+            checks.Add(foreign is not null
+                ? Err("control_table", $"{ControlTable.Name} holds the unfinished checkpoints of {foreign.Description}: that run is paused, "
+                                       + "failed or was interrupted part-way through this target, and a new run here is refused until it is "
+                                       + "resumed or cancelled from its own project."
+                                       + (foreign.Legacy ? $" If no db-migrate project still uses this target, {ControlTable.Name} can be dropped." : ""))
+                : ctlExists == 1 ? Ok("control_table", $"The checkpoint table {ControlTable.Name} already exists and will be reused.")
                 : canCreate == 1 && canAlterDbo == 1 ? Ok("control_table", $"Can create the checkpoint table {ControlTable.Name}.")
                 : Err("control_table", $"Creating {ControlTable.Name} needs CREATE TABLE and ALTER on schema dbo."));
         }

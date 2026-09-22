@@ -306,6 +306,103 @@ public sealed class TransferServiceTests(EngineSourceFixture fx) : IClassFixture
         Assert.True(rig.Service.View().CanStart, rig.Service.View().CannotStart ?? "");
     }
 
+    /// <summary>Another project's unfinished checkpoint row, written straight into the target as that project's engine would.</summary>
+    private static async Task PlantForeignCheckpointAsync(TempDatabase tgt, string projectId, string? folder, DateTime? updatedAt = null)
+    {
+        await using var conn = new SqlConnection(tgt.ConnectionString);
+        await conn.OpenAsync();
+        await ControlTable.EnsureAsync(conn, default);
+        await using var cmd = new SqlCommand("""
+            INSERT dbo.__dbm_checkpoint (run_id, task_id, chunk_no, last_key, rows_done, rows_error, done, updated_at, project_id, project_folder)
+            VALUES (1, N'T01', 1, N'[100]', 100, 0, 0, ISNULL(@at, SYSUTCDATETIME()), @p, @f);
+            """, conn);
+        cmd.Parameters.AddWithValue("@at", (object?)updatedAt ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@p", projectId);
+        cmd.Parameters.AddWithValue("@f", (object?)folder ?? DBNull.Value);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
+    /// Ruling 215 (re-review LOW): the start door's own refusal for another project's unfinished checkpoints - the probe, not the
+    /// engine - so the operator is told <c>busy</c> at Start instead of being handed a run that then refuses, and nothing is loaded.
+    /// The other project's run appears after a passing pre-flight (which would otherwise name it first), and the start reuses that
+    /// pre-flight - the window the probe exists for.
+    /// </summary>
+    [Fact]
+    public async Task A_start_over_another_projects_unfinished_checkpoints_is_busy_naming_its_folder()
+    {
+        await using var rig = await RigAsync();
+        Assert.True((await rig.Service.PreflightAsync(Skip, default)).Passed);
+        await PlantForeignCheckpointAsync(rig.Tgt, Guid.NewGuid().ToString("D"), @"D:\other-project");
+
+        var thrown = await Record.ExceptionAsync(() => rig.Service.StartAsync(Skip, rig.Tgt.Name, default));
+        await rig.Service.Current;
+
+        long parents = await rig.Tgt.CountAsync("app.Parent");
+        Assert.True(parents == 0, $"a start loaded {parents} rows into a target another project's run is part-way through");
+        var ex = Assert.IsType<TransferException>(thrown);
+        Assert.True(ex.Code == "busy" && ex.Message.Contains(@"run 1 of the project in D:\other-project", StringComparison.Ordinal),
+            $"the start was not refused busy naming the other project ({ex.Code}): {ex.Message}");
+        Assert.Equal(RunStatus.Cancelled, rig.S.Transfers.Latest()!.Status);                     // ruling 126's close, and retryable
+        Assert.True(rig.Service.View().CanStart, rig.Service.View().CannotStart ?? "");
+    }
+
+    /// <summary>
+    /// Ruling 215, N-3 (probe REVF_G). Rows an earlier engine wrote have no project, and as built only a resume could claim them - so
+    /// their own project's cancel left them, and they then blocked that project's next run too, for ever. The owner's cancel claims them
+    /// (only rows whose counters match what its run recorded), ends them, and its next run starts; another project cannot claim them.
+    /// </summary>
+    [Fact]
+    public async Task A_cancel_ends_its_runs_checkpoints_written_by_an_earlier_engine_and_the_next_run_starts()
+    {
+        await using var rig = await RigAsync();
+        int pauses = 0;   // pause only the first run
+        rig.Service.ChunkCommitted += c => { if (c.TaskId == "T01" && c.ChunkNo == 1 && Interlocked.Increment(ref pauses) == 1) rig.Service.Pause(); };
+        long runId = await rig.Service.StartAsync(Skip, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Paused, rig.S.Transfers.GetRun(runId)!.Status);
+        // What an upgrade leaves: the paused run's rows without a project, last written well before the quiet period.
+        await rig.Tgt.ExecAsync("UPDATE dbo.__dbm_checkpoint SET project_id = N'', project_folder = NULL, updated_at = DATEADD(HOUR, -1, SYSUTCDATETIME());");
+        await using (var conn = new SqlConnection(rig.Tgt.ConnectionString))
+        {
+            await conn.OpenAsync();
+            var other = new CheckpointOwner(Guid.NewGuid().ToString("D"), @"D:\other");
+            await ControlTable.ClaimLegacyAsync(conn, other, runId, [("T01", 999, 0)], default);
+            Assert.True(await ControlTable.ForeignUnfinishedAsync(conn, other, default) is { Legacy: true },
+                "another project's run 1 claimed checkpoints its recorded counters do not match");
+        }
+
+        await rig.Service.CancelAsync(default);
+        var refused = await Record.ExceptionAsync(() => rig.Service.StartAsync(Skip with { TruncateTarget = true, ChunkSize = 1000 }, rig.Tgt.Name, default));
+        await rig.Service.Current;
+
+        Assert.True(refused is null,
+            "the owner's cancel left its earlier-engine checkpoints behind, and they refused its own next run: " + refused?.Message);
+        Assert.Equal(RunStatus.Completed, rig.S.Transfers.Latest()!.Status);
+        Assert.Equal(300, await rig.Tgt.CountAsync("app.Parent"));
+    }
+
+    /// <summary>
+    /// Ruling 215, N-2 at the re-run door: a re-run abandons the failed run for a new id. With "Keep the checkpoint table" the failed
+    /// run's unfinished rows used to stay a claim on the target for ever; the abandon marks them done.
+    /// </summary>
+    [Fact]
+    public async Task A_rerun_that_abandons_a_failed_run_leaves_no_claim_on_the_target_even_with_the_table_kept()
+    {
+        await using var rig = await RigAsync();
+        var keep = Skip with { KeepControlTable = true };
+        long failed = await rig.Service.StartAsync(keep with { ErrorMode = "stop", ChunkSize = 500 }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.Equal(RunStatus.Failed, rig.S.Transfers.GetRun(failed)!.Status);
+
+        long second = await rig.Service.StartAsync(keep with { TruncateTarget = true, ChunkSize = 1000 }, rig.Tgt.Name, default);
+        await rig.Service.Current;
+        Assert.NotEqual(failed, second);
+
+        int unfinished = await rig.Tgt.ScalarAsync<int>($"SELECT COUNT(*) FROM dbo.__dbm_checkpoint WHERE run_id = {failed} AND done = 0");
+        Assert.True(unfinished == 0, $"the abandoned run {failed} still has {unfinished} unfinished checkpoints: a claim on the target for ever");
+    }
+
     /// <summary>
     /// Ruling 212 (c). Cancelling a paused run runs the plan's PostSql and removes checkpoints in the target, so it happens under the
     /// target lock: while another project's runner holds it the cancel is refused <c>busy</c> and changes nothing - before, it ran the
