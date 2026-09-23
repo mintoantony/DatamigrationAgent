@@ -140,6 +140,57 @@ public class RedactorTests
             $"Scrub did not redact an unterminated-quote password: \"{scrubbed}\".");
     }
 
+    /// <summary>
+    /// Ruling 225 (sweep H fix round 2 re-review): fix (c)'s free-text mask reused <c>PasswordPattern</c>, whose
+    /// raw alternative is <c>[^;]*</c> - correct for a real connection string (values are <c>;</c>-separated),
+    /// wrong for free text, where it ran to the next <c>;</c> or the end and swallowed everything after the
+    /// password. Reproduced live: <c>Password=ab1 was rejected for login x</c> became <c>Password=***</c>, losing
+    /// "was rejected for login x". Scrub runs on nearly every error and log surface (CoreEndpoints, TaskRunner,
+    /// TransferService, SqlValidator, Preflight, the jobs, DemoCommand), so this was real diagnostic data loss.
+    /// The free text pass now has its own regex, stopping the raw value at whitespace too (<c>[^;\s]*</c>), and
+    /// <see cref="Dbm.Core.Sql.Redactor"/>'s connection-string-parsing regex is untouched.
+    /// </summary>
+    [Theory]
+    [InlineData("Password=ab1 was rejected for login x", "Password=*** was rejected for login x")]
+    [InlineData("Set Password=newvalue in the target appsettings before retrying.",
+        "Set Password=*** in the target appsettings before retrying.")]
+    public void Scrub_masks_only_the_value_in_free_text_leaving_the_rest_of_the_sentence_intact(string text, string expected)
+    {
+        var scrubbed = Redactor.Scrub(text, []);
+
+        Assert.True(scrubbed == expected,
+            $"Scrub's free-text mask consumed text past the end of the password value (Ruling 225 regression): " +
+            $"expected \"{expected}\", got \"{scrubbed}\".");
+    }
+
+    [Fact]
+    public void Scrub_still_stops_a_free_text_value_at_a_semicolon()
+    {
+        var scrubbed = Redactor.Scrub("Server=a;Password=ab1;Encrypt=true", []);
+
+        Assert.True(scrubbed == "Server=a;Password=***;Encrypt=true",
+            $"Scrub's free-text mask did not stop the value at the semicolon: got \"{scrubbed}\".");
+    }
+
+    [Fact]
+    public void Scrub_still_masks_a_quoted_value_whole_in_free_text()
+    {
+        var scrubbed = Redactor.Scrub("connection said Password=\"Pa\"\"ss'word1\" was bad", []);
+
+        Assert.True(scrubbed == "connection said Password=*** was bad",
+            $"Scrub's free-text mask did not consume a whole quoted value, or ate text past it: got \"{scrubbed}\".");
+    }
+
+    [Fact]
+    public void Scrub_is_idempotent_on_already_masked_free_text()
+    {
+        var once = Redactor.Scrub("Password=ab1 was rejected for login x", []);
+        var twice = Redactor.Scrub(once, []);
+
+        Assert.True(once == twice,
+            $"Scrub is not idempotent on free text it already masked: first pass \"{once}\", second pass \"{twice}\".");
+    }
+
     [Fact]
     public void Normalize_sets_application_name_only_when_left_default()
     {

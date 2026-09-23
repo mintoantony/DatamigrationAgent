@@ -60,7 +60,33 @@ public static partial class Redactor
             var sqEscaped = s.Replace("'", "''", StringComparison.Ordinal);
             if (sqEscaped != s && sqEscaped.Length >= 4) text = text.Replace(sqEscaped, "***", StringComparison.Ordinal);
         }
-        return PasswordPattern().Replace(text, m => $"{m.Groups["key"].Value}=***");
+        // Ruling 225: this pass runs over arbitrary free text (an error message, a log line), not a real
+        // connection string, so it must not reuse PasswordPattern - that regex's raw alternative is [^;]*,
+        // correct for ;-separated connection-string values but wrong here: on free text it ran to the next ;
+        // or the end and swallowed everything after the password (e.g. "Password=ab1 was rejected for login x"
+        // became "Password=***", losing "was rejected for login x"). FreeTextPasswordPattern stops a raw value
+        // at whitespace too, and only the value is replaced - the key and everything after it are kept.
+        return FreeTextPasswordPattern().Replace(text, MaskFreeTextValue);
+    }
+
+    /// <summary>
+    /// H-4: a raw, unquoted password containing a space, written directly into free text outside a connection
+    /// string, is masked only up to its first space (the raw alternative stops at whitespace); the rest of the
+    /// value is covered only by <see cref="Scrub"/>'s per-secret substring pass above, which needs the exact
+    /// secret to be in the secrets list and to clear the 4-character floor. Not fixed: confirmed against
+    /// <see cref="SqlConnectionStringBuilder"/> that it double-quotes any value containing a space when
+    /// it renders a connection string (e.g. a password of "has space" renders as <c>Password="has space"</c>),
+    /// so a password with a space inside a real, builder-produced connection string is already quoted and
+    /// caught by the dq alternative in full - this residual risk is limited to a raw, unquoted occurrence
+    /// written directly into free text, outside any connection string a builder produced.
+    /// </summary>
+    private static string MaskFreeTextValue(Match m)
+    {
+        var key = m.Groups["key"].Value;
+        var raw = m.Groups["raw"];
+        // A trailing comma or period reads as sentence punctuation, not part of the value - keep it outside the mask.
+        if (raw.Success && raw.Value.Length > 0 && raw.Value[^1] is ',' or '.') return $"{key}=***{raw.Value[^1]}";
+        return $"{key}=***";
     }
 
     /// <summary>Password / client-secret values; falls back to a regex when the string does not parse.</summary>
@@ -101,4 +127,12 @@ public static partial class Redactor
 
     [GeneratedRegex("""(?i)(?<key>password|pwd)\s*=\s*(?:"(?<dq>(?:[^"]|"")*)"|'(?<sq>(?:[^']|'')*)'|(?<raw>[^;]*))""")]
     private static partial Regex PasswordPattern();
+
+    /// <summary>
+    /// Ruling 225: <see cref="PasswordPattern"/> is for parsing real, ;-separated connection strings (used by
+    /// <see cref="SecretsOf"/>) and must stay that way. This is <see cref="Scrub"/>'s free-text pass: same
+    /// key/quoting rules, but the raw value also stops at whitespace, not just ";" or the end of the string.
+    /// </summary>
+    [GeneratedRegex("""(?i)\b(?<key>password|pwd)\s*=\s*(?:"(?<dq>(?:[^"]|"")*)"|'(?<sq>(?:[^']|'')*)'|(?<raw>[^;\s]*))""")]
+    private static partial Regex FreeTextPasswordPattern();
 }
