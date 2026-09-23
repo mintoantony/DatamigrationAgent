@@ -26,6 +26,21 @@ public sealed class DemoCommand : ICommand
     /// </summary>
     internal static readonly ConcurrentDictionary<string, string> ProbeConnectionStringOverrides = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// Test seam (sweep item 52): when set, thrown right before the create/attach block runs, in place of it, so a test
+    /// can pin the catch-all that masks an exception which is neither SqlException nor a demo exception before it
+    /// reaches CliApp.cs unmasked. Null except while such a test holds it. Backed by <see cref="AsyncLocal{T}"/> like
+    /// SqlValidateCommand.ValidateLive (decision I-3): the unit and integration DemoCommandTests run in different xUnit
+    /// collections, so a plain static would make a concurrently-running live demo test fail as "internal".
+    /// </summary>
+    static readonly AsyncLocal<Func<Exception>?> SimulateInternalFailureOverride = new();
+
+    internal static Func<Exception>? SimulateInternalFailure
+    {
+        get => SimulateInternalFailureOverride.Value;
+        set => SimulateInternalFailureOverride.Value = value;
+    }
+
     private static string ProbeTarget(string database, string connectionString) =>
         ProbeConnectionStringOverrides.TryGetValue(database, out var o) ? o : connectionString;
 
@@ -72,7 +87,8 @@ public sealed class DemoCommand : ICommand
     /// as typed and as a connection string builder quotes it ("…""…" or '…''…').
     /// </summary>
     internal static string MaskSecrets(string text, string connectionString)
-    {        foreach (var secret in Redactor.SecretsOf(connectionString))
+    {
+        foreach (var secret in Redactor.SecretsOf(connectionString))
         {
             if (string.IsNullOrEmpty(secret)) continue;
             foreach (var form in new[]
@@ -145,6 +161,7 @@ public sealed class DemoCommand : ICommand
 
         try
         {
+            if (SimulateInternalFailure is { } simulate) throw simulate();
             var result = await DemoDatabases.CreateAsync(serverText, scale, prefix, args.Flag("force"), CancellationToken.None);
             if (attach)
             {
@@ -180,6 +197,12 @@ public sealed class DemoCommand : ICommand
         {
             // Ruling 157: names both databases, what happened to each, the server's text and the remedy.
             throw new CliFailure("sql_error", MaskSecrets(ex.Message, serverText));
+        }
+        catch (Exception ex) when (ex is not CliFailure)
+        {
+            // Sweep item 52: anything else (neither SqlException, caught above by AttachAsync's own catch, nor one of the
+            // demo exceptions) would otherwise reach CliApp.cs unmasked. serverText can hold a SQL-auth password.
+            throw new CliFailure("internal", MaskSecrets(ex.Message, serverText));
         }
     }
 

@@ -201,6 +201,35 @@ public class DemoCommandTests
         Assert.Contains("***", masked);
     }
 
+    /// <summary>
+    /// Sweep item 52: an exception that is neither SqlException nor a demo exception (e.g. a bug elsewhere in the
+    /// create/attach block) would otherwise reach CliApp.cs and print ex.Message unmasked. It must instead come back
+    /// as CliFailure("internal", ...) with any password in --server masked, exactly like the other failure routes.
+    /// </summary>
+    [Fact]
+    public async Task An_unexpected_exception_from_the_create_attach_block_is_reported_as_internal_and_masked()
+    {
+        using var tw = new TestWorkspace();
+        DemoCommand.SimulateInternalFailure = () => new InvalidOperationException("boom near password Secr3tPass in the demo pipeline");
+        try
+        {
+            var r = await CliRunner.RunAsync(tw.Ws, null,
+                "demo", "--server", "Server=nowhere;User ID=demo;Password=Secr3tPass;Connect Timeout=1");
+
+            Assert.True(r.Exit == 1 && r.Json["error"]?.GetValue<string>() == "internal",
+                $"an exception that is neither SqlException nor a demo exception must be reported as internal, not leak past unmasked: {r.Out}");
+            var message = r.Json["message"]!.GetValue<string>();
+            Assert.True(!message.Contains("Secr3tPass", StringComparison.Ordinal) && message.Contains("***", StringComparison.Ordinal),
+                $"an unexpected exception from the demo's create/attach block reached the caller with the --server password unmasked: {message}");
+            Assert.True(message.Contains("boom near password", StringComparison.Ordinal),
+                $"the internal failure must keep the exception's own text around the mask: {message}");
+        }
+        finally
+        {
+            DemoCommand.SimulateInternalFailure = null;
+        }
+    }
+
     [Fact]
     public void ConnectionView_never_shows_the_password()
     {
