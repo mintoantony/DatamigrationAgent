@@ -117,6 +117,46 @@ public sealed class SqlModuleTests : IDisposable
         Assert.Empty(_module.ApprovalBlockers(ctx, Json.ToNode(Plan())));   // the same plan with evidence is approvable
     }
 
+    /// <summary>Sweep I review, follow-up (b): SqlModule's own 3-minute LiveTimeout must not crash dry-run, a web patch or a UI
+    /// edit the way the CLI's 5-minute one used to (item 8 L3) before it was fixed. Uses the ValidateLive seam so the test needs
+    /// no live database and no real 3-minute wait - a plain instance field is enough here (unlike decision I-3's AsyncLocal for
+    /// SqlValidateCommand): ModuleRegistry.Create builds one SqlModule per DbmServices/project, so this test's module is already
+    /// isolated from every other test's.</summary>
+    [Fact]
+    public void A_live_validation_timeout_reports_cleanly_instead_of_crashing()
+    {
+        _services.Connections.Save(Side.Src, FakeServices.SrcConnection, FakeServices.Meta("src-host", "Legacy"));
+        _services.Connections.Save(Side.Tgt, FakeServices.TgtConnection, FakeServices.Meta("tgt-host", "ShopV2"));
+        _module.ValidateLive = (_, _, _, _) => throw new OperationCanceledException("test budget expired");
+        var plan = Plan();
+        var ctx = Ctx(plan);
+        var payload = Json.ToNode(plan);
+
+        var check = _module.Validate(ctx, payload);
+
+        Assert.True(check.Ok, string.Join("\n", check.Errors));
+        Assert.Contains(check.Warnings, w => w.Contains("timed out after 3 minutes", StringComparison.Ordinal));
+        Assert.Null(payload["validation"]);   // Ruling 204: nothing validated THIS run, so no evidence is stored
+    }
+
+    /// <summary>Sweep I review, follow-up (a): a version whose evidence has Ok false is NOT validated either - the same
+    /// presence-of-marker shape Ruling 204 closed for the ABSENT-evidence case, now closed for the FOUND-ERRORS case too.
+    /// Before this fix, NotValidatedReasons checked only "Validation is not null", so a version whose last live run reported
+    /// errors read as validated (empty reasons) exactly like one that passed cleanly.</summary>
+    [Fact]
+    public void A_version_whose_evidence_reports_errors_is_not_validated_either()
+    {
+        var plan = Plan();
+        plan.Validation = SqlValidation.From(new DateTimeOffset(2026, 9, 18, 9, 30, 0, TimeSpan.Zero), false);
+
+        var reasons = plan.NotValidatedReasons();
+
+        Assert.Equal([SqlModule.ValidatedWithErrors], reasons);
+        var blockers = _module.ApprovalBlockers(Ctx(plan), Json.ToNode(plan));
+        Assert.True(blockers.Contains(SqlModule.NotValidatedBlocker + SqlModule.ValidatedWithErrors),
+            "a version whose evidence reports errors was not blocked as not validated: [" + string.Join("; ", blockers) + "]");
+    }
+
     /// <summary>Ruling 204, every writer that validates: an offline run (SqlModule.Validate - agent patch, dry-run and UI edit) must not
     /// pass its base's evidence on, because it did not validate THIS SQL. Pinned through both stored doors, agent and human.</summary>
     [Fact]

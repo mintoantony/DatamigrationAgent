@@ -14,6 +14,12 @@ public sealed class SqlModule : IPhaseModule
 {
     static readonly TimeSpan LiveTimeout = TimeSpan.FromMinutes(3);
 
+    /// <summary>Test seam (sweep I review, follow-up b). A plain instance field, not a static one (contrast decision I-3's
+    /// <see cref="AsyncLocal{T}"/> for <c>SqlValidateCommand.ValidateLive</c>): <c>ModuleRegistry.Create</c> builds one
+    /// <see cref="SqlModule"/> per <c>DbmServices</c>/project, so an instance field here is already isolated between concurrently
+    /// running tests, each with its own workspace and its own module instance - no process-wide state to race over.</summary>
+    internal Func<DbmServices, SqlPlanPayload, string?, CancellationToken, Task<ValidationReport>> ValidateLive = SqlPlanSource.ValidateLiveAsync;
+
     /// <summary>Prefix of the ApprovalBlockers line for a version that is not validated (<see cref="SqlPlanPayload.NotValidatedReasons"/>).</summary>
     public const string NotValidatedBlocker = "plan is not validated: ";
 
@@ -148,10 +154,25 @@ public sealed class SqlModule : IPhaseModule
         var warnings = RemovedTaskEvidence(plan, basePlan);
         plan.Warnings.AddRange(warnings);
         var skipped = SqlPlanSource.SkippedWarning(ctx.Services);
+        ValidationReport? report = null;
         if (skipped is null)
         {
             using var cts = new CancellationTokenSource(LiveTimeout);
-            var report = SqlPlanSource.ValidateLiveAsync(ctx.Services, plan, null, cts.Token).GetAwaiter().GetResult();
+            try
+            {
+                report = ValidateLive(ctx.Services, plan, null, cts.Token).GetAwaiter().GetResult();
+            }
+            // Sweep I review, follow-up (b): mirrors the CLI fix (open item 8 L3, decision I-2). This token is internal to this
+            // call and never linked to any external cancellation source, so any OperationCanceledException here is LiveTimeout
+            // expiring - never a caller's cancellation. Report it the same way an unconfigured connection is reported (the
+            // offline branch below), instead of crashing dry-run, a web patch or a UI edit.
+            catch (OperationCanceledException)
+            {
+                skipped = SqlPlanSource.SkippedPrefix + "timed out after 3 minutes";
+            }
+        }
+        if (report is not null)
+        {
             SqlValidator.Apply(plan, report);
             plan.Warnings = WithoutSkippedMarker(plan.Warnings);
             errors.AddRange(report.GlobalErrors);
@@ -168,8 +189,8 @@ public sealed class SqlModule : IPhaseModule
         else
         {
             plan.Validation = null;   // Ruling 204: nothing validated THIS SQL, so the base's evidence does not pass on
-            plan.Warnings = [.. WithoutSkippedMarker(plan.Warnings), skipped];
-            warnings.Add(skipped);
+            plan.Warnings = [.. WithoutSkippedMarker(plan.Warnings), skipped!];
+            warnings.Add(skipped!);
             foreach (var (id, task) in plan.Tasks.OrderBy(kv => kv.Key, StringComparer.Ordinal))
                 errors.AddRange(SqlValidator.CheckShape(task).Select(e => $"{id}: {e}"));
         }
