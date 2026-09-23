@@ -39,6 +39,8 @@ public sealed class SqlGenJobTests
         // Open item 8 LOW-2: was `plan.WarningCount()` on both sides (tautological, could never fail). 11 is the real count for
         // the sample plan today: type-risk/no-key/trigger/review-merge generator warnings plus the live validator's identity and
         // nullability notices. A generator or validator change that shifts this number is exactly what this test exists to catch.
+        // Coupled to the SampleDatabases(1, seed: false)/SampleMappings.Approved()/SampleCatalogs fixtures above: changing any of
+        // those (a column, a mapping, a trigger, a key) can change 11 too, with no bug involved - update the pin to match.
         Assert.Equal("6 tasks, 0 errors, 11 warnings", result.Summary);
         Assert.Contains(plan.Tasks.Values.Single(t => t.Target == "app.Orders").Warnings,
             w => w.StartsWith("validate: Comment: varchar(500) -> nvarchar(200)", StringComparison.Ordinal));
