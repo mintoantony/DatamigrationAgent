@@ -227,7 +227,7 @@ public sealed class SqlCommandsTests : IDisposable
             var r = await CliRunner.RunAsync(_workspace.Ws, null, "sql", "validate", "--patch", PatchFile(CrPatch));
             Assert.Equal(1, r.Exit);
             Assert.True(r.Json["error"] is null, "the offline bare-CR scan needed live validation to finish before it could report: " + r.Out);
-            Assert.False((bool)r.Json["ok"]!);
+            Assert.False((bool)r.Json["ok"]!, "ok should be false: the offline bare-CR error must still fail the report even though live validation timed out: " + r.Out);
             Assert.Equal([CrLine], r.Json["taskErrors"]!["T05"]!.AsArray().Select(n => (string?)n));
             Assert.Contains("timed out", (string?)r.Json["globalWarnings"]![0], StringComparison.Ordinal);
         }

@@ -107,9 +107,12 @@ public class SqlValidatorUnitTests
             (cs, _) => Task.FromResult(new SqlConnection(cs)),   // never opened: any command against it throws InvalidOperationException
             CancellationToken.None);
 
-        Assert.False(report.Ok);
-        Assert.Contains(report.GlobalErrors, e => e.StartsWith(SqlValidator.ValidationStoppedPrefix, StringComparison.Ordinal));
-        Assert.All(plan.Tasks.Keys, id => Assert.Contains(report.TaskWarnings[id], w => w.Contains("not checked", StringComparison.Ordinal)));
+        Assert.False(report.Ok, "report.Ok should be false after a connection dropped mid-validation, got true with globalErrors: ["
+            + string.Join("; ", report.GlobalErrors) + "]");
+        Assert.True(report.GlobalErrors.Any(e => e.StartsWith(SqlValidator.ValidationStoppedPrefix, StringComparison.Ordinal)),
+            "expected a global error starting with '" + SqlValidator.ValidationStoppedPrefix + "', got: [" + string.Join("; ", report.GlobalErrors) + "]");
+        Assert.All(plan.Tasks.Keys, id => Assert.True(report.TaskWarnings[id].Any(w => w.Contains("not checked", StringComparison.Ordinal)),
+            $"task {id} should be marked not checked, got warnings: [{string.Join("; ", report.TaskWarnings[id])}]"));
     }
 
     [Fact]
