@@ -181,8 +181,10 @@ public sealed class DemoCommandTests : IAsyncLifetime
     /// Sweep K review HIGH-1, on the success path: a SQL login whose password is short (ab1) or holds both quote kinds is saved
     /// as the Setup screen saves it, `dbm demo --attach` builds on it, and the two connection strings it prints must carry
     /// Password=*** and nothing of the real value. The login and its databases are dropped by the test.
+    /// Sweep item 52: needs a real SQL login, so it skips (SqlAuthTheory) rather than fails when DBM_TEST_SQL is
+    /// Windows-auth-only or the test login lacks ALTER ANY LOGIN.
     /// </summary>
-    [Theory]
+    [SqlAuthTheory]
     [InlineData("ab1")]
     [InlineData("Pa\"ss'word1")]
     public async Task Demo_attach_on_a_sql_login_prints_both_connection_strings_with_the_password_masked(string password)
