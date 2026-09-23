@@ -272,6 +272,15 @@ public sealed class SqlCommandsTests : IDisposable
         var v = await CliRunner.RunAsync(_workspace.Ws, null, "artifact", "sql");
         Assert.True((bool)v.Json["validated"]!);
         Assert.Empty(v.Json["notValidatedReasons"]!.AsArray());
+
+        // Sweep I review, follow-up (a): evidence with ok:false must not say "validated" either.
+        plan.Validation = SqlValidation.From(DateTimeOffset.UtcNow, false);
+        s.Artifacts.Add(PhaseName.Sql, 2, Json.Serialize(plan), "script", "validated with errors");
+        s.Phases.SetCurrentVersion(PhaseName.Sql, 2);
+        var errored = await CliRunner.RunAsync(_workspace.Ws, null, "artifact", "sql");
+        Assert.True(errored.Json["validated"] is not null && !(bool)errored.Json["validated"]!,
+            "dbm artifact sql says a version whose evidence reports errors is validated: " + errored.Out[..Math.Min(300, errored.Out.Length)]);
+        Assert.Equal([SqlModule.ValidatedWithErrors], errored.Json["notValidatedReasons"]!.AsArray().Select(n => (string?)n));
     }
 
     [Fact]

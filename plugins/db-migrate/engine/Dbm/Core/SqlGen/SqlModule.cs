@@ -21,6 +21,14 @@ public sealed class SqlModule : IPhaseModule
     /// version stored before the evidence existed. Validate live (or `dbm sql validate`) while Sql awaits review records it (Ruling 211).</summary>
     public const string NoEvidence = "no live validation is recorded for this version; press Validate live on the SQL screen (or run `dbm sql validate`) while it awaits review to record one";
 
+    /// <summary>Sweep I review, follow-up (a): why a version is not validated when it carries evidence whose Ok is false. Before this,
+    /// <see cref="SqlPlanPayload.NotValidatedReasons"/> read "Validation is not null" as "validated", the same presence-of-marker
+    /// shape Ruling 204 closed for the ABSENT case - a version whose last live validation reported errors looked validated (empty
+    /// reasons) exactly like one that passed cleanly. Not a false pass today (ApprovalBlockers separately surfaces plan/task Errors),
+    /// but misleading wherever only NotValidatedReasons is read (`dbm artifact sql`'s "validated" flag, the script pack heading, the
+    /// SQL screen).</summary>
+    public const string ValidatedWithErrors = "the last live validation reported errors";
+
     public PhaseName Phase => PhaseName.Sql;
     public string Agent => "sql-engineer";
     public string JobKind => "sqlgen";

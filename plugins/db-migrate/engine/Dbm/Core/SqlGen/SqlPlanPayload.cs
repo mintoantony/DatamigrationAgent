@@ -13,21 +13,27 @@ public sealed class SqlPlanPayload
     /// <summary>Ruling 204 (open item 10): positive evidence that live validation ran over THIS version's SQL, written by every writer
     /// that validates (SqlGenJob, SqlModule.Validate - agent patch, dry-run and UI edit alike) and by nobody else; a patch may not
     /// change it. Null - an offline run, or a version stored before the evidence existed (the field is then absent) - means NOT
-    /// validated, whatever the warnings say.</summary>
+    /// validated, whatever the warnings say. This field alone only says the run HAPPENED; whether the version reads as validated
+    /// also depends on its Ok (see <see cref="NotValidatedReasons"/>, sweep I review follow-up a).</summary>
     public SqlValidation? Validation { get; set; }
 
     /// <summary>Review L3: prefix of the reason for a version whose live validation could not reach a database.</summary>
     public const string CouldNotConnect = "live validation could not connect: ";
 
-    /// <summary>Ruling 204: why this version is NOT validated - empty only when it carries <see cref="Validation"/> evidence and no
-    /// stored <see cref="SqlPlanSource.SkippedPrefix"/> line (the engine never writes both; a version that has both is refused too).
-    /// The stored skipped line(s) when there are any, else each stored connection failure as <see cref="CouldNotConnect"/> + line,
-    /// else <see cref="SqlModule.NoEvidence"/>. Read by ApprovalBlockers, the script pack and, through the same payload, the SQL screen.</summary>
+    /// <summary>Ruling 204, refined by sweep I review follow-up (a): why this version is NOT validated - empty only when it carries
+    /// <see cref="Validation"/> evidence whose Ok is true and no stored <see cref="SqlPlanSource.SkippedPrefix"/> line (the engine
+    /// never writes both; a version that has both is refused too). "Validated" means both that live validation ran over THIS
+    /// version's SQL and that it found no errors - <see cref="Validation"/> alone (regardless of its Ok) is not enough, the same
+    /// presence-of-marker shape Ruling 204 already closed for the absent case. The stored skipped line(s) when there are any, else
+    /// <see cref="SqlModule.ValidatedWithErrors"/> when Validation is present with Ok false, else each stored connection failure as
+    /// <see cref="CouldNotConnect"/> + line, else <see cref="SqlModule.NoEvidence"/>. Read by ApprovalBlockers, the script pack and,
+    /// through the same payload, the SQL screen.</summary>
     public List<string> NotValidatedReasons()
     {
         var skipped = (Warnings ?? []).Where(w => w is not null && w.StartsWith(SqlPlanSource.SkippedPrefix, StringComparison.Ordinal)).ToList();
-        if (Validation is not null && skipped.Count == 0) return [];
+        if (Validation is { Ok: true } && skipped.Count == 0) return [];
         if (skipped.Count > 0) return skipped;
+        if (Validation is { Ok: false }) return [SqlModule.ValidatedWithErrors];
         var failed = (Errors ?? []).Where(SqlValidator.IsConnectionFailure).Select(e => CouldNotConnect + e).ToList();   // review L3
         return failed.Count > 0 ? failed : [SqlModule.NoEvidence];
     }

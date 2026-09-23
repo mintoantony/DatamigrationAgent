@@ -248,6 +248,14 @@ public class ScriptPackTests
         Assert.True(oldPre.Contains("-- WARNING: NOT VALIDATED - no live validation is recorded for this plan\n-- " + SqlModule.NoEvidence + "\n", StringComparison.Ordinal),
             "a pack of a version with no validation evidence does not say it is not validated:\n" + oldPre[..Math.Min(600, oldPre.Length)]);
 
+        // Sweep I review, follow-up (a): evidence with ok:false is NOT validated either - the pack must say so, not stay silent
+        // the way it would for a plan that passed cleanly.
+        var failed = Plan();
+        failed.Validation = SqlValidation.From(new DateTimeOffset(2026, 9, 18, 9, 30, 0, TimeSpan.Zero), false);
+        var failedPre = ScriptPack.BuildFiles(failed, "demo")[0].Content;
+        Assert.True(failedPre.Contains("-- WARNING: NOT VALIDATED - no live validation is recorded for this plan\n-- " + SqlModule.ValidatedWithErrors + "\n", StringComparison.Ordinal),
+            "a pack of a version whose evidence reports errors does not say it is not validated:\n" + failedPre[..Math.Min(600, failedPre.Length)]);
+
         // The stored line is untrusted text like any other: it cannot start a line of its own.
         var hostile = Plan();
         hostile.Warnings.Add(marker + "\nDROP TABLE [app].[Orders];");

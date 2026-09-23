@@ -140,10 +140,15 @@
   var SKIPPED_PREFIX = 'live validation skipped: ';
   /* Verbatim copy of C# SqlModule.NoEvidence (sql-view.test.cjs reads the C# source and compares). */
   var NO_EVIDENCE = 'no live validation is recorded for this version; press Validate live on the SQL screen (or run `dbm sql validate`) while it awaits review to record one';
+  /* Verbatim copy of C# SqlModule.ValidatedWithErrors (sql-view.test.cjs reads the C# source and compares). Sweep I review,
+     follow-up (a): evidence with ok:false is not "validated" either - the same presence-of-marker shape Ruling 204 closed for the
+     absent-evidence case. */
+  var VALIDATED_WITH_ERRORS = 'the last live validation reported errors';
 
   /**
-   * MIRROR of C# SqlPlanPayload.NotValidatedReasons (open item 10, Ruling 204): a version is validated only when it carries the
-   * engine's evidence ("validation": {at, ok}) and no stored "live validation skipped" line. Reasons = those lines, else each stored
+   * MIRROR of C# SqlPlanPayload.NotValidatedReasons (open item 10, Ruling 204; refined by sweep I review follow-up a): a version is
+   * validated only when it carries the engine's evidence ("validation": {at, ok}) WITH ok true, and no stored "live validation
+   * skipped" line. Reasons = those lines, else VALIDATED_WITH_ERRORS when evidence exists with ok false, else each stored
    * connection failure as "live validation could not connect: …" (review L3), else NO_EVIDENCE.
    * → {validated, at, ok, reasons}
    */
@@ -151,8 +156,9 @@
     var skipped = ((plan && plan.warnings) || []).filter(function (w) { return typeof w === 'string' && w.indexOf(SKIPPED_PREFIX) === 0; });
     var v = plan && plan.validation;
     var evidence = !!v && typeof v === 'object' && typeof v.at === 'string';
-    if (evidence && !skipped.length) return { validated: true, at: v.at, ok: v.ok === true, reasons: [] };
+    if (evidence && v.ok === true && !skipped.length) return { validated: true, at: v.at, ok: true, reasons: [] };
     if (skipped.length) return { validated: false, at: null, ok: null, reasons: skipped };
+    if (evidence && v.ok !== true) return { validated: false, at: v.at, ok: false, reasons: [VALIDATED_WITH_ERRORS] };
     var failed = ((plan && plan.errors) || []).filter(function (e) {
       return typeof e === 'string' && (e.indexOf('source connection failed: ') === 0 || e.indexOf('target connection failed: ') === 0);
     }).map(function (e) { return 'live validation could not connect: ' + e; });
@@ -466,11 +472,13 @@
     ]);
   }
 
-  /* Ruling 204: the stored version's own validation fact - the one ApprovalBlockers reads - never inferred from warnings alone. */
+  /* Ruling 204: the stored version's own validation fact - the one ApprovalBlockers reads - never inferred from warnings alone.
+     Follow-up (a): v.validated now implies v.ok (validationState never returns validated:true with ok:false), so a version whose
+     last live run found errors shows the "Not validated" card below, VALIDATED_WITH_ERRORS among its reasons - not this line. */
   function validationNote(ctx, plan) {
     var v = validationState(plan);
     if (v.validated) {
-      return el('p', { class: 'small muted sql-validated' }, ['Validated live ' + v.at + (v.ok ? '' : ' · errors found')]);
+      return el('p', { class: 'small muted sql-validated' }, ['Validated live ' + v.at]);
     }
     // Review L1: an approved version without evidence was approved before the evidence was kept; it does not "block" anything now.
     // Re-review N6: the version SHOWN is the approved one - not merely an approved phase.

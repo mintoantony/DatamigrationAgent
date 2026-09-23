@@ -744,6 +744,8 @@ test('render: Compare with… on versions differing only in a lone CR shows the 
    positive evidence ("validation": {at, ok}) or NOT validated, whatever the warnings say. */
 const CS_MODULE = fs.readFileSync(path.join(__dirname, '..', '..', 'Dbm', 'Core', 'SqlGen', 'SqlModule.cs'), 'utf8');
 const NO_EVIDENCE = /public const string NoEvidence = "([^"]*)";/.exec(CS_MODULE)[1];
+/* Sweep I review, follow-up (a). */
+const VALIDATED_WITH_ERRORS = /public const string ValidatedWithErrors = "([^"]*)";/.exec(CS_MODULE)[1];
 
 test('validationState mirrors SqlPlanPayload.NotValidatedReasons', () => {
   const skipped = 'live validation skipped: source connection, target connection missing';
@@ -753,6 +755,10 @@ test('validationState mirrors SqlPlanPayload.NotValidatedReasons', () => {
     'no evidence and no marker (an old record) is NOT validated, with the engine\'s own sentence');
   assert.deepEqual(V.validationState({ warnings: ['x', skipped] }).reasons, [skipped]);
   assert.equal(V.validationState({ warnings: [skipped], validation: { at, ok: true } }).validated, false, 'evidence plus a marker is refused, as in C#');
+  // Follow-up (a): evidence with ok:false is not "validated" either - the presence-of-marker shape Ruling 204 closed for the
+  // absent-evidence case, now closed for the found-errors case too.
+  assert.deepEqual(V.validationState({ warnings: [], validation: { at, ok: false } }), { validated: false, at, ok: false, reasons: [VALIDATED_WITH_ERRORS] },
+    'evidence with ok:false must read as NOT validated, with the engine\'s own sentence');
 });
 
 test('render: a version with no validation evidence says Not validated, and a validated one says when', async () => {
