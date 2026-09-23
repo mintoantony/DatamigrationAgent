@@ -111,7 +111,7 @@ public static class SqlValidator
                 {
                     await ValidateTaskAsync(plan.Tasks[ids[i]], source, target, tgt, taskErrors[ids[i]], taskWarnings[ids[i]], Scrub, ct);
                 }
-                catch (InvalidOperationException ex)
+                catch (InvalidOperationException ex) when (ConnectionLooksDropped(source, target))
                 {
                     global.Add(ValidationStoppedPrefix + Scrub(ex.Message));
                     stoppedAt = i;
@@ -133,7 +133,7 @@ public static class SqlValidator
                     {
                         await CheckSequenceAsync(target, statements, customMerge: false, global, globalWarnings, Scrub, ct);
                     }
-                    catch (InvalidOperationException ex)
+                    catch (InvalidOperationException ex) when (ConnectionLooksDropped(source, target))
                     {
                         global.Add(ValidationStoppedPrefix + Scrub(ex.Message));
                         globalWarnings.Add("global preSql/postSql" + NotCheckedMarker + "validation stopped before these could be checked");
@@ -573,6 +573,17 @@ public static class SqlValidator
         try { return new SqlConnectionStringBuilder(cs) { Pooling = false }.ConnectionString; }
         catch (ArgumentException) { return cs; }
     }
+
+    /// <summary>Decision I-4 (sweep I review LOW): narrows the two "validation stopped" catches above to the case they exist for -
+    /// a connection that dropped mid-run - rather than swallowing every InvalidOperationException the per-task loop or the global
+    /// statement check can throw. True when a connection this run actually opened is no longer <see cref="ConnectionState.Open"/>
+    /// (a real drop, or a timeout that broke it); a null connection (its own open already failed and is reported separately) does
+    /// not count. When this returns false with both open connections still healthy, an InvalidOperationException is more likely a
+    /// real programming bug than a dropped connection, and is left to propagate rather than being reported as "validation stopped"
+    /// - the trade-off is not perfect (a bug could still coincide with a genuinely dropped connection, or throw before the driver
+    /// has updated State), but it stops an unrelated bug from silently reading as a routine connection failure.</summary>
+    static bool ConnectionLooksDropped(SqlConnection? source, SqlConnection? target) =>
+        (source is not null && source.State != ConnectionState.Open) || (target is not null && target.State != ConnectionState.Open);
 
     static IEnumerable<(string Field, string Sql)> TargetFields(TaskPlan task)
     {
