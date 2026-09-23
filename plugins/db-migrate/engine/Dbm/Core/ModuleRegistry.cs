@@ -10,7 +10,14 @@ public static class ModuleRegistry
     /// </summary>
     public static IEnumerable<IPhaseModule> Create(DbmServices s)
     {
-        if (s is null) yield break;   // keeps this an iterator while no module is registered
+        // Non-iterator wrapper: an iterator method's body does not run until the sequence is enumerated, so a guard
+        // clause inside one defers (and can silently swallow) its throw. Validate here, at call time, instead.
+        ArgumentNullException.ThrowIfNull(s);
+        return CreateModules(s);
+    }
+
+    private static IEnumerable<IPhaseModule> CreateModules(DbmServices s)
+    {
         // milestone registrations below
         yield return new Dbm.Core.Analysis.AnalysisModule();   // T2.7
         yield return new Dbm.Core.Mapping.MappingModule(s);    // T3.4

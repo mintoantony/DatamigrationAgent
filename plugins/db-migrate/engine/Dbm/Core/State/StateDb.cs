@@ -132,6 +132,11 @@ public sealed class StateDb : IDisposable
         null => DBNull.Value,
         Enum e => EnumText.ToText(e),
         DateTimeOffset d => d.ToUniversalTime().ToString("O"),
+        // H-1: Kind.Unspecified is ambiguous - .ToUniversalTime() would treat it as local and silently shift it by
+        // the machine's offset (a trap on this cross-platform, multi-machine project). No caller passes a bare
+        // DateTime today (every project time is a DateTimeOffset), so refuse it instead of guessing.
+        DateTime { Kind: DateTimeKind.Unspecified } d => throw new ArgumentException(
+            $"DateTime.Kind is {d.Kind}; pass a DateTimeOffset, or a DateTime with Kind.Utc or Kind.Local.", nameof(value)),
         DateTime d => new DateTimeOffset(d.ToUniversalTime()).ToString("O"),
         bool b => b ? 1L : 0L,
         _ => value,

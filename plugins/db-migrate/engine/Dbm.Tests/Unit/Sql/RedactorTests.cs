@@ -30,12 +30,183 @@ public class RedactorTests
         Assert.Equal(new[] { "p;w=x" }, Redactor.SecretsOf("Server=a;Bogus Key=1;Pwd='p;w=x'"));
     }
 
+    /// <summary>
+    /// Open item 3.3: the double-quoted capture <c>"(?&lt;dq&gt;[^"]*)"</c> already handles a doubled quote inside a
+    /// double-quoted value (<c>""</c> is the SQL-connection-string escape for a literal <c>"</c>), so
+    /// <c>Password="ab""cd"</c> redacts the whole <c>ab"cd</c>. The single-quoted capture did not have the matching
+    /// escape, so <c>Password='ab''cd'</c> only captured <c>ab</c>: the true secret (7 characters with the escaped
+    /// quote) never reached <c>Scrub</c>, and the truncated 2-character capture fell under the length-4 floor, so
+    /// <b>nothing was redacted at all</b>. Reachable only on the fallback (unparsable connection string) path.
+    /// <b>Harm:</b> a message built from an unparsable connection string with a single-quoted, quote-escaped
+    /// password would print the password in full.
+    /// </summary>
+    [Fact]
+    public void SecretsOf_handles_doubled_single_quotes_the_same_way_as_doubled_double_quotes()
+    {
+        Assert.Equal(new[] { "ab\"cd" }, Redactor.SecretsOf("this is ; not = valid ; Password=\"ab\"\"cd\""));
+        var sqSecrets = Redactor.SecretsOf("this is ; not = valid ; Password='ab''cd'").ToList();
+        Assert.True(sqSecrets.SequenceEqual(new[] { "ab'cd" }),
+            $"SecretsOf did not unescape a doubled single quote ('') the way it already unescapes a doubled double " +
+            $"quote (\"\"): got [{string.Join(", ", sqSecrets)}], expected [ab'cd].");
+    }
+
+    [Fact]
+    public void Scrub_redacts_a_single_quoted_password_with_a_doubled_quote_through_the_public_entry_point()
+    {
+        var secrets = Redactor.SecretsOf("this is ; not = valid ; Password='ab''cd'");
+
+        var scrubbed = Redactor.Scrub("connect failed: password ab'cd was rejected", secrets);
+
+        Assert.True(scrubbed == "connect failed: password *** was rejected",
+            $"Scrub did not redact the password recovered from a doubled-single-quote capture: got \"{scrubbed}\".");
+    }
+
     [Fact]
     public void Scrub_replaces_each_secret_of_four_or_more_characters()
     {
         var text = Redactor.Scrub("login failed for S3cr3t!pw and abc", ["S3cr3t!pw", "abc", null, ""]);
 
         Assert.Equal("login failed for *** and abc", text);
+    }
+
+    /// <summary>
+    /// Open item 51 (sweep K review HIGH-1), measured on LocalDB: <c>dbm demo --attach</c> printed
+    /// <c>Password=ab1</c> in clear. <c>Scrub</c>'s per-secret substring replacement keeps a 4-character floor
+    /// (Ruling: a 1-character secret must not mangle every occurrence of that character in a message), so a
+    /// short secret like <c>ab1</c> was never masked at all. Decision H-3: the floor stays for bare substring
+    /// replacement, but <c>Scrub</c> now also masks any <c>Password=</c>/<c>Pwd=</c> key/value pair visible in
+    /// the text itself, whatever its length - that is what a short secret still inside a live connection
+    /// string looks like. <b>Harm:</b> a 1-, 2- or 3-character password survives every log line, error message
+    /// and CLI printout that echoes the connection string.
+    /// </summary>
+    [Fact]
+    public void Scrub_masks_a_password_value_under_the_four_character_floor_via_its_key_value_pair()
+    {
+        var text = "dbm demo --attach failed for Server=a;Password=ab1;Encrypt=true";
+
+        var scrubbed = Redactor.Scrub(text, Redactor.SecretsOf("Server=a;Password=ab1;Encrypt=true"));
+
+        Assert.True(!scrubbed.Contains("ab1", StringComparison.Ordinal),
+            $"Scrub left a password shorter than the 4-character floor in clear text, because only the " +
+            $"per-secret substring replacement (which skips it) ran: \"{scrubbed}\".");
+        Assert.True(scrubbed.Contains("Password=***", StringComparison.Ordinal),
+            $"Scrub did not replace the short Password= key/value pair with Password=***: \"{scrubbed}\".");
+    }
+
+    /// <summary>
+    /// Open item 51: measured on LocalDB, <c>dbm demo --attach</c> also printed <c>Password="Pa""ss'word1"</c> -
+    /// <see cref="SqlConnectionStringBuilder"/> re-quotes a value containing both a <c>"</c> and a <c>'</c> by
+    /// wrapping it in double quotes and doubling the internal <c>"</c> (verified directly against the builder:
+    /// <c>Pa"ss'word1</c> renders as <c>"Pa""ss'word1"</c>). The bare secret <c>Pa"ss'word1</c> never matches
+    /// that rendered text as a substring, so it slipped through when it appeared without a <c>Password=</c>
+    /// prefix (e.g. quoted on its own inside a driver error message). <b>Harm:</b> a re-quoted password printed
+    /// by anything other than a literal <c>Password=</c> key/value pair reaches the log in clear text.
+    /// </summary>
+    [Fact]
+    public void Scrub_redacts_the_builders_re_quoted_rendering_of_a_secret_with_both_quote_characters()
+    {
+        var secret = "Pa\"ss'word1";
+        var rendered = new SqlConnectionStringBuilder { DataSource = "a", Password = secret }.ConnectionString;
+        var quotedValueOnly = rendered[rendered.IndexOf('"', StringComparison.Ordinal)..];   // "Pa""ss'word1" (no Password= prefix)
+
+        var scrubbed = Redactor.Scrub($"driver reported value {quotedValueOnly} was rejected", [secret]);
+
+        Assert.True(!scrubbed.Contains("ss'word1", StringComparison.Ordinal),
+            $"Scrub did not redact the builder's doubled-quote rendering of a secret that appeared without a " +
+            $"Password= prefix: \"{scrubbed}\" (rendered form was {quotedValueOnly}).");
+    }
+
+    /// <summary>
+    /// Open item 51 / sweep H review "Pre-existing": for an unterminated quote (<c>Password="abcdEFGH</c>, no
+    /// closing <c>"</c>), the dq and sq alternatives both fail to close, so the match falls through to the raw
+    /// alternative, which captures from right after "=" - including the opening quote that started the failed
+    /// attempt. <see cref="Redactor.SecretsOf"/> now strips that leading unmatched quote so the real secret
+    /// value is what gets returned (and later matched as a substring elsewhere); <see cref="Redactor.Scrub"/>'s
+    /// key/value pass masks the whole malformed key/value pair directly, regardless. <b>Harm:</b> without the
+    /// strip, the "secret" SecretsOf hands to any other Scrub call is <c>"abcdEFGH</c> (with the leading quote),
+    /// which never matches the bare password text (no leading quote) anywhere else it might be echoed.
+    /// </summary>
+    [Fact]
+    public void SecretsOf_strips_the_leading_quote_of_an_unterminated_quoted_password()
+    {
+        var text = "connection failed: Password=\"abcdEFGH";
+
+        var secrets = Redactor.SecretsOf(text).ToList();
+        Assert.True(secrets.Contains("abcdEFGH"),
+            $"SecretsOf's raw fallback kept the leading unmatched quote instead of stripping it: [{string.Join(", ", secrets)}].");
+
+        var scrubbed = Redactor.Scrub(text, secrets);
+        Assert.True(!scrubbed.Contains("abcdEFGH", StringComparison.Ordinal),
+            $"Scrub did not redact an unterminated-quote password: \"{scrubbed}\".");
+    }
+
+    /// <summary>
+    /// Ruling 225 (sweep H fix round 2 re-review): fix (c)'s free-text mask reused <c>PasswordPattern</c>, whose
+    /// raw alternative is <c>[^;]*</c> - correct for a real connection string (values are <c>;</c>-separated),
+    /// wrong for free text, where it ran to the next <c>;</c> or the end and swallowed everything after the
+    /// password. Reproduced live: <c>Password=ab1 was rejected for login x</c> became <c>Password=***</c>, losing
+    /// "was rejected for login x". Scrub runs on nearly every error and log surface (CoreEndpoints, TaskRunner,
+    /// TransferService, SqlValidator, Preflight, the jobs, DemoCommand), so this was real diagnostic data loss.
+    /// The free text pass now has its own regex, stopping the raw value at whitespace too (<c>[^;\s]*</c>), and
+    /// <see cref="Dbm.Core.Sql.Redactor"/>'s connection-string-parsing regex is untouched.
+    /// </summary>
+    [Theory]
+    [InlineData("Password=ab1 was rejected for login x", "Password=*** was rejected for login x")]
+    [InlineData("Set Password=newvalue in the target appsettings before retrying.",
+        "Set Password=*** in the target appsettings before retrying.")]
+    public void Scrub_masks_only_the_value_in_free_text_leaving_the_rest_of_the_sentence_intact(string text, string expected)
+    {
+        var scrubbed = Redactor.Scrub(text, []);
+
+        Assert.True(scrubbed == expected,
+            $"Scrub's free-text mask consumed text past the end of the password value (Ruling 225 regression): " +
+            $"expected \"{expected}\", got \"{scrubbed}\".");
+    }
+
+    /// <summary>
+    /// The H re-review's LOW: the mask kept a trailing comma or period outside itself but swallowed every other
+    /// sentence or wrapper character, so "(Password=abc)" lost its closing bracket and read as unbalanced.
+    /// </summary>
+    [Theory]
+    [InlineData("Connection string invalid (Password=abc)", "Connection string invalid (Password=***)")]
+    [InlineData("rejected: Password=abcdef!", "rejected: Password=***!")]
+    [InlineData("check [Password=abcdef] first", "check [Password=***] first")]
+    [InlineData("failed for Password=abcdef?", "failed for Password=***?")]
+    public void Scrub_keeps_trailing_sentence_punctuation_outside_the_free_text_mask(string text, string expected)
+    {
+        var scrubbed = Redactor.Scrub(text, []);
+
+        Assert.True(scrubbed == expected,
+            "Scrub's free-text mask swallowed the punctuation that closed the sentence around the password: " +
+            $"expected \"{expected}\", got \"{scrubbed}\".");
+    }
+
+    [Fact]
+    public void Scrub_still_stops_a_free_text_value_at_a_semicolon()
+    {
+        var scrubbed = Redactor.Scrub("Server=a;Password=ab1;Encrypt=true", []);
+
+        Assert.True(scrubbed == "Server=a;Password=***;Encrypt=true",
+            $"Scrub's free-text mask did not stop the value at the semicolon: got \"{scrubbed}\".");
+    }
+
+    [Fact]
+    public void Scrub_still_masks_a_quoted_value_whole_in_free_text()
+    {
+        var scrubbed = Redactor.Scrub("connection said Password=\"Pa\"\"ss'word1\" was bad", []);
+
+        Assert.True(scrubbed == "connection said Password=*** was bad",
+            $"Scrub's free-text mask did not consume a whole quoted value, or ate text past it: got \"{scrubbed}\".");
+    }
+
+    [Fact]
+    public void Scrub_is_idempotent_on_already_masked_free_text()
+    {
+        var once = Redactor.Scrub("Password=ab1 was rejected for login x", []);
+        var twice = Redactor.Scrub(once, []);
+
+        Assert.True(once == twice,
+            $"Scrub is not idempotent on free text it already masked: first pass \"{once}\", second pass \"{twice}\".");
     }
 
     [Fact]
