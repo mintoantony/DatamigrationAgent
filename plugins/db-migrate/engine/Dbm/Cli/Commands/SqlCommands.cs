@@ -58,9 +58,21 @@ public sealed class SqlValidateCommand : ICommand
     public string Name => "sql validate";
     public string Help => "Validate the current SQL plan live [--task <id>] [--patch <file> checks a patch first]; exit 1 when not ok";
 
-    /// <summary>Test seam (open item 8 L3, decision I-2). Tests may replace it (restore it in a finally block) to simulate the
-    /// 5-minute budget expiring without a live database or a real 5-minute wait.</summary>
-    internal static Func<DbmServices, SqlPlanPayload, string?, CancellationToken, Task<ValidationReport>> ValidateLive = SqlPlanSource.ValidateLiveAsync;
+    /// <summary>Test seam (open item 8 L3, decision I-2). Backed by <see cref="AsyncLocal{T}"/>, not a plain mutable static field
+    /// (decision I-3, sweep I review MED): a `static` field is one process-wide slot regardless of how many
+    /// <see cref="SqlValidateCommand"/> instances exist, so a plain static field set by one test would be visible to every other
+    /// test running concurrently in a different xUnit collection - including <c>SqlCommandsIntegrationTests</c>, which runs the real
+    /// `sql validate` against LocalDB. <see cref="AsyncLocal{T}"/> scopes the override to the setting call's own async execution
+    /// context (and whatever it awaits), so a value set inside one test's `CliRunner.RunAsync` call is invisible to a
+    /// concurrently-running test's, even though both flow through this same static property. Tests may still replace it (restore
+    /// it in a finally block) to simulate the 5-minute budget expiring without a live database or a real 5-minute wait.</summary>
+    static readonly AsyncLocal<Func<DbmServices, SqlPlanPayload, string?, CancellationToken, Task<ValidationReport>>?> ValidateLiveOverride = new();
+
+    internal static Func<DbmServices, SqlPlanPayload, string?, CancellationToken, Task<ValidationReport>> ValidateLive
+    {
+        get => ValidateLiveOverride.Value ?? SqlPlanSource.ValidateLiveAsync;
+        set => ValidateLiveOverride.Value = value;
+    }
 
     public async Task<int> RunAsync(Args args, CliContext ctx)
     {

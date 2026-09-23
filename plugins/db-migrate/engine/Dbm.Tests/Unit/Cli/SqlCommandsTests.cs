@@ -237,6 +237,22 @@ public sealed class SqlCommandsTests : IDisposable
         }
     }
 
+    /// <summary>Decision I-3 (sweep I review MED): ValidateLive is a static property, but it must be scoped per execution context,
+    /// not process-wide - otherwise SqlCommandsIntegrationTests (a different xUnit collection, running the real `sql validate`
+    /// against LocalDB concurrently) could pick up a stub a unit test set. Proven without any real concurrency: AsyncLocal flows
+    /// a COPY of its value into a child Task.Run and never propagates a child's write back to the parent, so a plain mutable
+    /// static field would fail this (the child's write would be visible everywhere) while the AsyncLocal-backed property does not.</summary>
+    [Fact]
+    public async Task ValidateLive_override_set_in_a_child_execution_context_does_not_leak_to_the_parent()
+    {
+        var original = SqlValidateCommand.ValidateLive;
+        Func<DbmServices, SqlPlanPayload, string?, CancellationToken, Task<ValidationReport>> fake = (_, _, _, _) => throw new OperationCanceledException("probe");
+
+        await Task.Run(() => { SqlValidateCommand.ValidateLive = fake; });
+
+        Assert.Same(original, SqlValidateCommand.ValidateLive);
+    }
+
     /// <summary>Review L4: `dbm artifact sql` states the validation fact in so many words - computed beside the payload, never stored
     /// in it - instead of leaving it to the absence of a field.</summary>
     [Fact]
