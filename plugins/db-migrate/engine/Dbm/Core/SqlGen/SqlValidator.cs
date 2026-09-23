@@ -47,6 +47,11 @@ public static class SqlValidator
     /// <summary>Start of the global error a report carries when it could not open that connection.</summary>
     public const string TargetConnectionFailed = "target connection failed: ";
 
+    /// <summary>Open item 8 L3: start of the global error a report carries when a connection dropped mid-validation
+    /// (InvalidOperationException, never SqlException - e.g. the server closed an idle connection). Never a cancellation: a
+    /// cancellation the caller requested still propagates rather than being reported here.</summary>
+    public const string ValidationStoppedPrefix = "validation stopped: ";
+
     /// <summary>True when the line records a connection this validation could not open.</summary>
     public static bool IsConnectionFailure(string? line) => line is not null
         && (line.StartsWith(SourceConnectionFailed, StringComparison.Ordinal) || line.StartsWith(TargetConnectionFailed, StringComparison.Ordinal));
@@ -95,17 +100,45 @@ public static class SqlValidator
             catch (Exception ex) when (ex is SqlException or InvalidOperationException or ArgumentException)
             { global.Add(TargetConnectionFailed + Scrub(ex.Message)); }
 
-            foreach (var id in ids)
-                await ValidateTaskAsync(plan.Tasks[id], source, target, tgt, taskErrors[id], taskWarnings[id], Scrub, ct);
+            // Open item 8 L3, decision I-2: a connection dropped mid-run (InvalidOperationException - never a cancellation, since
+            // nothing here cancels ct) ends the run with a report instead of an unhandled exception, so every caller (job, CLI,
+            // endpoint) gets ok:false and a named reason rather than a crash or a job with no stored evidence. Tasks the break
+            // reaches are marked "not checked" rather than left with empty error/warning lists that would silently read as clean.
+            var stoppedAt = ids.Count;
+            for (var i = 0; i < ids.Count; i++)
+            {
+                try
+                {
+                    await ValidateTaskAsync(plan.Tasks[ids[i]], source, target, tgt, taskErrors[ids[i]], taskWarnings[ids[i]], Scrub, ct);
+                }
+                catch (InvalidOperationException ex) when (ConnectionLooksDropped(source, target))
+                {
+                    global.Add(ValidationStoppedPrefix + Scrub(ex.Message));
+                    stoppedAt = i;
+                    break;
+                }
+            }
+            for (var i = stoppedAt; i < ids.Count; i++)
+                taskWarnings[ids[i]].Add("task" + NotCheckedMarker + "validation stopped before this task could be checked");
 
-            if (onlyTaskId is null)
+            if (stoppedAt == ids.Count && onlyTaskId is null)
             {
                 var statements = plan.PreSql.Select((sql, i) => ($"preSql[{i}]", sql))
                     .Concat(plan.PostSql.Select((sql, i) => ($"postSql[{i}]", sql))).ToList();
                 foreach (var (field, sql) in statements)
                     if (GoLine.IsMatch(sql)) global.Add($"{field}: GO batch separators are not allowed");
                 if (target is not null)
-                    await CheckSequenceAsync(target, statements, customMerge: false, global, globalWarnings, Scrub, ct);
+                {
+                    try
+                    {
+                        await CheckSequenceAsync(target, statements, customMerge: false, global, globalWarnings, Scrub, ct);
+                    }
+                    catch (InvalidOperationException ex) when (ConnectionLooksDropped(source, target))
+                    {
+                        global.Add(ValidationStoppedPrefix + Scrub(ex.Message));
+                        globalWarnings.Add("global preSql/postSql" + NotCheckedMarker + "validation stopped before these could be checked");
+                    }
+                }
             }
         }
         finally
@@ -540,6 +573,17 @@ public static class SqlValidator
         try { return new SqlConnectionStringBuilder(cs) { Pooling = false }.ConnectionString; }
         catch (ArgumentException) { return cs; }
     }
+
+    /// <summary>Decision I-4 (sweep I review LOW): narrows the two "validation stopped" catches above to the case they exist for -
+    /// a connection that dropped mid-run - rather than swallowing every InvalidOperationException the per-task loop or the global
+    /// statement check can throw. True when a connection this run actually opened is no longer <see cref="ConnectionState.Open"/>
+    /// (a real drop, or a timeout that broke it); a null connection (its own open already failed and is reported separately) does
+    /// not count. When this returns false with both open connections still healthy, an InvalidOperationException is more likely a
+    /// real programming bug than a dropped connection, and is left to propagate rather than being reported as "validation stopped"
+    /// - the trade-off is not perfect (a bug could still coincide with a genuinely dropped connection, or throw before the driver
+    /// has updated State), but it stops an unrelated bug from silently reading as a routine connection failure.</summary>
+    static bool ConnectionLooksDropped(SqlConnection? source, SqlConnection? target) =>
+        (source is not null && source.State != ConnectionState.Open) || (target is not null && target.State != ConnectionState.Open);
 
     static IEnumerable<(string Field, string Sql)> TargetFields(TaskPlan task)
     {

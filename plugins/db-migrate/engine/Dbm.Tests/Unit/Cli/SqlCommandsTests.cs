@@ -76,6 +76,42 @@ public sealed class SqlCommandsTests : IDisposable
         Assert.Equal("patch.phase must be 'sql'.", (string?)r.Json["message"]);
     }
 
+    /// <summary>Open item 8: `not_found` (SqlCommands.cs) had no test - the --patch file itself is missing.</summary>
+    [Fact]
+    public async Task Validate_reports_a_missing_patch_file()
+    {
+        WithSqlVersion();
+        var missing = Path.Combine(_workspace.Root, "does-not-exist.json");
+        var r = await CliRunner.RunAsync(_workspace.Ws, null, "sql", "validate", "--patch", missing);
+        Assert.Equal(1, r.Exit);
+        Assert.Equal("not_found", (string?)r.Json["error"]);
+        Assert.Contains(missing, (string?)r.Json["message"]);
+    }
+
+    /// <summary>Open item 8: the OTHER `invalid_patch` emitter (Patch.Parse's PatchException on malformed JSON), distinct from
+    /// the phase-mismatch path above, which is the only one previously covered.</summary>
+    [Fact]
+    public async Task Validate_refuses_a_patch_file_that_is_not_valid_json()
+    {
+        WithSqlVersion();
+        var r = await CliRunner.RunAsync(_workspace.Ws, null, "sql", "validate", "--patch", PatchFile("not json"));
+        Assert.Equal(1, r.Exit);
+        Assert.Equal("invalid_patch", (string?)r.Json["error"]);
+        Assert.Contains("not valid JSON", (string?)r.Json["message"]);
+    }
+
+    /// <summary>Open item 8: `bad_payload` (SqlCommands.cs) had no test - a structurally valid patch produces a payload that
+    /// does not deserialize into SqlPlanPayload (chunkSize expects a number).</summary>
+    [Fact]
+    public async Task Validate_reports_a_patch_that_produces_an_undeserialisable_payload()
+    {
+        WithSqlVersion();
+        var patch = PatchFile("{\"phase\":\"sql\",\"baseVersion\":0,\"ops\":[{\"op\":\"replace\",\"path\":\"/tasks/T01/identityInsert\",\"value\":\"not-a-bool\"}]}");
+        var r = await CliRunner.RunAsync(_workspace.Ws, null, "sql", "validate", "--patch", patch);
+        Assert.Equal(1, r.Exit);
+        Assert.Equal("bad_payload", (string?)r.Json["error"]);
+    }
+
     [Fact]
     public async Task Validate_refuses_a_stale_patch()
     {
@@ -149,6 +185,74 @@ public sealed class SqlCommandsTests : IDisposable
             "the live report left out the global statement's bare carriage return: " + r.Out);
     }
 
+    /// <summary>Open item 8 L3, decision I-2: the command's own 5-minute budget is internal to this command (never linked to an
+    /// external cancellation source), so any OperationCanceledException from it is this budget expiring - never a cancellation
+    /// the caller requested. It must report cleanly, not crash with an unhandled-exception stack trace. Uses the ValidateLive
+    /// seam so the test needs no live database and no real 5-minute wait.</summary>
+    [Fact]
+    public async Task Validate_reports_its_own_timeout_cleanly_instead_of_crashing()
+    {
+        var s = WithSqlVersion();
+        s.Connections.Save(Side.Src, FakeServices.SrcConnection, FakeServices.Meta("src-host", "Legacy"));
+        s.Connections.Save(Side.Tgt, FakeServices.TgtConnection, FakeServices.Meta("tgt-host", "ShopV2"));
+        s.Catalog.Save(Side.Tgt, SampleCatalogs.Target(), "tgt-fp");
+        var original = SqlValidateCommand.ValidateLive;
+        try
+        {
+            SqlValidateCommand.ValidateLive = (_, _, _, _) => throw new OperationCanceledException("test budget expired");
+            var r = await CliRunner.RunAsync(_workspace.Ws, null, "sql", "validate");
+            Assert.Equal(1, r.Exit);
+            Assert.Equal("not_ready", (string?)r.Json["error"]);
+            Assert.Contains("timed out", (string?)r.Json["message"], StringComparison.Ordinal);
+        }
+        finally
+        {
+            SqlValidateCommand.ValidateLive = original;
+        }
+    }
+
+    /// <summary>The offline bare-CR scan must not be lost just because live validation could not finish: the timeout message
+    /// joins the report's globalWarnings instead of replacing it with a generic "not ready".</summary>
+    [Fact]
+    public async Task Validate_reports_bare_carriage_returns_even_when_live_validation_times_out()
+    {
+        var s = WithSqlVersion();
+        s.Connections.Save(Side.Src, FakeServices.SrcConnection, FakeServices.Meta("src-host", "Legacy"));
+        s.Connections.Save(Side.Tgt, FakeServices.TgtConnection, FakeServices.Meta("tgt-host", "ShopV2"));
+        s.Catalog.Save(Side.Tgt, SampleCatalogs.Target(), "tgt-fp");
+        var original = SqlValidateCommand.ValidateLive;
+        try
+        {
+            SqlValidateCommand.ValidateLive = (_, _, _, _) => throw new OperationCanceledException("test budget expired");
+            var r = await CliRunner.RunAsync(_workspace.Ws, null, "sql", "validate", "--patch", PatchFile(CrPatch));
+            Assert.Equal(1, r.Exit);
+            Assert.True(r.Json["error"] is null, "the offline bare-CR scan needed live validation to finish before it could report: " + r.Out);
+            Assert.False((bool)r.Json["ok"]!, "ok should be false: the offline bare-CR error must still fail the report even though live validation timed out: " + r.Out);
+            Assert.Equal([CrLine], r.Json["taskErrors"]!["T05"]!.AsArray().Select(n => (string?)n));
+            Assert.Contains("timed out", (string?)r.Json["globalWarnings"]![0], StringComparison.Ordinal);
+        }
+        finally
+        {
+            SqlValidateCommand.ValidateLive = original;
+        }
+    }
+
+    /// <summary>Decision I-3 (sweep I review MED): ValidateLive is a static property, but it must be scoped per execution context,
+    /// not process-wide - otherwise SqlCommandsIntegrationTests (a different xUnit collection, running the real `sql validate`
+    /// against LocalDB concurrently) could pick up a stub a unit test set. Proven without any real concurrency: AsyncLocal flows
+    /// a COPY of its value into a child Task.Run and never propagates a child's write back to the parent, so a plain mutable
+    /// static field would fail this (the child's write would be visible everywhere) while the AsyncLocal-backed property does not.</summary>
+    [Fact]
+    public async Task ValidateLive_override_set_in_a_child_execution_context_does_not_leak_to_the_parent()
+    {
+        var original = SqlValidateCommand.ValidateLive;
+        Func<DbmServices, SqlPlanPayload, string?, CancellationToken, Task<ValidationReport>> fake = (_, _, _, _) => throw new OperationCanceledException("probe");
+
+        await Task.Run(() => { SqlValidateCommand.ValidateLive = fake; });
+
+        Assert.Same(original, SqlValidateCommand.ValidateLive);
+    }
+
     /// <summary>Review L4: `dbm artifact sql` states the validation fact in so many words - computed beside the payload, never stored
     /// in it - instead of leaving it to the absence of a field.</summary>
     [Fact]
@@ -168,6 +272,15 @@ public sealed class SqlCommandsTests : IDisposable
         var v = await CliRunner.RunAsync(_workspace.Ws, null, "artifact", "sql");
         Assert.True((bool)v.Json["validated"]!);
         Assert.Empty(v.Json["notValidatedReasons"]!.AsArray());
+
+        // Sweep I review, follow-up (a): evidence with ok:false must not say "validated" either.
+        plan.Validation = SqlValidation.From(DateTimeOffset.UtcNow, false);
+        s.Artifacts.Add(PhaseName.Sql, 2, Json.Serialize(plan), "script", "validated with errors");
+        s.Phases.SetCurrentVersion(PhaseName.Sql, 2);
+        var errored = await CliRunner.RunAsync(_workspace.Ws, null, "artifact", "sql");
+        Assert.True(errored.Json["validated"] is not null && !(bool)errored.Json["validated"]!,
+            "dbm artifact sql says a version whose evidence reports errors is validated: " + errored.Out[..Math.Min(300, errored.Out.Length)]);
+        Assert.Equal([SqlModule.ValidatedWithErrors], errored.Json["notValidatedReasons"]!.AsArray().Select(n => (string?)n));
     }
 
     [Fact]
