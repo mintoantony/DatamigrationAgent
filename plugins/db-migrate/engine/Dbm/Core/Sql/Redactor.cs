@@ -84,8 +84,10 @@ public static partial class Redactor
     {
         var key = m.Groups["key"].Value;
         var raw = m.Groups["raw"];
-        // A trailing comma or period reads as sentence punctuation, not part of the value - keep it outside the mask.
-        if (raw.Success && raw.Value.Length > 0 && raw.Value[^1] is ',' or '.') return $"{key}=***{raw.Value[^1]}";
+        // Trailing sentence or wrapper punctuation reads as prose, not part of the value - keep it outside the mask,
+        // so "(Password=abc)" does not lose its closing bracket (the H re-review's LOW).
+        if (raw.Success && raw.Value.Length > 0 && raw.Value[^1] is ',' or '.' or ')' or ']' or '}' or '!' or '?' or ':')
+            return $"{key}=***{raw.Value[^1]}";
         return $"{key}=***";
     }
 

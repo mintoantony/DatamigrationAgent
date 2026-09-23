@@ -163,6 +163,24 @@ public class RedactorTests
             $"expected \"{expected}\", got \"{scrubbed}\".");
     }
 
+    /// <summary>
+    /// The H re-review's LOW: the mask kept a trailing comma or period outside itself but swallowed every other
+    /// sentence or wrapper character, so "(Password=abc)" lost its closing bracket and read as unbalanced.
+    /// </summary>
+    [Theory]
+    [InlineData("Connection string invalid (Password=abc)", "Connection string invalid (Password=***)")]
+    [InlineData("rejected: Password=abcdef!", "rejected: Password=***!")]
+    [InlineData("check [Password=abcdef] first", "check [Password=***] first")]
+    [InlineData("failed for Password=abcdef?", "failed for Password=***?")]
+    public void Scrub_keeps_trailing_sentence_punctuation_outside_the_free_text_mask(string text, string expected)
+    {
+        var scrubbed = Redactor.Scrub(text, []);
+
+        Assert.True(scrubbed == expected,
+            "Scrub's free-text mask swallowed the punctuation that closed the sentence around the password: " +
+            $"expected \"{expected}\", got \"{scrubbed}\".");
+    }
+
     [Fact]
     public void Scrub_still_stops_a_free_text_value_at_a_semicolon()
     {
