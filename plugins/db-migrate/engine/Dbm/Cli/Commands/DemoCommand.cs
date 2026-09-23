@@ -29,9 +29,17 @@ public sealed class DemoCommand : ICommand
     /// <summary>
     /// Test seam (sweep item 52): when set, thrown right before the create/attach block runs, in place of it, so a test
     /// can pin the catch-all that masks an exception which is neither SqlException nor a demo exception before it
-    /// reaches CliApp.cs unmasked. Null except while such a test holds it.
+    /// reaches CliApp.cs unmasked. Null except while such a test holds it. Backed by <see cref="AsyncLocal{T}"/> like
+    /// SqlValidateCommand.ValidateLive (decision I-3): the unit and integration DemoCommandTests run in different xUnit
+    /// collections, so a plain static would make a concurrently-running live demo test fail as "internal".
     /// </summary>
-    internal static Func<Exception>? SimulateInternalFailure;
+    static readonly AsyncLocal<Func<Exception>?> SimulateInternalFailureOverride = new();
+
+    internal static Func<Exception>? SimulateInternalFailure
+    {
+        get => SimulateInternalFailureOverride.Value;
+        set => SimulateInternalFailureOverride.Value = value;
+    }
 
     private static string ProbeTarget(string database, string connectionString) =>
         ProbeConnectionStringOverrides.TryGetValue(database, out var o) ? o : connectionString;

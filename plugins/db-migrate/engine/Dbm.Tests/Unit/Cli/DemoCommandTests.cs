@@ -219,9 +219,10 @@ public class DemoCommandTests
             Assert.True(r.Exit == 1 && r.Json["error"]?.GetValue<string>() == "internal",
                 $"an exception that is neither SqlException nor a demo exception must be reported as internal, not leak past unmasked: {r.Out}");
             var message = r.Json["message"]!.GetValue<string>();
-            Assert.DoesNotContain("Secr3tPass", message);
-            Assert.Contains("***", message);
-            Assert.Contains("boom near password", message);
+            Assert.True(!message.Contains("Secr3tPass", StringComparison.Ordinal) && message.Contains("***", StringComparison.Ordinal),
+                $"an unexpected exception from the demo's create/attach block reached the caller with the --server password unmasked: {message}");
+            Assert.True(message.Contains("boom near password", StringComparison.Ordinal),
+                $"the internal failure must keep the exception's own text around the mask: {message}");
         }
         finally
         {
