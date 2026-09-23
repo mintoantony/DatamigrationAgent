@@ -30,6 +30,29 @@ public static class SqlConnect
         }
     }
 
+    private const string LocalDbPrefix = @"(localdb)\";
+
+    /// <summary>
+    /// Open item 49: <c>(localdb)\&lt;InstanceName&gt;</c> when the connection string's Data Source names a LocalDB instance, else null.
+    /// It is what stays the same across instance restarts, where <c>@@SERVERNAME</c> (<c>&lt;machine&gt;\LOCALDB#&lt;hex&gt;</c>) does
+    /// not. Only the Data Source is read, so nothing else in the string - a password above all - can reach the result.
+    /// </summary>
+    public static string? LocalDbDataSource(string connectionString)
+    {
+        string source;
+        try
+        {
+            source = new SqlConnectionStringBuilder(connectionString).DataSource.Trim();
+        }
+        catch (Exception ex) when (ex is ArgumentException or FormatException or KeyNotFoundException)
+        {
+            return null;
+        }
+        if (!source.StartsWith(LocalDbPrefix, StringComparison.OrdinalIgnoreCase)) return null;
+        string instance = source[LocalDbPrefix.Length..].Trim();
+        return instance.Length == 0 ? null : LocalDbPrefix + instance;
+    }
+
     public static async Task<ServerMeta> ProbeAsync(string connectionString, CancellationToken ct)
     {
         await using var connection = await OpenAsync(connectionString, ct);
@@ -54,6 +77,6 @@ public static class SqlConnect
         var compat = r.IsDBNull(7) ? 0 : Convert.ToInt32(r.GetValue(7), CultureInfo.InvariantCulture);
 
         return new ServerMeta(Text(0), Text(1), versionLine, productVersion, major, Text(4), Text(5), Text(6), compat,
-            Redactor.AuthMode(connectionString));
+            Redactor.AuthMode(connectionString), LocalDbDataSource(connectionString));
     }
 }

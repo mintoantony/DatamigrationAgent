@@ -1,11 +1,33 @@
 using Dbm.Core.SqlGen;
 using Dbm.Tests.Support;
+using Microsoft.Data.SqlClient;
 using Xunit;
 
 namespace Dbm.Tests.Unit.SqlGen;
 
 public class SqlValidatorUnitTests
 {
+    /// <summary>Open item 8 L2: the target connection must not be pooled, because the connection (and with it the #stg scaffold
+    /// in tempdb) must end when this validation's connection closes - a pooled connection could hand the same physical
+    /// connection, scaffold and all, to the next validation. Pinned via the connection-string builder the target `open` call
+    /// receives, using the fake-opener seam (no live database needed).</summary>
+    [Fact]
+    public async Task Target_connection_disables_pooling_but_the_source_connection_is_untouched()
+    {
+        var captured = new List<string>();
+        var plan = SqlGenerator.Generate(SampleMappings.Approved(), SampleCatalogs.Source(), SampleCatalogs.Target());
+        const string sourceCs = "Server=nowhere;Database=x;Pooling=true";
+        const string targetCs = "Server=nowhere;Database=y;Pooling=true";
+
+        await SqlValidator.ValidateAsync(plan, sourceCs, targetCs, SampleCatalogs.Target(), null,
+            (cs, _) => { captured.Add(cs); throw new InvalidOperationException("no server"); }, CancellationToken.None);
+
+        Assert.Equal(2, captured.Count);
+        Assert.Equal(sourceCs, captured[0]);   // the source connection keeps whatever pooling the caller configured
+        var targetPooling = new SqlConnectionStringBuilder(captured[1]).Pooling;
+        Assert.False(targetPooling, "the target connection must not be pooled (Pooling=true survived into it): " + captured[1]);
+    }
+
     [Fact]
     public void CheckShape_reports_mode_staging_duplicates_and_go()
     {
@@ -69,6 +91,28 @@ public class SqlValidatorUnitTests
 
         SqlValidator.Apply(plan, new ValidationReport(true, new(), new(), [], ["preSql[1]: not checked: fresh"]));
         Assert.Equal([discard, containsPrefix, "validate: preSql[1]: not checked: fresh"], plan.Warnings);   // (2) replaced, not accumulated
+    }
+
+    /// <summary>Open item 8 L3, decision I-2: a connection that drops mid-run (InvalidOperationException, never SqlException) ends
+    /// validation with a report, not an unhandled exception. A never-opened SqlConnection reproduces the same failure shape
+    /// ("...requires an open and available Connection...") without a live database. Every task not yet reached must be marked
+    /// not-checked, not left silently looking clean - the same rule the rest of this file already enforces for global statements.</summary>
+    [Fact]
+    public async Task A_connection_dropped_mid_validation_becomes_a_global_error_not_a_crash()
+    {
+        var plan = SqlGenerator.Generate(SampleMappings.Approved(), SampleCatalogs.Source(), SampleCatalogs.Target());
+
+        var report = await SqlValidator.ValidateAsync(plan, "Server=nowhere;Database=x", "Server=nowhere;Database=y",
+            SampleCatalogs.Target(), null,
+            (cs, _) => Task.FromResult(new SqlConnection(cs)),   // never opened: any command against it throws InvalidOperationException
+            CancellationToken.None);
+
+        Assert.False(report.Ok, "report.Ok should be false after a connection dropped mid-validation, got true with globalErrors: ["
+            + string.Join("; ", report.GlobalErrors) + "]");
+        Assert.True(report.GlobalErrors.Any(e => e.StartsWith(SqlValidator.ValidationStoppedPrefix, StringComparison.Ordinal)),
+            "expected a global error starting with '" + SqlValidator.ValidationStoppedPrefix + "', got: [" + string.Join("; ", report.GlobalErrors) + "]");
+        Assert.All(plan.Tasks.Keys, id => Assert.True(report.TaskWarnings[id].Any(w => w.Contains("not checked", StringComparison.Ordinal)),
+            $"task {id} should be marked not checked, got warnings: [{string.Join("; ", report.TaskWarnings[id])}]"));
     }
 
     [Fact]

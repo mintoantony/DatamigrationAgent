@@ -476,6 +476,56 @@ public class SqlGeneratorTests
     }
 
     [Fact]
+    public void Plan_level_discard_lines_are_ordered_ordinally_not_by_culture()
+    {
+        // "app.Àbbey" (leading A-with-grave, U+00C0 = 192) sorts AFTER "app.Zoo" ('Z' = U+005A = 90) under ordinal
+        // comparison, but BEFORE it under culture-aware comparison, which weighs the base letter 'A' ahead of the diacritic.
+        // A fixture using only plain ASCII names (e.g. "app.Addresses"/"app.Orders") sorts the same either way and would not
+        // catch a regression to StringComparer.CurrentCulture.
+        var previous = new SqlPlanPayload
+        {
+            Tasks =
+            {
+                ["T01"] = new TaskPlan { Target = "app.Zoo", Custom = true, MappingHash = "z" },
+                ["T02"] = new TaskPlan { Target = "app.Àbbey", Custom = true, MappingHash = "a" },
+            },
+        };
+        var mapping = new MappingPayload();
+        var src = TestCatalogs.Snapshot(TestCatalogs.Meta("S"), []);
+        var tgt = TestCatalogs.Snapshot(TestCatalogs.Meta("T"), []);
+
+        var plan = SqlGenerator.Generate(mapping, src, tgt, previous);
+
+        Assert.Equal(
+            ["app.Zoo: " + SqlGenerator.DiscardedNoTaskWarning, "app.Àbbey: " + SqlGenerator.DiscardedNoTaskWarning],
+            plan.Warnings.Where(w => w.Contains(SqlGenerator.DiscardedNoTaskWarning, StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public void NullTargetWarning_text_is_pinned()
+    {
+        Assert.Equal("custom SQL discarded: task has no target table", SqlGenerator.NullTargetWarning);
+    }
+
+    [Fact]
+    public void A_custom_task_with_a_null_target_gets_a_plan_warning_naming_the_task_instead_of_being_dropped()
+    {
+        // Only a hand-corrupted plan can produce this: TaskPlan.Target is a non-nullable string at compile time, but nothing
+        // stops a stored JSON payload from carrying an explicit "target": null.
+        var previous = new SqlPlanPayload
+        {
+            Tasks = { ["T07"] = new TaskPlan { Target = null!, Custom = true, MappingHash = "n" } },
+        };
+        var mapping = new MappingPayload();
+        var src = TestCatalogs.Snapshot(TestCatalogs.Meta("S"), []);
+        var tgt = TestCatalogs.Snapshot(TestCatalogs.Meta("T"), []);
+
+        var plan = SqlGenerator.Generate(mapping, src, tgt, previous);
+
+        Assert.Contains("T07: " + SqlGenerator.NullTargetWarning, plan.Warnings);
+    }
+
+    [Fact]
     public void A_still_generated_or_carried_custom_task_never_produces_the_plan_level_line()
     {
         var first = Plan();

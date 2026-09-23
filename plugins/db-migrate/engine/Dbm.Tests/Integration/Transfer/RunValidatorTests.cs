@@ -139,11 +139,16 @@ public sealed class RunValidatorTests(EngineSourceFixture fx) : IClassFixture<En
     /// minutes, so the bound is injected here and the note's wording is derived from the same value: the sentence cannot claim a bound
     /// the query was not given.
     /// <para>The rig: PrepareAsync records rows_source as null (its CountSql yields NULL), the plan's CountSql is then swapped for a
-    /// three-second one as the last chunk commits, and the completion hook's recount is the only thing left that runs it.</para>
+    /// slow one as the last chunk commits, and the completion hook's recount is the only thing left that runs it.</para>
+    /// <para>Open item 50: the bound is witnessed relative to the query's own delay, never against a wall-clock budget for the rest of
+    /// the hook. The query waits <c>DelaySec</c> (15 s) under a 1 s bound, so the hook ending before the delay could have run out is
+    /// proof the bound cut it, however slow the machine - the old "under 2.5 s" check lost to a loaded full-suite run while it timed
+    /// PostSql, the control-table drop, validation and the report as well. An unbounded query cannot end before its delay.</para>
     /// </summary>
     [Fact]
     public async Task The_in_hook_source_recount_is_bounded_and_a_timeout_becomes_a_note()
     {
+        const int DelaySec = 15;
         await using var tgt = await TempDatabase.CreateAsync("dbm_val_recount");
         await tgt.ExecAsync(TransferEngineTests.TargetSchema);
         using var svc = new XferServices();
@@ -162,7 +167,7 @@ public sealed class RunValidatorTests(EngineSourceFixture fx) : IClassFixture<En
         var control = new TransferControl();
         control.ChunkCommitted += _ =>
         {
-            task.CountSql = "WAITFOR DELAY '00:00:03'; SELECT CAST(1 AS bigint);";
+            task.CountSql = $"WAITFOR DELAY '00:00:{DelaySec:D2}'; SELECT CAST(1 AS bigint);";
             afterLastChunk.Restart();
         };
 
@@ -173,15 +178,17 @@ public sealed class RunValidatorTests(EngineSourceFixture fx) : IClassFixture<En
             afterLastChunk.Stop();
 
             // The bound first, because it is the thing with no other witness: if it is not applied the recount simply succeeds after
-            // the full three seconds, and every assertion below would then be testing an unbounded query's happy path.
-            Assert.True(afterLastChunk.Elapsed < TimeSpan.FromSeconds(2.5),
+            // its full delay, and every assertion below would then be testing an unbounded query's happy path.
+            Assert.True(afterLastChunk.Elapsed < TimeSpan.FromSeconds(DelaySec),
                 $"the hook took {afterLastChunk.Elapsed.TotalSeconds:F1}s after the last chunk for a recount bounded at 1s, so the "
-                + "bound was not applied and the query ran to its full three-second delay");
+                + $"bound was not applied and the query ran to its full {DelaySec}-second delay");
             Assert.Equal(RunStatus.Completed, outcome.Status);              // a bounded wait is a note, never a failed run
             var v = Json.Deserialize<TaskValidation>(svc.Services.Transfers.Tasks(runId).Single().ValidationJson!);
             Assert.Null(v.RowsSource);
             Assert.False(v.CountCompared);
             Assert.Contains("failed within 1 s", v.RowsSourceNote);
+            Assert.True(v.RowsSourceNote!.Contains("Timeout", StringComparison.OrdinalIgnoreCase),
+                "the recount failed, but not by its timeout: " + v.RowsSourceNote);
         }
         finally
         {

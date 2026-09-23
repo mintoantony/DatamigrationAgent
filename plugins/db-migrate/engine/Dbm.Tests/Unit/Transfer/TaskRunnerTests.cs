@@ -248,4 +248,36 @@ public sealed class TaskRunnerTests
         Assert.True(best?.Number == 547, $"a tie named {(best?.Number is int n ? n.ToString(System.Globalization.CultureInfo.InvariantCulture) : "no number")}, not error 547");
         Assert.Null(Tally((null, "a"), (null, "b"), (547, Fk)).MostCommon()?.Number);   // strictly more rows still wins
     }
+
+    /// <summary>
+    /// Review J, LOW-3. The lock question runs on the lock's own connection with its own 15 s timeout. Handed the run's token, a hard
+    /// stop that lands during it cancels the query, and <c>RunLock.LostAsync</c> reads the cancelled query as a lost session: the run is
+    /// told its lock was lost and notes it, when all that happened was a stop. The check stands here for the lock session: it answers
+    /// "lost" exactly when the token it was handed is cancelled.
+    /// </summary>
+    [Fact]
+    public async Task A_hard_stop_during_the_lock_question_is_not_read_as_a_lost_lock()
+    {
+        using var svc = new XferServices();
+        var control = new TransferControl();
+        using var stopped = new CancellationTokenSource();   // the hard stop lands while the question is on the wire
+        var rc = new RunContext
+        {
+            Services = svc.Services, RunId = 1, Plan = new SqlPlanPayload(), SourceCs = "", TargetCs = "",
+            Options = new TransferOptions(), Control = control, Progress = new TransferProgress(1, svc.Sink, []), Secrets = [],
+            LockCheck = t =>
+            {
+                stopped.Cancel();
+                return Task.FromResult<string?>(t.IsCancellationRequested ? "The lock on the target database was lost: cancelled." : null);
+            },
+        };
+
+        bool? lost = null;
+        var thrown = await Record.ExceptionAsync(async () => lost = await rc.LockLostAsync(stopped.Token));
+
+        Assert.True(lost != true && rc.Notes.Count == 0 && !control.StopRequested,
+            $"a hard stop during the lock question was read as a lost lock (lost={lost}, notes: {string.Join(" | ", rc.Notes)})");
+        Assert.True(thrown is OperationCanceledException,
+            "a hard stop during the lock question did not end as the cancellation it is: " + (thrown?.GetType().Name ?? "nothing thrown"));
+    }
 }

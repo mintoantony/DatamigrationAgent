@@ -7,8 +7,9 @@ namespace Dbm.Core.State;
 public sealed record TransferRunRow(long Id, int SqlVersion, RunStatus Status, TransferOptions Options,
     DateTimeOffset? StartedAt, DateTimeOffset? EndedAt, string? SummaryJson)
 {
-    /// <summary>Open item 22: the target server the run loaded into, as its connection resolved it (<c>@@SERVERNAME</c>). Null for a
-    /// run created before migration step 3, which recorded none. Never a credential.</summary>
+    /// <summary>Open item 22: the target server the run loaded into, as its connection resolved it (<c>@@SERVERNAME</c>) - or, on LocalDB,
+    /// the connection's stable data source <c>(localdb)\Name</c> (open item 49). Null for a run created before migration step 3, which
+    /// recorded none. Never a credential.</summary>
     public string? TargetServer { get; init; }
 
     /// <summary>Open item 22: the target database the run loaded into (<c>DB_NAME()</c>); null as for <see cref="TargetServer"/>.</summary>

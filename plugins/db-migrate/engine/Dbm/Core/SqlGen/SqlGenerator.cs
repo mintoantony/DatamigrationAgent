@@ -19,6 +19,11 @@ public static class SqlGenerator
     /// <summary>Plan-level, rendered as "&lt;target&gt;: " + this, for a previous custom task whose target gets no task in the new plan.</summary>
     public const string DiscardedNoTaskWarning = "custom SQL discarded: the table is no longer generated";
 
+    /// <summary>Open item 6 L-B: plan-level, rendered as "&lt;taskId&gt;: " + this, for a previous custom task whose Target is null.
+    /// Only a hand-corrupted plan can produce one (TaskPlan.Target is non-nullable at compile time); named by task id since there
+    /// is no target to name or sort it by.</summary>
+    public const string NullTargetWarning = "custom SQL discarded: task has no target table";
+
     /// <summary>Rendered as "&lt;Col&gt;: " + this for a column whose typeRisk is <see cref="TypeCompat.UnevaluatedRisk"/>: the conversion
     /// could not be evaluated, which is a different claim from a conversion evaluated and found lossy.</summary>
     public const string UnevaluatedWarning = "conversion not verified: custom expression";
@@ -82,13 +87,20 @@ public static class SqlGenerator
         }
 
         // 4b. Custom tasks whose target gets no task at all (skipped, unmapped, or gone from the target catalog) lose their
-        // hand-written SQL with no task to carry a warning, so report each one at plan level, ordinally by target.
+        // hand-written SQL with no task to carry a warning, so report each one at plan level, ordinally by target. Open item
+        // 6 L-B: a custom task with a null Target (only a hand-corrupted plan) has no target to sort or name it by, so it is
+        // named by task id instead of being silently excluded from the Where clause below.
         if (carryOver is not null)
+        {
+            foreach (var (taskId, orphan) in carryOver.Tasks.OrderBy(kv => kv.Key, StringComparer.Ordinal))
+                if (orphan is not null && orphan.Custom && orphan.Target is null)
+                    plan.Warnings.Add($"{taskId}: {NullTargetWarning}");
             foreach (var lost in carryOver.Tasks.OrderBy(kv => kv.Key, StringComparer.Ordinal).Select(kv => kv.Value)
                          .Where(p => p is not null && p.Custom && p.Target is not null
                              && !maps.Keys.Any(k => string.Equals(k, p.Target, StringComparison.OrdinalIgnoreCase)))
                          .OrderBy(p => p.Target, StringComparer.Ordinal))
                 plan.Warnings.Add($"{lost.Target}: {DiscardedNoTaskWarning}");
+        }
 
         // 5. FK cycles: disable the cut constraints for the load, re-enable WITH CHECK afterwards.
         foreach (var edge in topo.CycleEdges)

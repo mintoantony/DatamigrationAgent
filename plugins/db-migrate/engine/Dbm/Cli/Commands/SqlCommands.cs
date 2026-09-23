@@ -58,6 +58,22 @@ public sealed class SqlValidateCommand : ICommand
     public string Name => "sql validate";
     public string Help => "Validate the current SQL plan live [--task <id>] [--patch <file> checks a patch first]; exit 1 when not ok";
 
+    /// <summary>Test seam (open item 8 L3, decision I-2). Backed by <see cref="AsyncLocal{T}"/>, not a plain mutable static field
+    /// (decision I-3, sweep I review MED): a `static` field is one process-wide slot regardless of how many
+    /// <see cref="SqlValidateCommand"/> instances exist, so a plain static field set by one test would be visible to every other
+    /// test running concurrently in a different xUnit collection - including <c>SqlCommandsIntegrationTests</c>, which runs the real
+    /// `sql validate` against LocalDB. <see cref="AsyncLocal{T}"/> scopes the override to the setting call's own async execution
+    /// context (and whatever it awaits), so a value set inside one test's `CliRunner.RunAsync` call is invisible to a
+    /// concurrently-running test's, even though both flow through this same static property. Tests may still replace it (restore
+    /// it in a finally block) to simulate the 5-minute budget expiring without a live database or a real 5-minute wait.</summary>
+    static readonly AsyncLocal<Func<DbmServices, SqlPlanPayload, string?, CancellationToken, Task<ValidationReport>>?> ValidateLiveOverride = new();
+
+    internal static Func<DbmServices, SqlPlanPayload, string?, CancellationToken, Task<ValidationReport>> ValidateLive
+    {
+        get => ValidateLiveOverride.Value ?? SqlPlanSource.ValidateLiveAsync;
+        set => ValidateLiveOverride.Value = value;
+    }
+
     public async Task<int> RunAsync(Args args, CliContext ctx)
     {
         using var services = ctx.OpenProject();
@@ -100,10 +116,21 @@ public sealed class SqlValidateCommand : ICommand
         if (skipped is null)
         {
             using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
-            live = await SqlPlanSource.ValidateLiveAsync(services, plan, args.Opt("task"), cts.Token);
+            try
+            {
+                live = await ValidateLive(services, plan, args.Opt("task"), cts.Token);
+            }
+            // Open item 8 L3, decision I-2: this token is internal to the command and is never linked to any external
+            // cancellation source, so any OperationCanceledException here is this 5-minute budget expiring - never a
+            // cancellation the caller requested. Report it the same clean way an unconfigured connection is reported
+            // (`skipped`, consumed by WithBareCarriageReturns below), instead of an unhandled-exception stack trace.
+            catch (OperationCanceledException)
+            {
+                skipped = SqlPlanSource.SkippedPrefix + "timed out after 5 minutes";
+            }
         }
         var report = SqlValidator.WithBareCarriageReturns(live, plan, args.Opt("task"), skipped ?? "")
-            ?? throw new CliFailure("not_ready", "Both connections and the target catalog are needed to validate.");
+            ?? throw new CliFailure("not_ready", skipped ?? "Both connections and the target catalog are needed to validate.");
         // Rulings 210/211: without --patch, a whole-plan pass records the evidence a version lacks, as Validate live does - only while
         // Sql awaits review, never while the agent drafts or reworks (its baseVersion must not move).
         var store = live is null || patchPath is not null ? new SqlPlanSource.StoreOutcome(false, null, null)

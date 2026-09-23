@@ -193,30 +193,16 @@ public sealed class TransferEngine
             Options = run.Options.Normalized(), Control = control,
             Progress = new TransferProgress(runId, _services.Sink, tasks),
             Secrets = Redactor.SecretsOf(_sourceCs).Concat(Redactor.SecretsOf(_targetCs)).ToList(),
+            // Open items 20 and 48: every chunk's transaction asks the lock session, just before its COMMIT, whether it still holds the
+            // lock (RunContext.LockLostAsync). A lost lock rolls that chunk back and pauses the run, saying why (a runner elsewhere may
+            // already be loading); a resume takes the lock again. Decision J-1: this replaces the check that ran after each commit.
+            LockCheck = runLock.LostAsync,
         };
-        // Open item 20: after every chunk commit the lock session is asked whether it still holds the locks. A lost lock pauses the run
-        // after the current chunk (a runner elsewhere may already be loading) and says why; a resume takes the lock again.
-        int lockLost = 0;
-        void CheckLock(ChunkCommit _)
-        {
-            if (Volatile.Read(ref lockLost) != 0) return;
-            // Synchronous on purpose: ChunkCommitted is raised synchronously on the task worker right after its commit, and holding
-            // that worker for one short round trip is what makes the pause land before its next chunk. No deadlock: the worker runs on
-            // the thread pool with no synchronisation context, and LostAsync touches only the lock's own connection.
-            string? lost = runLock.LostAsync(CancellationToken.None).GetAwaiter().GetResult();
-            if (lost is null || Interlocked.Exchange(ref lockLost, 1) != 0) return;
-            string note = rc.Scrub(lost + " Without it another transfer could load into this target beside this one, so the run was "
-                                   + "paused after the current chunk. Resume takes the lock again and continues from the checkpoints.");
-            rc.AddNote(note);
-            rc.Log("error", note);
-            control.RequestPause();
-        }
         repo.SetRunStatus(runId, RunStatus.Running);
         _services.Sink.Publish("transfer_run_changed", new { runId, status = EnumText.ToText(RunStatus.Running) });
         rc.Log("info", $"Transfer run {runId}: {tasks.Count} tasks, parallelism {rc.Options.Parallelism}, errors: {rc.Options.ErrorMode}.");
         try
         {
-            control.ChunkCommitted += CheckLock;   // inside the try whose finally removes it
             await PrepareAsync(rc, tasks, ct);
             tasks = repo.Tasks(runId);
             foreach (var t in tasks) rc.Progress.SetSource(t.TaskId, t.RowsSource);
@@ -249,10 +235,6 @@ public sealed class TransferEngine
         catch (Exception ex)
         {
             return Finish(rc, RunStatus.Failed, rc.Describe(ex));
-        }
-        finally
-        {
-            control.ChunkCommitted -= CheckLock;
         }
     }
 

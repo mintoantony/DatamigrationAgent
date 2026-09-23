@@ -44,11 +44,13 @@ started; after that the connections are locked.
 - Connection strings are encrypted on your machine and masked after saving. Don't paste them into the Claude chat.
 - To try the tool without your own databases, use the demo (see the README). With Windows authentication (a
   connection string without a password) you can ask Claude to run `dbm demo --server "<your server>" --attach`. If the
-  server needs a SQL login, run that command yourself in a terminal outside Claude Code, in the project folder (which
-  `--attach` needs) — not with `!` in Claude Code,
-  whose command and output land in the conversation — so the password never reaches the chat (ask Claude for the
-  launcher's full path first: `dbm` is on the PATH only inside Claude Code). Without `--attach` the
-  command only prints the two connection strings with any password replaced by `***`, and you would have to put the
+  server needs a SQL login, save a connection to that server here first, on either side and to any database (e.g.
+  `master`), then ask Claude to run `dbm demo --attach` with no `--server`: it uses the server and login of the saved
+  connection (the source if saved, else the target) and replaces both connections with the two demo databases, so the
+  password is typed only here and never reaches the chat. Do this only in a new project: if both sides are saved on
+  different servers the command refuses and asks for `--server`. With or without `--attach`, `dbm demo` prints the two
+  demo connection strings with the password replaced by `***`, so Claude sees the server and login it was built from,
+  never the password. Without `--attach` the command only prints them and saves nothing, and you would have to put the
   password back in here yourself, so `--attach` is the easier way.
 - A certificate error on Test: add `TrustServerCertificate=True` for test servers, or install the server's CA certificate.
 - Entra ID: for example `Authentication=Active Directory Default` (uses your `az login` or IDE sign-in) or
@@ -192,8 +194,10 @@ before; only checkpoints of tasks that run had started, matching what it recorde
 checkpoints hold the target for every other project, and they are never taken over while they are
 still changing (within 10 minutes of the last write). If no db-migrate project still uses the target, the table can be
 dropped. The run checks
-after every committed chunk that it still holds the lock; if its lock connection was dropped (a network or failover
-fault), it pauses after the current chunk and says so in its notes, and **Resume** takes the lock again.
+that it still holds the lock before each chunk commits (and before a keyless task's single commit, and between its
+chunks). If its lock connection was dropped (a network or failover fault), the run is paused and the chunk about to
+commit is rolled back - for a keyless task, everything it had loaded of its table - and its notes say so.
+**Resume** takes the lock again and continues from the checkpoints, loading that chunk (or table) again.
 
 **Chunk keys.** When a task's source query joins other tables, pre-flight checks that its chunk key is still unique in
 that query. A join that repeats rows (one order per order line, say) would make the key repeat and lose rows at chunk

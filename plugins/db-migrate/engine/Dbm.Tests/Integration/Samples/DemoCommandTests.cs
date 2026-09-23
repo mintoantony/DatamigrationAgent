@@ -22,6 +22,15 @@ public sealed class DemoCommandTests : IAsyncLifetime
 
     public Task DisposeAsync() => DemoDatabases.DropAsync(SqlTestServer.ConnectionString, _prefix, CancellationToken.None);
 
+    /// <summary>Every string value in the CLI's answer, decoded.</summary>
+    private static IEnumerable<string> Strings(JsonNode? node) => node switch
+    {
+        JsonObject o => o.SelectMany(p => Strings(p.Value)),
+        JsonArray a => a.SelectMany(Strings),
+        JsonValue v when v.TryGetValue<string>(out var s) => [s],
+        _ => [],
+    };
+
     /// <summary>Exit 0, or a failure that prints the JSON the CLI actually answered.</summary>
     private static void AssertOk(CliResult r) => Assert.True(r.Exit == 0, $"expected exit 0, got {r.Exit}: {r.Out}");
 
@@ -138,6 +147,125 @@ public sealed class DemoCommandTests : IAsyncLifetime
             $"demo --attach published no state_changed {{setup, {setupBefore}}} after saving the connections; state_changed events: [{seen}]");
         Assert.True(endpointEvent < approved,
             $"the connections' state_changed must precede the workflow's {{setup, approved}}; state_changed events: [{seen}]");
+    }
+
+    /// <summary>
+    /// Open item 38: the server can come from a connection saved on the Setup screen, so a SQL-auth user never has to
+    /// hand a connection string to anyone. The saved source is preferred; the saved target here names the same server
+    /// with a login that does not exist, so the demo succeeds only if the source was used.
+    /// </summary>
+    [Fact]
+    public async Task Demo_attach_without_server_uses_the_saved_source_connection()
+    {
+        using var tw = new TestWorkspace();
+        using var services = tw.OpenServices();
+        services.Connections.Save(Side.Src, SqlTestServer.ConnectionString, await SqlConnect.ProbeAsync(SqlTestServer.ConnectionString, CancellationToken.None));
+        var meta = services.Connections.GetMeta(Side.Src)!;
+        var badLogin = new SqlConnectionStringBuilder(SqlTestServer.ConnectionString)
+        {
+            IntegratedSecurity = false, UserID = "dbmt_no_such_login", Password = "nope-nope", ConnectRetryCount = 0,
+        }.ConnectionString;
+        services.Connections.Save(Side.Tgt, badLogin, meta);
+
+        var r = await CliRunner.RunAsync(tw.Ws, null, "demo", "--prefix", _prefix, "--attach");
+
+        Assert.True(r.Exit == 0, $"demo --attach without --server must use the saved source connection's server; got exit {r.Exit}: {r.Out}");
+        Assert.True(r.Json["attached"]!.GetValue<bool>());
+        Assert.Equal(_prefix + "LegacyShop", services.Connections.GetMeta(Side.Src)!.Database);
+        Assert.Equal(_prefix + "ShopV2", services.Connections.GetMeta(Side.Tgt)!.Database);
+        Assert.Equal(1000, await ScalarAsync(SourceCs, "SELECT COUNT_BIG(*) FROM dbo.CUST"));
+        Assert.Equal(PhaseStatus.Running, services.Phases.Get(PhaseName.Discovery).Status);
+    }
+
+    /// <summary>
+    /// Sweep K review HIGH-1, on the success path: a SQL login whose password is short (ab1) or holds both quote kinds is saved
+    /// as the Setup screen saves it, `dbm demo --attach` builds on it, and the two connection strings it prints must carry
+    /// Password=*** and nothing of the real value. The login and its databases are dropped by the test.
+    /// Sweep item 52: needs a real SQL login, so it skips (SqlAuthTheory) rather than fails when DBM_TEST_SQL is
+    /// Windows-auth-only or the test login lacks ALTER ANY LOGIN.
+    /// </summary>
+    [SqlAuthTheory]
+    [InlineData("ab1")]
+    [InlineData("Pa\"ss'word1")]
+    public async Task Demo_attach_on_a_sql_login_prints_both_connection_strings_with_the_password_masked(string password)
+    {
+        var login = "dbmt_" + Guid.NewGuid().ToString("N")[..8];
+        await ExecOnMasterAsync($"CREATE LOGIN [{login}] WITH PASSWORD = N'{password.Replace("'", "''")}', CHECK_POLICY = OFF; " +
+                                $"ALTER SERVER ROLE dbcreator ADD MEMBER [{login}];");
+        try
+        {
+            var admin = new SqlConnectionStringBuilder(SqlTestServer.ConnectionString);
+            var cs = new SqlConnectionStringBuilder
+            {
+                DataSource = admin.DataSource, InitialCatalog = "master", IntegratedSecurity = false, UserID = login, Password = password,
+                TrustServerCertificate = true,
+            }.ConnectionString;
+            using var tw = new TestWorkspace();
+            using var services = tw.OpenServices();
+            services.Connections.Save(Side.Src, cs, await SqlConnect.ProbeAsync(cs, CancellationToken.None));
+
+            var r = await CliRunner.RunAsync(tw.Ws, null, "demo", "--prefix", _prefix, "--attach");
+
+            AssertOk(r);
+            // The JSON escapes quotes (\" and '), so look at the decoded string values, not at the raw output.
+            var printed = string.Join("\n", Strings(r.Json));
+            foreach (var form in new[] { password, password.Replace("\"", "\"\""), password.Replace("'", "''") })
+            {
+                Assert.True(!printed.Contains(form, StringComparison.Ordinal),
+                    $"dbm demo --attach printed the SQL login's password {password} in clear (as {form}): {printed}");
+            }
+            foreach (var side in new[] { "source", "target" })
+            {
+                var shown = new SqlConnectionStringBuilder(r.Json[side]!["connectionString"]!.GetValue<string>());
+                Assert.True(shown.Password == "***" && shown.UserID == login,
+                    $"the printed {side} connection string must name the login and mask the password as ***: {r.Out}");
+            }
+            Assert.Equal(password, new SqlConnectionStringBuilder(services.Connections.GetConnectionString(Side.Src)!).Password);
+        }
+        finally
+        {
+            await DemoDatabases.DropAsync(SqlTestServer.ConnectionString, _prefix, CancellationToken.None);
+            SqlConnection.ClearAllPools();
+            await ExecOnMasterAsync($"IF SUSER_ID(N'{login}') IS NOT NULL DROP LOGIN [{login}];");
+        }
+    }
+
+    /// <summary>
+    /// Sweep K review LOW-1: with both sides saved on different servers a bare --attach cannot know which to build on, so it
+    /// refuses before touching SQL and asks for --server. Neither server exists, so a connection attempt would be sql_error.
+    /// </summary>
+    [Fact]
+    public async Task Demo_attach_without_server_refuses_when_the_saved_connections_name_different_servers()
+    {
+        using var tw = new TestWorkspace();
+        using var services = tw.OpenServices();
+        var meta = await SqlConnect.ProbeAsync(SqlTestServer.ConnectionString, CancellationToken.None);
+        services.Connections.Save(Side.Src, "Server=nowhere-a;Database=Legacy;Integrated Security=true;Connect Timeout=1", meta);
+        services.Connections.Save(Side.Tgt, "Server=nowhere-b;Database=New;Integrated Security=true;Connect Timeout=1", meta);
+
+        var r = await CliRunner.RunAsync(tw.Ws, null, "demo", "--prefix", _prefix, "--attach");
+
+        Assert.True(r.Exit == 1 && r.Json["error"]?.GetValue<string>() == "usage",
+            $"a bare demo --attach over saved connections to two different servers must refuse with usage, not pick one: {r.Out}");
+        var message = r.Json["message"]!.GetValue<string>();
+        Assert.True(message.Contains("--server", StringComparison.Ordinal) && message.Contains("different servers", StringComparison.Ordinal),
+            $"the refusal must say the saved connections name different servers and ask for --server; it said: {message}");
+        Assert.Equal("Legacy", new SqlConnectionStringBuilder(services.Connections.GetConnectionString(Side.Src)!).InitialCatalog);
+    }
+
+    /// <summary>Open item 38: with only the target saved, that one gives the server.</summary>
+    [Fact]
+    public async Task Demo_attach_without_server_falls_back_to_the_saved_target_connection()
+    {
+        using var tw = new TestWorkspace();
+        using var services = tw.OpenServices();
+        services.Connections.Save(Side.Tgt, SqlTestServer.ConnectionString, await SqlConnect.ProbeAsync(SqlTestServer.ConnectionString, CancellationToken.None));
+
+        var r = await CliRunner.RunAsync(tw.Ws, null, "demo", "--prefix", _prefix, "--attach");
+
+        Assert.True(r.Exit == 0, $"demo --attach without --server must use the saved target connection when no source is saved; got exit {r.Exit}: {r.Out}");
+        Assert.Equal(_prefix + "LegacyShop", services.Connections.GetMeta(Side.Src)!.Database);
+        Assert.Equal(_prefix + "ShopV2", services.Connections.GetMeta(Side.Tgt)!.Database);
     }
 
     /// <summary>

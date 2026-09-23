@@ -242,13 +242,46 @@ public static class Preflight
     /// <para>Ruling 215 (N-4): a LocalDB server reports <c>&lt;machine&gt;\LOCALDB#&lt;hex&gt;</c>, and the hex changes every time the
     /// instance starts - so the server a connection was saved against and the one discovery read differ for the same database, a
     /// false red that "re-run discovery" cannot cure. Two LocalDB names are compared by their machine part.</para>
+    /// <para>Open item 49: the machine part cannot tell two LocalDB instances of one machine apart, so when both records carry the
+    /// stable data source (<c>(localdb)\Name</c>, <see cref="ServerMeta.DataSource"/>) it must match as well. A record written before
+    /// the data source existed has none, and is compared by the machine part alone, as before.</para>
     /// </summary>
     public static bool SameTarget(ServerMeta? a, ServerMeta? b)
     {
         if (a is null || b is null) return false;
         return string.Equals(a.Database ?? "", b.Database ?? "", StringComparison.OrdinalIgnoreCase)
-               && string.Equals(ServerIdentity(a.Server), ServerIdentity(b.Server), StringComparison.OrdinalIgnoreCase);
+               && string.Equals(ServerIdentity(a.Server), ServerIdentity(b.Server), StringComparison.OrdinalIgnoreCase)
+               && (a.DataSource is null || b.DataSource is null
+                   || string.Equals(a.DataSource, b.DataSource, StringComparison.OrdinalIgnoreCase));
     }
+
+    /// <summary>What separates the two parts of a LocalDB run's recorded server (decision J-5); no <c>@@SERVERNAME</c> holds a space.</summary>
+    private const string DataSourceSeparator = @" (localdb)\";
+
+    /// <summary>
+    /// Open item 49, for a run's recorded target server (<see cref="TransferRunRow.TargetServer"/>). A run started on LocalDB records
+    /// <c>&lt;machine&gt;\LOCALDB (localdb)\Name</c> (<see cref="StableServer"/>), and the saved connection must match both parts: the
+    /// machine by <see cref="ServerIdentity"/> (review J, MED-1: instance names repeat from machine to machine, and a copied project
+    /// folder carries its run records with it) and the instance by its data source. Any other record - another server, or a LocalDB run
+    /// recorded before item 49 - compares by <see cref="ServerIdentity"/> alone, as before, so it still resumes.
+    /// </summary>
+    internal static bool SameRecordedServer(ServerMeta saved, string? recordedServer)
+    {
+        ArgumentNullException.ThrowIfNull(saved);
+        string recorded = recordedServer?.Trim() ?? "";
+        int split = recorded.LastIndexOf(DataSourceSeparator, StringComparison.OrdinalIgnoreCase);
+        if (split > 0)
+            return string.Equals(ServerIdentity(saved.Server), recorded[..split], StringComparison.OrdinalIgnoreCase)
+                   && string.Equals(saved.DataSource, recorded[(split + 1)..], StringComparison.OrdinalIgnoreCase);
+        return string.Equals(ServerIdentity(saved.Server), ServerIdentity(recordedServer), StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Open item 49 and decision J-5: the server a run records as its target, and the one a refusal names. For LocalDB it is
+    /// the machine part and the stable data source, <c>&lt;machine&gt;\LOCALDB (localdb)\Name</c>: <c>&lt;machine&gt;\LOCALDB#&lt;hex&gt;</c>
+    /// alone reads the same for two instances of one machine, and <c>(localdb)\Name</c> alone the same for one name on two machines.
+    /// Any other server is its <c>@@SERVERNAME</c>.</summary>
+    internal static string StableServer(ServerMeta meta)
+        => meta.DataSource is { } source ? ServerIdentity(meta.Server) + " " + source : meta.Server;
 
     private static readonly System.Text.RegularExpressions.Regex LocalDbServer = new(@"^(?<machine>[^\\]+)\\LOCALDB#[0-9A-F]+$",
         System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
@@ -311,9 +344,9 @@ public static class Preflight
         if (saved is null)
             return NotRun("target_identity", "Not checked: the target connection is not saved.", causeIsAlreadyAnError: true);
         return SameTarget(saved, d)
-            ? Ok("target_identity", $"The saved target is the database discovery read: {d.Database} on {d.Server}.")
-            : Err("target_identity", $"The saved target connection ({saved.Database} on {saved.Server}) is not the database discovery read "
-                                     + $"({d.Database} on {d.Server}); the SQL plan was generated for {d.Database}. Re-run discovery.");
+            ? Ok("target_identity", $"The saved target is the database discovery read: {d.Database} on {StableServer(d)}.")
+            : Err("target_identity", $"The saved target connection ({saved.Database} on {StableServer(saved)}) is not the database discovery "
+                                     + $"read ({d.Database} on {StableServer(d)}); the SQL plan was generated for {d.Database}. Re-run discovery.");
     }
 
     /// <summary>

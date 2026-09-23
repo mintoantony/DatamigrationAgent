@@ -39,7 +39,8 @@ public static class ScriptPack
         /// <summary>Every way <see cref="SqlPlanPayload.Order"/> fails to list each task exactly once.</summary>
         public required List<string> Problems { get; init; }
         /// <summary><see cref="SqlPlanPayload.NotValidatedReasons"/>: the stored <see cref="SqlPlanSource.SkippedPrefix"/> line(s), or
-        /// <see cref="SqlModule.NoEvidence"/> for a version with no validation evidence.</summary>
+        /// <see cref="SqlModule.ValidatedWithErrors"/> for a version whose evidence has Ok false, or <see cref="SqlModule.NoEvidence"/>
+        /// for a version with no validation evidence at all.</summary>
         public required List<string> NotValidated { get; init; }
         /// <summary>The plan's stored plan-level <see cref="SqlPlanPayload.Errors"/>.</summary>
         public required List<string> PlanErrors { get; init; }

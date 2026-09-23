@@ -330,6 +330,71 @@ public sealed class PreflightTests(EngineSourceFixture fx) : IClassFixture<Engin
     }
 
     /// <summary>
+    /// Open item 49. Two LocalDB instances on one machine report the same machine part, so Ruling 215's rule alone takes a database on
+    /// one for the same database on the other - and a project repointed from <c>(localdb)\A</c> to <c>(localdb)\B</c> passes the
+    /// identity check. When both records carry the stable data source, that decides; a record without one (written before it existed)
+    /// still compares by the machine part.
+    /// </summary>
+    [Fact]
+    public void Two_LocalDB_instances_with_the_same_database_are_different_targets_when_both_records_name_their_instance()
+    {
+        var saved = TestCatalogs.Meta("Shop") with { Server = @"6DQWGK4\LOCALDB#51E04DEF", DataSource = @"(localdb)\MSSQLLocalDB" };
+        var discovered = saved with { Server = @"6DQWGK4\LOCALDB#1A254D6D" };
+
+        Assert.False(Preflight.SameTarget(saved, discovered with { DataSource = @"(localdb)\Other" }),
+            @"one database name on two LocalDB instances ((localdb)\MSSQLLocalDB and (localdb)\Other) counts as one target");
+        Assert.True(Preflight.SameTarget(saved, discovered with { DataSource = @"(LocalDB)\mssqllocaldb" }),
+            "one LocalDB instance, named in another case and read after a restart, is not the same target");
+        Assert.True(Preflight.SameTarget(saved, discovered with { DataSource = null }),
+            "a record written before the data source existed no longer matches by the machine part");
+        Assert.True(Preflight.SameTarget(saved with { DataSource = null }, discovered), "an older saved record no longer matches");
+        Assert.False(Preflight.SameTarget(saved, discovered with { Database = "Other" }), "a different database on one instance is the same");
+
+        // The run's recorded server (decision J-5): the machine part and the data source, both - the machine part for a run
+        // recorded before (it resumes).
+        Assert.True(Preflight.StableServer(saved) == @"6DQWGK4\LOCALDB (localdb)\MSSQLLocalDB",
+            $"a LocalDB run would record the server {Preflight.StableServer(saved)}, not its machine and its instance");
+        Assert.True(Preflight.SameRecordedServer(saved, @"6dqwgk4\localdb (localdb)\mssqllocaldb"), "a run's own LocalDB instance is refused");
+        Assert.False(Preflight.SameRecordedServer(saved, @"6DQWGK4\LOCALDB (localdb)\Other"),
+            @"a run recorded on (localdb)\Other resumes on MSSQLLocalDB");
+        Assert.True(Preflight.SameRecordedServer(saved, @"6dqwgk4\LOCALDB#1A254D6D"), "a LocalDB run recorded before item 49 no longer resumes");
+        Assert.False(Preflight.SameRecordedServer(saved with { DataSource = null }, @"6DQWGK4\LOCALDB (localdb)\Other"),
+            "a run recorded on a named instance resumes against a connection that names none");
+    }
+
+    /// <summary>
+    /// Review J, MED-1. A project folder copied to another machine carries its run record there, and LocalDB instance names repeat from
+    /// machine to machine - <c>(localdb)\MSSQLLocalDB</c> is the default everywhere. A run record holding only the data source would
+    /// take a same-named database on the other machine's LocalDB for the one the run loaded into, and resume there from checkpoints that
+    /// database has never seen; before item 49 the machine part refused it, and it still must.
+    /// </summary>
+    [Fact]
+    public void A_run_recorded_on_one_machines_LocalDB_does_not_resume_on_another_machines_instance_of_the_same_name()
+    {
+        var here = TestCatalogs.Meta("Shop") with { Server = @"6DQWGK4\LOCALDB#51E04DEF", DataSource = @"(localdb)\MSSQLLocalDB" };
+        var elsewhere = here with { Server = @"OTHERBOX\LOCALDB#1A254D6D" };
+        string recorded = Preflight.StableServer(here);
+
+        Assert.False(Preflight.SameRecordedServer(elsewhere, recorded),
+            $@"a run recorded as '{recorded}' resumes against (localdb)\MSSQLLocalDB on another machine ({elsewhere.Server})");
+        Assert.True(Preflight.SameRecordedServer(here with { Server = @"6DQWGK4\LOCALDB#0BADF00D" }, recorded),
+            "the run's own instance, restarted, no longer resumes");
+    }
+
+    /// <summary>Open item 49, additive: a ServerMeta stored before the data source existed still reads, with none.</summary>
+    [Fact]
+    public void A_server_record_stored_before_the_data_source_existed_still_reads()
+    {
+        var old = Json.Deserialize<Dbm.Core.Sql.ServerMeta>("""
+            {"server":"6DQWGK4\\LOCALDB#51E04DEF","database":"Shop","version":"Microsoft SQL Server 2022","productVersion":"16.0.1000.6",
+             "majorVersion":16,"edition":"Express Edition","serverCollation":"Latin1_General_CI_AS","databaseCollation":"Latin1_General_CI_AS",
+             "compatLevel":160,"authSummary":"integrated"}
+            """);
+
+        Assert.True(old is { Database: "Shop", DataSource: null }, $"an older server record did not read: {old}");
+    }
+
+    /// <summary>
     /// Ruling 215 (re-review concern 3). The start refuses while another project's run has unfinished checkpoints in the target; the
     /// checklist says so first, on its checkpoint-table line, naming that project's folder - instead of a green list above a busy Start.
     /// </summary>
